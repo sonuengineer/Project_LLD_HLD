@@ -1,0 +1,1065 @@
+[
+ {
+  "id": "OBJS-064",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A garbage collector runs while a large upload is still streaming. How does the system avoid deleting the in-flight blob, and what happens if the grace period is misconfigured?",
+  "answer_hinglish": "Short answer: GC orphan blobs ko tabhi delete karta hai jab woh `orphan_grace_seconds` (default 3600 sec, yaani 1 ghanta) se purane hon AUR Postgres mein koi row unhe reference na kare. In-flight upload ka blob abhi metadata mein commit nahi hua, toh woh 'unreferenced' dikhta hai -- sirf uski young age usko bachati hai.\n\nSocho: client 2 GB ka PUT kar raha hai. `put_object` pehle bytes ko ek naye random blob mein stream karta hai, aur commit transaction sirf end mein hota hai. Is beech agar worker `run_gc` chala de, toh `storage.list_older_than(orphan_grace_seconds)` sirf woh blobs deta hai jinka mtime (local) ya LastModified (S3) cutoff se purana hai. Naya likha ja raha blob list mein aata hi nahi, isliye bachta hai. Yeh exactly `test_gc_respects_grace_period_for_in_flight_uploads` prove karta hai.\n\nAb agar grace galat set ho gaya -- maan lo kisi ne 60 seconds kar diya aur upload 10 minute ka hai -- toh local adapter pe temp file `.tmp-<uuid>` ka mtime har write pe update hota hai, toh shayad bach jaye, lekin slow client jo 60s+ kuch na bheje uska temp file delete ho sakta hai; S3 pe boto3 multipart ke parts complete hone tak object exist hi nahi karta, lekin final object commit se pehle grace cross kar le toh GC usko delete kar dega aur phir metadata ek non-existent blob ko point karega -- yahi woh 'dangling metadata' hai jisse poora design bachna chahta tha. Rule of thumb: grace >> sabse lamba allowed upload time (max object 5 GiB / slowest expected client speed) + commit time.",
+  "why_needed": "Bytes-first ordering orphan blobs paida karta hai; unhe saaf karna zaroori hai, lekin 'orphan' aur 'abhi commit hone wala' blob storage layer pe ek jaise dikhte hain. Grace period hi dono ko alag karta hai.",
+  "real_world_analogy": "Restaurant mein waiter khaali dikhti table tabhi saaf karta hai jab woh 1 ghante se khaali ho -- warna ho sakta hai customer bas washroom gaya ho aur plate abhi bhi uski hai.",
+  "how_it_works": "`run_gc` do phase mein chalta hai: (1) `blob_deletions` queue ke blobs (reference re-check ke baad) delete; (2) `storage.list_older_than(grace)` se candidates, phir `SELECT blob_key FROM objects ... UNION SELECT blob_key FROM multipart_parts` se referenced set, aur jo candidate set mein nahi -> `delete_any`. Age hi safety hai; reference check correctness hai.",
+  "in_this_project": "`objstore/config.py` mein `orphan_grace_seconds: int = 3600` (comment: 'GC never deletes blobs younger than this'). `services/maintenance.py::run_gc` candidates `list_older_than` se leta hai. `storage/local.py::list_older_than` file ka `st_mtime` dekhta hai aur `.tmp-*` leftovers bhi include karta hai; `storage/s3.py::list_older_than` `LastModified` dekhta hai. Test: `tests/test_maintenance.py::test_gc_respects_grace_period_for_in_flight_uploads` ek fresh blob `cafebabe*5` likhta hai aur assert karta hai `deleted_orphans == 0`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/config.py::orphan_grace_seconds",
+   "projects/07-object-storage/objstore/storage/local.py::list_older_than",
+   "projects/07-object-storage/tests/test_maintenance.py::test_gc_respects_grace_period_for_in_flight_uploads"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_gc, orphan phase)\ncandidates = await storage.list_older_than(orphan_grace_seconds)\nasync with sm() as s:\n    referenced = set((await s.execute(text(\n        \"SELECT blob_key FROM objects WHERE blob_key IS NOT NULL UNION \"\n        \"SELECT blob_key FROM multipart_parts\"))).scalars().all())\nfor name in candidates:\n    if name not in referenced:\n        await storage.delete_any(name)",
+  "code_language": "python",
+  "advantages": [
+   "Simple time-based rule, koi distributed coordination nahi chahiye",
+   "Crash ke baad bache temp files aur orphan blobs dono saaf ho jaate hain",
+   "In-flight uploads ko koi lock nahi lena padta"
+  ],
+  "disadvantages": [
+   "Correctness ek config value pe depend karti hai -- galat grace = data loss",
+   "Orphans ka storage ek ghante tak waste hota hai",
+   "Clock skew (S3 server time vs worker time) cutoff ko bigaad sakta hai"
+  ],
+  "common_mistakes": [
+   "Grace ko average upload time pe set karna, worst case pe nahi",
+   "Sochna ki referenced check akela kaafi hai -- in-flight blob abhi referenced nahi hota",
+   "Test mein grace 0 rakh ke production mein bhi wahi copy kar dena"
+  ],
+  "follow_up_questions": [
+   "How would you make GC safe without relying on wall-clock age?",
+   "What happens with clock skew between the S3 backend and the worker?",
+   "Why does the queued-deletion phase not need a grace period for uploads?"
+  ],
+  "concepts": [
+   "garbage collection",
+   "grace period",
+   "orphan blobs",
+   "crash safety"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Time-based grace simple hai lekin implicit contract hai: 'koi upload grace se lamba nahi chalega'. Alternative explicit 'pending uploads' table hai jisme upload start pe row likho -- zyada DB writes, lekin GC exact hota hai.",
+   "failure_scenarios": "Grace bahut chhota -> committed-hone-wale blob delete -> metadata dangling, GET 500. Grace bahut bada -> crash-heavy environment mein orphan storage cost badhta hai. Worker aur storage ke clocks alag -> cutoff galat.",
+   "alternatives": "Intent log: upload start pe `pending_blobs(blob_key, started_at)` insert, commit pe delete; GC sirf woh orphans hataye jo pending mein bhi nahi. Ya S3 lifecycle rule on a 'staging/' prefix plus copy-on-commit.",
+   "scale_10x_100x": "Billions of blobs pe `list_older_than` poora store scan karta hai (observation O6) -- grace sahi ho tab bhi GC run khud ghanton lagega. Scale pe incremental scan (prefix shards, S3 Inventory) chahiye.",
+   "production_improvements": "Config validation: grace ko `max_object_bytes / min_client_throughput` se bada enforce karo; GC orphan count ka metric/alert; startup pe warn agar grace < 15 min."
+  }
+ },
+ {
+  "id": "OBJS-065",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "A user accidentally deletes an important file in a versioned bucket. What actually happened, and how do you recover it?",
+  "answer_hinglish": "Agar bucket mein versioning `enabled` hai, toh ek normal DELETE (bina `versionId` ke) data ko delete karta hi nahi. Woh sirf ek naya 'delete marker' version insert karta hai jo latest ban jata hai. Isliye GET 404 deta hai (header `x-obj-delete-marker: true` ke saath), lekin purane versions ke bytes aur rows dono safe hain.\n\nRecovery ka tareeka simple hai: pehle `GET /buckets/b/objects?versions=true&prefix=<key>` se versions list karo -- top pe delete marker dikhega (`is_delete_marker: true, is_latest: true`). Phir us marker ka version delete karo: `DELETE /buckets/b/objects/<key>?versionId=<marker_id>`. Yeh permanent version delete hai; kyunki marker latest tha, code next newest version ko `is_latest = true` bana deta hai. Bas -- file wapas aa gayi. Isko 'undelete' kehte hain.\n\nDhyan rakhne wali baat: agar bucket `disabled` (kabhi versioning on nahi kiya) tha, toh DELETE row hata deta hai aur blob `blob_deletions` queue mein chala jata hai; next GC run ke baad bytes gaye. Tab recovery sirf backup se hogi. Aur agar user ne galti se `versionId` ke saath specific version delete kiya, woh bhi permanent hai. Isliye important data wale buckets mein versioning on rakho, aur lifecycle `noncurrent_expiration_days` itna rakho ki galti pakadne ka time mile.",
+  "why_needed": "Insaan galtiyan karte hain; versioning + delete markers accidental delete ko reversible banate hain bina extra backup system ke.",
+  "real_world_analogy": "Recycle Bin jaisa: Delete dabane se file bin mein jaati hai, disk se nahi mitti. 'Restore' karo toh wapas. Bin khali kiya (versionId delete) toh sach mein gayi.",
+  "how_it_works": "`delete_object` mein versionId na ho aur versioning enabled/suspended ho -> `commit_version(..., delete_marker=True, blob_key=None, size=0)`. `head_object` latest row delete marker dekhe toh `NotFound` with `x-obj-delete-marker`. Marker version delete -> `UPDATE ... SET is_latest = true WHERE id = (SELECT ... ORDER BY created_at DESC, id DESC LIMIT 1)`.",
+  "in_this_project": "`services/objects.py::delete_object` dono paths handle karta hai. `tests/test_objects.py::test_versioning_and_delete_markers` exactly yeh scenario chalata hai: v1, v2 put -> delete -> 404 + marker header -> marker version delete -> GET dobara `v2` deta hai -> v2 permanently delete -> `v1` latest. FAILURE_SCENARIOS.md row 9 bhi yahi hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::delete_object",
+   "projects/07-object-storage/objstore/services/objects.py::head_object",
+   "projects/07-object-storage/tests/test_objects.py::test_versioning_and_delete_markers",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: tests/test_objects.py (test_versioning_and_delete_markers)\nd = (await a.delete(\"photos\", \"doc.txt\")).json()\nassert d[\"delete_marker\"] is True\ngone = await a.get(\"photos\", \"doc.txt\")\nassert gone.status_code == 404 and gone.headers[\"x-obj-delete-marker\"] == \"true\"\n# \"undelete\": remove the delete marker version -> v2 is current again\nawait a.delete(\"photos\", \"doc.txt\", version_id=d[\"version_id\"])\nassert (await a.get(\"photos\", \"doc.txt\")).content == b\"v2\"",
+  "code_language": "python",
+  "advantages": [
+   "Accidental deletes reversible hain",
+   "Koi alag backup restore process nahi chahiye",
+   "Audit trail: versions list mein dikhta hai kab delete hua"
+  ],
+  "disadvantages": [
+   "Delete markers aur purane versions quota/storage khaate rehte hain",
+   "Unversioned bucket mein yeh suraksha nahi hai",
+   "Users confuse hote hain ki 'delete kiya phir bhi space nahi mila'"
+  ],
+  "common_mistakes": [
+   "Sochna ki versioned bucket mein DELETE bytes free karta hai",
+   "Undelete ke liye marker ki jagah data version delete kar dena",
+   "Versioning ko `disabled` pe wapas le jaane ki koshish (API sirf enabled|suspended allow karta hai)"
+  ],
+  "follow_up_questions": [
+   "How does the system decide which version becomes latest after the marker is removed?",
+   "What happens to a lone delete marker after all older versions expire?",
+   "How would MFA delete or object lock protect against malicious deletes?"
+  ],
+  "concepts": [
+   "versioning",
+   "delete marker",
+   "undelete",
+   "recovery"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-066",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What happens if you lose the Postgres metadata database but the blob store survives -- or the other way round? How should backups be designed for this system?",
+  "answer_hinglish": "Seedha jawab: dono akele bekaar hain. Blob keys random hex hain (`new_blob_key()` = uuid4 hex + 8 chars), object key se derive nahi hote. Toh agar Postgres chala gaya, blob store mein lakhon `3f9a...` naam ki files padi hain -- kaunsi file kis bucket/key/version ki hai, content type kya tha, owner kaun, sab metadata mein tha. Practically data unreadable ho gaya. TRADEOFFS.md point 2 yahi bolta hai: random keys ki keemat 'blob store unreadable without the database'.\n\nUlta case: blob store gaya, Postgres safe. Ab metadata un blobs ko point karta hai jo exist nahi karte -- har GET pe adapter error (local pe FileNotFoundError, S3 pe NoSuchKey) -> 500. Listing sab dikhayegi lekin download fail -- sabse confusing state.\n\nIsliye DEPLOYMENT.md checklist ka point 1: 'Back up Postgres AND the blob store together'. Consistent backup ke liye order matter karta hai, bilkul write path jaisa: pehle Postgres snapshot (point in time T), phir blob store ka copy jo T ke baad complete ho. Blobs immutable hain aur kabhi reuse nahi hote, toh T ke baad copy kiye blob store mein T wale metadata ke saare blobs honge (plus kuch extra, jo restore ke baad GC orphan maan ke hata dega). Ek catch: T ke baad GC ne jo queued blobs delete kiye, woh T-snapshot mein still referenced ho sakte hain. Isliye backup window ke dauraan GC pause karo, ya blob store pe versioning/soft delete rakho.",
+  "why_needed": "Metadata/data split system ko do stateful stores deta hai; disaster recovery tabhi kaam karta hai jab dono ek doosre ke consistent point pe restore hon.",
+  "real_world_analogy": "Library mein kitaabein (blobs) aur catalog cards (metadata). Catalog jal gaya toh lakhon kitaabein bina title ke shelf pe -- kuch nahi milega. Kitaabein jal gayi toh catalog sirf khali references.",
+  "how_it_works": "Write path: blob pehle, metadata baad -> metadata kabhi aage nahi hota. Backup bhi isi invariant ko follow kare: metadata snapshot pehle, blobs baad -> restore ke baad har referenced blob present; extra blobs orphan hain jo `run_gc` grace ke baad delete karega.",
+  "in_this_project": "Random keys: `services/objects.py::new_blob_key`. Comment in migration: `blob_key text -- random id in the storage adapter; NEVER derived from key`. DEPLOYMENT.md production checklist point 1 aur 2 (worker run karo, `blob_deletions` growth pe alert). Is project mein koi backup tooling implement nahi hai -- yeh operational guidance hai. Review se pehle Docker compose mein Postgres ka volume nahi tha (container recreate = metadata loss, blobs orphan); ab named volume hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::new_blob_key",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/DEPLOYMENT.md",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/docker-compose.yml"
+  ],
+  "code_example": "# illustrative backup ordering (not in repo)\n# 1. pause maintenance worker (no GC deletes during backup)\ndocker compose stop worker\n# 2. metadata snapshot at time T\npg_dump -Fc objstore > meta_T.dump\n# 3. copy blob store AFTER T (blobs are immutable, never reused)\naws s3 sync s3://objstore-blobs s3://backup-blobs --endpoint-url http://seaweedfs:8333\n# 4. resume GC; extra blobs in the copy are orphans GC removes after grace on restore\ndocker compose start worker",
+  "code_language": "bash",
+  "advantages": [
+   "Write-path invariant hi backup ordering bata deta hai",
+   "Immutable blobs incremental backups ko easy banate hain",
+   "Restore ke baad orphans GC khud saaf karta hai"
+  ],
+  "disadvantages": [
+   "Do systems ka coordinated backup operationally mushkil",
+   "GC aur backup race kar sakte hain",
+   "Blob store bina metadata ke forensically bhi kaam ka nahi"
+  ],
+  "common_mistakes": [
+   "Sirf Postgres backup karna aur sochna data safe hai",
+   "Blob store pehle aur metadata baad copy karna (metadata naye blobs point karega jo backup mein nahi)",
+   "Backup ke dauraan GC chalne dena"
+  ],
+  "follow_up_questions": [
+   "How would you do point-in-time recovery for both stores?",
+   "Would you embed bucket/key in blob object metadata to make blobs self-describing?",
+   "How does cross-region replication change this?"
+  ],
+  "concepts": [
+   "disaster recovery",
+   "backups",
+   "metadata/data split",
+   "consistency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Random keys security aur metadata-only rename dete hain, lekin blob store ko self-describing nahi rehne dete. Ek middle ground: blob ke S3 object metadata mein (bucket, key, version_id) bhi likho -- path traversal risk nahi (yeh data hai, path nahi) aur DR mein reconstruct possible.",
+   "failure_scenarios": "Postgres corruption + no PITR -> total logical data loss. Blob store partial loss -> specific GETs 500 karte hain jabki listing normal dikhti hai. Backup ke beech GC -> restored metadata deleted blob ko point kare.",
+   "alternatives": "Postgres streaming replication + WAL archiving (PITR); blob layer pe S3 versioning/replication; ya content-addressed blobs (sha256 key) jisse integrity verify ho sake.",
+   "scale_10x_100x": "100x pe full pg_dump impractical -- continuous WAL archiving, aur blob store ke liye S3 cross-region replication; periodic reconciliation job jo random sample metadata rows ke blobs ka existence check kare.",
+   "production_improvements": "Postgres ke liye PITR (compose volume already added); blob backend pe versioning; reconciliation job (metadata -> blob exists?) with metric; restore runbook test karna (game day); blob object metadata mein reverse pointer."
+  }
+ },
+ {
+  "id": "OBJS-067",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A test uploading a key like `../../etc/passwd` succeeded but a GET returned a different object (or 404). How was this bug found and fixed?",
+  "answer_hinglish": "Yeh TESTING.md ka real bug #2 hai. Symptom: `test_hostile_keys_never_touch_filesystem_paths` mein key `../../etc/passwd` PUT hua, lekin server pe jo key store hui woh `etc/passwd` jaisi thi aur round trip match nahi hua. Server galat nahi tha -- client hi galat URL bhej raha tha.\n\nInvestigate kaise kiya: pehle socha server path normalise kar raha hai, toh server pe request ka `scope['raw_path']` aur route ka `key` param log kiya. Wahan dikha ki request hi `/buckets/photos/objects/etc/passwd` pe aayi thi. Matlab client side pe `/a/../b` -> `/b` ho gaya. Yeh RFC 3986 dot-segment removal hai: HTTP clients (httpx bhi) URL build karte waqt `.` aur `..` segments ko resolve kar dete hain, jaise browser karta hai.\n\nFix: `services/signing.py::quote_key` mein jo path segment exactly `.` ya `..` hai, usko `%2E` / `%2E%2E` encode karo. Encoded dots ko client normalise nahi karta, server unhe decode karke original key `../../etc/passwd` paata hai. Baaki segments `quote(seg, safe='-_.~')` se encode hote hain. Security angle: yeh kabhi filesystem tak nahi pahunchta kyunki blob path random hex hai -- bug correctness ka tha (galat object address), traversal ka nahi. Lesson: signing aur URL building ek hi canonical encoding use karein, warna signature bhi mismatch hota.",
+  "why_needed": "Object keys arbitrary strings hain; agar client unhe URL mein galat encode kare toh user ek object likhta hai aur doosra padhta hai -- silent data corruption jaisa.",
+  "real_world_analogy": "Courier ko address diya 'Flat 5, upar wali manzil se ek neeche' -- courier ne 'simplify' karke Flat 4 likh diya. Address literal likhna padta hai, interpret nahi.",
+  "how_it_works": "RFC 3986 section 5.2.4 remove_dot_segments: `/a/b/../c` -> `/a/c`. Percent-encoded `%2E%2E` dot segment nahi maana jata, toh survive karta hai. Server pe Starlette path decode karta hai aur `{key:path}` converter ko `../../etc/passwd` milta hai.",
+  "in_this_project": "`services/signing.py::quote_key` (docstring yahi bug explain karta hai), `client.py::ObjClient.put/get/delete` sab `quote_key` use karte hain, aur `/presign` route bhi `signing.quote_key(body.key)` se path banata hai. Test `tests/test_objects.py::test_hostile_keys_never_touch_filesystem_paths` keys `../../etc/passwd`, `a/../../b`, emoji, `%25`, backslash try karta hai aur check karta hai ki saari files `blobs/` ke andar hain aur naam `isalnum()`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/signing.py::quote_key",
+   "projects/07-object-storage/objstore/client.py::ObjClient",
+   "projects/07-object-storage/tests/test_objects.py::test_hostile_keys_never_touch_filesystem_paths",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/signing.py\ndef quote_key(key: str) -> str:\n    out = []\n    for seg in key.split(\"/\"):\n        if seg in (\".\", \"..\"):\n            out.append(seg.replace(\".\", \"%2E\"))\n        else:\n            out.append(quote(seg, safe=\"-_.~\"))\n    return \"/\".join(out)",
+  "code_language": "python",
+  "advantages": [
+   "Hostile keys bhi exactly round trip hote hain",
+   "Client, presign aur tests ek hi encoder share karte hain",
+   "Server ko key ke saath koi special-case nahi karna padta"
+  ],
+  "disadvantages": [
+   "Har client/SDK ko yeh rule follow karna padega",
+   "Browser address bar mein `%2E%2E` likha ho toh bhi kuch proxies normalise kar sakti hain"
+  ],
+  "common_mistakes": [
+   "Server pe bug dhoondte rehna jabki request hi galat URL pe aayi",
+   "`quote()` ko kaafi samajhna -- woh `.` ko safe maanta hai",
+   "Signing ke liye ek encoding aur request ke liye doosri use karna"
+  ],
+  "follow_up_questions": [
+   "Why is this not a security vulnerability in this design?",
+   "How would a reverse proxy like nginx treat `%2E%2E`?",
+   "How does AWS S3 handle keys with `..` segments?"
+  ],
+  "concepts": [
+   "URL encoding",
+   "dot segments",
+   "RFC 3986",
+   "debugging",
+   "path traversal"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-068",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "QuotaExceeded responses started failing with a 500 instead of a clean 403. What was the cause?",
+  "answer_hinglish": "Yeh TESTING.md ka real bug #1 hai. Symptom: quota wale bucket mein limit cross karne pe client ko proper `403 QuotaExceeded` JSON ki jagah 500 'Internal server error' mila. Logs mein (`bpcommon.errors` ka `unhandled_error` with stack trace) JSON serialization error tha: `Object of type Decimal is not JSON serializable`.\n\nInvestigation: 500 ka matlab exception handler tak koi non-AppError pahuncha. Stack trace dikhata tha ki failure `QuotaExceeded` banne ke baad response render karte waqt hua -- `details={\"used\": ..., \"adding\": ..., \"quota\": ...}` mein `used` ek `Decimal` tha. Root cause Postgres semantics: `sum(bigint)` ka result type `numeric` hota hai (overflow se bachne ke liye), aur asyncpg `numeric` ko Python `Decimal` mein map karta hai. Python mein `Decimal + int` chal jata hai, isliye comparison theek kaam kar raha tha -- sirf JSON response tod raha tha. Classic 'happy path pass, error path broken' bug.\n\nFix: `_check_quota` mein dono sums ko `int(...)` se wrap kiya, aur code mein comment chhoda: 'sum(bigint) is NUMERIC in Postgres -> Decimal in Python: cast for arithmetic + JSON.' Alternative SQL mein `sum(size)::bigint` cast bhi hota. Lesson: error responses bhi test karo (`test_quota_counts_all_versions` ab `r.json()['error']['code'] == 'QuotaExceeded'` assert karta hai), aur aggregates ka return type yaad rakho.",
+  "why_needed": "Error paths kam chalte hain, isliye unke bugs production mein pehli baar dikhte hain; type mismatch DB aur JSON ke beech common trap hai.",
+  "real_world_analogy": "Bank ne balance 'lakh' ki jagah 'crore' unit mein bheja -- calculator ne add kar diya, lekin receipt printer ne format pehchana hi nahi aur crash.",
+  "how_it_works": "Postgres: `sum(int)` -> bigint, `sum(bigint)` -> numeric, `avg` -> numeric. asyncpg numeric -> `decimal.Decimal`. FastAPI `JSONResponse` stdlib `json.dumps` use karta hai jo Decimal reject karta hai. `bpcommon.errors.install_error_handlers` ka generic `Exception` handler 500 deta hai.",
+  "in_this_project": "`services/objects.py::_check_quota` mein `used = int(await s.scalar(text(\"SELECT coalesce(sum(size), 0) FROM objects WHERE bucket = :b\")...))` aur parts ke liye bhi `int(...)`. Error `QuotaExceeded` (403) `details` ke saath raise hota hai. Test: `tests/test_objects.py::test_quota_counts_all_versions`. Note: `maintenance.py::bucket_stats` bhi `sum(size)` return karta hai -- wahan `/stats` JSON FastAPI ke `jsonable_encoder` se jata hai jo Decimal handle kar leta hai, isliye wahan break nahi hua.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+   "projects/07-object-storage/objstore/services/objects.py::QuotaExceeded",
+   "projects/07-object-storage/tests/test_objects.py::test_quota_counts_all_versions",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (_check_quota)\n# sum(bigint) is NUMERIC in Postgres -> Decimal in Python: cast for arithmetic + JSON.\nused = int(await s.scalar(text(\"SELECT coalesce(sum(size), 0) FROM objects WHERE bucket = :b\"), {\"b\": bucket[\"name\"]}))\nif used + parts + adding > bucket[\"quota_bytes\"]:\n    raise QuotaExceeded(f\"bucket quota of {bucket['quota_bytes']} bytes exceeded\",\n                        details={\"used\": used + parts, \"adding\": adding, \"quota\": bucket[\"quota_bytes\"]})",
+  "code_language": "python",
+  "advantages": [
+   "Fix ek line ka hai aur comment future reader ko warn karta hai",
+   "Error response ab test se covered hai"
+  ],
+  "disadvantages": [
+   "Har aggregate pe yaad rakhna padta hai ki type numeric hai",
+   "Python ka duck typing bug ko arithmetic mein chhupa deta hai"
+  ],
+  "common_mistakes": [
+   "Sirf success path test karna",
+   "500 dekh ke DB ya lock issue maan lena bina stack trace padhe",
+   "`float()` mein cast karna -- bade bytes pe precision issue"
+  ],
+  "follow_up_questions": [
+   "Why does Postgres return numeric for sum(bigint)?",
+   "How would you catch this class of bug with typing or tests?",
+   "Where else in the code are aggregates returned to clients?"
+  ],
+  "concepts": [
+   "Postgres types",
+   "Decimal",
+   "error handling",
+   "debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-069",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A client keeps getting 401 \"signature does not match\". How do you debug it?",
+  "answer_hinglish": "Approach: pehle 401 ka exact message dekho, kyunki `authenticate` alag messages deta hai -- 'malformed Authorization header', 'request date outside allowed clock skew', 'missing x-obj-content-sha256', 'unknown or revoked access key', aur last 'signature does not match'. Har ek alag cause hai.\n\nAgar message 'signature does not match' hai, toh secret aur key valid hain; mismatch string-to-sign mein hai. String-to-sign = `METHOD \\n RAW_PATH \\n CANONICAL_QUERY \\n DATE \\n CONTENT_SHA256`. Debug ke liye client aur server dono pe yeh string print karo aur diff karo. Common causes: (1) raw path encoding alag -- client ne `quote_key` use nahi kiya, ya proxy ne path re-encode/normalise kar diya (server `scope['raw_path']` sign karta hai, decoded path nahi); (2) query canonicalization -- client ne params sort/encode alag kiya; server `canonical_query` mein sort + `quote(safe='-_.~')` karta hai; (3) method case ya HEAD vs GET; (4) client ne `x-obj-content-sha256` body ke ek version ka diya aur baad mein body badal di (agar sha galat hai lekin signature sahi, toh 401 nahi, 400 BadDigest aata). (5) Galat secret -- woh bhi yahi message deta hai.\n\nAgar 'clock skew' message hai: client machine ka clock check karo, `x-obj-date` unix seconds hona chahiye aur 900s ke andar. Fix generally: official client (`ObjClient`) use karo jo build_request ke baad final URL se `raw_path` nikal ke sign karta hai -- isse encoding mismatch hota hi nahi.",
+  "why_needed": "Signed APIs mein ek byte ka farq bhi 401 deta hai aur server security reasons se detail nahi batata; systematic tareeka chahiye.",
+  "real_world_analogy": "Do log ek hi recipe se cake bana rahe hain aur taste alag hai -- dono ki recipe line by line compare karo, kahin ek ne 'cup' aur doosre ne 'mug' padha.",
+  "how_it_works": "Server: `raw_path = request.scope.get('raw_path', ...)`, `q = request.url.query`, `expected = sign(secret, string_to_sign(method, raw_path, q, date, sha))`, `hmac.compare_digest(expected, sig)`. Client: `req = http.build_request(...)`; `raw_path = req.url.raw_path.decode().split('?')[0]`; sign; send same req.",
+  "in_this_project": "`services/auth.py::authenticate` saare checks aur messages; `services/signing.py::string_to_sign` aur `canonical_query`; `client.py::ObjClient.request` dikhata hai ki sign hamesha final built URL pe hota hai. `test_auth_failures` teen 401 cases cover karta hai: doosre path pe replay, 1 ghanta purani date, galat secret. Logs: bpcommon middleware har request ka `http_request` log (method, path, status) deta hai aur response mein `x-request-id`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/objstore/services/signing.py::string_to_sign",
+   "projects/07-object-storage/objstore/services/signing.py::canonical_query",
+   "projects/07-object-storage/objstore/client.py::ObjClient",
+   "projects/07-object-storage/tests/test_objects.py::test_auth_failures"
+  ],
+  "code_example": "# illustrative debug helper: print what both sides sign\nfrom objstore.services import signing\ns = signing.string_to_sign(\"PUT\", \"/buckets/photos/objects/a%20b.txt\", \"x=1&a=2\", \"1763380000\", \"UNSIGNED-PAYLOAD\")\nprint(repr(s))   # compare with the server-side value logged at DEBUG\n# 'PUT\\n/buckets/photos/objects/a%20b.txt\\na=2&x=1\\n1763380000\\nUNSIGNED-PAYLOAD'",
+  "code_language": "python",
+  "advantages": [
+   "Distinct error messages cause ko narrow kar dete hain",
+   "Canonicalization deterministic hai, reproduce karna easy"
+  ],
+  "disadvantages": [
+   "Signature mismatch message secret galat hai ya path -- distinguish nahi karta (by design)",
+   "Proxies jo path rewrite karti hain silently tod deti hain"
+  ],
+  "common_mistakes": [
+   "Decoded path sign karna jabki server raw path sign karta hai",
+   "Query params ko insertion order mein sign karna",
+   "Server ke clock ko blame karna bina client ka NTP check kiye"
+  ],
+  "follow_up_questions": [
+   "Why does the server sign the raw path instead of the decoded one?",
+   "Should the server return the expected string-to-sign in the error, as AWS does?",
+   "How would a CDN or proxy in front break signatures?"
+  ],
+  "concepts": [
+   "request signing",
+   "canonicalization",
+   "debugging",
+   "HMAC"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-070",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Alert: the blob_deletions table keeps growing and disk usage is not going down. How do you investigate?",
+  "answer_hinglish": "Pehla sawal: GC chal bhi raha hai ya nahi? `blob_deletions` sirf `run_gc` drain karta hai, jo `objstore.worker` har 300 seconds chalata hai (ya admin `POST /admin/gc/run`). Check karo: worker container up hai? Logs mein `gc_run` info lines aa rahi hain ya `maintenance_failed` exceptions? `worker.py` exception pakad ke log karta hai aur loop chalta rehta hai -- matlab GC har run fail ho sakta hai aur process 'healthy' dikhega.\n\nSQL se state dekho: `SELECT count(*), min(queued_at) FROM blob_deletions;` -- agar min(queued_at) bahut purana hai toh drain ruka hua hai. Agar count badh raha hai lekin oldest naya hai, toh drain chal raha hai par write rate (overwrites/deletes) se slow hai -- har run max `LIMIT 10000` uthata hai, aur har blob ke liye alag reference query + storage delete + alag transaction hota hai, yaani ek run ~10000 * (2 DB round trips + 1 blob delete). Interval 300s pe throughput cap ho jata hai.\n\nCommon causes: (1) worker down / storage credentials galat -> `storage.delete` exceptions (review se pehle ek failure poora run abort karta tha; ab per-blob try/except hai, `failed` count result mein aur `gc_delete_failed` logs); (2) S3 backend slow; (3) bahut zyada overwrite traffic. Fix: worker restore (per-blob error handling already hai, toh ek bura blob queue block nahi karta), batch deletes (S3 `DeleteObjects` 1000 per call), interval chhota ya multiple workers (GC re-check safe hai). Aur alert `blob_deletions` count + oldest age pe -- DEPLOYMENT.md point 2 bhi yahi kehta hai.",
+  "why_needed": "Queue-based deletion request path ko fast rakhta hai, lekin agar consumer ruk jaye toh storage silently leak hota hai -- isko observe karna zaroori hai.",
+  "real_world_analogy": "Office mein shredding bin bhar raha hai kyunki shredder wala chhutti pe hai -- documents 'delete' ho gaye lekin kamra bhar raha hai.",
+  "how_it_works": "Overwrite/delete -> `_queue_blob_deletion` (`INSERT ... ON CONFLICT DO NOTHING`). `run_gc`: `SELECT blob_key FROM blob_deletions ORDER BY queued_at LIMIT 10000`; per blob: reference check (objects UNION multipart_parts), agar unused -> `storage.delete`, phir row delete apne transaction mein.",
+  "in_this_project": "`services/maintenance.py::run_gc` aur `worker.py::main` (`interval: float = 300`, `log.exception(\"maintenance_failed\")`). Queue writes `services/objects.py::_queue_blob_deletion` se. Test `test_gc_deletes_queued_and_orphan_blobs_but_keeps_live_ones` assert karta hai ki run ke baad `blob_deletions` count 0 hai. DEPLOYMENT.md: 'alert if blob_deletions grows or GC fails'. Koi dedicated Prometheus gauge is project mein nahi hai -- SQL ya logs se dekhna padega.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/worker.py::main",
+   "projects/07-object-storage/objstore/services/objects.py::_queue_blob_deletion",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "-- investigation queries (illustrative)\nSELECT count(*) AS queued, min(queued_at) AS oldest, now() - min(queued_at) AS lag FROM blob_deletions;\n-- are queued blobs still referenced (they will be skipped, not deleted)?\nSELECT count(*) FROM blob_deletions d\nWHERE EXISTS (SELECT 1 FROM objects o WHERE o.blob_key = d.blob_key);\n-- worker logs\n-- docker compose logs worker | grep -E 'gc_run|maintenance_failed'",
+  "code_language": "sql",
+  "advantages": [
+   "Queue khud ek observable backlog metric hai",
+   "Re-check logic se multiple workers safe hain",
+   "Request path blob store ki health pe depend nahi karta"
+  ],
+  "disadvantages": [
+   "Bahut saare failing deletes har run retry hote hain -- `failed` count pe alert chahiye",
+   "Per-blob multiple round trips -> drain throughput limited",
+   "Built-in metric/alert nahi hai"
+  ],
+  "common_mistakes": [
+   "Worker process up dekh ke maan lena GC kaam kar raha hai",
+   "Queue rows manually delete kar dena (blobs leak ho jaate hain)",
+   "Storage usage ko sirf `objects` table se calculate karna"
+  ],
+  "follow_up_questions": [
+   "How would you make run_gc resilient to a single failing blob?",
+   "How would you batch deletes against S3?",
+   "What metric and threshold would you alert on?"
+  ],
+  "concepts": [
+   "garbage collection",
+   "queues",
+   "observability",
+   "debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Async queue latency aur reliability deta hai lekin backlog ka operational burden laata hai; inline delete simple hai par request blob store pe depend ho jaati.",
+   "failure_scenarios": "Worker crash loop, storage credentials rotate, S3 throttling (503 SlowDown) -- sab mein queue badhti hai, user ko koi error nahi dikhta, sirf bill badhta hai.",
+   "alternatives": "S3 DeleteObjects batch API; SKIP LOCKED claim se parallel GC workers; ya blob store ka native lifecycle (tag 'deleted' + expire).",
+   "scale_10x_100x": "100x overwrite rate pe single worker 300s interval mein drain nahi kar payega -- partitioned GC workers (`FOR UPDATE SKIP LOCKED` claims), batch reference checks (`WHERE blob_key = ANY(:keys)`), batch deletes.",
+   "production_improvements": "Gauges: `blob_deletions_count`, `blob_deletions_oldest_age_seconds`, GC run duration/failures counter; per-blob try/except with retry count column; dead-letter for blobs failing N times."
+  }
+ },
+ {
+  "id": "OBJS-071",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "In the lifecycle test, a single run at simulated day 31 expired the current version, deleted the noncurrent one AND removed the delete marker. Is that a bug?",
+  "answer_hinglish": "Nahi, yeh bug nahi -- yeh simulated clock ka side effect hai, aur test ka comment isko explicitly explain karta hai. Samjho kya hua: `run_lifecycle(sm, st, now=FUTURE(31))` ko 'aaj se 31 din baad' ka `now` diya. Pehle expiration step chala: v2 (current) 30 din se purana -> `delete_object` call -> versioned bucket hai toh ek delete marker insert hua. Lekin yeh marker REAL time (`created_at DEFAULT now()`, aaj) pe stamp hua, simulated day 31 pe nahi.\n\nPhir same run mein noncurrent step: v2 ab noncurrent hai, aur uska 'noncurrent since' = next newer version (marker) ka `created_at` = aaj. Simulated now = day 31, cutoff = day 24. Aaj < day 24, toh v2 'already 31 din se noncurrent' lagta hai -> delete. Ab sirf marker bacha, kisi aur version ke bina -> 'lone delete marker' cleanup ne usko bhi hata diya. Result `(1, 1, 1)`.\n\nReal time mein yeh teen kaam alag din hote: day 31 pe marker, day 38 pe v2 noncurrent expiry, uske baad marker cleanup. Debug kaise kiya: counts unexpected the, toh `list_versions` aur `created_at` values print ki -- marker ka timestamp simulated timeline se 'pehle' tha. Lesson: jab sirf `now` parameter inject karo aur DB `now()` use kare, toh do clocks ho jaate hain. Proper fix agar exact timeline chahiye: DB timestamps bhi injected clock se likho, ya test mein rows ke `created_at` manually set karo.",
+  "why_needed": "Time-based logic (lifecycle, TTL) ko test karne ke liye fake clock chahiye; agar system ke kuch hisse real clock use karein toh tests confusing results dete hain.",
+  "real_world_analogy": "Time machine mein 31 din aage gaye lekin wahan jo letter likha uspe aaj ki date chhap gayi -- ab future mein woh letter 31 din purana dikhta hai.",
+  "how_it_works": "`run_lifecycle(now=...)` cutoffs `now - timedelta(days)` se banata hai, lekin inserts `created_at DEFAULT now()` (Postgres server clock) use karte hain. Noncurrent query: `lag(created_at) OVER (PARTITION BY key ORDER BY created_at DESC, id DESC)`.",
+  "in_this_project": "`tests/test_maintenance.py::test_lifecycle_expiration_noncurrent_and_markers`: day 10 run -> `expired_noncurrent == 1`; day 31 run -> `(1, 1, 1)` with comment 'The marker is stamped with REAL time (today)...(In real time these would happen on different days.)'; day 40 run -> sab zero (idempotency). Code: `services/maintenance.py::run_lifecycle`.",
+  "implementation_files": [
+   "projects/07-object-storage/tests/test_maintenance.py::test_lifecycle_expiration_noncurrent_and_markers",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# real, trimmed: tests/test_maintenance.py\n# Day 31: current v2 expires -> delete marker. The marker is stamped with REAL time (today), so in\n# simulated time v2 has already been noncurrent > 7 days -> removed in the same pass, which leaves a\n# lone delete marker -> removed too. (In real time these would happen on different days.)\nr = await run_lifecycle(sm, st, now=FUTURE(31))\nassert (r[\"expired_current\"], r[\"expired_noncurrent\"], r[\"removed_delete_markers\"]) == (1, 1, 1)",
+  "code_language": "python",
+  "advantages": [
+   "`now` injection test ko fast aur deterministic banata hai",
+   "Test comment future readers ka confusion bachata hai"
+  ],
+  "disadvantages": [
+   "Do clocks (injected + DB now()) -> unrealistic timelines",
+   "Test real-time ordering prove nahi karta"
+  ],
+  "common_mistakes": [
+   "Unexpected counts dekh ke production code 'fix' kar dena",
+   "Test mein `time.sleep` ya real dates use karna",
+   "Assert ko loose kar dena bina samjhe"
+  ],
+  "follow_up_questions": [
+   "How would you make the test reflect real-time ordering exactly?",
+   "Why is noncurrent age measured from the successor's created_at?",
+   "What does idempotency of run_lifecycle mean here?"
+  ],
+  "concepts": [
+   "testing",
+   "simulated clock",
+   "lifecycle",
+   "window functions"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-072",
+  "project_slug": "p07-object-storage",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "PUT throughput does not increase when you raise client concurrency. How do you find out whether it is lock contention or CPU?",
+  "answer_hinglish": "Is project mein exactly yeh investigation hui thi, do rounds mein. Round 1: 1KB PUT at 16 concurrency sirf 53 ops/s (local adapter). Hypothesis: lock contention. Check: Postgres mein `pg_locks` / `pg_stat_activity` dekho -- `wait_event_type = 'Lock'` wale sessions, aur kaunsi relation pe. Code padha toh har `put_object` `SELECT 1 FROM buckets WHERE name = :b FOR UPDATE` le raha tha -- matlab ek bucket ke saare writes, alag keys ke bhi, ek line mein. Fix: bucket lock sirf tab jab `quota_bytes` set hai; per-key advisory lock kaafi hai. Saath mein access-key secret cache aur local adapter mein kam thread hops. Result 72 ops/s (S3 adapter 44 -> 57).\n\nRound 2: ab bhi concurrency badhane pe scale nahi hua. Isliye concurrency vary karke process CPU time vs wall time measure kiya: c=1 31/s (CPU 44% of wall), c=4 76/s (CPU 122%), c=16 55/s (CPU 110%). CPU ~100%+ of wall ka matlab single Python process (client + server + SQLAlchemy + thread pool, sab in-process ASGI) CPU-bound hai -- locks nahi. c=16 pe throughput gira kyunki zyada contention/context switching overhead.\n\nSo rule: wait time (locks, I/O) vs CPU time separate karo. Tools: `pg_stat_activity` wait events, `time.process_time()` vs `perf_counter()`, py-spy flame graph. Production answer TESTING.md ke hisaab se: API stateless hai (coordination Postgres mein), toh more API processes.",
+  "why_needed": "Concurrency badhane se throughput na badhe toh bottleneck kahin serial hai; galat hypothesis pe optimize karna time waste hai -- measurement se cause pin karna padta hai.",
+  "real_world_analogy": "Toll plaza pe line lambi -- ya toh ek hi booth khula hai (lock), ya booth wala khud slow hai (CPU). Zyada gaadiyan bhejne se dono case mein kuch nahi hoga, fix alag hai.",
+  "how_it_works": "Lock-bound: CPU low, DB sessions 'Lock' wait mein, throughput concurrency se flat. CPU-bound: process CPU ~= cores available, waits low. I/O-bound: CPU low, waits on network/disk. Python GIL ek process ko effectively ~1 core tak limit karta hai (122% thread pool ke C-level kaam se aaya).",
+  "in_this_project": "Fix `services/objects.py::put_object` mein: `if bucket[\"quota_bytes\"] is not None:` ke andar hi `FOR UPDATE` -- comment 'Locking unconditionally serialised EVERY write in the bucket (measured: 53 PUT/s)'. Secret cache `services/auth.py::_secret` (`SecretCache`, TTL 60s, on `app.state`). Thread hop grouping `storage/local.py::put` comment. Benchmark `bench/throughput.py` (300 x 1KB PUT, semaphore 16, then 3 x 64MB). Numbers TESTING.md se: 2026-11-17, in-process ASGI, Postgres in Docker Desktop on Windows.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/objstore/storage/local.py::put",
+   "projects/07-object-storage/bench/throughput.py",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "-- lock contention check while the benchmark runs (illustrative)\nSELECT wait_event_type, wait_event, count(*)\nFROM pg_stat_activity WHERE datname = current_database() GROUP BY 1, 2 ORDER BY 3 DESC;\n\nSELECT l.locktype, l.relation::regclass, l.mode, l.granted, count(*)\nFROM pg_locks l GROUP BY 1, 2, 3, 4 ORDER BY 5 DESC;\n\n# python side (illustrative): CPU vs wall\n# t0, c0 = time.perf_counter(), time.process_time(); run(); print((time.process_time()-c0)/(time.perf_counter()-t0))",
+  "code_language": "sql",
+  "advantages": [
+   "Do alag bottlenecks alag tools se clearly separate hue",
+   "Fix chhota (ek `if`) aur measurable",
+   "Conclusion architecture se match: stateless API -> scale out"
+  ],
+  "disadvantages": [
+   "In-process benchmark client aur server ka CPU mix karta hai -- absolute numbers production jaise nahi",
+   "Windows + Docker Desktop numbers noisy hote hain"
+  ],
+  "common_mistakes": [
+   "Bina measure kiye connection pool badha dena",
+   "CPU-bound process mein concurrency aur badhana (c=16 worse tha)",
+   "Lock wait ko slow query samajhna"
+  ],
+  "follow_up_questions": [
+   "Why did c=16 perform worse than c=4?",
+   "How would you run the benchmark to separate client and server CPU?",
+   "What would multiple uvicorn workers change?"
+  ],
+  "concepts": [
+   "profiling",
+   "lock contention",
+   "CPU-bound",
+   "benchmarking",
+   "GIL"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bucket lock correctness (quota) ke liye simple tha lekin sabko serialise karta tha; conditional lock se non-quota buckets parallel hue, quota buckets abhi bhi serial hain -- yeh accepted trade-off hai.",
+   "failure_scenarios": "Galat diagnosis -> pool size badhao -> Postgres pe zyada connections -> aur contention. CPU-bound process mein event loop latency badhti hai, timeouts aate hain.",
+   "alternatives": "Quota ke liye per-bucket counter row with atomic `UPDATE ... SET used = used + :n WHERE used + :n <= quota` (short row lock, no full SUM); ya approximate async quota.",
+   "scale_10x_100x": "10x: multiple uvicorn workers/pods -> Postgres connections aur advisory locks next bottleneck; PgBouncer (transaction mode advisory xact locks ke saath theek). 100x: metadata sharding.",
+   "production_improvements": "Continuous profiling (py-spy/pyroscope), DB wait-event dashboards, per-route latency histograms already in bpcommon (`http_request_duration_seconds`), benchmark separate client process se."
+  }
+ },
+ {
+  "id": "OBJS-073",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why use Postgres for object metadata instead of a key-value store or a dedicated distributed metadata service?",
+  "answer_hinglish": "Is scale aur scope ke liye Postgres sahi choice tha kyunki metadata operations ko teen cheezein chahiye jo Postgres free mein deta hai: transactions, constraints, aur rich queries.\n\nTransactions: ek PUT mein purane latest ko `is_latest = false` karna, null version replace karna, naya row insert karna, aur purana blob queue karna -- sab atomic. KV store mein yeh multi-key atomicity khud banani padti. Constraints: `uq_objects_latest` partial unique index guarantee karta hai ki ek key ka sirf ek latest version ho, chahe code mein bug ho; CHECKs bucket name aur part_number validate karte hain. Rich queries: prefix listing `text_pattern_ops` index se range scan, lifecycle noncurrent age `lag()` window function se, stats `count(*) FILTER (...)` se, GC reference checks index se. Advisory locks bhi Postgres mein hi mil gaye -- alag lock service nahi chahiye.\n\nKeemat: ek database metadata ka scaling limit hai (TRADEOFFS point 1). Har PUT/GET metadata touch karta hai; billions objects aur lakhon requests/sec pe single primary nahi chalega. Real systems (S3 ka index layer, Ceph RGW bucket index shards, Google Colossus/Spanner-backed metadata) metadata ko shard karte hain -- aksar bucket ya hash(bucket,key) pe -- aur listing ke liye sorted, range-partitioned store use karte hain. Mera path: pehle read replicas listing ke liye, phir bucket se shard, aur end mein ordered distributed KV (jaise FoundationDB/Spanner/CockroachDB) jo transactions bhi de.",
+  "why_needed": "Metadata store choice correctness (atomic version flips) aur scale ceiling dono decide karta hai -- interview mein dono sides bolni chahiye.",
+  "real_world_analogy": "Chhote shehar ke library ka ek register (Postgres) -- sab kuch ek jagah, search aasaan. Metro city mein har mohalle ka alag register chahiye (sharding), aur ek central index jo batata hai kaun sa register dekhna hai.",
+  "how_it_works": "Postgres row per version; `UNIQUE (bucket, key, version_id)`, partial unique `WHERE is_latest`, listing index `(bucket, key text_pattern_ops) WHERE is_latest AND NOT is_delete_marker`. Per-key advisory lock same DB mein transaction-scoped.",
+  "in_this_project": "`migrations/versions/0001_initial.py` poora schema; `services/objects.py::commit_version` multi-statement atomic flip; `services/maintenance.py::run_lifecycle` window function; `bucket_stats` FILTER aggregates. ARCHITECTURE.md key decision 1 aur SYSTEM_DESIGN.md scaling table ('100x: shard metadata by bucket (or hash of bucket/key); move listing to a dedicated index').",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- real, trimmed: migrations/versions/0001_initial.py\nCREATE UNIQUE INDEX uq_objects_latest ON objects (bucket, key) WHERE is_latest;\nCREATE INDEX ix_objects_list ON objects (bucket, key text_pattern_ops) WHERE is_latest AND NOT is_delete_marker;",
+  "code_language": "sql",
+  "advantages": [
+   "ACID multi-row updates bina extra code",
+   "DB-enforced invariants (one latest per key)",
+   "SQL se lifecycle/stats/listing seedhe",
+   "Advisory locks built in"
+  ],
+  "disadvantages": [
+   "Single-primary write ceiling",
+   "Billions of rows pe vacuum/index bloat",
+   "Hot bucket ek shard pe hi rahega even after sharding"
+  ],
+  "common_mistakes": [
+   "Bina numbers ke 'Postgres scale nahi karta' bol dena",
+   "KV store choose karke multi-key atomicity bhool jaana",
+   "Listing ko hash-sharded store pe rakhna (ordered prefix scan toot jaata hai)"
+  ],
+  "follow_up_questions": [
+   "How would you shard this schema and keep prefix listing working?",
+   "What breaks first as object count grows: writes, listing or lifecycle?",
+   "Would you consider CockroachDB or FoundationDB here and why?"
+  ],
+  "concepts": [
+   "metadata store",
+   "Postgres",
+   "sharding",
+   "trade-offs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Postgres: correctness + developer speed, scale ceiling. Distributed KV: horizontal scale, lekin transactions/ordering/secondary indexes khud banane padte. Spanner-type NewSQL dono deta hai par ops/cost zyada.",
+   "failure_scenarios": "Postgres primary down -> poora object store down (reads bhi, kyunki har GET metadata padhta hai). Long lifecycle transactions -> bloat/locks. Replica lag -> listing stale (read-after-write sirf primary pe).",
+   "alternatives": "DynamoDB-style (partition key bucket#key, versions as sort key) -- listing ke liye GSI ya separate ordered index; FoundationDB ordered KV with transactions; Cassandra (no multi-row ACID -- version flip risky).",
+   "scale_10x_100x": "10x: read replicas for listing/stats, PgBouncer, partition `objects` by bucket hash. 100x: bucket-level sharding with a bucket->shard directory; hot buckets ke liye key-range splitting; lifecycle/GC per-shard workers.",
+   "production_improvements": "Partition objects table; autovacuum tuning for `is_latest` flips (update-heavy); move stats to async counters; metadata cache for hot GETs with invalidation via version id."
+  }
+ },
+ {
+  "id": "OBJS-074",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "Why does the bucket quota count every stored version and in-progress multipart part, not just the current objects?",
+  "answer_hinglish": "Kyunki quota ka matlab hai 'kitni storage hum actually use kar rahe hain', aur versioned bucket mein har purana version aur har uploaded part disk pe real bytes hain. S3 bhi billing aise hi karta hai -- noncurrent versions ka paisa lagta hai. Agar quota sirf current objects count kare, toh user ek hi key ko 1000 baar overwrite karke quota se 1000x zyada storage le sakta hai, aur quota ka purpose hi khatam.\n\nIs project mein `_check_quota` do sums karta hai: `SELECT coalesce(sum(size), 0) FROM objects WHERE bucket = :b` (har version, latest ho ya nahi; delete markers size 0 hain) plus `multipart_parts` ka sum us bucket ke uploads ke liye. Test `test_quota_counts_all_versions`: versioning enabled, quota 1000 bytes, pehla 600 byte PUT ok, doosra 600 byte PUT same key pe 403 `QuotaExceeded` -- kyunki 600 + 600 = 1200 > 1000, bhale hi 'current' sirf 600 hota.\n\nDownside, jo TRADEOFFS.md point 6 mein likha hai: user confuse hota hai -- 'maine file delete ki, phir bhi quota full?' Versioned bucket mein DELETE sirf delete marker lagata hai, bytes free nahi karta. Space wapas chahiye toh specific versions permanently delete karo (`versionId`), ya lifecycle `noncurrent_expiration_days` lagao. Stats endpoint (`/buckets/b/stats`) yeh transparency deta hai: `current_bytes` vs `stored_bytes`, `noncurrent_versions`, `incomplete_multipart_bytes`, `quota_used_pct`.",
+  "why_needed": "Quota tabhi meaningful hai jab woh real resource usage measure kare; warna versions aur abandoned parts ke through quota bypass ho jata hai.",
+  "real_world_analogy": "Godown ka rent pure saaman ke hisaab se lagta hai, sirf 'abhi use ho rahe' saaman ka nahi -- purane boxes jo kone mein pade hain unki bhi jagah gayi.",
+  "how_it_works": "Commit ke time (quota'd bucket mein bucket row lock ke baad) `used + parts + adding > quota_bytes` check. Stats: `stored_bytes = sum(size)` all versions, `quota_used_pct = (stored_bytes + mp bytes) / quota`.",
+  "in_this_project": "`services/objects.py::_check_quota` (comment: 'Every stored version counts (that's what you pay for in S3 too)'). `services/maintenance.py::bucket_stats` `quota_used_pct`. Test `tests/test_objects.py::test_quota_counts_all_versions` asserts `stored_bytes == 600` aur `quota_used_pct == 60.0`. Review fix (O3): pehle `complete_multipart` ka quota check uploads row ke cascade delete ke baad chalta tha aur parts dobara subtract karta tha (kabhi fail nahi hota); ab check delete se pehle, net = final - parts (`test_multipart_parts_respect_quota_and_completion_check_is_real`).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+   "projects/07-object-storage/objstore/services/maintenance.py::bucket_stats",
+   "projects/07-object-storage/tests/test_objects.py::test_quota_counts_all_versions",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_multipart_parts_respect_quota_and_completion_check_is_real"
+  ],
+  "code_example": "# real, trimmed: tests/test_objects.py (test_quota_counts_all_versions)\nawait a.request(\"PUT\", \"/buckets/photos/quota\", json={\"quota_bytes\": 1000})\nassert (await a.put(\"photos\", \"k\", b\"x\" * 600)).status_code == 200\nr = await a.put(\"photos\", \"k\", b\"y\" * 600)            # new version: 1200 > 1000 stored\nassert r.status_code == 403 and r.json()[\"error\"][\"code\"] == \"QuotaExceeded\"",
+  "code_language": "python",
+  "advantages": [
+   "Real storage cost ke saath aligned",
+   "Overwrite/multipart se bypass nahi hota",
+   "Stats endpoint breakdown deta hai"
+  ],
+  "disadvantages": [
+   "Users ko 'delete ke baad bhi full' surprise",
+   "Har check pe SUM query -- bade buckets pe mehenga",
+   "Quota buckets mein writes serialise hote hain (bucket lock)"
+  ],
+  "common_mistakes": [
+   "Sochna delete marker space free karta hai",
+   "Quota sirf `is_latest` rows pe count karna",
+   "Multipart parts ko quota se bahar chhodna"
+  ],
+  "follow_up_questions": [
+   "How would you make quota checks O(1) instead of a SUM?",
+   "Should delete markers count toward quota?",
+   "How would you notify users before they hit the quota?"
+  ],
+  "concepts": [
+   "quotas",
+   "versioning",
+   "storage accounting"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-075",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Multipart completion here re-streams all parts into a new blob. Why choose that over server-side composition, and what does it cost?",
+  "answer_hinglish": "Choice simplicity aur backend-agnostic hone ke liye thi. `complete_multipart` har chosen part ko `storage.get` se padhta hai, ek `concatenated()` async generator mein jodta hai, aur `storage.put(final_blob, HashingStream(...))` se ek naya single blob likhta hai. Fayda: StorageAdapter protocol sirf `put/get/delete/exists/list_older_than` hai -- koi 'compose' operation nahi chahiye, toh local FS aur kisi bhi S3-compatible backend pe same code chalta hai. Final object ek normal blob hai, toh GET aur range requests ka path bhi same rehta hai, aur SHA-256 poore object ka calculate ho jata hai (jo multipart ETag nahi deta).\n\nKeemat (TRADEOFFS point 7): completion pe I/O double -- har byte do baar likha (part + final) aur ek baar padha. 5 GB object ka complete call minutes le sakta hai, aur woh ek HTTP request ke andar ho raha hai -- client timeout, proxy timeout ka risk. Is dauraan storage bhi temporarily 2x lagti hai jab tak GC parts delete na kare.\n\nReal S3 server-side compose karta hai: parts already stored rehte hain, complete sirf metadata ('yeh object = part1..partN') likhta hai -- O(parts) metadata, zero data copy. Isko yahan karne ke do raaste: (1) S3 adapter mein backend ka native multipart use karo (UploadPartCopy / CompleteMultipartUpload), (2) object row ke saath ek `object_parts` manifest table rakho aur GET pe ranges ko parts pe map karo. Dono adapter protocol ko complex banate hain -- isliye v1 mein deliberately chhoda.",
+  "why_needed": "Large files ke liye completion latency aur storage amplification user experience aur cost dono affect karte hain; interview mein yeh trade-off clearly bolna chahiye.",
+  "real_world_analogy": "Puzzle ke pieces ko naye board pe chipka ke ek photo banana (re-stream) vs pieces jahan hain wahin rehne do aur ek index card likh do 'is order mein dekho' (composition).",
+  "how_it_works": "Re-stream: read N part blobs sequentially -> HashingStream (md5+sha256+size cap `sum(p.size)`) -> new blob -> short txn: lock key, delete upload row, queue all part blobs, commit_version. Composition: manifest rows (object_id, part_no, blob_key, offset) -> GET range maps to parts.",
+  "in_this_project": "`services/objects.py::complete_multipart`: `concatenated()` generator, `final_blob = new_blob_key()`, `storage.put(final_blob, HashingStream(concatenated(), sum(p.size for p in chosen)))`, phir transaction mein `_queue_blob_deletion` har stored part (unused bhi). README Known limitations: 'Multipart completion re-streams the parts into a new blob (real S3 composes server-side).' Test `test_multipart_upload` final content `A*10 + b*10 + C*3` verify karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::complete_multipart",
+   "projects/07-object-storage/objstore/storage/base.py::StorageAdapter",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/README.md",
+   "projects/07-object-storage/tests/test_objects.py::test_multipart_upload"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (complete_multipart)\nasync def concatenated():\n    for p in chosen:\n        async for chunk in storage.get(p.blob_key):\n            yield chunk\n\nfinal_blob = new_blob_key()\ninfo = await storage.put(final_blob, HashingStream(concatenated(), sum(p.size for p in chosen)))",
+  "code_language": "python",
+  "advantages": [
+   "Adapter protocol minimal rehta hai",
+   "Final object single blob -- GET/range path same",
+   "Full-object SHA-256 mil jata hai"
+  ],
+  "disadvantages": [
+   "Completion pe 2x write + 1x read I/O",
+   "Lambi completion request -> timeouts",
+   "Temporary 2x storage until GC"
+  ],
+  "common_mistakes": [
+   "Sochna multipart complete instant hai",
+   "Re-stream ke dauraan key lock pakad ke rakhna (yahan lock sirf baad ke short txn mein hai -- sahi)",
+   "Unused parts ko delete karna bhool jaana"
+  ],
+  "follow_up_questions": [
+   "How would you implement server-side composition with a manifest table?",
+   "How would range GETs work on a composed object?",
+   "What happens if the API process dies halfway through re-streaming?"
+  ],
+  "concepts": [
+   "multipart upload",
+   "server-side composition",
+   "I/O amplification",
+   "trade-offs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Simplicity/portability vs completion latency + I/O. Manifest-based composition fast hai lekin GET path complex (multi-blob range mapping) aur GC ko pata hona chahiye ki part blobs ab object ke hain.",
+   "failure_scenarios": "Re-stream ke beech process crash -> final_blob partial/orphan (GC grace ke baad saaf), upload row intact -> client retry kar sakta hai. Client timeout -> server complete kar deta hai lekin client ko pata nahi; retry pe `NoSuchUpload` milega (idempotency gap).",
+   "alternatives": "S3 backend ka native multipart (UploadPart + CompleteMultipartUpload) pass-through; UploadPartCopy; manifest table; async completion job with status polling (S3 bhi long completes ke dauraan whitespace keep-alive bhejta hai).",
+   "scale_10x_100x": "100x object sizes (TB) pe re-stream impractical -- composition mandatory. Bahut saari concurrent completions -> API pods ka bandwidth saturate.",
+   "production_improvements": "Adapter protocol mein optional `compose(parts) -> blob` capability; S3 adapter pe native multipart map; completion idempotency (completed upload_id -> result row) taaki retries safe hon."
+  }
+ },
+ {
+  "id": "OBJS-076",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "Why does the system store both an MD5 ETag and a SHA-256 checksum for every object?",
+  "answer_hinglish": "Dono alag kaam ke liye hain. MD5 ETag S3 compatibility aur familiarity ke liye hai: clients `Content-MD5` header bhejte hain, ETag caching (`If-None-Match` -> 304) mein use hota hai, aur single PUT ke liye ETag = object ka MD5 hex hota hai -- cheap integrity check. Lekin MD5 cryptographically toota hua hai (collisions bana sakte ho), aur sabse badi baat: multipart object ka ETag `md5(concat(part md5s))-N` hota hai, jo poore object ka MD5 NAHI hai. Toh end-to-end integrity ke liye MD5 ETag pe bharosa nahi kar sakte.\n\nSHA-256 strong hash hai aur har object (multipart bhi) ke poore bytes ka hota hai, kyunki `HashingStream` streaming ke time dono hashes saath compute karta hai -- extra pass nahi. Client `x-obj-checksum-sha256` header bhej ke verify karwa sakta hai, aur signed request mein `x-obj-content-sha256` bhi isi value se compare hota hai. GET response mein `x-obj-checksum-sha256` header wapas aata hai, toh downloader verify kar sakta hai.\n\nCost: do hashes per byte CPU -- small objects pe negligible, large pe thoda. TRADEOFFS point 8 yahi kehta hai: 'clients needing end-to-end integrity should use the SHA-256 checksum we also store'. AWS ne bhi baad mein additional checksums (CRC32C, SHA-256) add kiye isi wajah se.",
+  "why_needed": "Compatibility ke liye MD5 chahiye, correctness ke liye strong full-object hash; ek hash dono kaam nahi kar sakta.",
+  "real_world_analogy": "Parcel pe weight sticker (MD5) -- jaldi check ho jata hai par fake karna aasaan; aur sealed tamper-proof tape (SHA-256) -- serious verification ke liye.",
+  "how_it_works": "`HashingStream.__aiter__` har chunk pe `self.md5.update(chunk)` aur `self.sha.update(chunk)`; `info()` -> `BlobInfo(size, md5, sha256)`. `objects.etag` = md5 (ya composite), `objects.sha256` = full sha.",
+  "in_this_project": "`storage/base.py::HashingStream`, `services/objects.py::_verify_digests` (Content-MD5, x-obj-checksum-sha256, signed payload), `api/routes.py::_object_headers` `x-obj-checksum-sha256` return karta hai. Test `test_put_get_roundtrip_metadata_and_etag` ETag = md5 aur header = sha256 dono assert karta hai; `test_multipart_upload` composite ETag.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/base.py::HashingStream",
+   "projects/07-object-storage/objstore/services/objects.py::_verify_digests",
+   "projects/07-object-storage/objstore/api/routes.py::_object_headers",
+   "projects/07-object-storage/tests/test_objects.py::test_put_get_roundtrip_metadata_and_etag",
+   "projects/07-object-storage/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/storage/base.py (HashingStream.__aiter__)\nasync for chunk in self.source:\n    self.size += len(chunk)\n    if self.size > self.max:\n        raise TooLarge(f\"object exceeds {self.max} bytes\")\n    self.md5.update(chunk)\n    self.sha.update(chunk)\n    yield chunk",
+  "code_language": "python",
+  "advantages": [
+   "S3-compatible ETag behaviour",
+   "Full-object strong checksum even for multipart",
+   "Single streaming pass, no re-read"
+  ],
+  "disadvantages": [
+   "Do hashes ka CPU cost",
+   "Clients confuse hote hain kaun sa compare karein"
+  ],
+  "common_mistakes": [
+   "Multipart ETag ko file ka MD5 maan ke verify karna",
+   "MD5 ko security (tamper-proof) ke liye use karna",
+   "Checksum ke liye object dobara padhna"
+  ],
+  "follow_up_questions": [
+   "Why is the multipart ETag not the object's MD5?",
+   "Would CRC32C be a better choice for transfer integrity?",
+   "How does the signed payload hash relate to the SHA-256 checksum?"
+  ],
+  "concepts": [
+   "checksums",
+   "ETag",
+   "MD5",
+   "SHA-256",
+   "integrity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-077",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "This project uses a simplified SigV4. What does real AWS SigV4 add, and what do you lose by simplifying?",
+  "answer_hinglish": "Core security properties same hain: secret kabhi network pe nahi jaata, har request ka HMAC-SHA256 signature method + path + query + date + body hash ko bind karta hai, aur date se replay window limit hota hai. Woh sab is project mein hai (`string_to_sign`, `authenticate`).\n\nReal SigV4 extra kya karta hai: (1) Derived signing key: `kDate = HMAC('AWS4'+secret, date)`, `kRegion = HMAC(kDate, region)`, `kService = HMAC(kRegion, 's3')`, `kSigning = HMAC(kService, 'aws4_request')`. Server/edge sirf scoped derived key cache kar sakta hai -- leak ho toh sirf ek din, ek region, ek service ke liye valid; raw secret nahi chahiye har jagah. (2) Credential scope string-to-sign mein (`date/region/service/aws4_request`) -- signature ko doosre region/service pe replay nahi kar sakte. (3) Signed headers list: client batata hai kaun se headers sign hue (Host, content-type, x-amz-*), toh header tampering bhi pakdi jaati. Is project mein headers (sha aur date ko chhod ke) sign nahi hote -- jaise `Content-Type` ya `x-obj-meta-*` proxy badal sakti hai. (4) Canonical request ka hash sign hota hai, aur chunked streaming signatures (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) har chunk sign karti hain -- UNSIGNED-PAYLOAD ke bina streaming integrity.\n\nLoss: bada blast radius agar verification side se secret leak ho, headers unsigned, aur boto3 jaisi SDK seedhe talk nahi kar sakti. TRADEOFFS point 9 yahi honestly likhta hai.",
+  "why_needed": "Interview mein 'I implemented SigV4' bolne se pehle exactly kya implement kiya aur kya nahi, yeh clear hona chahiye.",
+  "real_world_analogy": "Master key (raw secret) se har darwaza khulta hai; AWS har din, har building ke liye alag duplicate key bana ke deta hai -- kho jaaye toh sirf ek din ek building ka risk.",
+  "how_it_works": "Is project: `signature = hex(HMAC_SHA256(secret, METHOD\\nRAW_PATH\\nCANONICAL_QUERY\\nDATE\\nCONTENT_SHA256))`. SigV4: `signature = hex(HMAC(kSigning, 'AWS4-HMAC-SHA256\\n' + amzdate + '\\n' + scope + '\\n' + hex(sha256(canonical_request))))`, canonical_request mein signed headers bhi.",
+  "in_this_project": "`services/signing.py` docstring format define karta hai; `sign()` raw secret se HMAC; `parse_auth_header` `OBJ-HMAC-SHA256 Credential=..., Signature=...`. README known limitation: 'Signing is a simplified SigV4 (no derived signing keys, region/service scoping).' Secrets plaintext `access_keys.secret` mein (HMAC verify ke liye zaroori).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/signing.py::string_to_sign",
+   "projects/07-object-storage/objstore/services/signing.py::sign",
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/README.md"
+  ],
+  "code_example": "# illustrative: AWS SigV4 signing-key derivation (NOT implemented in this repo)\nimport hmac, hashlib\ndef _h(key, msg): return hmac.new(key, msg.encode(), hashlib.sha256).digest()\nk_date = _h((\"AWS4\" + secret).encode(), \"20261117\")\nk_region = _h(k_date, \"us-east-1\")\nk_service = _h(k_region, \"s3\")\nk_signing = _h(k_service, \"aws4_request\")",
+  "code_language": "python",
+  "advantages": [
+   "Simple, readable, aur core properties intact",
+   "Easy to implement in any client",
+   "Test se verify: path replay, old date, wrong secret"
+  ],
+  "disadvantages": [
+   "Headers unsigned (content-type, metadata tamperable)",
+   "No scoping -> leaked secret full power",
+   "Standard SDKs/tools incompatible"
+  ],
+  "common_mistakes": [
+   "Bolna 'yeh SigV4 hai' bina caveats",
+   "Sochna HMAC encryption hai",
+   "Signed headers ka concept skip karna"
+  ],
+  "follow_up_questions": [
+   "Why does SigV4 derive a key per date/region/service?",
+   "Which headers would you add to the signed set first?",
+   "How does chunked payload signing avoid UNSIGNED-PAYLOAD?"
+  ],
+  "concepts": [
+   "SigV4",
+   "HMAC",
+   "request signing",
+   "key derivation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Simplification se code aur client chhote hain; trade-off blast radius aur header integrity hai. Demo/portfolio ke liye acceptable, multi-tenant production ke liye nahi.",
+   "failure_scenarios": "Proxy `x-obj-meta-*` ya Content-Type badal de -> stored metadata galat, signature phir bhi valid. Secret DB dump leak -> attacker kisi bhi user ke naam se kuch bhi sign kare (no scope).",
+   "alternatives": "Full SigV4 implement karo (S3 wire compatibility bhi milti); ya OAuth2/JWT bearer tokens short-lived with mTLS; ya asymmetric signatures (Ed25519) jahan server ko sirf public key chahiye -- plaintext secret problem khatam.",
+   "scale_10x_100x": "Bahut saare edge nodes pe verification -> raw secrets har node pe distribute karna risky; derived daily keys ya central auth service with caching better.",
+   "production_improvements": "Signed headers list add karo (host, content-type, x-obj-meta-*); derived keys; secrets KMS-encrypted; key rotation API with overlap window."
+  }
+ },
+ {
+  "id": "OBJS-078",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "The API has S3-like semantics but is JSON, not the S3 XML wire protocol. Why, and what does that mean for clients?",
+  "answer_hinglish": "Seedha: yeh S3 ke concepts (buckets, keys, versions, delete markers, multipart, presigned URLs, ranges) implement karta hai, lekin S3 ka exact HTTP/XML protocol nahi bolta. Responses JSON hain (FastAPI + Pydantic), errors bpcommon ke common shape mein `{\"error\": {\"code\", \"message\", \"details\", \"request_id\"}}` aate hain, auth header `OBJ-HMAC-SHA256` hai (AWS4-HMAC-SHA256 nahi), aur paths `/buckets/{b}/objects/{key}` hain (S3 `/{bucket}/{key}` ya virtual-host style).\n\nKyun: project ka goal object storage ke internals samajhna tha -- crash-safe write ordering, versioning model, integrity, multipart, signing -- XML parsing aur S3 ke saikdon edge-case headers ki compatibility nahi. JSON API ko OpenAPI (`/docs`) free mein mil jaata hai, tests readable rehte hain, aur poore portfolio ke projects ka error/metrics format same rehta hai.\n\nMatlab: boto3, aws-cli, rclone jaise tools is server se seedha baat nahi kar sakte -- README known limitations mein yeh pehla point hai. Isliye `objstore/client.py::ObjClient` ek chhota signing client hai (jo SDK karta hai). Interesting baat: storage side pe ulta hai -- `S3Adapter` boto3 use karke real S3-compatible backend (SeaweedFS) se baat karta hai. Agar compatibility chahiye toh ek translation layer (S3 XML frontend) API ke aage lagaya ja sakta hai, ya MinIO/SeaweedFS jaise systems seedhe use karo.",
+  "why_needed": "Scope decision interview mein defend karna padta hai: kya banaya, kya jaan-bujh kar nahi banaya, aur uska client impact.",
+  "real_world_analogy": "Restaurant ne wahi dishes banayi jo famous chain banati hai, lekin menu apni bhasha mein hai -- khaana same, lekin chain ka ordering app yahan kaam nahi karega.",
+  "how_it_works": "FastAPI routes JSON return karte hain; `bpcommon.errors.install_error_handlers` error shape; S3 error codes (`NoSuchKey`, `BadDigest`, `QuotaExceeded`) `code` ya `details.code` mein carry hote hain taaki semantics S3 jaise rahein.",
+  "in_this_project": "`api/routes.py` saare endpoints; API_DOCUMENTATION.md 'JSON API with S3-like semantics. OpenAPI at /docs'; README Known limitations point 1; `client.py::ObjClient`; `storage/s3.py::S3Adapter` boto3 se backend pe real S3 protocol.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/api/routes.py",
+   "projects/07-object-storage/objstore/client.py::ObjClient",
+   "projects/07-object-storage/objstore/storage/s3.py::S3Adapter",
+   "projects/07-object-storage/API_DOCUMENTATION.md",
+   "projects/07-object-storage/README.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Focus internals pe, protocol plumbing pe nahi",
+   "OpenAPI docs aur readable tests",
+   "Portfolio-wide consistent error format"
+  ],
+  "disadvantages": [
+   "Ecosystem tools (boto3, aws-cli, rclone) kaam nahi karte",
+   "Custom client chahiye",
+   "Migration to/from real S3 ke liye adapter chahiye"
+  ],
+  "common_mistakes": [
+   "Claim karna 'S3 compatible' jabki sirf semantics compatible hain",
+   "Error codes S3 jaise rakh ke status codes alag kar dena"
+  ],
+  "follow_up_questions": [
+   "What would it take to make boto3 talk to this server?",
+   "Which S3 behaviours did you keep exactly (status codes, ETag format)?",
+   "Would you build compatibility or use MinIO in production?"
+  ],
+  "concepts": [
+   "API design",
+   "S3 compatibility",
+   "scope",
+   "trade-offs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-079",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Overwritten and deleted blobs go into a blob_deletions queue instead of being deleted in the request. What are the trade-offs?",
+  "answer_hinglish": "Faisla: request path mein blob store ka delete call hi nahi hota. Jab unversioned key overwrite hoti hai, ya version permanently delete hota hai, ya multipart abort/complete hota hai, toh purane blob ka key `blob_deletions` table mein usi transaction mein insert hota hai jo metadata change karta hai. Maintenance worker baad mein `run_gc` se delete karta hai.\n\nFayde: (1) Atomicity -- queue entry aur metadata change ek hi Postgres transaction mein, toh 'metadata se hata diya par blob delete fail' wala dual-write gap nahi; blob kabhi bhoola nahi jaata. (2) Latency aur availability -- DELETE request S3 backend ke slow/down hone pe bhi succeed karta hai (FAILURE_SCENARIOS row 6). (3) Safety -- GC delete se pehle re-check karta hai ki blob kahin referenced to nahi. (4) Retry free -- agar GC run fail ho, row queue mein rehti hai.\n\nNuksan: storage turant free nahi hota (TRADEOFFS point 4) -- quota to turant free ho jata hai kyunki quota metadata se calculate hota hai, lekin actual disk/bill thodi der baad. Ek extra moving part hai jisko monitor karna padega (worker down = silent leak). Aur ek subtle race (O4, review mein mila, fixed): queued blobs pe pehle koi grace nahi thi -- agar koi GET purana blob stream kar raha ho aur GC beech mein chal jaaye, download toot sakta tha. Inline delete mein yahi race aur jaldi hoti. Ab `deletion_grace_seconds` (300s). Saath hi GC ab per-blob try/except karta hai -- ek failing delete poore run ko abort nahi karta, woh queue mein rehta hai aur agle run retry.",
+  "why_needed": "Request path ko external system ke side effects se decouple karna reliability ka classic pattern hai (transactional outbox jaisa).",
+  "real_world_analogy": "Office mein file discard karni ho toh 'to shred' tray mein daal do -- tumhara kaam turant khatam, shredding wala baad mein karega. Tray ka entry register mein bhi same time likha jaata hai, toh kuch chhoot nahi sakta.",
+  "how_it_works": "`_queue_blob_deletion`: `INSERT INTO blob_deletions (blob_key) VALUES (:b) ON CONFLICT DO NOTHING` (idempotent). GC: queue padho, reference check, `storage.delete`, row delete.",
+  "in_this_project": "`migrations/versions/0001_initial.py` comment: 'so the request path never waits on (or fails because of) blob deletion'. Callers: `commit_version` (null version replace), `delete_object`, `upload_part` (replaced part), `complete_multipart`, `abort_multipart`, lifecycle noncurrent expiry. Tests: `test_unversioned_overwrite_queues_old_blob` (count 1), `test_concurrent_writes_to_same_key` (19 queued).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_queue_blob_deletion",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/tests/test_objects.py::test_unversioned_overwrite_queues_old_blob",
+   "projects/07-object-storage/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nasync def _queue_blob_deletion(s, blob_key: str | None) -> None:\n    if blob_key:\n        await s.execute(text(\"INSERT INTO blob_deletions (blob_key) VALUES (:b) ON CONFLICT DO NOTHING\"), {\"b\": blob_key})",
+  "code_language": "python",
+  "advantages": [
+   "Metadata change aur delete intent atomic",
+   "Requests blob store outages se isolated",
+   "Retries automatic"
+  ],
+  "disadvantages": [
+   "Storage reclaim delayed",
+   "Worker monitoring zaroori",
+   "Grace (300s) se lambe downloads phir bhi race kar sakte hain"
+  ],
+  "common_mistakes": [
+   "Request mein inline delete karke error ko ignore karna (leak)",
+   "Queue mein ON CONFLICT na rakhna (double queue errors)",
+   "GC mein reference re-check skip karna"
+  ],
+  "follow_up_questions": [
+   "How is this related to the transactional outbox pattern?",
+   "How would you protect in-flight downloads from GC?",
+   "What happens if the same blob is queued twice?"
+  ],
+  "concepts": [
+   "async deletion",
+   "outbox pattern",
+   "garbage collection",
+   "trade-offs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Inline delete: immediate reclaim, lekin dual-write gap aur blob store pe latency/availability coupling. Queue: atomic + resilient, lekin delayed reclaim aur ek worker ka ops burden.",
+   "failure_scenarios": "Worker down -> leak (koi user-facing error nahi). GC + very long GET (beyond the 300s grace) -> broken download. Blob store permanently rejecting a key -> logged per blob (`gc_delete_failed`), retried every run; the rest of the queue still drains.",
+   "alternatives": "S3 bucket lifecycle/tags se deletion delegate; soft-delete rename to `trash/` prefix with backend expiry; reference counting (dedupe ke saath).",
+   "scale_10x_100x": "Bahut high overwrite rate pe queue drain throughput bottleneck -- batched DeleteObjects, partitioned GC workers with SKIP LOCKED.",
+   "production_improvements": "Queued deletions pe min-age grace (e.g. longest expected download), per-item error handling, metrics on backlog, dead-letter column for repeated failures."
+  }
+ },
+ {
+  "id": "OBJS-080",
+  "project_slug": "p07-object-storage",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "To serialise concurrent writers of the same key, why use a Postgres advisory lock instead of SELECT ... FOR UPDATE on the object row or optimistic retries on a unique violation?",
+  "answer_hinglish": "Problem: do PUTs same key pe -- dono 'current latest' padhte hain, dono usko `is_latest = false` karte hain, dono naya latest insert karte hain. Bina serialisation ke ya toh partial unique index violation aata hai ya null-version replace galat hota hai.\n\nOption 1, `SELECT ... FOR UPDATE` on latest row: kaam karta hai jab row exist kare. Lekin pehli baar key create ho rahi hai toh lock karne ko row hi nahi -- do creators dono 'nothing' dekhte hain (phantom). Toh first-write race bachti hai. Option 2, optimistic: bina lock ke try karo, `uq_objects_latest` violation pe retry. Correct hai, lekin contention pe retries ki storm, aur har retry mein poora transaction redo; error-driven control flow messy. Option 3 (chosen): `pg_advisory_xact_lock(hashtextextended(bucket || '/' || key, 0))` -- lock ek naam (hash) pe hai, row pe nahi, toh key exist kare ya na kare lock milta hai. Transaction-scoped hai: commit/rollback pe auto release, crash pe bhi leak nahi. Sirf same key ke writers wait karte hain, alag keys parallel.\n\nAur important: partial unique index phir bhi backstop hai -- agar koi code path lock lena bhool jaaye, DB duplicate latest reject karega. Lock correctness aur smoothness deta hai, index guarantee deta hai. Cost: hash collisions se kabhi do alag keys bhi serialise ho sakti hain (sirf performance, correctness nahi), aur advisory locks Postgres-specific hain; sharded metadata pe lock usi shard pe hona chahiye jahan key rehti hai.",
+  "why_needed": "Concurrency control ka choice correctness (first-write phantom), throughput aur code complexity teeno pe asar karta hai.",
+  "real_world_analogy": "Bank locker room: har locker number ke liye ek token board pe latka hai (advisory lock) -- locker abhi khula ho ya naya allot ho raha ho, token wahi hai. Row lock aisa hai ki sirf existing locker ka darwaza pakad sakte ho.",
+  "how_it_works": "`hashtextextended(text, seed)` 64-bit hash deta hai; `pg_advisory_xact_lock(bigint)` us number pe exclusive lock, transaction end pe release. Doosra writer same number pe block hota hai. Bina quota ke bucket row lock nahi liya jaata.",
+  "in_this_project": "`services/objects.py::key_lock_sql` (comment: 'serialises concurrent writers of the SAME key only'), `put_object`, `delete_object`, `complete_multipart` teeno lete hain. `commit_version` docstring: 'Caller must hold the key advisory lock in the same transaction.' Backstop `uq_objects_latest`. Test `test_concurrent_writes_to_same_key`: 20 parallel PUTs versioned bucket -> 20 rows, exactly 1 latest; unversioned -> 1 row, 19 blob deletions. Observation (O10): lifecycle ke bulk noncurrent/marker deletes yeh lock nahi lete.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key",
+   "projects/07-object-storage/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\ndef key_lock_sql() -> str:\n    # Transaction-scoped advisory lock: serialises concurrent writers of the SAME key only.\n    return \"SELECT pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0))\"\n\n# in put_object, inside a short transaction AFTER the bytes are stored:\nasync with sm() as s, s.begin():\n    await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})",
+  "code_language": "python",
+  "advantages": [
+   "Non-existent keys bhi lockable (no phantom)",
+   "Auto-release on commit/rollback/crash",
+   "Per-key granularity, alag keys parallel",
+   "Unique index backstop"
+  ],
+  "disadvantages": [
+   "Postgres-specific",
+   "Hash collisions -> false serialisation",
+   "Session-level advisory locks PgBouncer transaction mode ke saath risky (xact-level theek hai)"
+  ],
+  "common_mistakes": [
+   "Session-level `pg_advisory_lock` use karke unlock bhoolna",
+   "Lock bytes upload ke dauraan pakadna (yahan nahi -- sirf commit txn mein)",
+   "Sochna lock hai toh unique index ki zaroorat nahi"
+  ],
+  "follow_up_questions": [
+   "Why not SERIALIZABLE isolation instead?",
+   "What happens with advisory locks behind PgBouncer?",
+   "How would this work if metadata were sharded?"
+  ],
+  "concepts": [
+   "advisory locks",
+   "concurrency control",
+   "optimistic locking",
+   "phantoms"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Advisory lock: pessimistic, cheap, precise granularity, Postgres-only. FOR UPDATE: standard SQL but phantom problem on create. Optimistic: no waits at low contention, retry storms at high contention. SERIALIZABLE: generic but serialization failures + retries everywhere.",
+   "failure_scenarios": "Lock leak impossible (xact-scoped). Hot key (lakhon writers ek key pe) -> queue ban jaati hai, connection pool exhaust ho sakta hai since each waiter holds a connection.",
+   "alternatives": "Unique-violation retry loop; SERIALIZABLE isolation with retry; per-key row in a `keys` table locked with FOR UPDATE after `INSERT ... ON CONFLICT DO NOTHING`; distributed lock (Redis) -- unnecessary yahan.",
+   "scale_10x_100x": "Multi-shard metadata: lock aur rows same shard pe, toh lock shard-local hi rahega. Hot keys pe lock wait time metric dekho; extreme case mein last-writer-wins without waiting (S3 jaisa) acceptable.",
+   "production_improvements": "`lock_timeout` set karo taaki hot key pe requests indefinitely wait na karein; lock wait metrics; lifecycle deletes ko bhi key lock ke andar lao (O10)."
+  }
+ },
+ {
+  "id": "OBJS-081",
+  "project_slug": "p07-object-storage",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "How is the system deployed, and how do you switch between the local filesystem and S3 storage backends?",
+  "answer_hinglish": "Docker Compose se ek command: `docker compose up -d --build`. Isme paanch services hain: `postgres` (17-alpine, healthcheck `pg_isready`), `seaweedfs` (S3-compatible blob backend, `blobs` volume), `migrate` (same image, `alembic upgrade head`, ek baar chal ke exit), `api` (uvicorn, `127.0.0.1:58007` pe), aur `worker` (`python -m objstore.worker`, lifecycle + GC har 300s). `depends_on` order enforce karta hai: migrate tabhi jab Postgres healthy, api/worker tabhi jab migrate successfully complete. Phir `python seed.py http://127.0.0.1:58007` demo data banata hai -- access key, versioned bucket, multipart upload, presigned link, stats.\n\nBackend selection ek env var se: `OBJ_STORAGE_BACKEND=local|s3`. `main.py::make_storage` dekhta hai: `s3` hai toh `S3Adapter(settings.s3_endpoint, s3_bucket, s3_access_key, s3_secret_key, s3_region)`, warna `LocalAdapter(settings.local_root)`. Compose mein `OBJ_STORAGE_BACKEND: s3` aur `OBJ_S3_ENDPOINT: http://seaweedfs:8333` set hai; local dev default `local` hai with `./blobs`. Startup (lifespan) pe agar adapter mein `ensure_bucket` hai toh blob bucket bana deta hai.\n\nSaari settings `OBJ_` prefix se `pydantic-settings` padhta hai (`config.py`). Image Dockerfile ek hi hai, roles command se: api (default), worker, migrate; container non-root user `app` (uid 10001) se chalta hai. Note: review se pehle compose mein Postgres ka volume nahi tha (container recreate = metadata gone); ab named volume hai, lekin production mein managed DB + backups chahiye.",
+  "why_needed": "Production-readiness ka basic sawal: kaise chalta hai, kaun se components, aur config kaise badalta hai.",
+  "real_world_analogy": "Ek restaurant: kitchen (api), store room (seaweedfs), register (postgres), safai wala jo raat ko chalta hai (worker), aur opening se pehle setup karne wala (migrate) jo kaam karke chala jaata hai.",
+  "how_it_works": "Compose YAML anchors `x-env: &env` aur `x-img: &img` se env aur build config share hote hain. Settings class `env_prefix=\"OBJ_\"`. Lifespan engine banata hai (`pool_size=10, max_overflow=20, pool_pre_ping=True`) aur storage attach karta hai.",
+  "in_this_project": "`docker-compose.yml`, `Dockerfile` (python:3.12-slim, `USER app`), `objstore/main.py::make_storage` aur `create_app`, `objstore/config.py::Settings`, `objstore/worker.py`, `seed.py`, DEPLOYMENT.md. S3 tests ke liye standalone SeaweedFS: `docker run ... chrislusf/seaweedfs:4.48 server -s3 -dir=/data` (port 58333).",
+  "implementation_files": [
+   "projects/07-object-storage/docker-compose.yml",
+   "projects/07-object-storage/Dockerfile",
+   "projects/07-object-storage/objstore/main.py::make_storage",
+   "projects/07-object-storage/objstore/config.py::Settings",
+   "projects/07-object-storage/objstore/worker.py",
+   "projects/07-object-storage/seed.py",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, trimmed: objstore/main.py\ndef make_storage(settings: Settings):\n    if settings.storage_backend == \"s3\":\n        from .storage.s3 import S3Adapter\n        return S3Adapter(settings.s3_endpoint, settings.s3_bucket, settings.s3_access_key, settings.s3_secret_key,\n                         settings.s3_region)\n    return LocalAdapter(settings.local_root)",
+  "code_language": "python",
+  "advantages": [
+   "Ek command full stack",
+   "Backend swap bina code change",
+   "Migrations app start se pehle, ek baar",
+   "Non-root container"
+  ],
+  "disadvantages": [
+   "Demo compose mein Postgres persistence nahi",
+   "No TLS in compose",
+   "Default admin token `change-me-obj-admin`"
+  ],
+  "common_mistakes": [
+   "Admin token default chhod dena",
+   "Worker service na chalana (GC/lifecycle kabhi nahi chalega)",
+   "API replicas mein local backend use karna bina shared filesystem ke"
+  ],
+  "follow_up_questions": [
+   "Why must the local backend not be used with multiple API replicas on different hosts?",
+   "Why run migrations as a separate one-shot service?",
+   "What would you change for Kubernetes?"
+  ],
+  "concepts": [
+   "deployment",
+   "docker compose",
+   "configuration",
+   "storage backends"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-082",
+  "project_slug": "p07-object-storage",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "What would you monitor and alert on for this object store in production?",
+  "answer_hinglish": "Teen layers: request health, data-integrity/maintenance health, aur capacity.\n\nRequest health: bpcommon already Prometheus metrics deta hai -- `http_requests_total{service=\"objstore\", method, route, status}` aur `http_request_duration_seconds` histogram, route template label ke saath (raw path nahi, warna har object key ek naya label -- cardinality explosion). Alerts: 5xx rate (S3 backend down -> PUTs 500 deti hain), p99 latency PUT/GET, 401 spike (clock skew issues ya attack), 400 BadDigest spike (network corruption ya buggy client), 403 QuotaExceeded trends.\n\nMaintenance health: yeh sabse important hai kyunki failures silent hote hain. `blob_deletions` count aur oldest `queued_at` age (DEPLOYMENT.md: 'alert if blob_deletions grows or GC fails'); worker logs mein `maintenance_failed` exceptions; `gc_removed_orphan_blobs` warning count -- orphans normally sirf crashes se bante hain, toh steady orphan count ka matlab kuch baar baar crash ho raha hai ya commits fail ho rahe hain. Lifecycle run output counts (`expired_current`, `aborted_uploads`) log hote hain.\n\nCapacity: `/admin/stats` se `total_stored_bytes`, per-bucket `quota_used_pct`, `incomplete_multipart_bytes` (invisible cost). Postgres: connections (pool 10 + 20 overflow per process), lock waits (advisory lock contention on hot keys), table bloat (`is_latest` flips update-heavy hain). Blob backend: disk free, SeaweedFS health. Is project mein maintenance/capacity ke dedicated Prometheus gauges abhi nahi hain -- woh next step hai; abhi SQL/logs/admin stats se nikalna padta hai.",
+  "why_needed": "Object store ke failures (leaks, orphans, stuck GC) aksar user ko turant nahi dikhte -- bill ya disk full hone pe dikhte hain. Monitoring hi early warning hai.",
+  "real_world_analogy": "Building ka maintenance: lift chal rahi hai ya nahi (request health), kooda roz uth raha hai ya nahi (GC), aur paani ki tanki kitni bhari (capacity).",
+  "how_it_works": "bpcommon `setup_app` middleware har request pe counter + histogram update karta hai aur `/metrics` expose karta hai; JSON logs (`log_json=True`) request_id ke saath. Worker `log.info(\"gc_run\", extra=...)` aur `lifecycle_run`.",
+  "in_this_project": "`shared/bpcommon/http.py` metrics (`HTTP_REQUESTS`, `HTTP_LATENCY`, `_route_template`). `objstore/worker.py` logs `lifecycle_run`, `gc_run`, `maintenance_failed`. `services/maintenance.py::run_gc` `log.warning(\"gc_removed_orphan_blobs\")`. `/admin/stats` route `api/routes.py::admin_stats`. `/healthz` liveness endpoint.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/worker.py::main",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/api/routes.py::admin_stats",
+   "projects/07-object-storage/objstore/services/maintenance.py::bucket_stats",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "# illustrative Prometheus alert rules\n- alert: ObjstoreHigh5xx\n  expr: sum(rate(http_requests_total{service=\"objstore\",status=~\"5..\"}[5m]))\n        / sum(rate(http_requests_total{service=\"objstore\"}[5m])) > 0.01\n- alert: ObjstoreBlobDeletionBacklog\n  # needs a new gauge exported from SELECT count(*) / min(queued_at) FROM blob_deletions\n  expr: objstore_blob_deletions_oldest_age_seconds > 3600",
+  "code_language": "yaml",
+  "advantages": [
+   "Request metrics free via bpcommon",
+   "Route-template labels -> bounded cardinality",
+   "Admin stats gives capacity view"
+  ],
+  "disadvantages": [
+   "Maintenance health ke liye metrics missing (sirf logs)",
+   "Health endpoint deep check nahi karta (DB/storage)"
+  ],
+  "common_mistakes": [
+   "Raw path ko metric label banana",
+   "Sirf API uptime monitor karna, worker ko nahi",
+   "Orphan count warning ignore karna"
+  ],
+  "follow_up_questions": [
+   "Which metric would first tell you the S3 backend is degraded?",
+   "How would you detect metadata rows pointing to missing blobs?",
+   "Should /healthz check Postgres and the blob store?"
+  ],
+  "concepts": [
+   "observability",
+   "Prometheus",
+   "alerting",
+   "operations"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Logs-based monitoring simple hai lekin alerting fragile; dedicated gauges thoda code maangte hain par reliable. Deep health checks se false restarts ka risk (DB blip pe sab pods restart).",
+   "failure_scenarios": "Worker silently failing har run -> leak; S3 throttling -> latency spike before errors; Postgres connection exhaustion -> 500s across all routes.",
+   "alternatives": "OpenTelemetry traces (API -> Postgres -> blob store spans) for latency breakdown; S3 backend ke apne metrics; synthetic canary jo har minute PUT/GET/DELETE kare.",
+   "scale_10x_100x": "100x pe per-bucket metrics labels mat lagao (cardinality) -- top-N buckets via periodic job. Sharded metadata pe per-shard dashboards.",
+   "production_improvements": "Gauges: blob_deletions backlog/age, gc duration/failures, orphan counter, lifecycle actions; reconciliation job metric (metadata->blob missing count); canary probe; SLOs on PUT/GET latency and availability."
+  }
+ },
+ {
+  "id": "OBJS-083",
+  "project_slug": "p07-object-storage",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Presigned URLs generated in production point at 127.0.0.1 and fail for users. What is wrong?",
+  "answer_hinglish": "Cause: `OBJ_PUBLIC_BASE_URL` set nahi hai ya galat hai. `/presign` route URL aise banata hai: `cfg.public_base_url + signing.presign(...)`. Signature sirf path + query (method, raw_path, canonical query, 'PRESIGNED', expiry) pe hota hai -- host part signature mein nahi hai, woh bas prefix hai. Default value `config.py` mein `http://127.0.0.1:8007` hai, toh agar production mein env var nahi diya, har presigned URL localhost pe point karega aur user ke browser mein fail hoga.\n\nInvestigate: generated URL dekho (`POST /presign` ka `url` field). Host galat hai toh config issue confirm. Fix: `OBJ_PUBLIC_BASE_URL` ko externally visible URL pe set karo -- load balancer/CDN ka https domain (DEPLOYMENT.md checklist point 3: 'presigned URLs embed it'). Compose mein yeh `http://127.0.0.1:58007` set hai jo sirf local demo ke liye sahi hai.\n\nDo related gotchas: (1) Agar reverse proxy path prefix add karta hai (`/storage/buckets/...`), toh server ko jo raw path milega woh signed path se match karna chahiye -- proxy prefix strip kare, warna signature mismatch 401. (2) Kyunki host signed nahi hai, URL ko kisi doosre host pe bhi use kar sakte ho jo same backend chalaata ho -- generally theek, lekin multi-environment (staging/prod same secrets) mein dhyan rakho. Real SigV4 host header sign karta hai.",
+  "why_needed": "Presigned URLs third parties (browser, partner) use karte hain jo internal network mein nahi hain; galat base URL feature ko silently tod deta hai.",
+  "real_world_analogy": "Visiting card pe office ka internal extension number chhap diya -- office ke andar kaam karta hai, bahar wale call nahi kar sakte.",
+  "how_it_works": "`presign()` return karta hai `f\"{raw_path}?{q}&X-Obj-Signature={sig}\"` (relative); route usme `public_base_url` prepend karta hai. Verification `auth._presigned` sirf request ka raw path aur query use karta hai.",
+  "in_this_project": "`api/routes.py::presign` (`cfg.public_base_url + signing.presign(...)`), `config.py` `public_base_url: str = \"http://127.0.0.1:8007\"`, `.env.example` `OBJ_PUBLIC_BASE_URL`, compose `OBJ_PUBLIC_BASE_URL: http://127.0.0.1:58007`. Tests `public_base_url=\"http://obj\"` set karte hain aur `url.replace(\"http://obj\", \"\")` karke path use karte hain (`test_presigned_urls`).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/api/routes.py::presign",
+   "projects/07-object-storage/objstore/config.py::public_base_url",
+   "projects/07-object-storage/objstore/services/signing.py::presign",
+   "projects/07-object-storage/tests/test_objects.py::test_presigned_urls",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, trimmed: objstore/api/routes.py (presign)\npath = f\"/buckets/{body.bucket}/objects/{signing.quote_key(body.key)}\"\nextra = f\"versionId={body.version_id}\" if body.version_id else \"\"\nexpires_at = int(time.time()) + body.expires_in\nreturn {\"url\": cfg.public_base_url + signing.presign(c.access_key, secret, body.method, path, expires_at, extra),\n        \"method\": body.method, \"expires_at\": expires_at}",
+  "code_language": "python",
+  "advantages": [
+   "Base URL config se, code change nahi",
+   "Host signature mein nahi, toh LB/CDN domain change easy"
+  ],
+  "disadvantages": [
+   "Galat default silently broken URLs deta hai",
+   "Host unsigned -- URL doosre host pe bhi valid"
+  ],
+  "common_mistakes": [
+   "Default localhost value production mein chhod dena",
+   "Proxy path prefix ko ignore karna",
+   "Request ke Host header se base URL derive karna (host header injection)"
+  ],
+  "follow_up_questions": [
+   "Why not derive the base URL from the incoming request's Host header?",
+   "What happens if a reverse proxy rewrites the path?",
+   "Should the host be part of the signature?"
+  ],
+  "concepts": [
+   "presigned URLs",
+   "configuration",
+   "reverse proxy"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-084",
+  "project_slug": "p07-object-storage",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "An access key has been compromised. You revoke it. What can the attacker still do, and for how long?",
+  "answer_hinglish": "Revoke ka matlab `access_keys.revoked_at` set karna -- review ke baad iska endpoint hai: `DELETE /admin/access-keys/{id}` (admin token), jo local instance ke cache se key turant `forget` bhi karta hai (`test_revoked_access_key_stops_working`). `_secret()` query mein `revoked_at IS NULL` filter hai, toh DB level pe key turant dead hai. Lekin teen jagah window bachti hai.\n\n(1) Secret cache: har API instance `SecretCache` (`app.state.secret_cache`) mein `(secret, is_admin)` 60 seconds rakhta hai. Toh revoke ke baad DOOSRE instances pe max 60s tak purani entry se signed requests pass hongi (TRADEOFFS point 10). N replicas = N independent caches, sab 60s ke andar expire.\n\n(2) Already-signed requests: attacker ke paas jo signed requests hain woh 900s clock-skew window ke andar replay ho sakti thi -- lekin verification `_secret` se hi hoti hai, toh cache expire hone ke baad yeh bhi fail. Same for (3) presigned URLs: yeh signer ki key se sign hote hain aur verify pe `_secret(sm, akid)` call hota hai -- key revoke = saare outstanding presigned URLs dead (cache expiry ke baad). FAILURE_SCENARIOS row 12: 'revoke the signer's key to kill it early'. Yeh achha design hai: presigned URL ka koi alag state nahi, authority signer se aati hai.\n\nReview fix O1: pehle max expiry (7 days) sirf `/presign` endpoint enforce karta tha, toh raw secret wala attacker 10 saal ke URLs khud bana sakta tha. Ab use time pe bhi check hota hai, toh aise URLs turant 401 -- revoke ke bina bhi. Isliye revoke ke baad: audit karo kya access hua (bpcommon logs, request_id), naya key issue karo, aur agar admin key thi toh bucket ACLs/grants review karo.",
+  "why_needed": "Incident response mein 'revoke kiya toh safe' assume karna galat hai; caches aur bearer tokens ki window samajhni padti hai.",
+  "real_world_analogy": "Chori hua office ID card block kiya -- lekin security guards ki printed list har ghante update hoti hai, toh agle update tak purana card kuch gates pe chalega.",
+  "how_it_works": "Request -> `authenticate` -> `_secret(akid)`: cache hit (not expired) -> cached secret; miss -> DB query with `revoked_at IS NULL`; not found -> cached as None (negative cache) -> 401. Presigned path `_presigned` bhi `_secret` use karta hai.",
+  "in_this_project": "`services/auth.py::_secret` (docstring: 'a revoked key keeps working on each instance for up to 60s'), `SecretCache`, `_presigned`, `authenticate`. Schema `access_keys.revoked_at`. Config `clock_skew_seconds = 900`, `max_presign_seconds = 7 days`. Revoke endpoint: `api/routes.py::revoke_access_key` (`DELETE /admin/access-keys/{id}`, + local cache eviction), test `test_revoked_access_key_stops_working`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/objstore/services/auth.py::_presigned",
+   "projects/07-object-storage/objstore/config.py::max_presign_seconds",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md",
+   "projects/07-object-storage/objstore/api/routes.py::revoke_access_key",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_revoked_access_key_stops_working"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py (_secret) + api/routes.py (revoke)\nfound = cache.get(akid) if cache else ...\nif found is ...:\n    async with sm() as s:\n        row = (await s.execute(text(\"SELECT secret, is_admin FROM access_keys WHERE access_key_id = :a \"\n                                    \"AND revoked_at IS NULL\"), {\"a\": akid})).first()\n    found = (row.secret, row.is_admin) if row else None\n    ...  # cache.put(akid, found)\n\n# DELETE /admin/access-keys/{access_key_id}\nres = await s.execute(text(\"UPDATE access_keys SET revoked_at = now() WHERE access_key_id = :a AND revoked_at IS NULL\"), ...)\nrequest.app.state.secret_cache.forget(access_key_id)",
+  "code_language": "python",
+  "advantages": [
+   "Revocation presigned URLs ko bhi kill karta hai (stateless delegation)",
+   "Bounded window (60s) documented",
+   "Negative caching bogus key floods ko sasta banata hai"
+  ],
+  "disadvantages": [
+   "60s per-instance revocation lag",
+   "Revoke endpoint hai, lekin permission-change audit trail nahi",
+   "Cross-instance revocation delay up to 60s"
+  ],
+  "common_mistakes": [
+   "Sochna presigned URLs revoke nahi ho sakte",
+   "Cache ko multi-instance consistent maan lena",
+   "Revoke ke baad naya key bina rotation plan ke dena"
+  ],
+  "follow_up_questions": [
+   "How would you make revocation immediate across all instances?",
+   "Why is a negative cache entry also useful here?",
+   "How would you enforce max presign expiry at verification time?"
+  ],
+  "concepts": [
+   "key revocation",
+   "caching",
+   "incident response",
+   "presigned URLs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "60s cache se har request pe ek DB round trip bachta hai (perf fix ka hissa) aur revocation lag aata hai. Zero-lag chahiye toh har request DB hit ya push invalidation.",
+   "failure_scenarios": "Compromised admin key -> 60s mein buckets ki ACL change, grants add -- persistent backdoor jo revoke ke baad bhi rahe. Cache clear (>10000 entries) pe DB load spike.",
+   "alternatives": "Pub/sub invalidation (Postgres LISTEN/NOTIFY ya Redis) -> sab instances turant cache evict; short-lived credentials (STS-style session tokens, 15 min) taaki leak ka value kam; presigned URLs ke liye per-URL ids + deny list.",
+   "scale_10x_100x": "100 instances = 100 caches -- push invalidation zaroori. Auth ko dedicated service mein move karna jo cache central rakhe.",
+   "production_improvements": "Done: revoke endpoint + local cache eviction, verify-time max expiry (O1). Next: audit log for revocations, LISTEN/NOTIFY cache invalidation across instances, alert on use of revoked keys, key rotation with overlap."
+  }
+ }
+]

@@ -1,0 +1,1095 @@
+[
+ {
+  "id": "WHK-065",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Tell me about the performance investigation you did on the dispatcher.",
+  "answer_hinglish": "Yeh meri favourite interview story hai kyunki isme do galat hypotheses hain jo maine data se reject ki.\n\nStart: v1 dispatcher, `bench/bench_drain.py` se measure kiya -- 48 deliveries/s single dispatcher. Customer endpoint (demo receiver) fast tha, toh itna slow kyun?\n\nStep 1 -- measure, guess mat karo: `bench/phase_timing.py` likha jo dispatcher ke methods (`claim`, `deliver`, `_send`, `_record`, ratelimit) ko timers se wrap karta hai. Concurrency 20 pe: `deliver` avg 318ms, jisme `_record` 116ms aur HTTP send sirf 1.7ms. Concurrency 1 pe: `_record` 17ms, `deliver` 32ms -- yaani per delivery ~40ms sirf DB round trips. Time network mein nahi, database mein tha.\n\nStep 2 -- hypotheses: (a) \"Hot endpoint row lock\" -- har success `consecutive_failures = 0` ek hi endpoint row pe likh raha tha. Test: load 20 endpoints pe spread kiya -- 50 -> 52/s. Sirf partial. (b) \"WAL fsync\" -- `synchronous_commit=off` kiya: koi change nahi -> rejected.\n\nStep 3 -- fix round trips: v2 mein claim CTE se event + endpoint data ek saath, record ek statement (`RECORD_SQL`), aur routine success pe endpoint write skip. Result: 111/s with 1 dispatcher, 189/s with 3 (3000 deliveries per run, har signature verified, 0 duplicates, container start-up included).\n\nStep 4 -- after v2, process CPU = 82% of wall time -> ab Python process CPU-bound hai; next lever horizontal (more dispatchers). Environment: Windows 11 + Docker Desktop, 12 vCPU shared with ~25 containers.",
+  "why_needed": "Performance stories interviewers ko methodology dikhati hain -- measure, hypothesize, falsify, fix, re-measure.",
+  "real_world_analogy": "Doctor ka diagnosis: pehle tests (phase timing), phir do suspected bimaariyan rule out (hot row, fsync), phir asli ilaaj (round trips), aur phir check ki patient theek hua (re-benchmark).",
+  "how_it_works": "Instrument phases -> find dominant cost -> test hypotheses with controlled changes -> fix -> re-measure under same honest method.",
+  "in_this_project": "`TESTING.md` 'Throughput investigation' section (saare numbers wahan se), `bench/phase_timing.py` (`timed` wrapper, CONC/BATCH env vars), `bench/bench_drain.py`, `dispatcher.py` ka `CLAIM_SQL` + `RECORD_SQL` comments ('every success writing consecutive_failures = 0 to one shared row made all concurrent deliveries for an endpoint queue on that row lock').",
+  "implementation_files": [
+   "projects/04-webhooks/TESTING.md",
+   "projects/04-webhooks/bench/phase_timing.py",
+   "projects/04-webhooks/bench/bench_drain.py",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL"
+  ],
+  "code_example": "# real, trimmed: bench/phase_timing.py\ndef timed(name, fn):\n    async def w(*a, **k):\n        t = time.perf_counter()\n        try:\n            return await fn(*a, **k)\n        finally:\n            T[name] += time.perf_counter() - t\n            N[name] += 1\n    return w\n...\nfor name in (\"claim\", \"deliver\", \"_send\", \"_record\"):\n    setattr(d, name, timed(name, getattr(d, name)))",
+  "code_language": "python",
+  "advantages": [
+   "Data-driven, not guesswork",
+   "Rejected hypotheses documented",
+   "2.3x single-dispatcher gain"
+  ],
+  "disadvantages": [
+   "Numbers ek shared dev machine ke hain -- absolute values production nahi",
+   "Bench includes container start-up"
+  ],
+  "common_mistakes": [
+   "Pehle fix karna, baad mein measure",
+   "Sirf successful hypothesis batana, galat wale chhupana",
+   "Benchmark ko production capacity claim banana"
+  ],
+  "follow_up_questions": [
+   "Why did concurrency 20 make _record so much slower than concurrency 1?",
+   "Why did synchronous_commit=off not help?",
+   "What would you do next to go beyond 189/s?"
+  ],
+  "concepts": [
+   "performance investigation",
+   "profiling",
+   "round trips"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Round-trip reduction ne SQL complexity badhayi (CTE claim, 3-CTE record) -- readability vs throughput trade.",
+   "failure_scenarios": "Shared machine pe noise: 25 containers ke saath numbers +-variance; isliye har run `down -v` se fresh aur same method.",
+   "alternatives": "Batch size badhana, asyncpg raw queries (ORM overhead hatana), uvloop, multiple processes per container, record ko batch karna (multiple outcomes ek statement mein).",
+   "scale_10x_100x": "Horizontal: 3 dispatchers = 189/s (linear nahi kyunki shared CPU + DB). 100x ke liye Kafka relay.",
+   "production_improvements": "Continuous benchmark in CI on dedicated hardware; Prometheus histograms per phase in production instead of ad-hoc timers."
+  }
+ },
+ {
+  "id": "WHK-066",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "How does bench/phase_timing.py work and what did its numbers reveal?",
+  "answer_hinglish": "`phase_timing.py` ek in-process profiler hai specific questions ke liye: \"ek delivery ka time kahan jaata hai?\"\n\nSetup: test database truncate, ek endpoint, 300 events publish (dispatcher band). Dispatcher banao demo receiver ke ASGI transport ke saath (koi real network nahi -- HTTP cost minimum), `CONC` aur `BATCH` env vars se concurrency/batch. Phir monkeypatch: `claim`, `deliver`, `_send`, `_record` aur `limiter.acquire` ko `timed(name, fn)` se wrap -- har call ka cumulative time aur count. Loop `run_once` jab tak khaali na ho. End mein: wall time, process CPU (`time.process_time()`), CPU % of wall, aur har phase ka avg ms.\n\nKya pata chala (TESTING.md, v1): concurrency 20 pe `deliver` 318ms avg, jisme `_record` 116ms, `_send` sirf 1.7ms. Concurrency 1 pe `_record` 17ms, `deliver` 32ms. Interpretation: concurrency badhane pe `_record` 7x slow hua -- yeh contention ka signal hai (connections/locks pe queueing), aur single-threaded mein bhi ~40ms per delivery pure DB round trips. HTTP kabhi bottleneck tha hi nahi.\n\nv2 ke baad: CPU 82% of wall -> CPU-bound.\n\nLimitation: averages hain, percentiles nahi; async mein wall time overlapping phases count karta hai (concurrent `_record` calls ka sum > wall). Isliye ratios dekho, absolute sum nahi.",
+  "why_needed": "Bottleneck dhoondhne ke liye cheap, targeted instrumentation -- full profiler se pehle.",
+  "real_world_analogy": "Ghar ke bijli bill ko samajhne ke liye har appliance pe alag meter lagana -- pata chala AC nahi, geyser kha raha tha.",
+  "how_it_works": "Monkeypatched async wrappers accumulate perf_counter deltas per method; CPU/wall ratio shows CPU vs IO bound.",
+  "in_this_project": "`bench/phase_timing.py::timed` aur `main`, env vars CONC/BATCH, `tests/helpers.py::receiver` ASGI transport. Numbers: `TESTING.md` 'How the bottleneck was found'.",
+  "implementation_files": [
+   "projects/04-webhooks/bench/phase_timing.py::timed",
+   "projects/04-webhooks/bench/phase_timing.py::main",
+   "projects/04-webhooks/TESTING.md",
+   "projects/04-webhooks/tests/helpers.py::receiver"
+  ],
+  "code_example": "# real, trimmed: bench/phase_timing.py\nt0, c0 = time.perf_counter(), time.process_time()\nwhile await d.run_once():\n    pass\nel, cpu = time.perf_counter() - t0, time.process_time() - c0\nprint(f\"wall {el:.2f}s for 300 deliveries, process CPU {cpu:.2f}s ({cpu / el:.0%} of wall)\")\nfor k in T:\n    print(f\"{k:<10} calls={N[k]:<4} avg={T[k] / N[k] * 1000:7.1f} ms\")",
+  "code_language": "python",
+  "advantages": [
+   "Cheap, targeted",
+   "Compare concurrency levels easily",
+   "CPU vs IO bound signal"
+  ],
+  "disadvantages": [
+   "Averages only",
+   "Monkeypatching couples bench to method names",
+   "Overlapping async time"
+  ],
+  "common_mistakes": [
+   "Async phases ka sum ko wall time samajhna",
+   "ASGI transport numbers ko real network latency maanna"
+  ],
+  "follow_up_questions": [
+   "Why compare concurrency 1 vs 20?",
+   "What does CPU/wall ratio tell you?",
+   "How would you get percentiles?"
+  ],
+  "concepts": [
+   "profiling",
+   "instrumentation",
+   "benchmarking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-067",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Which hypotheses did you reject during the performance work, and how?",
+  "answer_hinglish": "Do hypotheses -- aur dono ko maine controlled experiment se test kiya.\n\nHypothesis 1: \"Hot endpoint row lock\". Logic: v1 mein har successful delivery `UPDATE endpoints SET consecutive_failures = 0 WHERE id = ...` karti thi. Bench mein saari deliveries ek hi endpoint ki thi, toh 20 concurrent records ek row lock pe queue ho rahe the -- yeh `_record` ke concurrency pe 7x slow hone ko explain karta. Experiment: load 20 endpoints pe spread karo -- agar hot row hi problem hai toh throughput bahut badhna chahiye. Result: 50 -> 52/s. Matlab hot row real tha lekin minor -- \"only partly right\". Main bottleneck kuch aur.\n\nHypothesis 2: \"WAL fsync\". Logic: har commit pe Postgres WAL disk pe flush karta hai; Docker Desktop on Windows ka disk IO slow ho sakta hai. Experiment: `synchronous_commit=off` (commit fsync ka wait nahi karta). Result: no change -> rejected. Commits durable-wait pe atke hi nahi the.\n\nToh bacha kya? Round trip count. Har delivery ke liye v1 multiple SELECTs (event, endpoint) + 5-statement record transaction -- har statement ek network round trip + Python/SQLAlchemy overhead. Fix: CTE claim + single-statement record -> 111/s.\n\nInterview mein point: galat hypotheses bolna weakness nahi, methodology hai. Main ne hot-row fix phir bhi rakha (routine success pe endpoint write skip), kyunki woh real contention tha aur production mein multi-dispatcher pe badhta.",
+  "why_needed": "Falsification dikhata hai ki aap cargo-cult fixes nahi karte.",
+  "real_world_analogy": "Car ka mileage kam: pehle socha tyre pressure (check kiya, thoda hi farak), phir fuel quality (badla, koi farak nahi), aakhir mein pata chala handbrake halka laga tha.",
+  "how_it_works": "Hypothesis -> predicted effect -> minimal experiment -> compare against baseline -> accept/partial/reject.",
+  "in_this_project": "`TESTING.md` bullets: 'Hypothesis hot endpoint row lock was only partly right (spreading over 20 endpoints: 50 -> 52/s)', 'Hypothesis WAL fsync was tested with synchronous_commit=off: no change -> rejected'. `RECORD_SQL` comment aur `TRADEOFFS.md` #8 hot-row fix explain karte hain.",
+  "implementation_files": [
+   "projects/04-webhooks/TESTING.md",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/04-webhooks/TRADEOFFS.md",
+   "projects/04-webhooks/bench/local_dispatch.py"
+  ],
+  "code_example": "-- the experiment for hypothesis 2 (session/server setting, illustrative)\nALTER SYSTEM SET synchronous_commit = off;   -- commit returns before WAL fsync\nSELECT pg_reload_conf();\n-- re-run bench: no throughput change -> fsync was not the bottleneck",
+  "code_language": "sql",
+  "advantages": [
+   "Avoids wrong fixes",
+   "Builds credible narrative",
+   "Kept the partial fix that is still valuable"
+  ],
+  "disadvantages": [
+   "Experiments time lete hain",
+   "Shared machine noise se small deltas (50 vs 52) inconclusive ho sakte hain"
+  ],
+  "common_mistakes": [
+   "synchronous_commit=off production mein 'performance fix' ki tarah chhod dena (data loss risk on crash)",
+   "Ek experiment se zyada conclude karna"
+  ],
+  "follow_up_questions": [
+   "What does synchronous_commit=off risk in production?",
+   "Why was the hot row only a small effect?",
+   "How did you know round trips were the real cause?"
+  ],
+  "concepts": [
+   "hypothesis testing",
+   "WAL",
+   "lock contention"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "synchronous_commit=off durability ke against latency trade hai -- crash pe last ~few hundred ms ke commits lose; webhooks ke liye matlab accepted events lose -- unacceptable. Isliye experiment only.",
+   "failure_scenarios": "Hot row multi-dispatcher production mein zyada matter karta (3 dispatchers x 20 concurrency same endpoint row pe). Fix ne woh future problem bhi hata di.",
+   "alternatives": "Profiling ke alternatives: py-spy flame graphs, pg_stat_statements (per-query time), auto_explain, OpenTelemetry spans.",
+   "scale_10x_100x": "Scale pe round trips aur important ho jaate hain (DB network latency cloud mein 0.5-2ms vs local); batching aur fewer statements multiply hote hain.",
+   "production_improvements": "Performance regression tests CI mein; pg_stat_statements production pe enable."
+  }
+ },
+ {
+  "id": "WHK-068",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "Why did you discard the first benchmark result of 7,526 deliveries per second?",
+  "answer_hinglish": "Kyunki woh measurement galat cheez naap raha tha. Pehle attempt mein benchmark events publish kar raha tha aur saath saath dispatchers chal rahe the, aur throughput ko kuch aisa calculate kiya jo publish rate aur delivery overlap ko mix kar raha tha -- result 7,526/s print hua jo is setup pe physically impossible tha (baad mein honest number 48/s nikla). `TESTING.md` isko \"meaningless\" kehta hai aur discard karta hai.\n\nHonest method (`bench/bench_drain.py`): (1) `docker compose down -v` -- fresh database, koi purana data nahi. (2) Stack up with `--scale dispatcher=0` -- dispatchers band. (3) N events publish karo -> backlog of N pending deliveries. (4) Phir dispatchers start karo aur time karo jab tak `pending == 0 and in_flight == 0`. (5) Delivered count / elapsed. (6) Receiver se verify: unique count aur duplicates.\n\nKyun yeh sahi hai: hum sirf drain rate naap rahe hain -- publish speed mix nahi hoti. Container start-up time include hai (conservative -- real number thoda better). Receiver har signature verify karta hai, toh \"fast but broken\" possible nahi.\n\nDoosri galti bhi hui: ek run hang hua kyunki seed ka purana endpoint subscribed tha aur fail ho raha tha -- uski deliveries pending rehti aur \"pending == 0\" kabhi nahi hota. Fix: har run `down -v`.\n\nLesson jo main bolta hoon: suspiciously achha number = bug in measurement, celebration nahi.",
+  "why_needed": "Benchmark integrity -- galat numbers galat capacity decisions banate hain.",
+  "real_world_analogy": "Petrol pump pe tank ka level dekh ke speed naapna jab pump abhi bhi chal raha hai -- level badh bhi raha hai aur ghat bhi, number bekaar.",
+  "how_it_works": "Isolate the measured phase: build backlog first, then time only the drain; reset state per run; verify correctness alongside speed.",
+  "in_this_project": "`bench/bench_drain.py` (`fresh_stack`, `--scale dispatcher=0`, drain loop, receiver verification), `TESTING.md` paragraph about 7,526/s aur hang.",
+  "implementation_files": [
+   "projects/04-webhooks/bench/bench_drain.py::fresh_stack",
+   "projects/04-webhooks/bench/bench_drain.py::main",
+   "projects/04-webhooks/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: bench/bench_drain.py\ndef fresh_stack() -> None:\n    \"\"\"Every run starts from an empty database so old endpoints/retries can't distort the result.\"\"\"\n    subprocess.run([\"docker\", \"compose\", \"down\", \"-v\"], capture_output=True)\n    subprocess.run([\"docker\", \"compose\", \"up\", \"-d\", \"--scale\", \"dispatcher=0\"], capture_output=True)\n...\nsubprocess.run([\"docker\", \"compose\", \"up\", \"-d\", \"--scale\", f\"dispatcher={replicas}\", \"dispatcher\"], ...)",
+  "code_language": "python",
+  "advantages": [
+   "Measures one thing",
+   "Reproducible from clean state",
+   "Correctness verified with speed"
+  ],
+  "disadvantages": [
+   "Includes start-up (understates)",
+   "Slow per run (full stack reset)"
+  ],
+  "common_mistakes": [
+   "Overlapping producer and consumer phases measure karna",
+   "Stale state ke saath benchmark",
+   "Speed naapna bina correctness verify kiye"
+  ],
+  "follow_up_questions": [
+   "What else can make a benchmark lie?",
+   "Why include container start-up?",
+   "How would you measure end-to-end latency instead of throughput?"
+  ],
+  "concepts": [
+   "benchmarking",
+   "measurement validity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-069",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "After the optimisation, process CPU was 82% of wall time. What does that mean and what are the next levers?",
+  "answer_hinglish": "Matlab dispatcher process ab zyada tar time CPU pe kaam kar raha hai, IO ka wait nahi kar raha. Python asyncio single-threaded hai -- ek core. Agar CPU 82% of wall hai, toh woh core almost saturated hai: JSON encoding, HMAC, SQLAlchemy result processing, httpx request building, logging, event loop overhead. Isse aage concurrency badhane se kuch nahi hoga -- aur tasks bas CPU ke liye queue karenge.\n\nv1 mein situation ulta tha -- process mostly DB round trips ka wait kar raha tha. Round trips hatane se bottleneck IO se CPU pe shift hua. Yeh healthy progression hai: ab ek process apni capacity ke paas hai.\n\nNext levers, order mein: (1) Horizontal -- zyada dispatcher processes. Isiliye 3 dispatchers 189/s dete hain (1 se 111/s). Linear nahi kyunki shared 12 vCPU machine pe 25 aur containers the aur Postgres bhi wahi CPU share kar raha tha. (2) Per-delivery CPU kam karo: SQLAlchemy ORM/text ke bajaye raw asyncpg, `orjson`, uvloop, logging level/JSON formatting ka cost, response snippet decode avoid. (3) Batch record -- 20 outcomes ek statement mein (round trips aur Python overhead dono kam).\n\nPehle (1), kyunki dispatchers stateless hain aur SKIP LOCKED automatic sharding deta hai -- zero code change. Measurement first: py-spy se flame graph leke dekhna kaunsa function CPU kha raha hai, tabhi (2).",
+  "why_needed": "CPU-bound vs IO-bound pehchaanna decide karta hai ki scale up, scale out, ya code optimise.",
+  "real_world_analogy": "Ek dukandaar ab customers ka wait nahi kar raha -- woh poore din billing mein busy hai. Ab tez billing machine (optimise) ya doosra counter (scale out) -- doosra counter sabse aasaan.",
+  "how_it_works": "CPU time / wall time ~ 1 => CPU-bound single core; asyncio can't use more cores; scale processes.",
+  "in_this_project": "`bench/phase_timing.py` prints `process CPU ... (% of wall)`; `TESTING.md`: 'After v2, process CPU = 82% of wall time -> the single process is CPU-bound in Python; the remaining lever is more dispatcher processes (hence 3 dispatchers scale further)'. `SYSTEM_DESIGN.md` Capacity section.",
+  "implementation_files": [
+   "projects/04-webhooks/TESTING.md",
+   "projects/04-webhooks/bench/phase_timing.py::main",
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/docker-compose.yml"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear next step (scale out)",
+   "Stateless dispatchers make it trivial"
+  ],
+  "disadvantages": [
+   "More processes = more DB connections (pool 10+10 each)",
+   "Python per-message CPU cost relatively high"
+  ],
+  "common_mistakes": [
+   "CPU-bound process mein concurrency badhate rehna",
+   "Bina profiling ke rewrite in Go"
+  ],
+  "follow_up_questions": [
+   "How do you profile an asyncio process in production?",
+   "What's the DB connection cost of 20 dispatchers?",
+   "When would you rewrite the dispatcher in a compiled language?"
+  ],
+  "concepts": [
+   "CPU-bound",
+   "horizontal scaling",
+   "asyncio"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Scale out simple hai lekin DB connections aur Redis connections multiply hote hain; optimise-in-place sasta infra lekin engineering time.",
+   "failure_scenarios": "Zyada dispatchers + shared DB: DB CPU next bottleneck; claim contention badhega. 3 dispatchers ka sub-linear scaling (111 -> 189) iska early sign hai (plus shared host).",
+   "alternatives": "Multiprocessing within a container; Go/Rust dispatcher; PgBouncer for connections.",
+   "scale_10x_100x": "10x: ~10+ dispatchers + PgBouncer + bigger batches. 100x: Kafka, Python CPU cost per message dominate karega -> compiled language worth considering.",
+   "production_improvements": "Per-process CPU metrics aur event-loop lag metric (asyncio loop delay) export karna."
+  }
+ },
+ {
+  "id": "WHK-070",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "How many round trips does one delivery cost, and why do round trips matter so much?",
+  "answer_hinglish": "v2 mein per delivery: claim (1 statement, lekin batch of 20 ke liye shared, toh 1/20), Redis acquire (1), DNS resolve (SSRF check, 1 OS resolver call), HTTP POST (1), aur record (1 statement). `SYSTEM_DESIGN.md`: \"1/batch claim statement + 1 record statement + 1 Redis call + the HTTP request\". v1 mein extra per-delivery reads aur 5-statement record transaction (BEGIN, multiple UPDATE/INSERT, COMMIT -- har ek round trip).\n\nRound trips kyun matter karte hain: har round trip mein network latency + driver overhead + Python await/scheduling cost + server parse/plan. Local Docker pe bhi ~1-2ms; cloud mein cross-AZ 0.5-2ms. Agar ek delivery 10 round trips leti hai sequentially, toh 10-20ms bas wait -- chahe query microseconds ki ho.\n\nConcurrency se kyun nahi chhupta? Little's law: throughput = concurrency / latency. Concurrency 20 aur latency 40ms -> max 500/s theoretical -- lekin real mein concurrency badhane se connection pool aur DB pe queueing hoti hai, latency bhi badhti hai (TESTING.md: `_record` 17ms -> 116ms jab concurrency 1 -> 20). Toh latency kam karna (round trips ghatana) dono taraf fayda deta hai.\n\nRule jo main follow karta hoon: per-item path mein statements gino; jo data saath aa sakta hai woh JOIN/CTE se lao; jo writes saath ho sakte hain unhe ek statement mein karo.",
+  "why_needed": "Database-backed systems mein round-trip count aksar query speed se zyada matter karta hai.",
+  "real_world_analogy": "Market se 10 cheezein laani hain: har cheez ke liye alag chakkar (10 round trips) vs ek list leke ek chakkar. Dukan kitni bhi fast ho, chakkar ka time bachta nahi.",
+  "how_it_works": "Latency per item = sum of sequential round trips; throughput = concurrency / latency (Little's law), bounded by shared resource queueing.",
+  "in_this_project": "`SYSTEM_DESIGN.md` Capacity, `ARCHITECTURE.md` decision 2 ('a delivery costs 2 DB round trips (measured 2.3x throughput vs the first version)'), `CLAIM_SQL`, `RECORD_SQL`.",
+  "implementation_files": [
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/ARCHITECTURE.md",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Predictable per-delivery cost",
+   "Simple mental model for capacity"
+  ],
+  "disadvantages": [
+   "Fewer statements = more complex SQL"
+  ],
+  "common_mistakes": [
+   "ORM lazy loads in loops (N+1)",
+   "Concurrency badha ke latency problem chhupana"
+  ],
+  "follow_up_questions": [
+   "What is Little's law and how does it apply here?",
+   "Could you batch the record statements too?",
+   "How does DB latency in the cloud change these numbers?"
+  ],
+  "concepts": [
+   "round trips",
+   "Little's law",
+   "latency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-071",
+  "project_slug": "p04-webhooks",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would this system scale 10x and 100x?",
+  "answer_hinglish": "Pehle current: 111/s single dispatcher, 189/s with 3 on a shared dev box (TESTING.md). Bottlenecks order mein: dispatcher CPU, phir Postgres (claims + records + vacuum), phir publish fan-out.\n\n10x (~1-2k deliveries/s): (1) Dispatcher replicas badhao -- stateless, SKIP LOCKED automatic. (2) PgBouncer (transaction pooling) kyunki har dispatcher 10+10 connections leta hai. (3) Batch size 20 se 100 -- claim round trips amortize. (4) GIN index on `endpoints.event_types` -- fan-out query scan se bachao. (5) `delivery_attempts` monthly partitions + retention. (6) Queue table autovacuum tuning. `SYSTEM_DESIGN.md` 10x row exactly yeh list karta hai.\n\n100x (~10-20k/s): Postgres ek queue ke roop mein ceiling pe hai. (1) Outbox relay -> Kafka (partition by endpoint_id), Postgres sirf source of truth. (2) Retry scheduling separate (retry topics ya scheduler store). (3) Bulkheads: per-endpoint queues/concurrency caps so one slow customer can't fill dispatcher slots. (4) Circuit breakers per endpoint (open after failures, half-open probe). (5) HTTP/2 / keep-alive connection pooling per host -- TLS handshakes bachao. (6) Deliveries table time-partitioned; status writes async/batched. (7) Multi-region dispatch for latency to customers.\n\nHar stage pe pehle measure: oldest pending age, claim latency, DB CPU, dispatcher CPU. Premature Kafka nahi.",
+  "why_needed": "Senior interviews mein 'what changes at scale' expected hai, numbers aur ordered steps ke saath.",
+  "real_world_analogy": "Chhota dhaba se restaurant chain: pehle aur cooks (dispatchers), phir bada kitchen (DB tuning), phir central kitchen + delivery hubs (Kafka + regional dispatch).",
+  "how_it_works": "Scale out stateless workers -> remove DB per-message costs (batching, indexes, partitions) -> move hot path off DB (Kafka) -> isolate tenants (bulkheads, breakers).",
+  "in_this_project": "`SYSTEM_DESIGN.md` 'Scaling path' table (10x, 100x, slow customers), `TRADEOFFS.md` #1, `DEPLOYMENT.md` connection budget item 6. Implemented abhi: sirf horizontal dispatchers aur round-trip optimisation.",
+  "implementation_files": [
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/TRADEOFFS.md",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/webhooks/db/session.py::make_engine"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Incremental path, no big-bang rewrite",
+   "Each step justified by a measurable bottleneck"
+  ],
+  "disadvantages": [
+   "Kafka stage adds major ops complexity",
+   "Bulkheads/breakers add per-endpoint state"
+  ],
+  "common_mistakes": [
+   "Day one pe Kafka",
+   "Sirf throughput sochna, tenant isolation nahi",
+   "Connection count ignore karna jab replicas badhayein"
+  ],
+  "follow_up_questions": [
+   "What's the first metric that tells you Postgres is the bottleneck?",
+   "How do bulkheads differ from rate limits?",
+   "Why HTTP/2 connection pooling?"
+  ],
+  "concepts": [
+   "scalability",
+   "capacity planning",
+   "bulkhead",
+   "Kafka"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "10x path cheap hai aur Postgres consistency rakhta hai; 100x path throughput deta hai lekin do sources of state (Kafka + Postgres) aur relay lag.",
+   "failure_scenarios": "Scale pe noisy neighbour sabse common outage: ek bada customer slow hua toh fleet ke slots usi pe atke. Bulkheads ke bina 10x replicas bhi kaafi nahi.",
+   "alternatives": "Managed queues (SQS), serverless dispatchers (Lambda) with per-endpoint concurrency, ya Svix jaisa vendor.",
+   "scale_10x_100x": "10x: PgBouncer, GIN, partitions, more replicas. 100x: Kafka relay, bulkheads, breakers, multi-region. 1000x: cell-based architecture (customers sharded into independent cells).",
+   "production_improvements": "Capacity model: deliveries/s per dispatcher measured on prod hardware; load tests before each stage; SLO on time-to-first-attempt."
+  }
+ },
+ {
+  "id": "WHK-072",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "What URL rules does validate_url_syntax enforce, and why each one?",
+  "answer_hinglish": "`validate_url_syntax(url, allow_private)` registration aur send dono pe chalta hai. Chaar rules:\n\n1. Scheme sirf `https` ya `http`. `ftp://`, `file://`, `gopher://` jaise schemes reject -- kuch HTTP libraries in schemes ko bhi support karti hain aur `file:///etc/passwd` ya gopher se internal protocols pe attack hota hai.\n\n2. Plain `http` sirf jab `allow_private` true ho (dev/test). Production mein https mandatory -- webhook payload mein sensitive data hota hai (orders, emails), aur plaintext mein network pe padha/modify kiya ja sakta hai. Signature tampering pakad leta hai, lekin confidentiality sirf TLS deta hai.\n\n3. Hostname hona chahiye -- `https:///nohost` jaise malformed URLs reject.\n\n4. URL mein credentials (`https://user:pass@host`) nahi. Kyun? Credentials logs, dashboard aur delivery views mein leak hote hain (URL list endpoints mein dikhta hai), aur yeh classic SSRF/parser confusion trick bhi hai (`https://trusted.com@evil.com` -- host actually evil.com hai).\n\nRegistration pe yeh sirf UX/early feedback hai -- `EndpointService._check_url` `BlockedDestination` ko 422 `Unprocessable` mein convert karta hai. Real enforcement send time pe `assert_public_destination` karta hai jo pehle yahi syntax check chalata hai phir DNS. Tests: `test_url_syntax_rules`, `test_api_rejects_unsafe_urls_in_production_mode` (http, ftp, credentials -> 422).",
+  "why_needed": "Input validation SSRF aur data leak ki pehli (lekin akeli nahi) layer hai.",
+  "real_world_analogy": "Courier booking pe address form: sirf valid pin code, ghar ka number zaroori, aur 'address mein locker ka password mat likho'.",
+  "how_it_works": "urlsplit -> scheme check -> http only if dev -> hostname present -> no userinfo.",
+  "in_this_project": "`services/ssrf.py::validate_url_syntax`, `services/endpoints.py::_check_url` (create aur update pe), routes return 422. Tests `tests/test_signing_ssrf.py::test_url_syntax_rules`, `tests/test_publish_api.py::test_api_rejects_unsafe_urls_in_production_mode`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/ssrf.py::validate_url_syntax",
+   "projects/04-webhooks/webhooks/services/endpoints.py::_check_url",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_url_syntax_rules",
+   "projects/04-webhooks/tests/test_publish_api.py::test_api_rejects_unsafe_urls_in_production_mode"
+  ],
+  "code_example": "# real: webhooks/services/ssrf.py\ndef validate_url_syntax(url: str, *, allow_private: bool) -> None:\n    parts = urlsplit(url)\n    if parts.scheme not in (\"https\", \"http\"):\n        raise BlockedDestination(\"only http(s) URLs are allowed\")\n    if parts.scheme == \"http\" and not allow_private:\n        raise BlockedDestination(\"plain http is only allowed in development\")\n    if not parts.hostname:\n        raise BlockedDestination(\"URL has no host\")\n    if parts.username or parts.password:\n        raise BlockedDestination(\"credentials in URL are not allowed\")",
+  "code_language": "python",
+  "advantages": [
+   "Early, clear errors for customers",
+   "Blocks scheme and userinfo tricks"
+  ],
+  "disadvantages": [
+   "Syntax alone does not stop SSRF (DNS)",
+   "Ports not restricted (e.g. :6379 on a public IP allowed)"
+  ],
+  "common_mistakes": [
+   "Sirf registration pe validate karna",
+   "Regex se URL parse karna"
+  ],
+  "follow_up_questions": [
+   "Should you restrict ports (only 443)?",
+   "Why is registration-time validation 'only UX'?",
+   "What is the user@host parser confusion trick?"
+  ],
+  "concepts": [
+   "input validation",
+   "SSRF",
+   "URL parsing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-073",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "What is DNS rebinding, why do you check SSRF at send time, and how did you close the check-then-connect gap?",
+  "answer_hinglish": "DNS rebinding: attacker ka domain `hooks.evil.com` registration ke time public IP (1.2.3.4) pe resolve hota hai -- check pass. Baad mein attacker DNS record badal deta hai (TTL 0) to `10.0.0.5` ya `169.254.169.254`. Agar humne sirf registration pe check kiya, toh har delivery ab internal address pe jaayegi. Isliye `ssrf.py` docstring: \"validating only at registration is defeated by DNS rebinding\".\n\nIs project mein: `Dispatcher._send` har attempt pe `assert_public_destination(url)` chalata hai -- `getaddrinfo` se resolve, saare returned addresses `_is_public` se check, koi bhi private ho toh `BlockedDestination` -> outcome `blocked` -> delivery dead (retry nahi), aur koi HTTP request nahi jaati. `test_ssrf_destination_blocked_at_send_time` 127.0.0.1 endpoint pe dikhata hai ki transport ko zero calls gayi.\n\nCode review mein gap mila: check aur connect alag DNS lookups the. `assert_public_destination` resolve karta tha, phir `httpx` khud dobara resolve karta connect ke liye. Attacker DNS jo pehli query pe public IP aur doosri pe private IP de (TTL 0 + alternating answers), woh window exploit kar sakta tha -- classic TOCTOU. Fix kiya: `assert_public_destination` ab validated IP return karta hai, aur `_send` request ka URL host us IP se replace karta hai (`req.url.copy_with(host=pinned_ip)`), jabki `Host` header original netloc rakhta hai aur `req.extensions['sni_hostname']` original host -- toh TLS certificate verification hostname ke against hi hota hai. Regression test: `test_connection_is_pinned_to_the_validated_ip`. Alternative jo bhi valid hai: egress proxy (smokescreen) jo connect time pe check kare. Plus network-level egress block (DEPLOYMENT.md item 2) defence in depth -- tab app bug bhi internal tak nahi pahunchega.",
+  "why_needed": "SSRF filters ka sabse common bypass DNS-based hai; time-of-check vs time-of-use samajhna zaroori.",
+  "real_world_analogy": "Guard ne gate pe ID check kiya (pass), lekin andar jaate waqt banda doosra ho gaya -- check aur entry ke beech gap. Fix: jis bande ko check kiya, usi ka haath pakad ke andar le jao.",
+  "how_it_works": "Rebinding: DNS answer changes between validation and use. Send-time check shrinks window from days to milliseconds; IP pinning (connect to the validated IP, Host + SNI keep the name) closes it.",
+  "in_this_project": "`services/ssrf.py` docstring + `assert_public_destination`, `Dispatcher._send` (check, then connect to the pinned IP with Host header + `sni_hostname`), test `test_connection_is_pinned_to_the_validated_ip`, `Dispatcher._record` (blocked -> dead). `SECURITY.md` 'DNS rebinding' row, `FAILURE_SCENARIOS.md` #12, `DEPLOYMENT.md` item 2 network-level egress blocking.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/ssrf.py::assert_public_destination",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_send",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_ssrf_destination_blocked_at_send_time",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_connection_is_pinned_to_the_validated_ip"
+  ],
+  "code_example": "# real, trimmed: Dispatcher._send\npinned_ip = await assert_public_destination(c.url, allow_private=self.cfg.allow_private_destinations)\n...\nreq = self.client.build_request(\"POST\", c.url, content=body, headers=headers)\nif pinned_ip:\n    # Connect to the IP we validated, not to whatever DNS answers next (DNS rebinding TOCTOU).\n    # Host header and TLS SNI/cert verification still use the original hostname.\n    host = req.url.host\n    req.headers[\"host\"] = req.url.netloc.decode()\n    req.url = req.url.copy_with(host=pinned_ip)\n    req.extensions[\"sni_hostname\"] = host",
+  "code_language": "python",
+  "advantages": [
+   "Rebinding over days/hours blocked",
+   "Check-then-connect window closed by IP pinning",
+   "No request leaves on block",
+   "Blocked deliveries not retried"
+  ],
+  "disadvantages": [
+   "Extra DNS lookup per attempt",
+   "Only the first resolved address is used (no happy-eyeballs fallback)",
+   "App-level control; network egress deny still recommended"
+  ],
+  "common_mistakes": [
+   "Sirf registration pe check",
+   "Sirf pehla A record check",
+   "IP pinning karte waqt TLS SNI/Host bhool jaana"
+  ],
+  "follow_up_questions": [
+   "IP pin karte waqt TLS verification hostname ke against kaise rehta hai?",
+   "What is an egress proxy like smokescreen?",
+   "Why mark blocked deliveries dead instead of retrying?"
+  ],
+  "concepts": [
+   "DNS rebinding",
+   "TOCTOU",
+   "SSRF"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "App-level check flexible hai lekin bypassable; network-level egress deny robust hai lekin coarse. Dono chahiye.",
+   "failure_scenarios": "Before the fix: TTL-0 alternating DNS gave a check-pass/connect-private race. Now the connection goes to the validated IP. Still relevant: redirects (blocked by follow_redirects=False), IPv6 literal tricks (handled by ipaddress).",
+   "alternatives": "Egress proxy (smokescreen) jo resolve + connect ek jagah karta hai; custom httpx transport with pinned IP; separate network namespace/VPC for dispatchers with no route to internal CIDRs.",
+   "scale_10x_100x": "Scale pe DNS lookups har attempt pe resolver pe load -- local caching resolver (lekin cache TTL respect karna rebinding semantics ke saath).",
+   "production_improvements": "IP pinning done; next: dispatcher subnet egress ACLs, IMDSv2 (token-required metadata service)."
+  }
+ },
+ {
+  "id": "WHK-074",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "Signing secrets are stored in plaintext in Postgres. How would you fix that?",
+  "answer_hinglish": "Pehle samjho kyun plaintext hai: HMAC sign karne ke liye dispatcher ko actual secret chahiye -- password jaisa hash karke store nahi kar sakte. Toh \"hash it\" option nahi. `SECURITY.md` aur `TRADEOFFS.md` #9 isko documented gap maante hain.\n\nRisk: DB backup leak, read replica access, SQL injection kahin aur, ya koi analyst `SELECT * FROM endpoints` -- sab customers ke signing secrets mil gaye, attacker unke liye valid webhooks forge kar sakta hai.\n\nFix: envelope encryption with KMS. Har secret ko ek data key (DEK) se AES-GCM encrypt karo; DEK khud KMS master key (KEK) se encrypted store ho. DB mein sirf ciphertext + encrypted DEK + key version. Dispatcher startup pe ya cache miss pe KMS se DEK decrypt karata hai (KMS IAM se sirf dispatcher role ko allowed), memory mein short TTL cache. API create pe plaintext customer ko ek baar dikhata hai, phir encrypt karke store.\n\nFayde: DB dump akela bekaar; KMS access audit logged; key rotation (re-wrap DEKs) bina secrets badle.\n\nTrade-offs: claim path mein decrypt cost (AES local hai, sasta; KMS call sirf DEK ke liye, cached). Abhi `CLAIM_SQL` secret seedha select karta hai -- woh ciphertext select karega aur dispatcher decrypt karega. Also `/secret` endpoint ko restrict karo -- `DEPLOYMENT.md` item 3: \"Encrypt endpoint secrets at rest (KMS); restrict who can call /secret\". Alternative bada change: asymmetric signatures (Ed25519) -- tab DB mein private key encrypted, customers ke paas sirf public key, aur customer side leak se forging impossible.",
+  "why_needed": "Ek DB leak se saare customers ke webhooks forge hone ka risk -- high impact gap.",
+  "real_world_analogy": "Bank locker ki chaabi: locker room (DB) mein chaabi rakhte ho toh room ka chor sab le gaya. Chaabi ek alag tijori (KMS) mein jiska access sirf manager (dispatcher) ke paas aur har use register mein likha.",
+  "how_it_works": "Envelope encryption: data encrypted with DEK; DEK encrypted with KMS KEK; decrypt requires KMS permission; cache DEK briefly.",
+  "in_this_project": "Abhi: `db/models.py::Endpoint.secret` aur `previous_secret` `String(100)` plaintext; `CLAIM_SQL` `e.secret, e.previous_secret` select karta hai; `routes.py::get_secret` return karta hai. Docs: `SECURITY.md` Gaps, `TRADEOFFS.md` #9, `DEPLOYMENT.md` item 3, README limitations. Encryption implement nahi hai.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/db/models.py::Endpoint",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/api/routes.py::get_secret",
+   "projects/04-webhooks/SECURITY.md"
+  ],
+  "code_example": "# illustrative (NOT in this repo): envelope-encrypt a signing secret\nfrom cryptography.hazmat.primitives.ciphers.aead import AESGCM\nimport os\n\ndef encrypt_secret(plaintext: str, dek: bytes, key_version: int) -> dict:\n    nonce = os.urandom(12)\n    ct = AESGCM(dek).encrypt(nonce, plaintext.encode(), associated_data=b\"endpoint-secret\")\n    return {\"ciphertext\": nonce + ct, \"key_version\": key_version}",
+  "code_language": "python",
+  "advantages": [
+   "DB leak no longer leaks secrets",
+   "Audited key access",
+   "Key rotation possible"
+  ],
+  "disadvantages": [
+   "KMS dependency on hot path (mitigated by cache)",
+   "More complex secret lifecycle",
+   "Migration of existing rows"
+  ],
+  "common_mistakes": [
+   "Secret ko hash karna (sign hi nahi kar paoge)",
+   "Encryption key ko same DB/config mein rakhna",
+   "Decrypted secrets logs mein"
+  ],
+  "follow_up_questions": [
+   "Why can't you hash webhook secrets like passwords?",
+   "How does envelope encryption make key rotation cheap?",
+   "Would asymmetric signatures remove this problem?"
+  ],
+  "concepts": [
+   "envelope encryption",
+   "KMS",
+   "secrets management"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "App-level envelope encryption vs Postgres TDE/disk encryption: disk encryption sirf stolen disk se bachata hai, DB user access se nahi. App-level stronger lekin code changes.",
+   "failure_scenarios": "KMS outage -> cached DEKs expire -> dispatchers sign nahi kar sakte -> deliveries fail/retry. Cache TTL aur graceful degradation plan chahiye.",
+   "alternatives": "HashiCorp Vault transit engine (sign inside Vault -- secret kabhi app tak nahi aata); Ed25519 with private key in HSM; per-tenant keys.",
+   "scale_10x_100x": "Bahut endpoints pe per-row decrypt CPU negligible (AES-NI); KMS calls DEK caching se constant.",
+   "production_improvements": "Secret access audit log, `/secret` endpoint ko step-up auth ke peeche, secret scanning (whsec_ prefix) GitHub pe enable."
+  }
+ },
+ {
+  "id": "WHK-075",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "The API uses a single admin bearer token. What are the risks and what would you build instead?",
+  "answer_hinglish": "Abhi `require_token` har route pe ek hi `WH_API_TOKEN` compare karta hai (constant-time). Jo bhi yeh token jaanta hai woh sab kar sakta hai: events publish, endpoints create/update/disable, kisi bhi endpoint ka secret padhna (`/secret`), replays trigger karna. `SECURITY.md` aur README isko gap maante hain: \"Single admin token; no per-customer accounts (multi-tenancy is Project 6)\".\n\nRisks: (1) Blast radius -- ek leak = poora system. (2) No least privilege -- publishing service ko secrets padhne ki zaroorat nahi, phir bhi kar sakta hai. (3) No tenant isolation -- customer A endpoint B ka secret padh sakta hai agar token unke paas ho (isliye customers ko yeh token kabhi diya hi nahi jaa sakta). (4) Rotation painful -- ek token badla toh saare clients ek saath update. (5) No audit -- kisne kya kiya, pata nahi.\n\nProduction design: per-tenant API keys (hashed in DB, prefix se identifiable), scopes (`events:write`, `endpoints:read`, `endpoints:write`, `secrets:read`), har endpoint/event pe `tenant_id` aur har query mein tenant filter (row-level security bhi option), multiple active keys per tenant for rotation, audit log. Internal publishers ke liye service-to-service auth (mTLS ya short-lived JWTs).\n\nDemo mein token default `change-me-wh-token` hai -- `.env.example` aur compose `${WH_API_TOKEN:-...}` se override.",
+  "why_needed": "Authorization design multi-tenant SaaS ka core hai; single shared secret sirf demo ke liye theek hai.",
+  "real_world_analogy": "Poori building ki ek master key sab tenants ke paas -- koi bhi kisi ka flat khol sakta hai. Har flat ki alag chaabi aur security register chahiye.",
+  "how_it_works": "Bearer token == shared secret; compare per request. Better: key -> (tenant, scopes) lookup; enforce scope per route; tenant filter per query.",
+  "in_this_project": "`webhooks/api/routes.py::require_token` (router-level dependency `APIRouter(dependencies=[Depends(require_token)])`), `config.py::api_token`, `SECURITY.md` Gaps, README Known limitations.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/api/routes.py::require_token",
+   "projects/04-webhooks/webhooks/config.py::api_token",
+   "projects/04-webhooks/SECURITY.md",
+   "projects/04-webhooks/README.md"
+  ],
+  "code_example": "# illustrative scoped auth (NOT in this repo)\ndef require_scope(scope: str):\n    async def dep(request: Request, authorization: str | None = Header(default=None)):\n        key = await lookup_key(hash_token(authorization))     # -> tenant_id, scopes\n        if key is None or scope not in key.scopes:\n            raise Forbidden(\"missing scope \" + scope)\n        request.state.tenant_id = key.tenant_id\n    return dep",
+  "code_language": "python",
+  "advantages": [
+   "Simple for a demo",
+   "Constant-time compare already"
+  ],
+  "disadvantages": [
+   "Total blast radius",
+   "No tenant isolation",
+   "No audit"
+  ],
+  "common_mistakes": [
+   "Customers ko admin token dena",
+   "Tenant filter sirf UI mein, API mein nahi"
+  ],
+  "follow_up_questions": [
+   "How would you add tenant_id without breaking existing data?",
+   "Postgres row-level security -- pros/cons?",
+   "How do you rotate API keys without downtime?"
+  ],
+  "concepts": [
+   "authorization",
+   "multi-tenancy",
+   "least privilege"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-076",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Why sign the id and timestamp, not just the body? What attacks remain even with correct signatures?",
+  "answer_hinglish": "Sirf body sign karte toh: (1) Replay forever -- captured request kabhi bhi dobara bhejo, valid. (2) Id swap -- attacker same body ke saath naya `webhook-id` daal ke receiver ka dedupe bypass kar sakta: dedupe \"naya id hai\" maan ke dobara process karega. `id.timestamp.body` sign karne se teeno bind ho jaate hain: id badla toh signature fail (`test_roundtrip_and_tamper_detection` `webhook-id = \"evt_2\"` set karke fail dikhata hai), timestamp badla toh fail, aur purana timestamp tolerance se bahar reject.\n\nDelimiter `.` kyun? Id aur timestamp ke format fixed hain (id mein dot nahi, timestamp numeric), toh concatenation ambiguous nahi -- `a.12.body` ko alag tarah split karke same bytes nahi bana sakte.\n\nJo attacks phir bhi bachte hain: (1) Replay within 5-min window -- receiver dedupe se band, agar receiver implement kare. (2) Leaked secret -- attacker valid signatures bana sakta hai; fix rotation (grace 0 if leaked). (3) Receiver bugs -- signature verify hi nahi kiya, ya parsed body verify kiya, ya `==` compare. Hum reference receiver aur docs dete hain lekin enforce nahi kar sakte. (4) Symmetric HMAC -- receiver ke paas bhi same secret hai, toh receiver side ka koi bhi insider ya leak webhooks forge kar sakta hai; non-repudiation nahi. Asymmetric (Ed25519) isko solve karta hai. (5) Confidentiality -- signature encryption nahi hai; TLS chahiye (isliye prod mein https only).",
+  "why_needed": "Security reasoning 'kya protect hua aur kya nahi' -- dono batana senior signal.",
+  "real_world_analogy": "Cheque pe sirf amount pe sign karo aur date/cheque number blank chhodo -- koi bhi copy bana ke kabhi bhi encash kare. Sign date aur number ko bhi cover kare.",
+  "how_it_works": "MAC over (id, ts, body) binds identity, freshness and content; tolerance + dedupe cover replay; residual: key compromise, receiver bugs, symmetric-key limits.",
+  "in_this_project": "`services/signing.py` docstring ('Why sign id + timestamp too...'), `sign`, `verify`; tests `test_roundtrip_and_tamper_detection`, `test_replay_outside_tolerance_rejected`. `SECURITY.md` receiver threats table.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/signing.py::sign",
+   "projects/04-webhooks/webhooks/services/signing.py::verify",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_roundtrip_and_tamper_detection",
+   "projects/04-webhooks/SECURITY.md"
+  ],
+  "code_example": "# real, trimmed: tests/test_signing_ssrf.py\nh = headers([s], 1000)\nh[\"webhook-id\"] = \"evt_2\"\nwith pytest.raises(VerificationError):\n    verify([s], h, BODY, now=1000)                                     # id is signed too",
+  "code_language": "python",
+  "advantages": [
+   "Identity, freshness, integrity bound together",
+   "Dedupe can't be bypassed via id swap"
+  ],
+  "disadvantages": [
+   "Symmetric: no non-repudiation",
+   "Relies on receiver doing it right"
+  ],
+  "common_mistakes": [
+   "Sirf body sign karna",
+   "Ambiguous concatenation without delimiter/fixed formats"
+  ],
+  "follow_up_questions": [
+   "Why is the concatenation unambiguous?",
+   "What does Ed25519 give you that HMAC doesn't?",
+   "How should a customer respond to a leaked secret?"
+  ],
+  "concepts": [
+   "signature design",
+   "replay",
+   "threat model"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "HMAC fast aur simple; asymmetric slower (still fast) lekin customers ko secret store karne ki zaroorat nahi aur forging sirf sender kar sakta hai.",
+   "failure_scenarios": "Receiver ka secret leak (unke logs/repo mein) -> attacker forge karta hai; hum detect nahi kar sakte. Rotation hi remedy.",
+   "alternatives": "Standard Webhooks `v1a` Ed25519 signatures; mTLS (client certs) for transport-level auth; JWS-signed payloads.",
+   "scale_10x_100x": "Scale se cryptographic cost negligible (HMAC microseconds). Asymmetric sign ~tens of microseconds -- still fine.",
+   "production_improvements": "Dono schemes parallel offer karna (`v1` + `v1a` in same header), secret leak detection (GitHub secret scanning with whsec_ prefix)."
+  }
+ },
+ {
+  "id": "WHK-077",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "List the threats to the sender and to the receiver in a webhook system, and the mitigations here.",
+  "answer_hinglish": "`SECURITY.md` do tables mein yeh split karta hai -- yeh framing interview mein clean lagti hai.\n\nSender (hum) ke threats: (1) SSRF -- customer URL internal pe point kare -> send-time DNS check, private ranges block, no redirects, http only in dev, no credentials in URL. (2) DNS rebinding -> har send pe check. (3) Slow-loris endpoints dispatcher slots pakdein -> 3s connect / 10s total timeout + concurrency semaphore. (4) Huge responses -> sirf 1KB snippet store. (5) Unauthorized publish/config -> bearer token, constant-time compare. (6) Secret disclosure -> secret sirf create pe ya explicit `/secret` pe, list views mein kabhi nahi.\n\nReceiver (customer) ke threats aur hum kya dete hain: (1) Forged webhooks -> HMAC-SHA256 with per-endpoint 256-bit secret. (2) Replay -> timestamp MAC ke andar, 5 min tolerance. (3) Timing attack on compare -> `compare_digest` reference verifier mein. (4) Re-serialisation breaking signatures -> raw body verify karo. (5) Duplicate processing -> stable `webhook-id`. (6) Leaked secret -> rotation with grace.\n\nDocumented gaps: plaintext secrets in DB, single admin token, no mTLS / static egress IPs.\n\nFraming ka fayda: interviewer ko dikhta hai ki aap dono sides sochte ho -- platform ko apne aap ko customer URLs se bachana hai, aur customers ko tools dene hain khud ko attackers se bachane ke liye.",
+  "why_needed": "Threat modelling ka structured jawab -- assets, actors, mitigations, gaps.",
+  "real_world_analogy": "Courier company: apne delivery boys ko khatarnak addresses se bachana (sender threats), aur customers ko seal + tracking number dena taaki woh nakli parcels pehchaan sakein (receiver threats).",
+  "how_it_works": "Two trust boundaries: our network vs customer-controlled URLs; customer endpoint vs the internet.",
+  "in_this_project": "`SECURITY.md` poori file; code refs: `services/ssrf.py`, `Dispatcher.__init__` (timeouts, redirects), `config.py::max_response_snippet`, `routes.py::require_token`, `endpoints.py::endpoint_view`, `services/signing.py`, `receiver/app.py`.",
+  "implementation_files": [
+   "projects/04-webhooks/SECURITY.md",
+   "projects/04-webhooks/webhooks/services/ssrf.py",
+   "projects/04-webhooks/webhooks/services/signing.py",
+   "projects/04-webhooks/webhooks/receiver/app.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear separation of responsibilities",
+   "Gaps explicitly listed"
+  ],
+  "disadvantages": [
+   "Receiver-side mitigations depend on customer implementation"
+  ],
+  "common_mistakes": [
+   "Sirf signing ko 'security' samajhna, SSRF bhool jaana",
+   "Gaps chhupana"
+  ],
+  "follow_up_questions": [
+   "Which threat has the highest impact for the sender?",
+   "How would you help customers implement verification correctly?",
+   "What is missing from this threat model?"
+  ],
+  "concepts": [
+   "threat modelling",
+   "security"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-078",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "Enterprise customers want to allow-list your IPs and some want mTLS. How would you design egress?",
+  "answer_hinglish": "Abhi project mein yeh nahi hai -- `SECURITY.md` Gaps: \"No mTLS / static egress IPs (customers often allow-list sender IPs; needs a NAT gateway)\", aur `DEPLOYMENT.md` item 2 NAT gateway + network-level egress block suggest karta hai.\n\nStatic egress IPs: dispatchers private subnet mein, unka saara outbound traffic NAT gateway(s) se jaata hai jinke Elastic IPs fixed hain. Customers apne firewall mein sirf woh 2-3 IPs allow karte hain. Docs mein IP list publish karo aur changes ka advance notice. Multi-region ho toh har region ke IPs. NAT gateway per-connection limits aur cost (data processing charges) plan karne padte hain; HTTP keep-alive se connections kam.\n\nNetwork-level SSRF defence same jagah: dispatcher subnet ke security group/NACL mein internal CIDRs (10/8, 172.16/12, 192.168/16, 169.254/16) pe egress deny. App ka SSRF check bypass bhi ho jaye toh packet internal tak nahi jaayega. Metadata service ke liye IMDSv2 (token required) -- simple GET SSRF metadata nahi padh sakta.\n\nmTLS: hum customer ko client certificate present karte hain; customer apne TLS terminator pe humara CA trust kare. Benefit: transport-level authentication -- unsigned/forged requests TLS handshake pe hi reject. Cost: certificate lifecycle (rotation, revocation), per-customer CA configs ka support burden. Usually optional enterprise feature; HMAC signatures default rehte hain.\n\nAlternative ek dedicated egress proxy (e.g. smokescreen) -- SSRF policy, static IPs aur logging ek jagah.",
+  "why_needed": "Enterprise sales mein IP allow-listing common requirement hai; aur egress control SSRF ka strongest defence hai.",
+  "real_world_analogy": "Society ke gate pe guard sirf registered courier company ki gaadi number allow karta hai (IP allow-list); kuch societies courier boy ka photo ID card bhi check karti hain (mTLS).",
+  "how_it_works": "Private subnet -> NAT GW with fixed EIPs -> internet. SG/NACL deny internal CIDRs. Optional client cert in httpx for mTLS.",
+  "in_this_project": "Abhi dispatchers Docker network se direct egress karte hain; `DEPLOYMENT.md` production checklist item 2 aur `SECURITY.md` Gaps is design ko future work batate hain. `Dispatcher.__init__` httpx client mein `cert=` add karke mTLS possible hoga.",
+  "implementation_files": [
+   "projects/04-webhooks/SECURITY.md",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::Dispatcher"
+  ],
+  "code_example": "# illustrative (NOT in this repo): mTLS client cert on the dispatcher client\nself.client = httpx.AsyncClient(\n    follow_redirects=False,\n    cert=(\"/run/secrets/webhooks-client.crt\", \"/run/secrets/webhooks-client.key\"),\n    timeout=httpx.Timeout(10.0, connect=3.0))",
+  "code_language": "python",
+  "advantages": [
+   "Customer firewalls can trust us",
+   "Network-level SSRF defence",
+   "Optional strong auth via mTLS"
+  ],
+  "disadvantages": [
+   "NAT cost and connection limits",
+   "Cert lifecycle burden",
+   "IP changes need customer coordination"
+  ],
+  "common_mistakes": [
+   "Dispatchers ko public IPs dena (har replica ka alag IP)",
+   "Sirf app-level SSRF pe rely karna"
+  ],
+  "follow_up_questions": [
+   "How do you change egress IPs without breaking customers?",
+   "mTLS vs HMAC -- do you need both?",
+   "What does IMDSv2 protect against?"
+  ],
+  "concepts": [
+   "egress",
+   "NAT gateway",
+   "mTLS",
+   "defence in depth"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Static IPs operational stability chahiye (IP change = customer outage); mTLS strong lekin har customer ke saath onboarding.",
+   "failure_scenarios": "NAT gateway port exhaustion at high concurrency to same destination; NAT AZ failure -> egress outage for that AZ (multi-AZ NAT).",
+   "alternatives": "Egress proxy fleet with fixed IPs; cloud provider 'outbound IP' features; customer-side alternatives like signature-only + public endpoints.",
+   "scale_10x_100x": "100x pe multiple NAT gateways/IPs per region, IP list versioning, aur keep-alive pooling taaki connection count control mein.",
+   "production_improvements": "Published IP list API (machine-readable), advance change notifications, mTLS as opt-in per endpoint config."
+  }
+ },
+ {
+  "id": "WHK-079",
+  "project_slug": "p04-webhooks",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Should webhooks be signed with asymmetric keys (Ed25519) instead of HMAC?",
+  "answer_hinglish": "Dono valid choices hain; mera project HMAC (`v1`) use karta hai kyunki Standard Webhooks ka default wahi hai aur reference vector test available hai. Lekin trade-offs samajhna zaroori hai.\n\nHMAC: shared secret -- sender aur receiver dono ke paas same key. Fast, har language mein trivial. Problems: (1) Receiver bhi valid signature bana sakta hai -- receiver side leak (logs, git, laptop) = forgery possible, aur hum prove nahi kar sakte kaun sa message humne bheja (no non-repudiation). (2) Per-endpoint secret hamare DB mein recoverable form mein chahiye (plaintext/encrypted) -- humara DB leak = sab customers expose.\n\nEd25519 (Standard Webhooks `v1a`): hum private key se sign karte hain, customer sirf public key se verify karta hai. Customer side leak harmless -- public key se sign nahi ho sakta. Hum ek hi key (ya per-tenant key) use kar sakte hain aur customers ko public key publish (JWKS-style) kar sakte hain -- per-endpoint secret distribute/rotate karne ka jhanjhat kam. Private key HSM/KMS mein, kabhi app memory mein bhi nahi (KMS sign API).\n\nCost: verify libraries thodi kam common, signature compute thoda mehenga (still microseconds-ish), aur key rotation ke liye key ids chahiye. Practical path: header mein dono bhejo (`v1,... v1a,...`) -- `verify` already unknown versions ignore karta hai, toh forward compatible. Customers dheere dheere migrate karein.",
+  "why_needed": "Crypto choice ka threat-model-based justification -- 'HMAC kyun' ka mature jawab.",
+  "real_world_analogy": "HMAC = ghar ki duplicate chaabi jo aapke paas bhi hai aur padosi ke paas bhi -- padosi ki chaabi chori hui toh ghar khul gaya. Asymmetric = sirf aap sign karte ho (signature), padosi sirf pehchaan sakta hai.",
+  "how_it_works": "HMAC: verify = recompute with shared key. Ed25519: sign with private key, verify with public key; leak of verifier key harmless.",
+  "in_this_project": "`services/signing.py` (`sign` with `v1,` prefix, `verify` filters `startswith(\"v1,\")` -- other versions ignored), `test_standard_webhooks_reference_vector`. Asymmetric implement nahi hai.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/signing.py::sign",
+   "projects/04-webhooks/webhooks/services/signing.py::verify",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_standard_webhooks_reference_vector"
+  ],
+  "code_example": "# illustrative (NOT in this repo): v1a Ed25519 signature\nfrom cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey\n\ndef sign_v1a(private_key: Ed25519PrivateKey, msg_id: str, ts: int, body: bytes) -> str:\n    sig = private_key.sign(f\"{msg_id}.{ts}.\".encode() + body)\n    return \"v1a,\" + base64.b64encode(sig).decode()",
+  "code_language": "python",
+  "advantages": [
+   "HMAC: simple, fast, standard",
+   "Ed25519: no shared secret, non-repudiation, receiver leak harmless"
+  ],
+  "disadvantages": [
+   "HMAC: forgery from receiver leak, secrets in our DB",
+   "Ed25519: fewer libraries, key-id management"
+  ],
+  "common_mistakes": [
+   "Asymmetric ko 'encryption' samajhna",
+   "Version prefix ke bina naya scheme add karna (breaking change)"
+  ],
+  "follow_up_questions": [
+   "How would you roll out v1a without breaking existing customers?",
+   "Where would the private key live?",
+   "Does asymmetric signing remove the need for timestamps?"
+  ],
+  "concepts": [
+   "asymmetric cryptography",
+   "Ed25519",
+   "HMAC"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "HMAC per-endpoint secrets blast radius per customer limit karte hain; single Ed25519 key ka compromise sab customers ko affect karta (per-tenant keys se mitigate).",
+   "failure_scenarios": "Private key leak = universal forgery -> rotation with key ids aur customers ko naya public key fetch karna padega.",
+   "alternatives": "mTLS; JWS (JSON Web Signature) with kid header; HTTP Message Signatures (RFC 9421).",
+   "scale_10x_100x": "Sign cost scale pe negligible; KMS sign API calls per delivery mehenge ho sakte hain -- batching nahi hota, toh key in HSM-backed local signer.",
+   "production_improvements": "Dual-header rollout, public key discovery endpoint, deprecation timeline for v1."
+  }
+ },
+ {
+  "id": "WHK-080",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "A customer's endpoint returns 500 for an hour. What exactly happens?",
+  "answer_hinglish": "Step by step, default config ke saath.\n\nPehla attempt fail (500) -> `http_error` outcome, attempt log entry, `consecutive_failures + 1`, delivery `pending` with next attempt ~5s (+-20%). Phir ~30s, ~2m, ~10m, ~30m -- schedule `[5, 30, 120, 600, 1800, ...]`. Ek ghante mein ek delivery roughly 5-6 attempts kar leti hai. Har attempt delivery_attempts mein dikhta hai with status 500 aur response snippet.\n\nLekin us ghante mein naye events bhi aa rahe hain -- har ek ki apni delivery aur apna schedule. Endpoint-level counter `consecutive_failures` har failed attempt pe badhta hai (kisi bhi delivery ka). Default threshold 20 hai -- toh agar endpoint pe traffic hai, 20 consecutive failed attempts jaldi ho jaate hain aur endpoint auto-disable ho jaata hai: `enabled = false`, `disabled_reason = 'auto-disabled after 20 consecutive failures'`. Disabled endpoint ki pending deliveries claim nahi hoti -- woh wait karti hain, dead nahi hoti.\n\nCustomer fix karke `PATCH /endpoints/{id}` with `enabled: true` karta hai -> `consecutive_failures = 0`, `disabled_reason = None`. Pending deliveries due hain toh turant flow shuru (rate limit ke andar). Jo deliveries schedule exhaust karke dead ho gayi thi, unke liye `POST /endpoints/{id}/replay-dead`.\n\nAgar beech mein ek bhi success aaya toh counter 0 pe reset.",
+  "why_needed": "Sabse common real-world failure; customer support ko exact behaviour batana padta hai.",
+  "real_world_analogy": "Dukan band hai: courier har kuch der mein aata hai, aur 20 baar band milne pe company us address pe deliveries pause kar deti hai jab tak dukandaar call karke 'ab khula hai' na bole.",
+  "how_it_works": "Per-delivery retry schedule + per-endpoint failure counter -> auto-disable -> deliveries wait -> re-enable -> drain; dead ones need replay.",
+  "in_this_project": "`config.py` (`retry_schedule_seconds`, `auto_disable_after_failures = 20`), `RECORD_SQL`, `services/endpoints.py::update` (re-enable resets counter), `routes.py::replay_dead`. `FAILURE_SCENARIOS.md` #1, #2, #6.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/config.py::auto_disable_after_failures",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/04-webhooks/webhooks/services/endpoints.py::update",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: services/endpoints.py::update\nif body.enabled is not None:\n    e.enabled = body.enabled\n    if body.enabled:\n        e.disabled_reason = None\n        e.consecutive_failures = 0",
+  "code_language": "python",
+  "advantages": [
+   "No data lost during outage",
+   "Dead endpoint stops consuming capacity",
+   "Clear recovery path"
+  ],
+  "disadvantages": [
+   "High-traffic endpoints disable quickly on short blips",
+   "Customer must manually re-enable"
+  ],
+  "common_mistakes": [
+   "Sochna disabled = deliveries dead",
+   "Re-enable ke baad replay-dead bhool jaana"
+  ],
+  "follow_up_questions": [
+   "What if the customer never re-enables?",
+   "Should the system auto re-enable with a probe?",
+   "How does the customer know they were disabled?"
+  ],
+  "concepts": [
+   "retries",
+   "auto-disable",
+   "outage recovery"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-081",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens when Redis goes down?",
+  "answer_hinglish": "Redis is system mein sirf per-endpoint rate limiting ke liye hai -- queue aur state Postgres mein hain. Toh Redis down hone pe deliveries rukti nahi.\n\n`EndpointRateLimiter.acquire` script call ko `try/except RedisError` mein wrap karta hai aur error pe `0` return karta hai -- matlab \"go ahead\". Yeh fail-open hai. Docstring: \"a Redis outage should slow nothing down; endpoints are protected again once Redis is back.\"\n\nConsequence: Redis down ke dauraan per-endpoint rate limit enforce nahi hota. Agar us waqt kisi customer ka bada backlog drain ho raha hai, toh unpe dispatcher ki full speed (har dispatcher ki concurrency 20) ja sakti hai -- unka server overload ho sakta hai. Lekin woh 5xx/timeouts dega aur normal retry/backoff kaam karega, aur 429 + Retry-After diya toh woh bhi honour hoga. Toh second line of defence hai.\n\nEk subtle issue: Redis \"down\" ka matlab connection refused (fast fail) ya slow/hung Redis ho sakta hai. Dispatcher ka `BlockingConnectionPool` `timeout=2` -- pool se connection na mile toh 2s wait. Hung Redis pe socket timeouts ke bina har delivery mein latency add hoti -- review mein yeh observation tha, aur ab dispatcher ka pool `socket_timeout=0.5, socket_connect_timeout=0.5` ke saath banta hai, toh fail-open genuinely fast hai.\n\nFail-closed kyun nahi? Tab Redis outage = poora webhook system band -- protection mechanism availability ka single point ban jaata.",
+  "why_needed": "Har dependency ka failure mode explicitly decide karna chahiye -- fail open ya closed.",
+  "real_world_analogy": "Traffic signal kharab ho gaya: shehar ki traffic band nahi karte (fail-closed), log dhyan se chalte hain (fail-open) aur traffic police (Retry-After / backoff) backup hai.",
+  "how_it_works": "RedisError -> return 0 -> deliver proceeds unthrottled; customer-side 429/5xx triggers normal backoff.",
+  "in_this_project": "`services/ratelimit.py::acquire` (fail-open), `dispatcher/__main__.py` (`BlockingConnectionPool.from_url(..., max_connections=20, timeout=2)`), `FAILURE_SCENARIOS.md` #14 ('Redis down -> rate limiter fails open (delivery continues); documented').",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/ratelimit.py::acquire",
+   "projects/04-webhooks/webhooks/dispatcher/__main__.py::main",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md",
+   "projects/04-webhooks/webhooks/dispatcher/__main__.py::socket_timeout"
+  ],
+  "code_example": "# real: webhooks/services/ratelimit.py\nasync def acquire(self, endpoint_id: str, per_second: float) -> int:\n    \"\"\"0 = go ahead, otherwise milliseconds to wait. Fails OPEN on Redis errors...\"\"\"\n    burst = max(1.0, per_second)\n    try:\n        return int(await self._script(keys=[f\"wh:rl:{endpoint_id}\"], args=[burst, per_second]))\n    except RedisError:\n        return 0",
+  "code_language": "python",
+  "advantages": [
+   "Redis is not a single point of failure for delivery",
+   "Simple behaviour"
+  ],
+  "disadvantages": [
+   "Customers unprotected during outage",
+   "Hung Redis still costs up to ~0.5s per limiter call before failing open"
+  ],
+  "common_mistakes": [
+   "Fail-closed rate limiter in a delivery path",
+   "Redis errors ko silently swallow karna bina metric/log"
+  ],
+  "follow_up_questions": [
+   "How would you notice the limiter is failing open?",
+   "Would a local fallback limiter help?",
+   "0.5s socket timeout kyun, aur bahut chhota ho toh kya hoga?"
+  ],
+  "concepts": [
+   "fail-open",
+   "dependency failure",
+   "graceful degradation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-082",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens when Postgres is down or failing over?",
+  "answer_hinglish": "Postgres yahan source of truth aur queue dono hai, toh uska down hona sab kuch rok deta hai -- lekin data loss nahi.\n\nAPI: `POST /events` ka transaction fail -> unhandled exception -> `bpcommon` error handler 500 (internal_error, stack trace leak nahi). Publisher ko 500 milta hai aur woh retry kare -- idempotency key ke saath retry safe hai: agar pehla commit actually ho gaya tha (response kho gaya), retry original event return karega. Bina key ke retry duplicate event bana sakta hai. Engine `pool_pre_ping=True` failover ke baad stale connections detect karke naye leta hai.\n\nDispatchers: `claim()` exception throw karega. Review mein mila tha ki `run()` yeh exception catch nahi karta tha -- process exit hota aur restart policy pe depend tha, jabki `FAILURE_SCENARIOS.md` #15 'log and retry' claim karta tha. Fix: `run()` ab exception pe `dispatch_loop_error` log karke exponential backoff (max 30s) se retry karta hai; DB wapas aate hi claims resume. Test: `test_dispatch_loop_survives_database_errors`.\n\nIn-flight deliveries: HTTP already ja chuka, `_record` fail -> `_guarded` crash ko `internal_error` attempt record karne ki koshish karta hai, woh bhi fail (DB down) -> row `in_flight` rehti hai -> DB wapas aane pe lease expire -> re-send (duplicate, webhook-id same).\n\nFailover: managed Postgres (RDS Multi-AZ) mein 30-60s typical; us window ke publishes retry pe depend karte hain.",
+  "why_needed": "Single critical dependency ke failure modes ka honest analysis.",
+  "real_world_analogy": "Bank ka core server down: counter pe deposit nahi hota (API 500), lekin jo paisa pehle jama hua tha woh safe hai. Server wapas aate hi kaam phir chalu.",
+  "how_it_works": "DB down -> API 500 -> client retries with idempotency key; dispatcher claim raises -> run() logs and backs off (max 30s) -> resumes; record failures -> lease recovery -> possible duplicate.",
+  "in_this_project": "`shared/bpcommon/errors.py` (`_unhandled` -> 500), `db/session.py` (`pool_pre_ping=True`), `Dispatcher.run`/`run_once`/`_guarded`, `FAILURE_SCENARIOS.md` #15, `docker-compose.yml`.",
+  "implementation_files": [
+   "shared/bpcommon/errors.py::install_error_handlers",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::run",
+   "projects/04-webhooks/webhooks/db/session.py::make_engine",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_dispatch_loop_survives_database_errors"
+  ],
+  "code_example": "# real: webhooks/dispatcher/dispatcher.py\nasync def run(self, idle_sleep: float = 0.5) -> None:\n    backoff = idle_sleep\n    while not self._stop.is_set():\n        try:\n            n = await self.run_once()\n            backoff = idle_sleep\n        except Exception:\n            # Postgres restart / network blip: log and retry with backoff instead of exiting the process.\n            log.exception(\"dispatch_loop_error\")\n            n = 0\n            backoff = min(backoff * 2, 30.0)\n        if n == 0:\n            try:\n                await asyncio.wait_for(self._stop.wait(), timeout=backoff)\n            except asyncio.TimeoutError:\n                pass",
+  "code_language": "python",
+  "advantages": [
+   "No data loss",
+   "Idempotent publish makes client retries safe",
+   "Lease recovers in-flight work"
+  ],
+  "disadvantages": [
+   "Up to 30s resume delay after the DB comes back (backoff)",
+   "Publishes without key may duplicate on retry"
+  ],
+  "common_mistakes": [
+   "Publisher bina idempotency key ke retry",
+   "Restart policy na hona (dispatcher mara toh mara)"
+  ],
+  "follow_up_questions": [
+   "Dispatcher loop DB errors ke baad kaise survive karta hai, aur pehle kya hota tha?",
+   "What does pool_pre_ping cost and save?",
+   "How do clients know a 500 publish is safe to retry?"
+  ],
+  "concepts": [
+   "database failover",
+   "availability",
+   "idempotent retry"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Postgres-as-queue ka trade: consistency simple, lekin DB = SPOF for publish and delivery. Kafka design mein ingest DB down ho toh bhi already-queued deliveries chalti rehtin.",
+   "failure_scenarios": "Pehle failover ke dauraan restart storm hota (saare dispatchers crash-restart, CrashLoopBackOff delay). Ab loop andar hi backoff karta hai; risk sirf yeh ki bahut lamba outage silent na rahe -- dispatch_loop_error pe alert chahiye.",
+   "alternatives": "Local buffering at publishers; Kafka as durable ingest; read replicas for dashboards so ops tooling works during primary issues.",
+   "scale_10x_100x": "Bade scale pe Patroni/RDS Multi-AZ, PgBouncer reconnect handling, aur publishers ke paas client-side retry budgets.",
+   "production_improvements": "Loop backoff done; next: health/readiness probes, alert on dispatch_loop_error and publish 5xx rate."
+  }
+ },
+ {
+  "id": "WHK-083",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A few customer endpoints become very slow (or slow-loris). How does that affect everyone else?",
+  "answer_hinglish": "Yeh noisy neighbour problem hai aur is design mein partially mitigated hai.\n\nMitigations jo hain: (1) Timeouts -- connect 3s, request 10s. Koi endpoint dispatcher slot 10s se zyada nahi pakad sakta (per httpx phase). (2) Concurrency semaphore 20 per dispatcher -- unbounded tasks nahi. (3) Per-endpoint rate limit -- ek endpoint ko kitni requests jaayengi, limit.\n\nProblem jo bachti hai: (1) Batch-level head-of-line blocking -- `run_once` `gather` poore batch ka wait karta hai. Batch mein ek slow endpoint ki delivery hai toh poore batch ka cycle 10s ka ho jaata hai; baaki 19 slots idle. Agar slow endpoint ki bahut deliveries hain, toh har batch mein kuch aayengi -> dispatcher throughput collapse (20 deliveries per 10s = 2/s instead of 111/s). (2) Rate limit concurrency limit nahi hai: 10/s endpoint jo 10s leta hai -> steady state 100 in-flight requests uske liye -- semaphore ke saare slots wahi kha jaata hai. (3) Retries badhate hain: timeouts failures hain -> aur attempts -> aur slots.\n\nFixes (SYSTEM_DESIGN.md \"Slow customers\" row): per-endpoint concurrency cap (bulkhead) -- e.g. max 5 in-flight per endpoint via Redis counter; circuit breaker -- N timeouts ke baad endpoint ko kuch der ke liye \"open\" (claim mat karo), phir half-open probe; aur continuous pipeline loop (semaphore free hote hi naya claim) instead of batch-and-wait. Auto-disable ek blunt version hai (20 consecutive failures).",
+  "why_needed": "Multi-tenant delivery systems ka sabse common performance outage.",
+  "real_world_analogy": "Ek toll plaza: ek truck ka FASTag kharab, 10 minute atka. Agar har lane mein aisa ek truck aa jaaye toh poora plaza ruk jaata hai. Fix: problem vehicles ki alag lane (bulkhead).",
+  "how_it_works": "Slow sends occupy concurrency slots up to timeout; gather makes batch wait for slowest; Little's law: in-flight = rate x latency.",
+  "in_this_project": "`Dispatcher.__init__` timeouts aur `Semaphore(concurrency)`, `run_once` (`asyncio.gather`), `services/ratelimit.py`, `SECURITY.md` slow-loris row, `SYSTEM_DESIGN.md` 'Slow customers: per-endpoint concurrency caps + circuit breaker'. Bulkhead/breaker implement nahi hain.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::run_once",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::Dispatcher",
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/SECURITY.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Timeouts bound the damage per request",
+   "Auto-disable eventually removes dead endpoints"
+  ],
+  "disadvantages": [
+   "Batch HOL blocking amplifies slow endpoints",
+   "No per-endpoint concurrency cap",
+   "No circuit breaker"
+  ],
+  "common_mistakes": [
+   "Rate limit ko concurrency limit samajhna",
+   "Timeout bahut bada rakhna 'customer ke liye polite' banne ke liye"
+  ],
+  "follow_up_questions": [
+   "How would you implement a per-endpoint concurrency cap across dispatchers?",
+   "How does a circuit breaker differ from auto-disable?",
+   "How would you restructure run_once?"
+  ],
+  "concepts": [
+   "noisy neighbour",
+   "bulkhead",
+   "head-of-line blocking",
+   "circuit breaker"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bulkheads isolation dete hain lekin per-endpoint state (Redis counters with leases) aur complexity; batch loop simple lekin HOL. Continuous pipeline thoda complex lekin slot utilisation high.",
+   "failure_scenarios": "Redis-based concurrency counter crash pe leak ho sakta hai (in-flight count kabhi decrement nahi) -- TTL/lease based counters chahiye.",
+   "alternatives": "Separate dispatcher pools for 'slow' endpoints (tiering by p95 latency); per-endpoint queues; adaptive timeouts.",
+   "scale_10x_100x": "100x pe noisy neighbours guaranteed hain; cell-based isolation + per-endpoint queues zaroori.",
+   "production_improvements": "Metrics per endpoint: p95 latency, in-flight count, timeout rate; breaker state on dashboard."
+  }
+ },
+ {
+  "id": "WHK-084",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "A customer was auto-disabled during a 6-hour outage. Walk through recovery.",
+  "answer_hinglish": "Situation: endpoint `enabled=false`, `disabled_reason='auto-disabled after 20 consecutive failures'`. Deliveries teen buckets mein hain: (a) disable se pehle jinke saare attempts khatam ho gaye -> `dead`; (b) disable ke time retry pending thi -> `pending`, claim nahi ho rahi; (c) disable ke baad publish hue events -> nayi `pending` rows (publish disabled endpoints ko bhi fan-out karta hai, kyunki subscribed query `enabled` filter nahi karti) -- woh bhi wait.\n\nRecovery steps:\n1. Customer ka fix confirm karo -- dashboard pe last errors/response snippets dekho (`GET /deliveries?endpoint_id=...&status=dead`, `GET /deliveries/{id}`).\n2. Rate limit check -- 6 ghante ka backlog hai; customer ka server kitna handle karega? Zaroorat ho toh `PATCH rate_limit_per_second` kam karo pehle.\n3. `PATCH /endpoints/{id}` `{\"enabled\": true}` -> counter 0, reason clear. Bucket (b) aur (c) turant claimable (due hain) -- token bucket rate pe drain.\n4. `POST /endpoints/{id}/replay-dead` -> bucket (a) `pending, attempts=0`. Response mein requeued count.\n5. Monitor `/stats` -- pending count ghatna chahiye, `oldest_pending_due_at` aage badhna chahiye.\n\nCustomer ko batao: events out of order aayenge (purane dead replays naye pending ke saath mix), aur duplicates possible -- webhook-id pe dedupe karein, aur state-dependent logic ke liye latest state fetch karein.\n\nGap: customer ko disable hone ka koi notification nahi jaata -- production mein email/alert chahiye.",
+  "why_needed": "Real ops runbook -- interviewers practical recovery sochna dekhte hain.",
+  "real_world_analogy": "Society ka gate band tha 6 ghante: kuch parcels courier wapas le gaya (dead), kuch gate pe wait kar rahe hain (pending). Gate khulte hi waiting wale aate hain, aur wapas gaye parcels ko dobara mangwana padta hai (replay).",
+  "how_it_works": "Re-enable releases pending; replay-dead requeues dead; token bucket paces the drain.",
+  "in_this_project": "`services/endpoints.py::update`, `routes.py::replay_dead`, `routes.py::list_deliveries` filters, `routes.py::stats`, `services/events.py::publish` (no enabled filter), `test_410_gone_disables_endpoint` comment 'deliveries for a disabled endpoint wait, they are not claimed'.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/api/routes.py::replay_dead",
+   "projects/04-webhooks/webhooks/services/endpoints.py::update",
+   "projects/04-webhooks/webhooks/api/routes.py::stats",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_410_gone_disables_endpoint"
+  ],
+  "code_example": "# real: webhooks/api/routes.py\n@router.post(\"/endpoints/{endpoint_id}/replay-dead\", tags=[\"deliveries\"])\nasync def replay_dead(endpoint_id: str, s=Depends(session)):\n    res = await s.execute(update(Delivery).where(Delivery.endpoint_id == endpoint_id, Delivery.status == \"dead\")\n                          .values(status=\"pending\", attempts=0, next_attempt_at=func.now()))\n    return {\"requeued\": res.rowcount}",
+  "code_language": "python",
+  "advantages": [
+   "No data lost",
+   "Two simple API calls",
+   "Rate limit protects the recovering server"
+  ],
+  "disadvantages": [
+   "Manual steps; no notification",
+   "Replay-dead is all-or-nothing (no time range)",
+   "Large single UPDATE for big backlogs"
+  ],
+  "common_mistakes": [
+   "Replay first, re-enable later (replayed rows still wait -- harmless but confusing)",
+   "Rate limit ignore karke backlog flood"
+  ],
+  "follow_up_questions": [
+   "Should replay-dead also re-enable the endpoint?",
+   "How would you replay only a time window?",
+   "How would you notify the customer automatically?"
+  ],
+  "concepts": [
+   "runbook",
+   "replay",
+   "recovery"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-085",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What happens to a 'poison' delivery that crashes the dispatcher code path every time?",
+  "answer_hinglish": "Poison delivery = woh row jiska processing hamesha unexpected exception deta hai -- jaise payload mein kuch aisa jo serialization tod de, ya koi bug specific endpoint config pe. Yeh code review mein mila real gap tha, aur ab fix hai.\n\nPehle ka behaviour: `_guarded` exception pakadta, `deliver_crashed` log karta, aur row ko `in_flight` chhod deta ('Never lose a delivery'). Lease (30s) expire -> `CLAIM_SQL` phir claim, `attempts + 1` -> phir crash -> loop. Retry schedule sirf `_record` mein check hota tha, jo crash path pe kabhi nahi chalta. Toh poison row har 30s re-claim hoti, `attempts` unbounded, kabhi `dead` nahi. Aur lease-expired rows `ORDER BY next_attempt_at` mein hamesha aage (purana timestamp) -- har batch mein pehle.\n\nFix (do layers):\n1. `_guarded` ke except block mein crash ko ek normal failed attempt ki tarah record karo: `_record(c, SendResult('internal_error', error=...))`. Fenced update hai, toh retry schedule aur max attempts -> DLQ wahi rules follow karte hain. Test: `test_crashing_delivery_eventually_goes_dead`.\n2. Backstop: agar record bhi fail ho (DB issue), toh `claim()` har batch se pehle `UPDATE deliveries SET status='dead' ... WHERE status='in_flight' AND locked_until < now() AND attempts >= max` chalata hai -- final attempt ke baad lease-expired row dobara round nahi lagati. Test: `test_claim_backstop_dead_letters_exhausted_expired_rows`.\n\nInterview point: 'never lose' aur 'bounded retries' dono chahiye -- dead row visible aur replayable hai, toh yeh data loss nahi. Project 3 (job queue) mein poison jobs ke liye DLQ tha -- wahi idea yahan apply kiya.",
+  "why_needed": "Poison messages har queue ko kabhi na kabhi milte hain; unbounded retry loops outages banate hain.",
+  "real_world_analogy": "Ek parcel jiska barcode scanner ko har baar hang kar deta hai: har shift mein koi naya worker use uthata hai aur machine phir hang. Rule chahiye: 3 baar ke baad parcel alag 'problem' shelf pe.",
+  "how_it_works": "Exception -> recorded as an internal_error attempt (fenced) -> normal retry schedule -> dead after the last attempt; if recording fails, the claim-time backstop dead-letters exhausted lease-expired rows.",
+  "in_this_project": "`Dispatcher._guarded` (crash -> `internal_error` attempt via `_record`), `Dispatcher.claim` (backstop UPDATE before `CLAIM_SQL`), `Dispatcher._next_delay`, tests `test_crashing_delivery_eventually_goes_dead` and `test_claim_backstop_dead_letters_exhausted_expired_rows`, `TESTING.md` review-fix table, `DEPLOYMENT.md` alert on `deliver_crashed`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_guarded",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::claim",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_next_delay",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_crashing_delivery_eventually_goes_dead",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_claim_backstop_dead_letters_exhausted_expired_rows"
+  ],
+  "code_example": "# real: Dispatcher.claim (backstop, runs before CLAIM_SQL in the same transaction)\nawait s.execute(text(\n    \"UPDATE deliveries SET status = 'dead', locked_until = NULL, locked_by = NULL, \"\n    \"last_error = coalesce(last_error, '') || ' [dead: lease expired after final attempt]' \"\n    \"WHERE status = 'in_flight' AND locked_until < now() AND attempts >= :max\"),\n    {\"max\": len(self.cfg.retry_schedule_seconds) + 1})",
+  "code_language": "sql",
+  "advantages": [
+   "Poison rows end in dead (visible, replayable) instead of looping",
+   "Crash attempts appear in the attempt log with outcome internal_error",
+   "Backstop covers the case where even recording fails"
+  ],
+  "disadvantages": [
+   "A crash after the HTTP send can still duplicate a request on retry (same webhook-id)",
+   "Backstop runs an extra UPDATE on every claim"
+  ],
+  "common_mistakes": [
+   "Retry limit sirf happy failure path pe enforce karna",
+   "Exception pe delivery silently drop karna"
+  ],
+  "follow_up_questions": [
+   "Crash ko attempt ki tarah record karna aur claim-time backstop -- dono kyun chahiye?",
+   "How do you distinguish a crash from a dispatcher kill -9?",
+   "How did Project 3 handle poison jobs?"
+  ],
+  "concepts": [
+   "poison message",
+   "dead letter",
+   "retry limits"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Never-lose vs bounded retries: dono chahiye -- bounded retries ke baad dead (visible aur replayable) data loss nahi hai. Pehle sirf never-lose tha.",
+   "failure_scenarios": "Bad deploy jo ek event type pe crash kare: ab woh rows normal schedule se retry hoke dead jaati hain (replay after the fix); pehle hazaron rows har 30s loop karti aur logs flood hote.",
+   "alternatives": "Crash counter separate column (`crash_count`); claim-time guard; sweeper job; quarantine status `poisoned` distinct from dead.",
+   "scale_10x_100x": "Scale pe poison rows ka share chhota lekin absolute count bada; batch head pe hamesha aana throughput ko measurably girata hai.",
+   "production_improvements": "Crash recording + backstop done; next: alert on deliver_crashed and internal_error outcome rate, separate crash_count if crashes should be budgeted differently from HTTP failures."
+  }
+ },
+ {
+  "id": "WHK-086",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "An endpoint's hostname starts resolving to an internal IP. What does the system do?",
+  "answer_hinglish": "Har delivery attempt se pehle `_send` `assert_public_destination(url)` chalata hai. DNS ab private IP (jaise 10.0.0.5) deta hai -> `_is_public` false -> `BlockedDestination(\"destination resolves to non-public address(es): 10.0.0.5\")`. `_send` `SendResult(\"blocked\", error=...)` return karta hai -- koi HTTP request nahi bhejti.\n\n`_record` mein `r.outcome == \"blocked\"` -> delay None -> delivery seedha `dead` (retry nahi). Attempt log mein outcome `blocked` aur error message. Endpoint ka `consecutive_failures` bhi badhta hai (failure count hota hai), toh bahut saari blocked deliveries endpoint ko auto-disable kar dengi.\n\nRetry kyun nahi? (1) Agar yeh attack hai (DNS rebinding), toh retry karna attacker ko aur chances dena hai. (2) Agar genuine misconfiguration hai (customer ne internal DNS galti se public kar diya), toh retry se fix nahi hoga -- customer ko URL/DNS fix karke replay maangna padega. Dead + replay usi ke liye hai.\n\nTest `test_ssrf_destination_blocked_at_send_time`: endpoint 127.0.0.1 pe register (allow_private=True context mein), dispatcher `allow_private_destinations=False` ke saath -> `calls == []` (transport tak kuch nahi pahuncha), status `dead`, outcome `blocked`. Comment: \"registered while private was allowed (or via DNS rebinding)\".\n\nOps angle: blocked outcomes security signal hain -- alert lagana chahiye; ek customer ke URL ka achanak internal resolve hona investigate karne layak hai.",
+  "why_needed": "SSRF guard ka runtime behaviour aur kyun retry nahi karte.",
+  "real_world_analogy": "Courier ko address pe pahunch ke pata chala yeh toh army cantonment ka andar wala gate hai -- entry nahi, parcel 'undeliverable' mark, baar baar koshish nahi.",
+  "how_it_works": "Send-time resolve -> non-public -> blocked outcome -> dead (no retry) -> counts toward auto-disable.",
+  "in_this_project": "`Dispatcher._send` (blocked branch), `Dispatcher._record` (`gone or r.outcome == \"blocked\"`), `services/ssrf.py::assert_public_destination`, test `tests/test_dispatcher.py::test_ssrf_destination_blocked_at_send_time`, `FAILURE_SCENARIOS.md` #12.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_send",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_record",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_ssrf_destination_blocked_at_send_time",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: tests/test_dispatcher.py\nawait add_endpoint(sm, url=\"https://127.0.0.1/hook\")   # registered while private was allowed (or via DNS rebinding)\n...\nd = dispatcher(sm, limiter, httpx.MockTransport(lambda r: calls.append(r) or httpx.Response(200)),\n               allow_private_destinations=False)\nawait d.run_once()\nassert calls == [] and row.status == \"dead\"\nassert (await attempts(sm, row.id))[0].outcome == \"blocked\"",
+  "code_language": "python",
+  "advantages": [
+   "No request leaves",
+   "Not retried (no attacker retries)",
+   "Visible in attempt log"
+  ],
+  "disadvantages": [
+   "Transient DNS weirdness kills the delivery immediately",
+   "No dedicated security alert"
+  ],
+  "common_mistakes": [
+   "Blocked ko normal failure ki tarah retry karna",
+   "Block reason customer ko na dikhana"
+  ],
+  "follow_up_questions": [
+   "Should a DNS resolution failure also be 'blocked' and dead?",
+   "How would you alert on blocked outcomes?",
+   "Is killing the delivery too harsh for flapping DNS?"
+  ],
+  "concepts": [
+   "SSRF",
+   "DNS rebinding",
+   "failure handling"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-087",
+  "project_slug": "p04-webhooks",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A bad deploy SIGKILLs every dispatcher at the same moment mid-batch. What happens?",
+  "answer_hinglish": "Sab dispatchers ke claimed batches (har ek ke 20 rows) `in_flight` reh jaate hain with `locked_until = claim_time + 30s`. Inme kuch rows ka HTTP request ja chuka tha (customer ne process bhi kiya ho sakta hai), kuch ka nahi.\n\nNaye dispatchers start hote hain. Pehle 30s tak in rows ko koi nahi uthata (lease valid). Baaki pending rows normally process hoti hain. 30s baad lease expire -> `CLAIM_SQL` ka `in_flight AND locked_until < now()` branch inhe pick karta hai, `attempts + 1`. Lease-expired rows ka `next_attempt_at` purana hai, toh `ORDER BY next_attempt_at` mein yeh sabse aage -- jaldi recover hote hain.\n\nCustomer impact: jinka request already gaya tha, unhe duplicate milega (same webhook-id) -- receiver dedupe karega. Jinka nahi gaya tha, unhe ~30s delay. Attempt counter ek extra badh gaya (crash wala attempt record nahi hua, toh attempt log mein gap dikhega: attempt 1 missing, attempt 2 success) -- support ke liye yeh \"crash recovery\" ka signature hai. Koi delivery lost nahi.\n\nAgar purane dispatchers SIGKILL se pehle kisi tarah zinda rahe (network partition, zombie) aur baad mein record karne aaye -> fencing (`attempts` mismatch) -> stale.\n\nBad deploy loop ho (naya code bhi crash karta hai) -> `deliver_crashed` / restart loop -> poison-like behaviour; rollback hi fix. Lesson: graceful shutdown (SIGTERM + grace > 10s timeout) se yeh scenario normal deploys mein avoid hota hai.",
+  "why_needed": "Mass crash recovery dikhata hai ki lease + fencing design kitna robust hai.",
+  "real_world_analogy": "Poore delivery staff ki shift achanak khatam -- jo parcels unke bag mein the woh 30 minute baad 'unassigned' maane jaate hain aur nayi shift utha leti hai; kuch log ko parcel do baar milega.",
+  "how_it_works": "Leases expire -> rows re-claimed with attempts+1 -> at-least-once preserved; duplicates for sent-but-unrecorded; zombies fenced.",
+  "in_this_project": "`CLAIM_SQL` lease-expired branch, `RECORD_SQL` fencing, `config.py::lease_seconds`, `FAILURE_SCENARIOS.md` #7/#8, test `test_crashed_dispatcher_lease_expires_and_zombie_result_is_rejected`, graceful path `dispatcher/__main__.py`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_crashed_dispatcher_lease_expires_and_zombie_result_is_rejected",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No delivery lost",
+   "Automatic recovery, no operator action",
+   "Zombies fenced"
+  ],
+  "disadvantages": [
+   "30s recovery delay",
+   "Duplicates for already-sent requests",
+   "Attempt log gaps"
+  ],
+  "common_mistakes": [
+   "Lease bahut lamba (recovery slow)",
+   "Deploy without graceful shutdown"
+  ],
+  "follow_up_questions": [
+   "How would you shorten recovery without raising duplicate risk?",
+   "How would support explain an attempt log that starts at attempt 2?",
+   "What deploy settings prevent this?"
+  ],
+  "concepts": [
+   "crash recovery",
+   "lease",
+   "at-least-once"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lease length = recovery latency vs duplicate risk; graceful shutdown hi asli fix hai normal deploys ke liye.",
+   "failure_scenarios": "Crash loop deploy: har 30s mass re-claim + crash -> duplicates har cycle mein un rows ke liye jinka send crash se pehle hua.",
+   "alternatives": "On SIGTERM explicitly release leases of unsent rows (set back to pending, attempts-1) -- faster recovery; heartbeat-based short leases.",
+   "scale_10x_100x": "Bade fleet mein rolling deploys (maxUnavailable) taaki ek waqt mein kuch hi dispatchers restart hon.",
+   "production_improvements": "Deploy pipeline mein canary dispatchers, `stale_delivery_result` aur `deliver_crashed` alerts, grace period > request timeout."
+  }
+ }
+]

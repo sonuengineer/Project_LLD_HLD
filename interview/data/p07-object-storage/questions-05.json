@@ -1,0 +1,1099 @@
+[
+ {
+  "id": "OBJS-085",
+  "project_slug": "p07-object-storage",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A customer bucket grows to hundreds of millions of blobs. What breaks first in GC and listing, and how would you fix it?",
+  "answer_hinglish": "Sabse pehle GC ka orphan scan tootega, listing nahi. `run_gc` do kaam karta hai: queued deletions (yeh scale karta hai, kyunki `blob_deletions` sirf delete hone wale keys rakhta hai, LIMIT 10000 per run) aur orphan scan. Orphan scan `storage.list_older_than(grace)` se POORE blob store ki listing leta hai, aur phir `SELECT blob_key FROM objects ... UNION SELECT blob_key FROM multipart_parts` se har referenced key ek Python set mein load karta hai. Observation (O6): yeh O(total blobs) per run hai -- 100 million keys ka set memory mein, aur S3 pe 1000-1000 karke list karna ghanton lagega. Worker har 300 second chalta hai, toh run khatam hi nahi hoga.\n\nListing ka path theek hai: `list_objects` `ix_objects_list (bucket, key text_pattern_ops)` partial index pe range scan karta hai aur `LIMIT max_keys + 1` leta hai, toh ek page ka cost bucket size se independent hai (assuming planner index use kare -- observation O8, EXPLAIN se check karna chahiye collation ki wajah se).\n\nFix: orphan scan ko incremental banao. Blob keys random hex hain, toh keyspace ko prefix shards (00..ff) mein baanto, har run ek shard scan kare. Har shard ke liye referenced set DB se usi prefix ke saath nikalo (`blob_key LIKE 'ab%'`, `ix_objects_blob` index use hoga). Ya better: orphan detection ko \"intent log\" se replace karo -- upload start pe `pending_blobs` row likho, commit pe hata do; GC sirf purane pending rows dekhe. Tab full scan ki zaroorat hi nahi.",
+  "why_needed": "Orphan scan correctness ke liye zaroori hai (crash ke baad garbage), lekin uska cost bucket size ke saath linearly badhta hai -- production mein yahi pehla wall hai.",
+  "real_world_analogy": "Godown ka stock-check: har mahine poora godown gin-na (full scan) chhote godown mein chalta hai; bade godown mein aisle-by-aisle rotation ya entry register (intent log) chahiye.",
+  "how_it_works": "`list_older_than` local adapter pe `root.glob('*/*/*')` aur S3 pe paginated `list_objects_v2` karta hai. Phir har candidate ko `referenced` set ke against check karke `delete_any` hota hai. Queued path alag hai: `blob_deletions` se 10000 keys, har ek ke liye reference re-check, phir delete.",
+  "in_this_project": "`objstore/services/maintenance.py::run_gc` mein `candidates = await storage.list_older_than(orphan_grace_seconds)` aur `referenced = set(...)` -- dono full-size hain. `storage/s3.py::list_older_than` `MaxKeys: 1000` ke saath ContinuationToken loop chalata hai. Listing `services/objects.py::list_objects` page-bounded hai. `DEPLOYMENT.md` bhi kehta hai ki `blob_deletions` growth aur GC failure pe alert lagao.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/storage/s3.py::list_older_than",
+   "projects/07-object-storage/objstore/storage/local.py::list_older_than",
+   "projects/07-object-storage/objstore/services/objects.py::list_objects",
+   "projects/07-object-storage/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_gc, orphan part)\ncandidates = await storage.list_older_than(orphan_grace_seconds)\nasync with sm() as s:\n    referenced = set((await s.execute(text(\n        \"SELECT blob_key FROM objects WHERE blob_key IS NOT NULL UNION \"\n        \"SELECT blob_key FROM multipart_parts\"))).scalars().all())\nfor name in candidates:\n    if name not in referenced:\n        await storage.delete_any(name)",
+  "code_language": "python",
+  "advantages": [
+   "Current design simple aur correct hai chhote/medium scale pe",
+   "Queued deletions already bounded (LIMIT 10000)",
+   "Listing page cost bucket size se independent"
+  ],
+  "disadvantages": [
+   "Orphan scan O(total blobs) time + memory",
+   "S3 listing bahut slow aur paid API calls",
+   "Ek run khatam hone se pehle agla schedule aa sakta hai"
+  ],
+  "common_mistakes": [
+   "Listing aur GC ko ek hi problem samajhna -- listing index-backed hai, GC nahi",
+   "Grace period hata ke scan fast karna -- in-flight uploads delete ho jayenge",
+   "Referenced set ko per-candidate query se replace karna bina index ke"
+  ],
+  "follow_up_questions": [
+   "How would an intent log (pending_blobs) replace the orphan scan?",
+   "How do AWS S3 Inventory reports help with this kind of reconciliation?",
+   "How would you shard the GC across several workers safely?"
+  ],
+  "concepts": [
+   "garbage collection",
+   "orphan blobs",
+   "scalability",
+   "reconciliation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Full scan = simple aur self-healing (koi bhi garbage pakad leta hai); intent log = fast lekin ek extra write per upload aur extra table.",
+   "failure_scenarios": "Agar GC run timeout ho ya OOM ho, worker `maintenance_failed` log karke sleep karega -- orphans kabhi saaf nahi honge aur storage cost chupke se badhegi.",
+   "alternatives": "Prefix-sharded incremental scan; pending_blobs intent table; blob store inventory files (S3 Inventory) ko offline DB ke saath diff karna; blob store lifecycle tags.",
+   "scale_10x_100x": "10x: prefix sharding kaafi hai. 100x: intent log + inventory-based weekly reconciliation, GC multiple workers mein shard by prefix with advisory locks.",
+   "production_improvements": "GC metrics (scanned, orphans, duration) export karo, run time pe alert, orphan scan ko queued-deletion path se alag schedule karo."
+  }
+ },
+ {
+  "id": "OBJS-086",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Why does put_object wrap the metadata commit in `except BaseException` and delete the blob?",
+  "answer_hinglish": "Kyunki us point pe blob already storage mein likha ja chuka hai lekin abhi koi metadata use reference nahi karta. Agar digest check fail ho (BadDigest), quota exceed ho (QuotaExceeded), DB error aaye, ya client disconnect ho aur task cancel ho -- toh woh blob ek orphan ban jayega. Isliye `except BaseException:` mein `await storage.delete(blob_key)` aur phir `raise`. Exception swallow nahi hoti, sirf cleanup hota hai.\n\n`Exception` ke bajaye `BaseException` kyun? asyncio mein request cancel hone pe `asyncio.CancelledError` aata hai, jo Python 3.8+ mein `BaseException` ka subclass hai, `Exception` ka nahi. Agar sirf `except Exception` likhte toh cancellation pe cleanup skip ho jata. KeyboardInterrupt bhi isi category mein hai.\n\nYeh \"best effort\" hai: agar delete khud fail ho jaye (S3 down), toh blob orphan reh jata hai -- lekin yahi toh GC ka orphan scan pakadta hai grace period ke baad. Toh do layers: fast path pe turant cleanup, aur safety net GC. Important baat: blob_key random aur naya hai, toh is blob ko delete karna kabhi kisi live object ko nahi chhoo sakta.",
+  "why_needed": "Failed uploads ko storage leak nahi banna chahiye; turant cleanup storage cost bachata hai aur GC pe load kam karta hai.",
+  "real_world_analogy": "Restaurant mein order cancel hua toh plate jo bana li thi turant hata do; agar bhool gaye toh raat ko safai wala (GC) utha lega.",
+  "how_it_works": "Flow: `storage.put` (bytes) -> `_verify_digests` -> transaction (advisory lock, optional quota, `commit_version`). Inme se kahin bhi exception -> blob delete -> exception re-raise -> bpcommon error handler usko JSON error mein convert karta hai (400 BadDigest, 403 QuotaExceeded, 500 ...).",
+  "in_this_project": "`objstore/services/objects.py::put_object` -- `try: _verify_digests(...); async with sm() as s, s.begin(): ...` aur `except BaseException: await storage.delete(blob_key); raise`. Test `test_integrity_checks_reject_corrupted_uploads` assert karta hai ki `list((tmp_path / \"blobs\").glob(\"*/*/*\")) == []` -- yaani rejected blob disk pe nahi bacha. `upload_part` aur `complete_multipart` mein bhi same pattern hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::upload_part",
+   "projects/07-object-storage/tests/test_objects.py::test_integrity_checks_reject_corrupted_uploads"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (put_object)\ntry:\n    _verify_digests(info, content_md5, sha256_header, signed_sha256)\n    async with sm() as s, s.begin():\n        await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n        ...\n        vid = await commit_version(s, bucket, key, blob_key=blob_key, ...)\nexcept BaseException:\n    await storage.delete(blob_key)   # nothing references it; best effort (GC catches failures)\n    raise",
+  "code_language": "python",
+  "advantages": [
+   "Cancellation pe bhi cleanup",
+   "Exception type preserve hota hai (bare raise)",
+   "GC pe load kam"
+  ],
+  "disadvantages": [
+   "Cleanup khud fail ho sakta hai -- GC zaroori",
+   "Commit succeed hone ke baad ack lost ho toh bhi yeh path nahi chalta (correct hai)"
+  ],
+  "common_mistakes": [
+   "`except Exception` likhna aur CancelledError miss karna",
+   "Exception swallow karke 200 return karna",
+   "Commit ke BAAD wale error pe bhi blob delete kar dena (tab woh live hai)"
+  ],
+  "follow_up_questions": [
+   "Why is CancelledError a BaseException in modern Python?",
+   "What if the COMMIT succeeds but the connection drops before the client sees it?",
+   "Why does storage.put failure (TooLarge) take a different branch?"
+  ],
+  "concepts": [
+   "exception safety",
+   "cleanup",
+   "asyncio cancellation",
+   "orphan blobs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-087",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Why do object routes use `{key:path}` and what does `_check_key` enforce?",
+  "answer_hinglish": "Object key mein slash hota hai -- `2026/trip/beach.jpg` ek hi key hai. FastAPI ka normal `{key}` path parameter sirf ek segment match karta hai (slash pe ruk jata hai), toh `/buckets/photos/objects/2026/trip/beach.jpg` 404 deta. `{key:path}` Starlette ka path converter hai jo baaki poora path (slashes ke saath) ek string mein de deta hai. Isse flat namespace ka \"folder\" illusion bina kisi special handling ke chal jata hai.\n\n`_check_key` do cheezein check karta hai: key empty na ho, aur UTF-8 encoded length 1024 bytes se zyada na ho (S3 ka bhi yahi limit hai). Bytes count karna zaroori hai, characters nahi -- emoji 4 bytes ka hota hai. Isse bahut lambi keys index aur URL limits ko nahi todti.\n\nNote karo key ke content pe koi restriction nahi: `../../etc/passwd`, spaces, `%`, backslash -- sab valid data hai, kyunki key kabhi filesystem path nahi banti (blob key random hai). Path ke liye safety client side `quote_key` se aati hai jo dot segments ko `%2E` bana deta hai, warna HTTP client URL normalise kar deta.",
+  "why_needed": "Keys mein slashes aur arbitrary bytes allowed hone chahiye, lekin size bounded rehna chahiye.",
+  "real_world_analogy": "Library mein book ka poora catalogue number '2026/Fiction/A-12' ek hi label hai -- shelf ka naam nahi.",
+  "how_it_works": "Starlette path converter regex `.*` use karta hai. Route `@router.put(\"/buckets/{bucket}/objects/{key:path}\")` -> `key` mein decoded path. `_check_key` `len(key.encode()) > 1024` pe `Unprocessable` (422) raise karta hai. Multipart initiate route (`/uploads/{key:path}`) bhi `_check_key` call karta hai.",
+  "in_this_project": "`objstore/api/routes.py::_check_key` aur `put_object` / `initiate` routes. Test `test_hostile_keys_never_touch_filesystem_paths` keys jaise `\"emoji/\\U0001F600.txt\"`, `\"spaces and %25 and ?q=1\"`, `\"../../etc/passwd\"` round trip karta hai. GET/HEAD/DELETE `_check_key` call nahi karte -- woh bas lookup karte hain, invalid key ka row hoga hi nahi.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/api/routes.py::_check_key",
+   "projects/07-object-storage/objstore/api/routes.py::put_object",
+   "projects/07-object-storage/objstore/services/signing.py::quote_key",
+   "projects/07-object-storage/tests/test_objects.py::test_hostile_keys_never_touch_filesystem_paths"
+  ],
+  "code_example": "# real: objstore/api/routes.py\ndef _check_key(key: str) -> None:\n    if not key or len(key.encode()) > 1024:\n        raise Unprocessable(\"object key must be 1..1024 bytes\")",
+  "code_language": "python",
+  "advantages": [
+   "Slash wali keys naturally kaam karti hain",
+   "Byte-based limit Unicode ke saath sahi",
+   "S3 compatible limit"
+  ],
+  "disadvantages": [
+   "Path converter trailing slash wali keys pe dhyan maangta hai",
+   "Validation sirf write routes pe hai"
+  ],
+  "common_mistakes": [
+   "`{key}` use karna aur slashes tod dena",
+   "len(key) characters mein count karna",
+   "Key ke content ko sanitize karna (`..` hata dena) -- yeh data badal deta hai"
+  ],
+  "follow_up_questions": [
+   "How does the client make sure `..` segments reach the server unchanged?",
+   "Should keys with control characters be rejected?",
+   "Why is 1024 bytes a sensible limit for an indexed text column?"
+  ],
+  "concepts": [
+   "routing",
+   "path converter",
+   "object keys",
+   "input validation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-088",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does ObjClient sign a request, and why does it send UNSIGNED-PAYLOAD for streamed bodies?",
+  "answer_hinglish": "`ObjClient` woh kaam karta hai jo boto3 S3 ke liye karta hai: request build karo, phir uske exact bytes ke upar signature lagao. `request()` pehle `httpx.build_request` se request banata hai, taaki URL wahi encoding le jo wire pe jayega. Phir `req.url.raw_path` se raw (percent-encoded) path nikalta hai -- server bhi `scope[\"raw_path\"]` se hi verify karta hai, toh dono same string sign karte hain. Query `req.url.query` se, aur `sign_headers` `Authorization`, `x-obj-date`, `x-obj-content-sha256` headers set karta hai.\n\nBody: agar content bytes hai toh `sha256(body)` sign hota hai -- server pe `signed_sha256` banta hai aur `_verify_digests` usko actual body se compare karta hai, toh beech mein body swap pakda jata hai. Lekin agar content async iterator (stream) hai, toh client ke paas poori body sign karne ke liye pehle se nahi hai -- use buffer ya do baar padhna padega. Isliye `body=None` -> `UNSIGNED-PAYLOAD`. Tab body integrity Content-MD5 / checksum header aur TLS pe depend karti hai.\n\n`put()` default mein Content-MD5 bhi bhejta hai (`md5=True`), jo transit corruption pakadta hai. Benchmark `md5=False` use karta hai.",
+  "why_needed": "Client aur server ko byte-for-byte same canonical string banana hai, warna 401; streams ke liye double hashing avoid karna hai.",
+  "real_world_analogy": "Cheque pe amount aur payee dono likh ke sign karna (signed payload) vs blank amount wala signed cheque jahan amount alag se verify hota hai (unsigned payload).",
+  "how_it_works": "`sign_headers(ak, sk, method, raw_path, query, body)` -> date = now, sha = sha256(body) ya UNSIGNED, sig = HMAC(secret, METHOD/RAW_PATH/CANONICAL_QUERY/DATE/SHA). Server `authenticate` same string recompute karke `hmac.compare_digest` karta hai.",
+  "in_this_project": "`objstore/client.py::ObjClient.request` -- `body = req.content if (sign_body and not hasattr(content, \"__aiter__\")) else None` aur `raw_path = req.url.raw_path.decode().split(\"?\")[0]`. `put()` keys ko `quote_key` se encode karta hai. `test_signed_body_cannot_be_swapped` signed sha256 ke saath tampered body bhejta hai -> 400 BadDigest.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/client.py::ObjClient",
+   "projects/07-object-storage/objstore/services/signing.py::sign_headers",
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/tests/test_objects.py::test_signed_body_cannot_be_swapped"
+  ],
+  "code_example": "# real, trimmed: objstore/client.py\nasync def request(self, method, path, *, params=None, content=None, json=None, headers=None, sign_body=True):\n    req = self.http.build_request(method, path, params=params, content=content, json=json, headers=headers)\n    body = req.content if (sign_body and not hasattr(content, \"__aiter__\")) else None\n    raw_path = req.url.raw_path.decode().split(\"?\")[0]\n    req.headers.update(sign_headers(self.ak, self.sk, method, raw_path, req.url.query.decode(), body))\n    return await self.http.send(req)",
+  "code_language": "python",
+  "advantages": [
+   "Signs exactly what goes on the wire",
+   "Streams supported without buffering",
+   "Content-MD5 by default"
+  ],
+  "disadvantages": [
+   "UNSIGNED-PAYLOAD pe proxy body swap signature se nahi pakdega",
+   "Client clock skew 15 min se zyada ho toh 401"
+  ],
+  "common_mistakes": [
+   "Decoded path sign karna jabki server raw path verify karta hai",
+   "Query ko sort kiye bina sign karna",
+   "Body sign karne ke liye 5GB file memory mein padh lena"
+  ],
+  "follow_up_questions": [
+   "How does AWS solve streaming with signed payloads (chunked signing)?",
+   "Why does the client need quote_key for dot segments?",
+   "What would break if the client used local time that is 20 minutes off?"
+  ],
+  "concepts": [
+   "request signing",
+   "HMAC",
+   "SDK",
+   "streaming uploads"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-089",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "How is user metadata (`x-obj-meta-*`) stored and returned?",
+  "answer_hinglish": "Client koi bhi custom header `x-obj-meta-<name>: <value>` PUT ke saath bhej sakta hai -- jaise `x-obj-meta-camera: x100`. Server prefix hata ke `{\"camera\": \"x100\"}` dict banata hai aur `objects.user_metadata` jsonb column mein store karta hai. GET/HEAD pe `_object_headers` us dict ko wapas `x-obj-meta-camera` headers mein badal deta hai. S3 mein bhi exactly yahi pattern hai (`x-amz-meta-*`).\n\nImportant: metadata version ke saath immutable hai. Metadata badalna hai toh naya PUT (naya version) karna padta hai -- in-place update nahi. Multipart mein metadata initiate ke time pe `multipart_uploads.user_metadata` mein save hota hai aur complete ke time version pe copy hota hai.\n\nDhyan dene wali baat: HTTP header names case-insensitive hain, toh keys lowercase mein aati hain (Starlette headers lowercase deta hai). Aur headers ka total size proxies pe limited hota hai (typically 8KB jaise ballpark), toh metadata chhota rakhna chahiye -- bade data ke liye object hi use karo.",
+  "why_needed": "Objects ke saath app-specific info (camera, uploader, original filename) bina alag database ke rakhni hoti hai.",
+  "real_world_analogy": "Parcel pe chipka sticker: andar ka saamaan (bytes) nahi badalta, sticker pe extra info likhi hoti hai.",
+  "how_it_works": "PUT: `_meta_headers(request)` -> dict -> `put_object(metadata=...)` -> `commit_version` -> `CAST(:md AS jsonb)`. GET: `head_object` row -> `_object_headers(row)` -> `for k, v in row[\"user_metadata\"].items(): h[f\"x-obj-meta-{k}\"] = v`.",
+  "in_this_project": "`objstore/api/routes.py::_meta_headers` aur `_object_headers`; column `user_metadata jsonb NOT NULL DEFAULT '{}'` in `migrations/versions/0001_initial.py`. Test `test_put_get_roundtrip_metadata_and_etag` `meta={\"camera\": \"x100\"}` bhejta hai aur `g.headers[\"x-obj-meta-camera\"] == \"x100\"` assert karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/api/routes.py::_meta_headers",
+   "projects/07-object-storage/objstore/api/routes.py::_object_headers",
+   "projects/07-object-storage/tests/test_objects.py::test_put_get_roundtrip_metadata_and_etag"
+  ],
+  "code_example": "# real: objstore/api/routes.py\ndef _meta_headers(request: Request) -> dict:\n    return {k[len(\"x-obj-meta-\"):]: v for k, v in request.headers.items() if k.startswith(\"x-obj-meta-\")}",
+  "code_language": "python",
+  "advantages": [
+   "Schema-less, flexible",
+   "S3 jaisa familiar contract",
+   "Version ke saath consistent"
+  ],
+  "disadvantages": [
+   "Header size limits",
+   "Metadata pe query/search ka index nahi",
+   "Non-ASCII values headers mein tricky"
+  ],
+  "common_mistakes": [
+   "Metadata ko case-sensitive maan lena",
+   "Badi JSON metadata headers mein bhejna",
+   "Metadata update ke liye in-place UPDATE ki ummeed karna"
+  ],
+  "follow_up_questions": [
+   "How would you support searching objects by metadata?",
+   "What is the difference between user metadata and system metadata like Content-Type?"
+  ],
+  "concepts": [
+   "user metadata",
+   "jsonb",
+   "HTTP headers"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-090",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Why does canonical_query sort and percent-encode query parameters before signing?",
+  "answer_hinglish": "Signature tabhi verify ho sakta hai jab client aur server bilkul same string ka HMAC nikalein. Query string ke saath problem yeh hai ki same meaning ki kai representations hain: `a=1&b=2` aur `b=2&a=1` same hain; `%2F` aur `/`, ya space ka `+` vs `%20` -- different bytes, same meaning. Agar raw query sign karte, toh koi proxy ya HTTP library order ya encoding badal de toh signature fail.\n\n`canonical_query` ek canonical form banata hai: `parse_qsl(..., keep_blank_values=True)` se decode, `sorted()` se key/value order fix, phir `quote(k, safe='-_.~')` se ek fixed encoding (RFC 3986 unreserved characters chhod ke sab encode). Dono side yahi function call karti hain, toh representation ka farak mit jata hai.\n\n`exclude` parameter presigned URLs ke liye hai: `X-Obj-Signature` khud signature ka hissa nahi ho sakta (chicken-and-egg), isliye canonical query se bahar. Lekin `X-Obj-Credential` aur `X-Obj-Expires` andar hain -- toh expiry badal ke URL lamba nahi kar sakte. `keep_blank_values` zaroori hai warna `?versions=` jaisa param chupke se drop ho jata.",
+  "why_needed": "Canonicalisation ke bina harmless re-encoding se valid requests reject hongi, ya worse, do alag requests same signature share karengi.",
+  "real_world_analogy": "Do log ek shopping list compare kar rahe hain -- pehle dono alphabetically sort karo, tab line-by-line match karo.",
+  "how_it_works": "`string_to_sign = METHOD \\n RAW_PATH \\n canonical_query(query) \\n DATE \\n SHA`. Presign: `canonical_query(q, {\"X-Obj-Signature\"})` + `\"PRESIGNED\"` + expires. Server `presigned_string` same exclude ke saath recompute karta hai.",
+  "in_this_project": "`objstore/services/signing.py::canonical_query`, `string_to_sign`, `presign`, `presigned_string`. `test_presigned_urls` key badalne pe 401 assert karta hai; `test_auth_failures` different path pe replay 401.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/signing.py::canonical_query",
+   "projects/07-object-storage/objstore/services/signing.py::presigned_string",
+   "projects/07-object-storage/objstore/services/auth.py::authenticate"
+  ],
+  "code_example": "# real: objstore/services/signing.py\ndef canonical_query(query: str, exclude: set[str] = frozenset()) -> str:\n    pairs = sorted((k, v) for k, v in parse_qsl(query, keep_blank_values=True) if k not in exclude)\n    return \"&\".join(f\"{quote(k, safe='-_.~')}={quote(v, safe='-_.~')}\" for k, v in pairs)",
+  "code_language": "python",
+  "advantages": [
+   "Order/encoding independent",
+   "Presign param exclusion clean",
+   "Blank values preserved"
+  ],
+  "disadvantages": [
+   "Path canonicalised nahi -- raw path exactly match hona chahiye",
+   "Duplicate keys sort ho jate hain lekin semantics app pe depend"
+  ],
+  "common_mistakes": [
+   "Signature param ko hi sign karne ki koshish",
+   "keep_blank_values bhool jana",
+   "Client aur server mein alag quote safe sets"
+  ],
+  "follow_up_questions": [
+   "Why is the path signed raw instead of canonicalised?",
+   "How does AWS SigV4 canonicalise headers as well?",
+   "What attack would be possible if X-Obj-Expires were excluded from signing?"
+  ],
+  "concepts": [
+   "canonicalization",
+   "request signing",
+   "presigned URLs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-091",
+  "project_slug": "p07-object-storage",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "In upload_part, why is a re-uploaded part handled with ON CONFLICT upsert, and why is the old part's blob queued instead of deleted?",
+  "answer_hinglish": "Multipart ka main promise hai \"failed part ko dobara bhejo\". Client same `part_number` ke saath retry karega -- kabhi isliye ki pehla attempt fail hua, kabhi isliye ki pehla succeed hua tha par response kho gaya. Dono case mein server ko last upload ko winner banana hai. `INSERT ... ON CONFLICT (upload_id, part_number) DO UPDATE SET size, etag, blob_key, uploaded_at = now()` ek atomic upsert hai: koi \"pehle check karo, phir insert ya update\" race nahi.\n\nPurana blob turant delete kyun nahi? Kyunki delete transaction ke andar storage call hoti -- agar transaction baad mein rollback ho jaye toh row purane blob ko point karegi jo delete ho chuka hai (dangling metadata). Isliye project ka rule: metadata transaction ke andar sirf `_queue_blob_deletion(s, old)` -- yeh bhi same transaction ka hissa hai, rollback hua toh queue entry bhi gayi. Commit hua toh GC baad mein `blob_deletions` se uthayega, aur delete se pehle re-check karega ki koi `objects` ya `multipart_parts` row ab bhi use reference toh nahi karta.\n\nReview fix (O2): pehle yahan `_check_quota` bucket `FOR UPDATE` lock ke bina chalta tha, toh concurrent part uploads quota se aage nikal sakte the. Ab quota'd bucket pe part upload bhi `SELECT 1 FROM buckets WHERE name = :b FOR UPDATE` leta hai, `put_object` jaisa (`test_multipart_parts_respect_quota_and_completion_check_is_real`).",
+  "why_needed": "Retries idempotent-ish aur crash-safe hone chahiye, aur storage deletion kabhi metadata se aage nahi jana chahiye.",
+  "real_world_analogy": "Exam mein answer sheet ka page dobara likha -- naya page staple karo, purana page 'shred' tray mein daalo; shredder baad mein confirm karke shred karega.",
+  "how_it_works": "upload_part: upload exist check -> naya random blob stream -> Content-MD5 verify -> txn: upload re-check, quota check, old blob_key select, upsert, old blob queue -> commit. Fail pe naya blob delete.",
+  "in_this_project": "`objstore/services/objects.py::upload_part` -- `old = SELECT blob_key FROM multipart_parts WHERE upload_id = :u AND part_number = :n`, phir upsert, phir `_queue_blob_deletion(s, old)`. Primary key `(upload_id, part_number)` migration mein hai. Test `test_multipart_upload` part 2 ko `b\"b\" * 10` se re-upload karta hai aur final content mein naya part aata hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::upload_part",
+   "projects/07-object-storage/objstore/services/objects.py::_queue_blob_deletion",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/tests/test_objects.py::test_multipart_upload",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_multipart_parts_respect_quota_and_completion_check_is_real"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (upload_part)\nold = (await s.execute(text(\"SELECT blob_key FROM multipart_parts WHERE upload_id = :u AND part_number = :n\"),\n                       {\"u\": upload_id, \"n\": part_number})).scalar()\nawait s.execute(text(\n    \"INSERT INTO multipart_parts (upload_id, part_number, size, etag, blob_key) VALUES (:u, :n, :sz, :e, :bk) \"\n    \"ON CONFLICT (upload_id, part_number) DO UPDATE SET size = EXCLUDED.size, etag = EXCLUDED.etag, \"\n    \"blob_key = EXCLUDED.blob_key, uploaded_at = now()\"), {...})\nawait _queue_blob_deletion(s, old)",
+  "code_language": "python",
+  "advantages": [
+   "Atomic replace, no race",
+   "Rollback-safe deletion",
+   "Retries natural"
+  ],
+  "disadvantages": [
+   "Two concurrent uploads of the same part: last commit wins, dusre ka blob queue hota hai (fine, but wasted I/O)",
+   "Quota'd buckets pe parts bhi bucket lock pe serialize (review fix ka cost)"
+  ],
+  "common_mistakes": [
+   "Transaction ke andar storage.delete call karna",
+   "Old blob_key ko upsert ke BAAD select karna (tab naya mil jayega)",
+   "Retry ko naye part_number ke saath bhejna"
+  ],
+  "follow_up_questions": [
+   "Is the SELECT-then-upsert racy between two concurrent retries of the same part?",
+   "How would you fix the quota race in upload_part?",
+   "Why does GC re-check references before deleting a queued blob?"
+  ],
+  "concepts": [
+   "upsert",
+   "idempotent retries",
+   "deferred deletion",
+   "multipart upload"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Queue-based deletion ek extra table aur GC dependency laata hai, lekin metadata/data ordering kabhi nahi tootta.",
+   "failure_scenarios": "Do concurrent same-part retries: dono `old` = pehla blob padh sakte hain; ek ka naya blob overwritten ho jata hai aur kabhi queue nahi hota -> orphan, jo orphan scan grace ke baad hatata hai.",
+   "alternatives": "Part row pe `SELECT ... FOR UPDATE` ya part-level advisory lock; ya `RETURNING` ke saath old value capture karne ke liye CTE.",
+   "scale_10x_100x": "Hazaron parallel parts pe quota sum query (sum over all objects + parts) har part pe mehngi -- counters table chahiye.",
+   "production_improvements": "Bucket lock (done, O2) ki jagah scale pe usage counter row; `old` capture ko CTE se atomic banao; per-part metrics."
+  }
+ },
+ {
+  "id": "OBJS-092",
+  "project_slug": "p07-object-storage",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "If you replaced the S3 backend with your own blob layer, how would you add durability through replication or erasure coding?",
+  "answer_hinglish": "Seedha jawab: is project mein yeh implement nahi hai -- durability S3-compatible backend (SeaweedFS / MinIO / AWS) ko delegate ki gayi hai, README ki known limitations mein likha hai \"no replication/erasure coding\". Production mein apna blob layer banana ho toh aise karte:\n\nReplication (simple): har blob ko 3 storage nodes pe likho, alag failure domains (rack/AZ) mein. Write tab successful jab write quorum (jaise 2 of 3) ack kare; read kisi bhi healthy replica se, checksum verify karke. Cost: 3x storage.\n\nErasure coding (efficient): blob ko k data chunks mein todo aur m parity chunks banao (Reed-Solomon), jaise 8+4. Koi bhi 8 chunks se poora blob reconstruct ho jata hai, toh 4 nodes tak loss bardasht; storage overhead sirf 1.5x. Cost: CPU encode/decode, aur chhoti files pe bahut chunks -- isliye chhote objects ko pack karke bade \"volumes\" mein rakhte hain (Haystack / SeaweedFS ka idea).\n\nBackground repair: scrubber har chunk ka checksum periodically verify kare, aur missing chunks rebuild kare. Hamara SHA-256 per object already end-to-end check deta hai.\n\nAchhi baat: hamare design mein `StorageAdapter` protocol hai -- metadata ko pata hi nahi bytes kaise store hain, toh naya adapter plug ho sakta hai bina API badle.",
+  "why_needed": "Disks aur nodes fail hote hain; ek copy wala blob store data loss guarantee karta hai.",
+  "real_world_analogy": "Important document ki 3 photocopies teen alag shehron mein (replication) vs ek puzzle ke tukde jisme koi bhi 8 of 12 tukde poori picture bana dein (erasure coding).",
+  "how_it_works": "Write path: chunking -> encode -> parallel writes to k+m nodes -> placement map (blob_key -> nodes) metadata mein -> ack. Read path: k chunks fetch (parallel, fastest first), decode, verify checksum. Repair: scrub, detect, rebuild on a new node, update placement.",
+  "in_this_project": "`objstore/storage/base.py::StorageAdapter` (put/get/delete/exists/list_older_than) wahi seam hai jahan naya `ReplicatedAdapter` ya `ErasureCodedAdapter` aata. `storage/s3.py::S3Adapter` aaj durability backend ko deta hai; `SYSTEM_DESIGN.md` \"erasure coding in the blob layer\" ko huge-object scaling step ke roop mein list karta hai. `objects.sha256` integrity scrub ke liye reuse ho sakta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/base.py::StorageAdapter",
+   "projects/07-object-storage/objstore/storage/s3.py::S3Adapter",
+   "projects/07-object-storage/SYSTEM_DESIGN.md",
+   "projects/07-object-storage/README.md"
+  ],
+  "code_example": "# illustrative (NOT in repo): shape of a replicated adapter behind the same protocol\nclass ReplicatedAdapter:\n    name = \"replicated\"\n    def __init__(self, nodes, w=2):\n        self.nodes, self.w = nodes, w\n    async def put(self, blob_key, stream):\n        # tee the stream to all replicas; succeed when >= w acks\n        ...\n    async def get(self, blob_key, start=0, end=None):\n        for node in self.healthy_nodes_for(blob_key):\n            try:\n                async for chunk in node.get(blob_key, start, end):\n                    yield chunk\n                return\n            except IOError:\n                continue",
+  "code_language": "python",
+  "advantages": [
+   "Adapter seam already exists",
+   "Erasure coding ~1.5x overhead vs 3x replication",
+   "SHA-256 per object helps scrubbing"
+  ],
+  "disadvantages": [
+   "Apna blob layer banana bahut bada operational kaam",
+   "EC chhote objects pe inefficient",
+   "Repair traffic network ko bhar sakta hai"
+  ],
+  "common_mistakes": [
+   "Durability aur availability ko same samajhna",
+   "Replicas ek hi rack mein rakhna",
+   "Checksum verify kiye bina replica se serve karna (silent corruption)"
+  ],
+  "follow_up_questions": [
+   "How do you choose k and m for erasure coding?",
+   "How does a scrubber detect bit rot?",
+   "Why do systems pack small objects into large volumes?"
+  ],
+  "concepts": [
+   "erasure coding",
+   "replication",
+   "durability",
+   "quorum writes"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Replication: simple, fast reads, 3x cost. EC: sasta storage, lekin CPU aur tail latency (k fetches) badhti hai. Aksar hybrid: naye/garam data replicated, purane EC.",
+   "failure_scenarios": "Correlated failures (poora AZ down), repair storm jab ek bada node gire, silent corruption bina scrubbing ke.",
+   "alternatives": "Managed S3/GCS use karna (aaj ka approach), Ceph RADOS, SeaweedFS volumes with EC, MinIO EC sets.",
+   "scale_10x_100x": "100x pe placement metadata khud ek distributed system ban jata hai (consistent hashing / CRUSH maps), aur repair bandwidth throttle karna padta hai.",
+   "production_improvements": "Pehle managed backend pe raho; agar apna banana hai toh scrubbing, repair throttling, failure-domain-aware placement aur durability SLO monitoring pehle din se."
+  }
+ },
+ {
+  "id": "OBJS-093",
+  "project_slug": "p07-object-storage",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Design server-side multipart composition so completion does not re-stream all the bytes.",
+  "answer_hinglish": "Aaj `complete_multipart` saare parts ko `storage.get` se padh ke ek naye blob mein `storage.put` karta hai -- yaani 5GB object ke liye completion pe 5GB read + 5GB write, aur client ka complete request tab tak latka rehta hai. TRADEOFFS.md is cheez ko \"doubles I/O at completion\" bolta hai. Server-side composition is project mein implement nahi hai; production mein aise karte:\n\nOption 1 -- manifest object: final object ka metadata ek list of (part blob_key, size) ban jaye. Completion sirf ek DB transaction hai: parts ko \"owned by version X\" mark karo, ETag compute karo (already md5-of-md5s hai), done -- O(1) data movement. GET pe ek concatenating reader parts ko sequence mein stream karta hai; Range request ke liye cumulative offsets se sahi part aur offset dhundho. Iske liye `objects` table mein `blob_key` ki jagah `object_parts (object_id, seq, blob_key, offset, size)` chahiye, aur GC reference check us table ko bhi dekhe.\n\nOption 2 -- backend native: S3 backend pe khud S3 multipart use karo (`create_multipart_upload`, `upload_part`, `complete_multipart_upload`) -- backend compose karta hai. Lekin local adapter mein yeh nahi hai, toh adapter protocol mein optional `compose()` capability chahiye.\n\nSHA-256 ka issue: full-object SHA-256 bina bytes padhe nahi milta -- ya toh per-part checksums store karo (S3 bhi \"checksum of checksums\" deta hai), ya background job baad mein compute kare.",
+  "why_needed": "Bade objects pe completion latency aur double I/O bekaar cost hai; real S3 completion fast hota hai.",
+  "real_world_analogy": "Kitaab ke chapters alag-alag file mein -- nayi copy chhapne ke bajaye ek table of contents (manifest) bana do jo chapters ko order mein point kare.",
+  "how_it_works": "Manifest approach: complete txn -> lock key -> delete upload row -> insert object row with manifest -> unused parts queue for deletion. GET -> manifest -> ordered part streams. Delete -> sab part blobs queue.",
+  "in_this_project": "Aaj ka code: `objstore/services/objects.py::complete_multipart` mein `async def concatenated(): for p in chosen: async for chunk in storage.get(p.blob_key): yield chunk` aur `storage.put(final_blob, HashingStream(concatenated(), ...))`. `README.md` known limitation: \"Multipart completion re-streams the parts into a new blob (real S3 composes server-side)\". ETag line `hashlib.md5(b\"\".join(bytes.fromhex(p.etag) for p in chosen)).hexdigest() + f\"-{len(chosen)}\"` bytes nahi padhti, toh manifest design mein as-is chalegi.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::complete_multipart",
+   "projects/07-object-storage/objstore/storage/base.py::StorageAdapter",
+   "projects/07-object-storage/TRADEOFFS.md",
+   "projects/07-object-storage/README.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (today: re-streaming)\nasync def concatenated():\n    for p in chosen:\n        async for chunk in storage.get(p.blob_key):\n            yield chunk\n\nfinal_blob = new_blob_key()\ninfo = await storage.put(final_blob, HashingStream(concatenated(), sum(p.size for p in chosen)))",
+  "code_language": "python",
+  "advantages": [
+   "O(1) completion",
+   "Backend-agnostic manifest",
+   "ETag logic reuse"
+  ],
+  "disadvantages": [
+   "Range GET mein offset math",
+   "GC/quota ko manifest samajhna padega",
+   "Full-object SHA-256 free nahi milta"
+  ],
+  "common_mistakes": [
+   "Manifest parts ko GC orphan samajh ke delete kar de",
+   "Range across part boundary galat calculate karna",
+   "Composite ETag ko full MD5 maan lena"
+  ],
+  "follow_up_questions": [
+   "How would Range requests work across part boundaries in a manifest object?",
+   "How would you compute a full-object checksum without re-reading?",
+   "What happens to unused uploaded parts?"
+  ],
+  "concepts": [
+   "multipart upload",
+   "manifest objects",
+   "server-side composition",
+   "I/O amplification"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Manifest: fast completion, lekin har GET multiple blobs touch karta hai aur metadata complex. Re-streaming: simple single-blob model, I/O double.",
+   "failure_scenarios": "Manifest ka ek part blob kho gaya toh poora object corrupt; GC bug manifest parts ko orphan samjhe toh data loss.",
+   "alternatives": "Backend-native S3 multipart; concatenation background job (async compaction) jo baad mein single blob banaye.",
+   "scale_10x_100x": "100x bade objects (TBs) pe re-streaming practically impossible -- manifest ya native composition must.",
+   "production_improvements": "Adapter mein optional compose capability, manifest table with FK, per-part SHA-256, compaction job for objects with too many tiny parts."
+  }
+ },
+ {
+  "id": "OBJS-094",
+  "project_slug": "p07-object-storage",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "How would you add object lock / WORM retention to this system?",
+  "answer_hinglish": "Is project mein object lock implement nahi hai -- SECURITY.md gaps mein \"no object lock / WORM\" likha hai. Abhi bucket owner (ya admin) `DELETE ?versionId=` se koi bhi version permanently mita sakta hai, aur lifecycle bhi. Ransomware ya compromised key ke case mein backups bhi gayab ho sakte hain.\n\nProduction mein aise karte: versioning mandatory karo (lock sirf versioned bucket pe, S3 ki tarah). `objects` mein do columns: `retain_until timestamptz` aur `legal_hold boolean`. Bucket pe default retention rule (jaise 30 days, mode governance/compliance).\n\nEnforcement points -- yahi important hai:\n1. `delete_object` with versionId: agar `retain_until > now()` ya legal_hold -> 403 (compliance mode mein admin bhi nahi; governance mein special permission se bypass).\n2. `commit_version` disabled/suspended path jo 'null' version ko DELETE karta hai -- locked null version ko overwrite nahi hone dena.\n3. Lifecycle noncurrent expiration aur lone-marker cleanup ki bulk SQL mein `AND (retain_until IS NULL OR retain_until < now()) AND NOT legal_hold`.\n4. GC: blob_deletions mein locked blob kabhi aana hi nahi chahiye -- defence in depth ke liye GC bhi check kare.\nDelete marker lagana allowed rehta hai (data recoverable rehta hai), sirf permanent delete block hota hai.\n\nRetention badhana allowed, ghatana sirf governance mode mein. Clock: DB ka `now()` use karo, client ka nahi.",
+  "why_needed": "Compliance (SEC 17a-4 jaise rules) aur ransomware protection ke liye kuch data ko fixed time tak undeletable rakhna padta hai.",
+  "real_world_analogy": "Bank locker jiska time-lock hai -- chabi hone ke bawajood 30 din se pehle nahi khulega.",
+  "how_it_works": "Har destructive path (version delete, null overwrite, lifecycle, GC) ek common predicate se guard hota hai `is_locked(row, now)`. Settings change (retention shorten) bhi audit log ke saath.",
+  "in_this_project": "Aaj ke destructive paths: `objstore/services/objects.py::delete_object` (`DELETE FROM objects ... AND version_id = :v`), `commit_version` (null row DELETE), `objstore/services/maintenance.py::run_lifecycle` (bulk DELETE with `lag()`), aur `run_gc`. Bucket config routes (`set_versioning`, `set_lifecycle`) `objstore/api/routes.py` mein -- wahi naya `PUT /buckets/{b}/object-lock` jata.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::delete_object",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/SECURITY.md"
+  ],
+  "code_example": "# illustrative (NOT in repo): guard inside delete_object before the permanent DELETE\nrow = (await s.execute(text(\n    \"SELECT retain_until, legal_hold FROM objects WHERE bucket = :b AND key = :k AND version_id = :v\"),\n    {\"b\": bucket[\"name\"], \"k\": key, \"v\": version_id})).first()\nif row and (row.legal_hold or (row.retain_until and row.retain_until > now_db)):\n    raise Forbidden(\"object version is locked\", details={\"code\": \"AccessDenied\", \"retain_until\": str(row.retain_until)})",
+  "code_language": "python",
+  "advantages": [
+   "Ransomware-resistant backups",
+   "Compliance requirement pura",
+   "Delete markers phir bhi kaam karte hain"
+  ],
+  "disadvantages": [
+   "Storage cost: locked data quota/billing mein rehta hai",
+   "Galat retention set hua toh compliance mode mein undo nahi",
+   "Har destructive path pe check -- ek bhi miss = bypass"
+  ],
+  "common_mistakes": [
+   "Sirf API delete pe check lagana, lifecycle/GC bhool jana",
+   "Client clock se retention compare karna",
+   "Unversioned bucket pe lock allow karna (overwrite = data loss)"
+  ],
+  "follow_up_questions": [
+   "What is the difference between governance and compliance mode?",
+   "How does legal hold differ from retention?",
+   "How would quotas interact with locked objects?"
+  ],
+  "concepts": [
+   "object lock",
+   "WORM",
+   "retention",
+   "compliance"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strong guarantee vs flexibility: compliance mode admin ko bhi rok deta hai -- galti ka koi undo nahi.",
+   "failure_scenarios": "Ek missed path (jaise null-version overwrite) lock bypass kar deta hai; DB admin direct SQL se bhi mita sakta hai -- isliye true WORM ke liye blob layer (S3 Object Lock) pe bhi lock chahiye.",
+   "alternatives": "Backend S3 Object Lock ko pass-through karna; immutable backup copies alag account mein; append-only audit log.",
+   "scale_10x_100x": "Locked data accumulate hota hai -- 100x pe storage cost forecast aur lifecycle reporting important.",
+   "production_improvements": "Lock checks ek central function mein, property tests jo har destructive path try karein, aur blob-level lock on the S3 backend."
+  }
+ },
+ {
+  "id": "OBJS-095",
+  "project_slug": "p07-object-storage",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you add server-side encryption, and how would envelope encryption with a KMS fit this design?",
+  "answer_hinglish": "Is project mein server-side encryption (SSE) implement nahi hai -- SECURITY.md gaps mein \"no server-side encryption of blobs\" aur \"access key secrets stored in plaintext\" dono hain; DEPLOYMENT.md checklist bolta hai \"Encrypt access key secrets and, if required, blobs at rest (SSE)\". Production mein aise karte:\n\nEnvelope encryption: har object (ya version) ke liye ek random data key (DEK, AES-256) banao. Bytes ko DEK se encrypt karo -- streaming ke liye AES-GCM per chunk (jaise 64KB chunks, har chunk ka apna nonce aur tag) taaki Range GET bhi kaam kare aur poora object memory mein na aaye. DEK ko KMS ki master key (KEK) se encrypt (wrap) karo aur wrapped DEK `objects` row mein store karo. Master key kabhi KMS se bahar nahi aati.\n\nKyun envelope? 5GB data KMS ko bhejna impossible; sirf 32-byte DEK wrap/unwrap hota hai. Key rotation sasti: KEK rotate karo toh sirf wrapped DEKs re-wrap, data re-encrypt nahi.\n\nIs codebase mein fit: `HashingStream` ki tarah ek `EncryptingStream` jo `storage.put` se pehle wrap kare, aur `storage.get` ke baad decrypting generator. Important: MD5/SHA-256 plaintext pe compute ho (client ETag compare karta hai), toh hashing encryption se pehle. Range: requested plaintext range ko chunk boundaries pe align karke ciphertext range fetch karo.\n\nAccess key secrets ke liye bhi same: secret ko KMS se encrypt karke store, aur `_secret` cache mein decrypted rakho.",
+  "why_needed": "Disk/backup chori ya blob store compromise pe data readable nahi hona chahiye; compliance (PCI, HIPAA) maangta hai.",
+  "real_world_analogy": "Har locker ki apni chabi (DEK), aur saari chabiyan ek master safe (KMS) mein band -- safe ki master chabi kabhi bahar nahi aati.",
+  "how_it_works": "PUT: plaintext -> HashingStream (md5/sha) -> EncryptingStream(DEK) -> adapter. Metadata: wrapped_dek, key_id, chunk_size. GET: unwrap DEK (KMS call, cacheable) -> ciphertext range -> decrypt chunks -> trim to requested plaintext range.",
+  "in_this_project": "Seams: `objstore/storage/base.py::HashingStream` (wrapping stream pattern), `objstore/services/objects.py::put_object` (jahan stream banta hai), `objstore/api/routes.py::get_object` (`storage.get(row[\"blob_key\"], start, end)`), aur `objstore/services/auth.py::_secret` (plaintext `secret` column). Migration comment: `secret text NOT NULL -- needed to verify HMACs (like AWS); encrypt at rest in production`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/base.py::HashingStream",
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/SECURITY.md",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "# illustrative (NOT in repo): chunked AES-GCM wrapper in the same style as HashingStream\nfrom cryptography.hazmat.primitives.ciphers.aead import AESGCM\n\nclass EncryptingStream:\n    CHUNK = 64 * 1024\n    def __init__(self, source, dek: bytes, object_nonce: bytes):\n        self.source, self.aes, self.nonce = source, AESGCM(dek), object_nonce\n    async def __aiter__(self):\n        buf, idx = b\"\", 0\n        async for chunk in self.source:\n            buf += chunk\n            while len(buf) >= self.CHUNK:\n                yield self._seal(buf[:self.CHUNK], idx); buf, idx = buf[self.CHUNK:], idx + 1\n        if buf:\n            yield self._seal(buf, idx)\n    def _seal(self, data, idx):\n        return self.aes.encrypt(self.nonce[:8] + idx.to_bytes(4, \"big\"), data, None)",
+  "code_language": "python",
+  "advantages": [
+   "Blob store compromise pe data safe",
+   "Cheap key rotation",
+   "Per-object keys limit blast radius"
+  ],
+  "disadvantages": [
+   "CPU cost har byte pe",
+   "Range GET complex (chunk alignment)",
+   "KMS availability critical dependency"
+  ],
+  "common_mistakes": [
+   "Poore object ka ek GCM tag -- Range aur streaming toot jata hai",
+   "Hash ciphertext pe compute karna (ETag mismatch)",
+   "Nonce reuse same DEK ke saath"
+  ],
+  "follow_up_questions": [
+   "Why is envelope encryption preferred over encrypting everything directly with KMS?",
+   "How does key rotation work without re-encrypting data?",
+   "What is SSE-C and why would a customer want it?"
+  ],
+  "concepts": [
+   "encryption at rest",
+   "envelope encryption",
+   "KMS",
+   "AES-GCM"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "SSE-S3 style (hum keys manage karein) vs SSE-KMS (customer audit/control) vs SSE-C (customer key, hum store nahi karte). Zyada control = zyada operational complexity.",
+   "failure_scenarios": "KMS down -> koi encrypted object read nahi hoga; wrapped DEK kho gaya -> data permanently lost. DEK cache leak = us object ka data exposed.",
+   "alternatives": "Backend ka native SSE (S3/MinIO) on karna -- simplest, lekin blob store admin ke against protection nahi; client-side encryption.",
+   "scale_10x_100x": "100x pe KMS call rate limit -- DEK unwrap results cache karo (short TTL), ya per-bucket data keys.",
+   "production_improvements": "Pehle secrets ko KMS se encrypt karo (sabse bada gap), phir backend SSE on, phir agar zaroorat ho toh app-level envelope encryption."
+  }
+ },
+ {
+  "id": "OBJS-096",
+  "project_slug": "p07-object-storage",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a test proving that after a DELETE in a versioned bucket, GET and HEAD return 404 with the delete-marker header, but GET with the old versionId still returns the data.",
+  "answer_hinglish": "Test ka goal hai delete marker semantics pin karna: versioned bucket mein DELETE data nahi mitata, sirf ek naya \"latest\" version (marker) banata hai. Toh teen cheezein assert karni hain: (1) plain GET 404 aur `x-obj-delete-marker: true` header, (2) HEAD bhi 404 deta hai (body nahi hoti lekin status aur headers same logic `head_object` se aate hain), (3) `versionId=<v1>` ke saath GET purana data deta hai -- proof ki bytes abhi bhi stored hain.\n\nEk extra check jo achha signal deta hai: stats mein `delete_markers == 1` aur `all_versions == 1`, aur `stored_bytes` original size ke barabar -- yaani delete ne storage free nahi kiya (yahi quota mein surprise hota hai).\n\nRepo ke existing helpers use karo: `server(tmp_path)` context manager jo app + signed clients deta hai, aur `bucket(c)` helper jo `photos` bucket banata hai. HEAD ke liye `a.request(\"HEAD\", ...)` aur path `quote_key` se. Response header `x-obj-version-id` mein marker ka version id aata hai -- woh delete response JSON ke `version_id` se match hona chahiye.",
+  "why_needed": "Versioning ke edge cases (marker, HEAD, versionId) regressions ke liye sabse fragile hote hain; test unhe lock karta hai.",
+  "real_world_analogy": "Recycle bin check: file desktop se gayab dikhni chahiye, lekin recycle bin (version history) mein se khul sakti hai.",
+  "how_it_works": "`delete_object` versioned bucket pe `commit_version(..., delete_marker=True)` call karta hai. `head_object` latest row dekhta hai; `is_delete_marker` pe `NotFound` with headers `x-obj-delete-marker`/`x-obj-version-id`. bpcommon error handler `exc.headers` response pe lagata hai.",
+  "in_this_project": "Test `tests/test_objects.py` style mein likha jayega, `from .conftest import server` aur `bucket` helper ke saath. Existing `test_versioning_and_delete_markers` GET 404 check karta hai lekin HEAD aur stats nahi -- yeh test woh gap cover karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/tests/conftest.py::server",
+   "projects/07-object-storage/tests/test_objects.py::test_versioning_and_delete_markers",
+   "projects/07-object-storage/objstore/services/objects.py::head_object",
+   "projects/07-object-storage/objstore/services/objects.py::delete_object"
+  ],
+  "code_example": "# solution: tests/test_objects.py (new test)\nasync def test_delete_marker_hides_object_but_versions_survive(db, tmp_path):\n    async with server(tmp_path) as (app, cl, anon):\n        a = cl[\"alice\"]\n        await bucket(a)\n        await a.request(\"PUT\", \"/buckets/photos/versioning\", json={\"status\": \"enabled\"})\n        v1 = (await a.put(\"photos\", \"r.txt\", b\"report\")).headers[\"x-obj-version-id\"]\n        d = (await a.delete(\"photos\", \"r.txt\")).json()\n        assert d[\"delete_marker\"] is True\n\n        g = await a.get(\"photos\", \"r.txt\")\n        assert g.status_code == 404 and g.headers[\"x-obj-delete-marker\"] == \"true\"\n        assert g.headers[\"x-obj-version-id\"] == d[\"version_id\"]\n\n        h = await a.request(\"HEAD\", f\"/buckets/photos/objects/{quote_key('r.txt')}\")\n        assert h.status_code == 404 and h.headers[\"x-obj-delete-marker\"] == \"true\"\n\n        old = await a.get(\"photos\", \"r.txt\", params={\"versionId\": v1})\n        assert old.status_code == 200 and old.content == b\"report\"\n\n        st = (await a.request(\"GET\", \"/buckets/photos/stats\")).json()\n        assert st[\"delete_markers\"] == 1 and st[\"all_versions\"] == 1 and st[\"stored_bytes\"] == 6",
+  "code_language": "python",
+  "advantages": [
+   "HEAD path bhi cover",
+   "Storage not freed ka proof",
+   "Real HTTP stack through ASGI"
+  ],
+  "disadvantages": [
+   "Real Postgres chahiye (conftest DB_URL)",
+   "Test thoda broad -- fail hone pe reason dhundhna padega"
+  ],
+  "common_mistakes": [
+   "HEAD pe body assert karna",
+   "versionId ko query ke bajaye header mein bhejna",
+   "Unversioned bucket mein marker expect karna"
+  ],
+  "follow_up_questions": [
+   "What should GET ?versionId=<marker id> return?",
+   "How would you test undelete in the same test?",
+   "Why does the delete in an unversioned bucket not create a marker?"
+  ],
+  "concepts": [
+   "testing",
+   "versioning",
+   "delete markers",
+   "HEAD"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-097",
+  "project_slug": "p07-object-storage",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Add `If-Match` support to PUT so a client can overwrite an object only if its current ETag matches (optimistic concurrency).",
+  "answer_hinglish": "Use case: do clients ek JSON config object edit kar rahe hain. Bina condition ke last writer wins aur ek ka change chupchap kho jata hai (lost update). `If-Match: \"<etag>\"` ke saath client kehta hai \"overwrite tabhi karo jab current version wahi hai jo maine padha tha\", warna 412 Precondition Failed. Observation (O9): aaj sirf GET pe single-ETag If-None-Match hai, If-Match nahi.\n\nSahi jagah check ki: transaction ke andar, per-key advisory lock lene ke BAAD. Agar lock se pehle check karte toh check aur commit ke beech doosra writer aa sakta tha (TOCTOU). Lock ke baad latest row stable hai, kyunki same key ke saare writers isi lock pe serialize hote hain.\n\nOrder bhi same rehta hai: bytes pehle stream ho chuke hain. Precondition fail hone pe exception `except BaseException` branch mein jati hai jo naya blob delete kar deti hai -- toh koi orphan nahi. Downside: client ne poora body upload kar diya aur phir 412 mila -- bade objects ke liye client pehle HEAD karke check kar sakta hai, lekin authoritative check commit ke time hi hai.\n\n`If-Match: *` = \"object exist karna chahiye\"; latest delete marker hai toh woh \"not exist\" maana jayega.",
+  "why_needed": "Read-modify-write workflows mein lost updates rokne ke liye; S3 ne bhi 2024 mein conditional writes add kiye.",
+  "real_world_analogy": "Google Doc ka 'someone else edited this, reload first' warning -- aapka save tabhi jayega jab aapne latest version dekha ho.",
+  "how_it_works": "Route header `if_match` padhta hai -> `put_object(if_match=...)` -> txn: key lock -> `SELECT etag, is_delete_marker FROM objects WHERE bucket AND key AND is_latest` -> compare -> mismatch pe `PreconditionFailed` (412) -> blob cleanup via existing except branch.",
+  "in_this_project": "Changes: `objstore/services/objects.py` mein naya `PreconditionFailed(AppError)` (status 412), `put_object` mein `if_match` param aur lock ke baad check; `objstore/api/routes.py::put_object` mein `if_match: str | None = Header(default=None)` pass karna. Existing helper `key_lock_sql()` reuse.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/objstore/api/routes.py::put_object",
+   "projects/07-object-storage/tests/conftest.py::server"
+  ],
+  "code_example": "# solution (sketch on the real code): objstore/services/objects.py\nclass PreconditionFailed(AppError):\n    status_code, code = 412, \"PreconditionFailed\"\n\n# inside put_object(..., if_match: str | None = None), in the transaction AFTER the key lock:\n        async with sm() as s, s.begin():\n            await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n            if if_match is not None:\n                cur = (await s.execute(text(\"SELECT etag, is_delete_marker FROM objects \"\n                                            \"WHERE bucket = :b AND key = :k AND is_latest\"),\n                                       {\"b\": bucket[\"name\"], \"k\": key})).first()\n                exists = cur is not None and not cur.is_delete_marker\n                ok = exists if if_match.strip() == \"*\" else (exists and cur.etag == if_match.strip().strip('\"'))\n                if not ok:\n                    raise PreconditionFailed(\"If-Match does not match the current ETag\")\n            ...  # quota + commit_version unchanged\n\n# routes.py put_object: add `if_match: str | None = Header(default=None)` and pass if_match=if_match\n\n# test\nasync def test_if_match_prevents_lost_update(db, tmp_path):\n    async with server(tmp_path) as (app, cl, anon):\n        a = cl[\"alice\"]\n        await bucket(a)\n        e1 = (await a.put(\"photos\", \"cfg.json\", b\"{}\")).headers[\"etag\"]\n        h = {\"if-match\": e1}\n        r1 = await a.request(\"PUT\", \"/buckets/photos/objects/cfg.json\", content=b'{\"a\":1}', headers=h)\n        r2 = await a.request(\"PUT\", \"/buckets/photos/objects/cfg.json\", content=b'{\"b\":2}', headers=h)\n        assert r1.status_code == 200 and r2.status_code == 412\n        assert (await a.get(\"photos\", \"cfg.json\")).content == b'{\"a\":1}'",
+  "code_language": "python",
+  "advantages": [
+   "Lost updates prevented",
+   "Check under the same lock as commit -> no TOCTOU",
+   "Failed blob auto-cleaned"
+  ],
+  "disadvantages": [
+   "Body upload ho chuka hota hai 412 se pehle (wasted bandwidth)",
+   "Multipart complete pe alag se add karna padega"
+  ],
+  "common_mistakes": [
+   "Check lock se pehle karna",
+   "Quotes ke saath/bina ETag compare mismatch",
+   "Delete marker ko existing object maan lena"
+  ],
+  "follow_up_questions": [
+   "How would you add If-None-Match: * (create-only) on PUT?",
+   "Why must the check happen after the advisory lock?",
+   "How would you support this on multipart complete?"
+  ],
+  "concepts": [
+   "optimistic concurrency",
+   "conditional requests",
+   "If-Match",
+   "TOCTOU"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Optimistic (ETag precondition) vs pessimistic (client-held lock/lease). Optimistic stateless hai aur object storage ke liye natural.",
+   "failure_scenarios": "Client 412 ko retry loop mein bina re-read ke bhejta rahe -> livelock; bade bodies pe bandwidth waste.",
+   "alternatives": "Version-id based precondition (x-obj-if-version), ya application-level lock objects.",
+   "scale_10x_100x": "Hot key pe bahut contention ho toh 412 rate badhega -- us data ko object storage ke bajaye DB/KV mein rakhna better.",
+   "production_improvements": "If-None-Match: * for create-only, 412 metrics, aur docs mein retry guidance (re-read -> merge -> retry)."
+  }
+ },
+ {
+  "id": "OBJS-098",
+  "project_slug": "p07-object-storage",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a test that pages through a delimiter listing with a small max_keys and proves no key or common prefix is duplicated or missed.",
+  "answer_hinglish": "Pagination with delimiter tricky hai kyunki ek page contents (keys) aur common_prefixes (folders) dono count karta hai, aur ek \"folder\" ke andar hazaron keys ho sakti hain jinhe skip karna hai. `list_objects` folder milne pe `after = cp + \"\\U0010ffff\"` set karta hai taaki next query us folder ki saari keys ke aage se shuru ho, aur truncate hone pe `next_start_after` return karta hai. Bug ka classic form: ek prefix do pages pe repeat ho jaye, ya page boundary pe ek key chhoot jaye.\n\nTest strategy: ground truth ek single `max_keys=1000` call se lo, phir `max_keys=2` se loop chalao jab tak `is_truncated` false na ho, har page ke contents aur prefixes collect karo, aur assert karo (1) concatenation ground truth ke barabar hai, (2) koi duplicate nahi, (3) loop bounded hai (infinite loop guard).\n\nKeys aisi chuno jo edge cases maaren: folder pehli position pe, folder page boundary pe, ek folder ke andar subfolder, aur `%`/`_` wali key (LIKE escaping). Observation (O8): ordering DB collation pe depend karti hai; test ground truth se compare karta hai isliye collation-independent hai.",
+  "why_needed": "Listing pagination bugs silent hote hain -- client ko kuch keys kabhi dikhti hi nahi; property-style test unhe pakadta hai.",
+  "real_world_analogy": "Kitaab ke index ko 2-2 entries karke padhna aur check karna ki poore index se koi entry chhooti ya dohrai to nahi.",
+  "how_it_works": "Har page: `GET /buckets/b/objects?delimiter=/&max_keys=2&start_after=<prev next_start_after>`. Result keys + prefixes ko list mein append. Loop guard: max 50 iterations.",
+  "in_this_project": "`objstore/services/objects.py::list_objects` aur route `objstore/api/routes.py::list_objects` (`max_keys` 1..1000). Existing `test_listing_prefix_delimiter_pagination` sirf bina delimiter ke 2 pages check karta hai -- yeh test delimiter + many pages cover karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::list_objects",
+   "projects/07-object-storage/objstore/api/routes.py::list_objects",
+   "projects/07-object-storage/tests/test_objects.py::test_listing_prefix_delimiter_pagination"
+  ],
+  "code_example": "# solution: tests/test_objects.py (new test)\nasync def test_delimiter_pagination_no_dupes_no_gaps(db, tmp_path):\n    async with server(tmp_path) as (app, cl, anon):\n        a = cl[\"alice\"]\n        await bucket(a)\n        keys = [\"a/1\", \"a/2\", \"b.txt\", \"c/x/1\", \"c/y\", \"d.txt\", \"e/1\", \"f_%.txt\", \"g.txt\"]\n        for k in keys:\n            await a.put(\"photos\", k, b\"x\")\n        url = \"/buckets/photos/objects\"\n        full = (await a.request(\"GET\", url, params={\"delimiter\": \"/\"})).json()\n        truth = [c[\"key\"] for c in full[\"contents\"]] + full[\"common_prefixes\"]\n\n        seen, start = [], \"\"\n        for _ in range(50):\n            p = {\"delimiter\": \"/\", \"max_keys\": \"2\"}\n            if start:\n                p[\"start_after\"] = start\n            page = (await a.request(\"GET\", url, params=p)).json()\n            seen += [c[\"key\"] for c in page[\"contents\"]] + page[\"common_prefixes\"]\n            if not page[\"is_truncated\"]:\n                break\n            start = page[\"next_start_after\"]\n        else:\n            raise AssertionError(\"pagination did not terminate\")\n        assert len(seen) == len(set(seen)), seen\n        assert sorted(seen) == sorted(truth)\n        assert set(full[\"common_prefixes\"]) == {\"a/\", \"c/\", \"e/\"}",
+  "code_language": "python",
+  "advantages": [
+   "Ground-truth comparison",
+   "Edge cases at page boundaries",
+   "Infinite loop guard"
+  ],
+  "disadvantages": [
+   "Small dataset -- random/property testing (hypothesis) aur strong hota",
+   "Real DB required"
+  ],
+  "common_mistakes": [
+   "Sirf ek page assert karna",
+   "Termination guard na rakhna",
+   "Prefixes ko count mein na ginna"
+  ],
+  "follow_up_questions": [
+   "Why does the skip-ahead use U+10FFFF?",
+   "What does S3 return as NextContinuationToken versus StartAfter?",
+   "How would you turn this into a hypothesis property test?"
+  ],
+  "concepts": [
+   "pagination",
+   "testing",
+   "listing",
+   "common prefixes"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-099",
+  "project_slug": "p07-object-storage",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "The 7-day presign limit used to be checked only when the URL was created. How is it enforced at verification time now, and how is it tested?",
+  "answer_hinglish": "Review finding O1 (fixed): `/presign` route `expires_in > cfg.max_presign_seconds` pe 422 deta hai, lekin `auth._presigned` sirf `int(expires) < time.time()` check karta tha. Presigning ek pure client-side HMAC operation hai -- `signing.presign()` ko koi bhi jiske paas secret hai call kar sakta hai, server ke `/presign` endpoint ke bina. Toh ek SDK ya leaked secret wala attacker 10 saal valid URL bana sakta hai, aur woh URL key revoke hone tak chalega. Policy jo sirf ek optional endpoint pe enforce ho, woh policy nahi hai.\n\nShipped fix: verification pe `exp > time.time() + max_age + 60` (60s skew margin) -> 401 'presigned URL expiry exceeds the maximum'. Regression test `test_presigned_url_with_excessive_expiry_is_rejected_at_use`. Max value ka source settings hai; `_presigned` ke paas `request` hai, toh `request.app.state.settings.max_presign_seconds` padh sakte hain -- signature badalne ki zaroorat nahi. Real AWS bhi yahi karta hai: `X-Amz-Expires` max 604800 seconds verify time pe reject hota hai.\n\nEk aur subtle baat: URL mein issue time nahi hai, sirf absolute expiry hai. Isliye hum \"lifetime\" nahi, \"remaining lifetime\" check kar sakte hain -- jo kaafi hai, kyunki 7 din se aage ki expiry wala URL abhi turant reject ho jayega.",
+  "why_needed": "Security limits server pe har request ke time enforce hone chahiye, kisi ek convenience endpoint pe nahi.",
+  "real_world_analogy": "Visitor pass ki validity security guard gate pe check karta hai, sirf reception pe nahi -- warna koi khud pass chhaap le.",
+  "how_it_works": "`_presigned`: parse expires -> expired? 401 -> too far in future? 401 -> secret lookup -> recompute `presigned_string` -> `compare_digest`. Check signature se pehle karna sasta bhi hai (DB/cache lookup bachta hai).",
+  "in_this_project": "`objstore/services/auth.py::_presigned` (use-time check); limit `objstore/config.py::Settings` ka `max_presign_seconds = 7 * 24 * 3600`; test `tests/test_review_fixes.py::test_presigned_url_with_excessive_expiry_is_rejected_at_use` (URL `signing.presign` se directly banata hai, `/presign` ko bypass karke).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::_presigned",
+   "projects/07-object-storage/objstore/config.py::Settings",
+   "projects/07-object-storage/objstore/services/signing.py::presign",
+   "projects/07-object-storage/tests/test_objects.py::test_presigned_urls",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_presigned_url_with_excessive_expiry_is_rejected_at_use"
+  ],
+  "code_example": "# real: objstore/services/auth.py (_presigned)\nmax_age = request.app.state.settings.max_presign_seconds\ntry:\n    exp = int(expires)\nexcept (TypeError, ValueError):\n    raise Unauthorized(\"invalid presigned URL\") from None\nif exp < time.time():\n    raise Unauthorized(\"presigned URL expired\")\nif exp > time.time() + max_age + 60:\n    # Enforced at USE time too: anyone holding a secret can mint URLs offline, bypassing /presign's check.\n    raise Unauthorized(f\"presigned URL expiry exceeds the maximum of {max_age}s\")\nsecret, is_admin = await _secret(sm, akid or \"\", getattr(request.app.state, \"secret_cache\", None))\n...  # signature check unchanged",
+  "code_language": "python",
+  "advantages": [
+   "Policy enforced where it matters",
+   "Cheap check before signature work",
+   "Matches AWS behaviour"
+  ],
+  "disadvantages": [
+   "Settings via request.app.state couples auth to app wiring",
+   "Old long-lived URLs already issued would start failing (intended)"
+  ],
+  "common_mistakes": [
+   "Sirf creation endpoint pe validate karna",
+   "Margin bilkul na rakhna (clock skew)",
+   "Expiry ko signature se pehle trust karna -- yeh theek hai kyunki expiry bhi signed hai, tamper pe signature fail"
+  ],
+  "follow_up_questions": [
+   "Why is it safe to read X-Obj-Expires before verifying the signature?",
+   "How would you kill an already-issued presigned URL early?",
+   "Should the URL also carry an issued-at time?"
+  ],
+  "concepts": [
+   "presigned URLs",
+   "defence in depth",
+   "policy enforcement",
+   "testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Verify-time check thoda extra coupling laata hai (settings in auth) lekin security boundary sahi jagah aati hai.",
+   "failure_scenarios": "Limit config galti se 0 ho jaye toh saare presigned URLs fail; isliye config validation chahiye.",
+   "alternatives": "URL mein issued-at sign karna aur max lifetime = expires - issued; ya short-lived STS-style session keys se presign.",
+   "scale_10x_100x": "Scale pe koi farak nahi -- pure CPU check; bas multi-instance config consistent ho.",
+   "production_improvements": "Per-bucket max presign policy, presign usage metrics, aur 'revoke all URLs before T' ke liye key-level not-before timestamp."
+  }
+ },
+ {
+  "id": "OBJS-100",
+  "project_slug": "p07-object-storage",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Write a test proving that concurrent PUTs into a bucket with a quota can never push stored bytes over the quota.",
+  "answer_hinglish": "Quota check classic check-then-act race hai: do concurrent PUTs dono `SELECT sum(size)` padhte hain = 600, dono sochte hain 300 aur add ho sakta hai (900 <= 1000), dono insert karte hain -> 1200. Project yeh `SELECT 1 FROM buckets WHERE name = :b FOR UPDATE` se rokta hai -- quota wale bucket ke saare writers commit pe serialize hote hain, aur check + insert same transaction mein lock ke andar hain. Lock sirf `quota_bytes is not None` hone pe liya jata hai (bucket-lock bottleneck fix, TESTING.md: 53 -> 72 PUT/s).\n\nTest: quota 1000 bytes, 10 alag keys pe 300-300 bytes ke 10 PUTs `asyncio.gather` se ek saath. Sahi behaviour: exactly 3 succeed (900), baaki 7 ko 403 QuotaExceeded. Assert: 200 count == 3, DB mein `sum(size) <= 1000`, stats ka `stored_bytes == 900`, aur disk pe sirf 3 blobs (rejected uploads ke blobs `except BaseException` branch delete karti hai).\n\nAgar koi future refactor lock hata de, toh yeh test (ASGI in-process, real Postgres, concurrency) usually fail karega -- race tests probabilistic hote hain, lekin 10 parallel writers ke saath window kaafi badi hai. Review mein yahi gap multipart ke liye mila tha (O2: `upload_part` lock nahi leta tha) -- fix ke baad `test_multipart_parts_respect_quota_and_completion_check_is_real` parts ke liye bhi quota assert karta hai.",
+  "why_needed": "Quota bypass = billing/abuse problem; concurrency bugs sirf concurrent tests se pakde jaate hain.",
+  "real_world_analogy": "Cinema mein last 3 seats: do counters ek saath 'available' dekh ke ticket bech dein toh overbooking; ek central lock wala counter hi sahi hai.",
+  "how_it_works": "put_object: stream blob -> txn: key advisory lock -> bucket FOR UPDATE (quota only) -> `_check_quota` sums objects + parts -> commit_version -> commit releases lock. Next writer lock milne pe naya sum dekhta hai.",
+  "in_this_project": "`objstore/services/objects.py::put_object` aur `_check_quota`; existing `test_quota_counts_all_versions` sequential hai, aur `test_concurrent_writes_to_same_key` concurrency hai lekin bina quota. Yeh test dono ko combine karta hai, `db` fixture se direct SQL assert ke saath.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+   "projects/07-object-storage/tests/test_objects.py::test_quota_counts_all_versions",
+   "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key"
+  ],
+  "code_example": "# solution: tests/test_objects.py (new test)\nasync def test_concurrent_puts_never_exceed_quota(db, tmp_path):\n    async with server(tmp_path) as (app, cl, anon):\n        a = cl[\"alice\"]\n        await bucket(a)\n        await a.request(\"PUT\", \"/buckets/photos/quota\", json={\"quota_bytes\": 1000})\n        rs = await asyncio.gather(*[a.put(\"photos\", f\"k{i}\", b\"z\" * 300) for i in range(10)])\n        codes = sorted(r.status_code for r in rs)\n        assert codes == [200] * 3 + [403] * 7, codes\n        assert all(r.json()[\"error\"][\"code\"] == \"QuotaExceeded\" for r in rs if r.status_code == 403)\n        from sqlalchemy import text\n        async with db() as s:\n            assert await s.scalar(text(\"SELECT coalesce(sum(size), 0) FROM objects WHERE bucket = 'photos'\")) == 900\n        files = [p for p in (tmp_path / \"blobs\").glob(\"*/*/*\") if not p.name.startswith(\".tmp-\")]\n        assert len(files) == 3      # rejected blobs were cleaned up",
+  "code_language": "python",
+  "advantages": [
+   "Proves the FOR UPDATE lock matters",
+   "Also proves cleanup of rejected blobs",
+   "Uses real Postgres concurrency"
+  ],
+  "disadvantages": [
+   "Probabilistic: race window may not always open on very slow machines",
+   "Needs real DB, slower than unit tests"
+  ],
+  "common_mistakes": [
+   "Same key pe test karna (advisory lock already serialize karega, quota lock prove nahi hoga)",
+   "Sirf status codes check karna, DB sum nahi",
+   "Sequential `for` loop se 'concurrency' test"
+  ],
+  "follow_up_questions": [
+   "Why test different keys rather than the same key?",
+   "Multipart parts ke liye quota test kaise likha (O2 fix)?",
+   "How would a usage counter row replace sum() for scale?"
+  ],
+  "concepts": [
+   "race conditions",
+   "quota",
+   "SELECT FOR UPDATE",
+   "concurrency testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bucket lock correctness deta hai lekin us bucket ke saare writes serialize karta hai -- isliye sirf quota buckets pe.",
+   "failure_scenarios": "Lock hata diya toh overshoot; lock order galat (bucket pehle, key baad mein kahin aur) toh deadlock possible -- abhi order consistent hai: key lock phir bucket lock.",
+   "alternatives": "Atomic counter: `UPDATE bucket_usage SET used = used + :n WHERE used + :n <= quota RETURNING` -- single row, no sum.",
+   "scale_10x_100x": "100x pe `sum(size)` over all versions har PUT pe mehnga -- counter row ya periodic reconciliation + soft limits.",
+   "production_improvements": "Usage counter table, O2 fix (upload_part mein bhi lock/counter), aur race tests CI mein repeat-N mode mein."
+  }
+ },
+ {
+  "id": "OBJS-101",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Walk me through the overall architecture of your object storage system.",
+  "answer_hinglish": "Paanch parts hain. (1) FastAPI API (`objstore/main.py`, `api/routes.py`) -- buckets, objects, multipart, presign, admin routes. Stateless hai: koi in-memory coordination nahi, sirf ek 60s secret cache. (2) Auth layer (`services/auth.py`, `services/signing.py`) -- har request pe authenticate (signed header, presigned URL, ya anonymous) aur authorize (owner, grants, public_read, admin). (3) Metadata in Postgres -- buckets, objects (har version ek row), multipart uploads/parts, grants, lifecycle rules, blob_deletions queue. Transactions, partial unique index aur advisory locks se correctness. (4) Bytes in a StorageAdapter -- local filesystem (temp + fsync + rename, sharded dirs) ya koi bhi S3-compatible store via boto3; blobs random keys pe, object key se kabhi derive nahi. (5) Maintenance worker (`worker.py`) -- har 300s lifecycle rules aur GC.\n\nPUT ka flow: verify signature -> authorize write -> bytes ko naye random blob mein stream (MD5 + SHA-256 + size limit on the fly) -> digests verify -> chhota transaction: key advisory lock, quota ho toh bucket lock + check, versions flip, insert -> 200 ETag + version id. Overwritten blobs queue mein jaate hain, GC baad mein delete karta hai.\n\nGET: latest (ya versionId) row -> delete marker? 404 -> If-None-Match match? 304 -> Range? 206 -> storage se stream.\n\nCore idea: metadata ke liye database ki guarantees, bytes ke liye sasta blob store, aur dono ke beech crash-safe ordering.",
+  "why_needed": "Interviewer pehle big picture dekhna chahta hai -- components, responsibilities, aur data flow.",
+  "real_world_analogy": "Library: catalogue (Postgres) batata hai kaunsi kitaab kis shelf number pe hai; godown (blob store) mein bas numbered boxes hain; librarian (worker) raat ko purane boxes saaf karta hai.",
+  "how_it_works": "Request -> bpcommon middleware (request id, metrics, logs) -> route -> authenticate/authorize -> services (objects/maintenance) -> Postgres + StorageAdapter. Worker same services ko direct call karta hai, API ke through nahi.",
+  "in_this_project": "`ARCHITECTURE.md` mein mermaid diagrams (components, PUT ordering, GET with Range). `objstore/main.py::make_storage` backend choose karta hai (`OBJ_STORAGE_BACKEND=local|s3`), `create_app` lifespan mein engine (pool_size=10, max_overflow=20) aur adapter set karta hai. Docker compose: postgres, seaweedfs, migrate, api, worker.",
+  "implementation_files": [
+   "projects/07-object-storage/ARCHITECTURE.md",
+   "projects/07-object-storage/objstore/main.py::make_storage",
+   "projects/07-object-storage/objstore/main.py::create_app",
+   "projects/07-object-storage/objstore/api/routes.py",
+   "projects/07-object-storage/objstore/worker.py"
+  ],
+  "code_example": "# real, trimmed: objstore/main.py\ndef make_storage(settings: Settings):\n    if settings.storage_backend == \"s3\":\n        from .storage.s3 import S3Adapter\n        return S3Adapter(settings.s3_endpoint, settings.s3_bucket, settings.s3_access_key,\n                         settings.s3_secret_key, settings.s3_region)\n    return LocalAdapter(settings.local_root)",
+  "code_language": "python",
+  "advantages": [
+   "Clear separation: metadata vs bytes",
+   "Stateless API -> horizontal scale",
+   "Pluggable storage"
+  ],
+  "disadvantages": [
+   "Postgres single metadata bottleneck",
+   "Bytes API process se guzarte hain (CPU)",
+   "JSON API, S3 wire protocol nahi"
+  ],
+  "common_mistakes": [
+   "Sirf components gina dena, flow na batana",
+   "Worker ko API ka hissa bata dena",
+   "Ye claim karna ki replication hum karte hain (backend karta hai)"
+  ],
+  "follow_up_questions": [
+   "Why is the API stateless and where does coordination live?",
+   "What happens on a crash in the middle of a PUT?",
+   "Where is the bottleneck at 10x traffic?"
+  ],
+  "concepts": [
+   "architecture",
+   "metadata/data split",
+   "stateless services"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-102",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Why a pluggable StorageAdapter protocol, and how did you prove the abstraction works against a real S3 API?",
+  "answer_hinglish": "`StorageAdapter` ek `typing.Protocol` hai jisme paanch async methods hain: `put(blob_key, HashingStream) -> BlobInfo`, `get(blob_key, start, end)` (async byte iterator, range support ke saath), `delete`, `exists`, `list_older_than(seconds)`. Services sirf yahi interface jaante hain; koi `isinstance` ya backend-specific branch nahi. Protocol structural typing hai -- `LocalAdapter` aur `S3Adapter` ko inherit karne ki zaroorat nahi, bas methods match hone chahiye.\n\nInterface narrow kyun hai? Kyunki metadata (naam, versions, ACLs) Postgres mein hai -- blob layer ko sirf \"opaque bytes under random key\" chahiye. Isse koi bhi backend chal jata hai: filesystem, AWS S3, MinIO, SeaweedFS, Ceph. Hashing aur size limit `HashingStream` mein hai, adapter ke bahar -- toh integrity logic ek hi jagah hai.\n\nProof: abstraction tab tak sirf theory hai jab tak doosra real implementation pass na kare. `tests/test_s3_adapter.py` wahi API flow (PUT, GET, Range, multipart, delete, GC) real SeaweedFS S3 endpoint ke against chalata hai, aur ek 20MB streaming upload jahan boto3 8MB threshold ke upar apna managed multipart use karta hai -- `_QueueReader` bounded queue (max ~8 chunks) se constant memory. Endpoint na ho toh tests skip hote hain (`pytestmark skipif`).\n\nLeaky parts honestly: `delete_any` (GC helper for `.tmp-*` files) protocol mein nahi hai par dono adapters mein hai; aur `ensure_bucket` sirf S3 ke liye `hasattr` se call hota hai.",
+  "why_needed": "Backend lock-in avoid karna, local dev simple rakhna, aur production mein managed durable storage use karna.",
+  "real_world_analogy": "Mobile charger ka USB-C port: phone ko farak nahi padta ki power wall socket se aa rahi hai ya power bank se, jab tak plug standard hai.",
+  "how_it_works": "`put` stream consume karta hai (jo hashing karta hai), `stream.info()` return karta hai. `get` local pe seek + chunked read, S3 pe `Range` header ke saath `get_object`. GC `list_older_than` + `delete_any` use karta hai.",
+  "in_this_project": "`objstore/storage/base.py::StorageAdapter` aur `HashingStream`; `storage/local.py::LocalAdapter`; `storage/s3.py::S3Adapter` + `_QueueReader`. Tests: `test_full_flow_on_s3_backend`, `test_large_streaming_upload_over_8mb_uses_s3_multipart`. TESTING.md benchmarks dono backends ke liye: 64MB PUT 153 MB/s local vs 45 MB/s S3 (SeaweedFS in Docker on Windows).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/base.py::StorageAdapter",
+   "projects/07-object-storage/objstore/storage/s3.py::_QueueReader",
+   "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+   "projects/07-object-storage/tests/test_s3_adapter.py::test_large_streaming_upload_over_8mb_uses_s3_multipart"
+  ],
+  "code_example": "# real: objstore/storage/base.py\nclass StorageAdapter(Protocol):\n    name: str\n    async def put(self, blob_key: str, stream: HashingStream) -> BlobInfo: ...\n    async def get(self, blob_key: str, start: int = 0, end: int | None = None) -> AsyncIterator[bytes]: ...\n    async def delete(self, blob_key: str) -> None: ...\n    async def exists(self, blob_key: str) -> bool: ...\n    async def list_older_than(self, seconds: float) -> list[str]: ...",
+  "code_language": "python",
+  "advantages": [
+   "Backend swap via one env var",
+   "Integrity logic centralised",
+   "Proven against a real S3 implementation"
+  ],
+  "disadvantages": [
+   "Lowest-common-denominator: backend-native features (server-side compose, SSE) unused",
+   "delete_any/ensure_bucket protocol ke bahar",
+   "boto3 sync -> thread hops"
+  ],
+  "common_mistakes": [
+   "Interface mein object keys/metadata leak karna",
+   "Sirf mocks se abstraction 'prove' karna",
+   "Adapter-specific hashing (do jagah integrity logic)"
+  ],
+  "follow_up_questions": [
+   "How would you add an optional capability like server-side compose to the protocol?",
+   "Why use typing.Protocol instead of an abstract base class?",
+   "What does the bounded queue protect against?"
+  ],
+  "concepts": [
+   "abstraction",
+   "ports and adapters",
+   "Protocol",
+   "integration testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Narrow interface = portability, lekin backend ke smart features (native multipart compose, SSE, lifecycle) use nahi hote.",
+   "failure_scenarios": "S3 backend partial outage: put fail -> 500 before metadata change (bytes-first); delete fail -> GC retry via queue/orphan scan.",
+   "alternatives": "Direct boto3 calls services mein (lock-in); aiobotocore for native async; capability flags per adapter.",
+   "scale_10x_100x": "100x pe adapter ke peeche multiple backends (sharded by blob key prefix) ya tiered storage (hot/cold) -- same protocol.",
+   "production_improvements": "delete_any aur ensure_bucket protocol mein formalise karo, adapter conformance test suite jo har adapter pe chale, async S3 client."
+  }
+ },
+ {
+  "id": "OBJS-103",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Design an S3-like object storage service from scratch. What are the key components and decisions?",
+  "answer_hinglish": "Main isko teen planes mein baant ke design karta hoon, aur mere project ke decisions as reference.\n\n1. Front/API plane: stateless HTTP servers, auth (HMAC signed requests, presigned URLs), rate limits. Horizontally scale. Mere project mein FastAPI + `authenticate/authorize`.\n\n2. Metadata plane: bucket -> key -> versions, ACLs, multipart state, lifecycle. Requirements: strong consistency per key (read-after-write), ordered prefix listing, transactions for version flips. Chhote scale pe ek Postgres (mera choice: partial unique index for one-latest-per-key, advisory lock per key). Bade scale pe sharded metadata (bucket ya hash(bucket,key) se) -- jaise S3 ka internal index, ya FoundationDB/Spanner jaisa ordered transactional KV.\n\n3. Data plane: bytes in immutable blobs under random ids, replication/erasure coding, scrubbing. Mera project yeh S3-compatible backend ko delegate karta hai.\n\nKey decisions jo main highlight karta hoon: (a) bytes first, metadata second -- crash = orphan garbage, never dangling pointers; GC with grace period. (b) deletions async via queue. (c) end-to-end integrity: MD5/SHA-256 computed while streaming, Content-MD5 and signed payload checked. (d) multipart for big objects, ranges for resumable downloads. (e) versioning with delete markers. (f) lifecycle for cost.\n\nScale numbers (generic ballpark): metadata ops har request pe hote hain, bytes sirf data requests pe -- isliye metadata usually pehla bottleneck hai. Bytes ko API se bypass karne ke liye presigned URLs directly blob tier/CDN ko.",
+  "why_needed": "Classic system design question; candidate ko metadata/data separation, consistency, durability aur scale reasoning dikhana hota hai.",
+  "real_world_analogy": "Airport: check-in counter (API), central booking system (metadata), baggage handling (data plane) -- bags ka tag number random hai, naam se nahi.",
+  "how_it_works": "PUT: API -> auth -> data plane write (placement, replicas) -> metadata commit (version flip) -> ack. GET: metadata lookup -> data plane read (ranged) -> stream. Background: GC, lifecycle, scrubbing, rebalancing.",
+  "in_this_project": "Mere project mein data plane ke alawa sab real hai: `services/objects.py` (put/get/delete/list/multipart), `migrations/versions/0001_initial.py` (schema + `uq_objects_latest`), `services/maintenance.py` (lifecycle + GC), `storage/*` (adapters). `SYSTEM_DESIGN.md` scaling table: 10x more API processes + read replicas; 100x shard metadata, dedicated listing index, CDN, presign direct to blob store.",
+  "implementation_files": [
+   "projects/07-object-storage/SYSTEM_DESIGN.md",
+   "projects/07-object-storage/ARCHITECTURE.md",
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear separation of concerns",
+   "Crash-safe ordering simple to reason about",
+   "Each plane scales independently"
+  ],
+  "disadvantages": [
+   "Metadata sharding hard (listing across shards)",
+   "Own data plane = big operational cost",
+   "Many moving parts"
+  ],
+  "common_mistakes": [
+   "Files ko key-based paths pe store karna (traversal + rename cost)",
+   "Metadata first likhna",
+   "Consistency requirement na batana",
+   "Listing ko afterthought samajhna"
+  ],
+  "follow_up_questions": [
+   "How do you keep listing ordered when metadata is sharded?",
+   "How do you guarantee durability of 11 nines?",
+   "How do you handle hot keys or hot buckets?",
+   "How would presigned URLs bypass the API for bytes?"
+  ],
+  "concepts": [
+   "system design",
+   "object storage",
+   "metadata plane",
+   "data plane"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Single Postgres metadata: simple aur strongly consistent, lekin vertical limit. Sharded KV: scale, lekin cross-shard listing aur transactions mushkil.",
+   "failure_scenarios": "Metadata DB down = poora service down (bytes hote hue bhi); data node loss = replicas/EC se repair; split brain avoid karne ke liye single-writer per key shard.",
+   "alternatives": "Ceph RGW (RADOS + index pools), MinIO (erasure sets, no external DB), SeaweedFS (volume servers + filer), AWS S3 itself.",
+   "scale_10x_100x": "10x: API replicas + read replicas. 100x: metadata shards by hash(bucket,key) with range-partitioned listing index, CDN, direct-to-blob presign, erasure-coded data tier.",
+   "production_improvements": "Observability per plane, chaos tests for crash ordering, backup/restore that snapshots metadata and blobs consistently, quota counters instead of sum()."
+  }
+ },
+ {
+  "id": "OBJS-104",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Why is the API stateless, and what exactly makes horizontal scaling safe?",
+  "answer_hinglish": "API process mein koi aisi state nahi jo correctness ke liye zaroori ho. Saari coordination Postgres mein hai: same-key writers `pg_advisory_xact_lock` pe serialize hote hain (yeh lock DB ka hai, process ka nahi, toh 2 instance hon ya 20 -- lock same hai); one-latest-per-key `uq_objects_latest` partial unique index enforce karta hai; quota ke liye bucket row `FOR UPDATE`. Bytes shared storage mein hain (S3 backend ya shared volume). Isliye load balancer kisi bhi request ko kisi bhi instance pe bhej sakta hai -- koi sticky session nahi.\n\nRead-after-write consistency bhi isi se aati hai: PUT ka 200 metadata COMMIT ke baad jata hai, toh agla GET kisi bhi instance pe ho, woh primary se latest row padhega.\n\nEk hi per-instance state hai: `app.state.secret_cache` (`SecretCache`, 60s TTL). Yeh correctness nahi, sirf performance hai -- cost: revoke kiya hua key har instance pe 60s tak chal sakta hai (TRADEOFFS.md #10).\n\nCaveats: local adapter ke saath horizontal scaling ke liye blob root shared hona chahiye -- isliye compose S3 backend (SeaweedFS) use karta hai. Aur TESTING.md finding: ek Python process c=4 pe CPU-bound ho jata hai (76 PUT/s, CPU 122% of wall), toh throughput ka answer \"zyada processes\" hi hai -- jo statelessness ki wajah se possible hai.",
+  "why_needed": "Throughput badhane ka sabse sasta tareeka replicas hain; woh tabhi safe hai jab instances ke beech koi hidden shared state na ho.",
+  "real_world_analogy": "Bank ke kai cashier counters: sab ek hi central ledger mein entry karte hain, toh customer kisi bhi counter pe jaa sakta hai.",
+  "how_it_works": "Instance A aur B dono same key pe PUT: dono apna blob likhte hain (parallel), phir commit pe DB advisory lock pe line lagate hain, ek ke baad ek version flip. Unique index last line of defence.",
+  "in_this_project": "`objstore/services/objects.py::key_lock_sql` (`pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0))`), `objstore/services/auth.py::_secret` (cache), `DEPLOYMENT.md`: \"The API is stateless: run as many replicas as needed behind a load balancer.\" `docker-compose.yml` default backend `s3`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/DEPLOYMENT.md",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real: objstore/services/objects.py\ndef key_lock_sql() -> str:\n    # Transaction-scoped advisory lock: serialises concurrent writers of the SAME key only.\n    return \"SELECT pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0))\"",
+  "code_language": "python",
+  "advantages": [
+   "Replicas = linear-ish API scaling",
+   "No sticky sessions",
+   "Locks survive any instance crash (txn-scoped)"
+  ],
+  "disadvantages": [
+   "Postgres becomes the shared bottleneck",
+   "Per-instance secret cache revocation lag",
+   "Local adapter needs shared filesystem"
+  ],
+  "common_mistakes": [
+   "In-process locks (asyncio.Lock) se same-key writes serialize karna",
+   "Local disk adapter ke saath multiple hosts chalana",
+   "Cache ko correctness ke liye use karna"
+  ],
+  "follow_up_questions": [
+   "What happens to the advisory lock if an instance crashes mid-transaction?",
+   "How many Postgres connections do N replicas need (pool_size=10, max_overflow=20)?",
+   "When would you need a connection pooler like PgBouncer?"
+  ],
+  "concepts": [
+   "stateless services",
+   "horizontal scaling",
+   "advisory locks",
+   "consistency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-105",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Why do lifecycle and garbage collection run in a separate worker instead of inside API requests?",
+  "answer_hinglish": "Teen reasons. (1) Latency aur reliability: request path ko blob delete ya bulk lifecycle SQL ka wait nahi karna chahiye. DELETE request sirf metadata change + `blob_deletions` queue insert karta hai, aur turant return; blob store slow ya down ho toh bhi user ka delete succeed hota hai. (2) Time-based kaam: lifecycle \"30 din purane logs expire karo\" kisi request se trigger nahi hota -- kisi ko periodically check karna hai. (3) Isolation: GC ka orphan scan poora blob store list karta hai -- heavy work API ke event loop pe nahi hona chahiye.\n\n`objstore/worker.py` ek simple loop hai: har 300 seconds `run_lifecycle` phir `run_gc`; exception pe `maintenance_failed` log karke agle cycle pe retry. Same container image, alag command (`python -m objstore.worker`).\n\nMultiple workers safe hain (worker docstring): lifecycle idempotent hai (doosri baar kuch extra nahi karta -- `test_lifecycle_expiration_noncurrent_and_markers` third run pe saare counters 0 assert karta hai), aur GC delete se pehle reference re-check karta hai. Lekin duplicate work hota hai -- production mein ek leader (advisory lock) ya sharding behtar.\n\nAdmins ke liye `POST /admin/lifecycle/run` aur `/admin/gc/run` bhi hain -- tests aur manual ops ke liye, same functions call karte hain.",
+  "why_needed": "Background maintenance ko user-facing path se alag rakhna latency, failure isolation aur time-based scheduling deta hai.",
+  "real_world_analogy": "Restaurant ke waiters customers serve karte hain; bartan dhone wala staff peeche alag kaam karta hai -- waiter har plate dhone nahi rukta.",
+  "how_it_works": "Worker loop: lifecycle (per rule: expire current via delete_object, noncurrent via lag(), lone markers, abort old multipart) -> GC (queued deletions with re-check, orphan scan with grace) -> sleep 300.",
+  "in_this_project": "`objstore/worker.py::main` (interval 300), `objstore/services/maintenance.py::run_lifecycle` aur `run_gc`, admin routes `lifecycle_run` / `gc_run` in `objstore/api/routes.py`. Compose mein `worker` service `command: [\"python\", \"-m\", \"objstore.worker\"]`. DEPLOYMENT.md: \"alert if blob_deletions grows or GC fails\".",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/worker.py::main",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/objstore/api/routes.py::gc_run",
+   "projects/07-object-storage/docker-compose.yml"
+  ],
+  "code_example": "# real, trimmed: objstore/worker.py\nwhile True:\n    try:\n        log.info(\"lifecycle_run\", extra=await run_lifecycle(sm, storage))\n        log.info(\"gc_run\", extra=await run_gc(sm, storage, s.orphan_grace_seconds))\n    except Exception:\n        log.exception(\"maintenance_failed\")\n    await asyncio.sleep(interval)",
+  "code_language": "python",
+  "advantages": [
+   "Fast, reliable user deletes",
+   "Heavy scans off the request path",
+   "Independently deployable/scalable"
+  ],
+  "disadvantages": [
+   "Storage reclaimed late (eventual)",
+   "Worker down = garbage + expired data accumulate silently",
+   "Multiple workers duplicate work"
+  ],
+  "common_mistakes": [
+   "GC ko request ke andar inline chalana",
+   "Worker failure pe alert na lagana",
+   "Lifecycle ko non-idempotent likhna (double run = double delete)"
+  ],
+  "follow_up_questions": [
+   "How would you ensure only one worker runs GC at a time?",
+   "What metrics show the worker is falling behind?",
+   "Why is lifecycle expiration on a versioned bucket a delete marker rather than a hard delete?"
+  ],
+  "concepts": [
+   "background jobs",
+   "garbage collection",
+   "lifecycle",
+   "idempotency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-106",
+  "project_slug": "p07-object-storage",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "How would you take this to multiple regions with a CDN in front of public reads?",
+  "answer_hinglish": "Seedha: is project mein multi-region, cross-region replication aur CDN integration implement nahi hai; yeh single-region, single-Postgres design hai. SYSTEM_DESIGN.md 100x step mein \"CDN in front of public reads\" aur \"presigned URLs pointing directly at the blob store\" suggest karta hai. Production mein aise karte:\n\nCDN (sabse pehla, sabse sasta win): public_read bucket objects immutable-per-version hain aur ETag strong hai, toh CDN cache kar sakta hai. Cache key mein versionId ho; latest-key URLs ke liye short TTL ya overwrite/delete pe purge. Private objects ke liye CDN signed URLs (presign jaisa) -- API sirf URL sign kare, bytes CDN/edge se. Range requests (206) CDN support karte hain.\n\nMulti-region: do models. (a) Home region per bucket: metadata aur writes ek region mein (strong consistency wahin), aur async cross-region replication (CRR) se doosre region mein read copies -- doosre region ke reads eventually consistent. Replication ek queue se: commit ke saath outbox row likho, replicator bytes copy kare, phir remote metadata likhe -- yahan bhi bytes first, metadata second rule chalega. (b) Active-active: conflicting writes same key pe -- last-writer-wins by timestamp/version, jo complex aur lossy hai; zyada tar systems (S3 bhi) per-bucket home region rakhte hain.\n\nFailover: home region down toh replica promote, lekin replication lag ka data RPO ke roop mein jaa sakta hai -- yeh honestly batana zaroori hai.",
+  "why_needed": "Global users ke liye latency, aur region outage se survive karne ke liye disaster recovery.",
+  "real_world_analogy": "Head office (home region) mein master register, branch offices mein photocopy jo har ghante update hoti hai; dukaan ke bahar vending machine (CDN) popular cheezein turant deti hai.",
+  "how_it_works": "Write: home region API -> blob -> metadata commit + replication outbox row (same txn). Replicator: read outbox -> copy blob to remote -> remote metadata upsert (idempotent by version_id) -> mark done. Reads: nearest region; strong reads home region se.",
+  "in_this_project": "Hooks jo already hain: `objects.version_id` (replication idempotency key), `sha256` (remote copy verify), `blob_deletions` jaisa queue pattern outbox ke liye, aur `/presign` (`objstore/api/routes.py::presign`) jo `public_base_url` embed karta hai -- CDN domain set karna wahin se. `objstore/api/routes.py::get_object` `ETag`, `Last-Modified`, `Accept-Ranges` headers already deta hai jo CDN caching ke liye zaroori hain.",
+  "implementation_files": [
+   "projects/07-object-storage/SYSTEM_DESIGN.md",
+   "projects/07-object-storage/objstore/api/routes.py::get_object",
+   "projects/07-object-storage/objstore/api/routes.py::presign",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "CDN offloads public read bytes completely",
+   "Home-region model keeps strong consistency per bucket",
+   "Existing version ids make replication idempotent"
+  ],
+  "disadvantages": [
+   "Cross-region replicas eventually consistent",
+   "Failover can lose recent writes (RPO)",
+   "Purge/invalidations for latest-key URLs"
+  ],
+  "common_mistakes": [
+   "Active-active ko 'free consistency' samajhna",
+   "Mutable latest-key URLs ko long TTL pe cache karna",
+   "Replication mein metadata pehle copy karna (remote dangling pointer)"
+  ],
+  "follow_up_questions": [
+   "How would you invalidate CDN caches on overwrite?",
+   "What is the RPO/RTO of async cross-region replication?",
+   "How would you replicate delete markers and permanent version deletes?"
+  ],
+  "concepts": [
+   "multi-region",
+   "CDN",
+   "replication",
+   "disaster recovery"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Home-region: simple + strong per bucket, lekin far users ke writes slow. Active-active: low latency writes, conflicts aur complexity.",
+   "failure_scenarios": "Region outage during replication lag -> recent objects missing in replica; replicator bug -> silent divergence (sha256 compare se detect).",
+   "alternatives": "Backend-level replication (S3 CRR / MinIO site replication) for bytes + Postgres logical replication for metadata; global DB (Spanner/CockroachDB) for metadata.",
+   "scale_10x_100x": "100x reads: CDN hit ratio sabse bada lever; 100x writes: metadata sharding pehle, regions baad mein.",
+   "production_improvements": "Replication lag metrics + alerts, periodic cross-region checksum audits, documented RPO/RTO, CDN cache keys with versionId."
+  }
+ }
+]

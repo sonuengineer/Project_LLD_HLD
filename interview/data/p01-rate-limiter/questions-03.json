@@ -1,0 +1,958 @@
+[
+ {
+  "id": "RATE-043",
+  "project_slug": "p01-rate-limiter",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "The in-memory limiter uses asyncio.Lock. What does that lock protect, and what does it not protect?",
+  "answer_hinglish": "`InMemoryRateLimiter` mein `self._lock = asyncio.Lock()` hai aur poora check `async with self._lock:` ke andar hai. Yeh lock ek hi event loop ke andar coroutines ki interleaving se bachata hai. Andar ka code (`_fixed_window`, `_token_bucket`) actually synchronous hai -- koi `await` nahi -- toh practically ek event loop mein interleave hona waise bhi mushkil hai, lekin lock intent explicit karta hai aur future mein koi `await` add kare toh bhi safe rahe.\n\nKya protect NAHI karta: (1) Doosre processes -- `uvicorn --workers 4` mein har worker alag process hai, alag memory, alag lock. (2) Doosre servers -- bilkul independent. (3) Threads -- `asyncio.Lock` thread-safe nahi hai; agar koi thread pool se call kare toh lock kaam nahi karega. Process ke bahar ke coordination ke liye shared store aur atomic operation chahiye.\n\nIsliye memory limiter ke docstring mein likha hai: \"Correct for ONE process, wrong for a fleet\". Test `test_in_memory_limiter_overshoots_with_multiple_servers` mein har server ka apna lock hai aur result 3x.\n\nInterview point: \"lock lagaya hai toh thread/process safe hai\" ek common galat assumption hai. Lock ka scope hamesha us memory tak hai jahan lock object rehta hai. Distributed lock chahiye toh woh bhi shared store (Redis) mein -- lekin rate limiting ke liye distributed lock ki zaroorat nahi, Lua script khud hi serialization deta hai aur lock se bahut sasta hai.",
+  "why_needed": "Lock scope galat samajhna concurrency bugs ka sabse common source hai.",
+  "real_world_analogy": "Ghar ke bathroom ka kundi sirf us ghar ke logon ko rokti hai, padosi ke bathroom pe uska koi asar nahi.",
+  "how_it_works": "asyncio.Lock: coroutine-level mutual exclusion within one event loop thread. No cross-thread or cross-process effect.",
+  "in_this_project": "`limiter/memory_limiter.py` comment: \"protects against interleaving inside ONE event loop only\".",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/memory_limiter.py::InMemoryRateLimiter",
+   "projects/01-rate-limiter/tests/test_distributed_correctness.py::test_in_memory_limiter_overshoots_with_multiple_servers"
+  ],
+  "code_example": "# real: memory_limiter.py\nself._lock = asyncio.Lock()  # protects against interleaving inside ONE event loop only\n...\nasync with self._lock:\n    if policy.algorithm is Algorithm.TOKEN_BUCKET:\n        return self._token_bucket(key, policy, limit, cost, now)",
+  "code_language": "python",
+  "advantages": [
+   "Cheap within one loop",
+   "Makes intent explicit"
+  ],
+  "disadvantages": [
+   "Useless across workers/servers",
+   "Not thread-safe"
+  ],
+  "common_mistakes": [
+   "asyncio.Lock ko threading.Lock jaisa samajhna",
+   "Distributed rate limit ke liye Redis distributed lock lagana (slow, unnecessary)"
+  ],
+  "follow_up_questions": [
+   "What happens with uvicorn --workers 4 and the in-memory limiter?",
+   "When would you need a distributed lock?",
+   "Is a Redis lock (SET NX PX) a good fit here?"
+  ],
+  "concepts": [
+   "asyncio",
+   "locks",
+   "process boundaries"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-044",
+  "project_slug": "p01-rate-limiter",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Policies are cached per instance for 5 seconds. What consistency problems does that create?",
+  "answer_hinglish": "`PolicyStore` har instance pe policies ka local cache rakhta hai aur `policy_cache_ttl_seconds` (default 5s) baad hi Redis se `HGETALL rl:config:policies` karta hai. Iska matlab eventual consistency: admin ne instance A pe `PUT /admin/policies/user_plan` kiya, A turant apply karta hai (`self._loaded_at = 0.0` se cache invalidate), lekin B aur C up to 5 seconds tak purani policy use karte hain.\n\nConcrete effects: (1) Limit 600 se 60 ki, toh 5 seconds tak kuch instances 600 allow karte rahenge -- brief overshoot. (2) Algorithm change kiya (jaise fixed_window se token_bucket), toh 5 seconds tak alag instances alag algorithm ke saath same identity check karenge. Key structures alag hain (fixed window ki key `:<window_start>` suffix ke saath string, token bucket ka base key hash) toh collision nahi hoti, lekin dono state alag count karti hain -- us dauraan effective limit roughly double ho sakti hai. (3) Revert (`DELETE .../override`) bhi same delay ke saath.\n\nKyun accept kiya? Bina cache ke har request pe ek extra Redis call -- 3 policies wale route pe 4 calls ho jaate. Config changes rare hain, requests constant. 5 seconds ki staleness rate limiting ke liye acceptable hai. Test `test_policy_override_propagates_to_other_instance` cache TTL 0 ke saath dono instances share karne ka behaviour verify karta hai.\n\nAgar strict chahiye: Redis pub/sub se invalidation broadcast, ya version counter key jo har request pe sasta check ho.",
+  "why_needed": "Caching distributed config ka classic trade-off hai: freshness vs load.",
+  "real_world_analogy": "Office notice board ki photo har team apne phone mein rakhti hai aur har 5 minute mein nayi photo leti hai -- notice badla toh kuch teams thodi der purana rule follow karti hain.",
+  "how_it_works": "TTL-based pull cache: `if monotonic() - loaded_at < ttl: return`. Writer instance self-invalidates; others converge within TTL.",
+  "in_this_project": "`services/policy_store.py::_refresh`, `upsert` (`self._loaded_at = 0.0  # this instance applies immediately; others within TTL`); TRADEOFFS #7.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py::PolicyStore",
+   "projects/01-rate-limiter/tests/test_api.py::test_policy_override_propagates_to_other_instance",
+   "projects/01-rate-limiter/TRADEOFFS.md"
+  ],
+  "code_example": "# real: policy_store.py\nasync def _refresh(self) -> None:\n    if time.monotonic() - self._loaded_at < self._ttl:\n        return\n    overrides = await self._redis.hgetall(OVERRIDES_KEY)\n    ...",
+  "code_language": "python",
+  "advantages": [
+   "No per-request config read",
+   "Survives Redis blips with last-known config"
+  ],
+  "disadvantages": [
+   "Up to TTL seconds of inconsistent limits across instances"
+  ],
+  "common_mistakes": [
+   "Cache bina TTL ke (changes kabhi apply nahi hote)",
+   "Algorithm change ko instant samajhna"
+  ],
+  "follow_up_questions": [
+   "How would you make policy changes propagate instantly?",
+   "What happens if two admins update the same policy concurrently?",
+   "Why monotonic time for the cache?"
+  ],
+  "concepts": [
+   "eventual consistency",
+   "caching",
+   "configuration"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "TTL pull cache: simple, robust; push invalidation (pub/sub): fresh but pub/sub messages miss ho sakte hain (fire-and-forget), toh TTL fallback phir bhi chahiye.",
+   "failure_scenarios": "Thundering refresh: saare instances lagbhag same time pe HGETALL -- 5s TTL pe negligible. Redis down pe refresh fail -> last known policies (FAILURE_SCENARIOS #8).",
+   "alternatives": "Pub/sub invalidation + TTL backstop; config version key; config service (etcd/Consul) watches.",
+   "scale_10x_100x": "1000 instances pe har 5s HGETALL = 200 calls/s -- trivial. Bahut badi policy sets pe version key check sasta.",
+   "production_improvements": "Policy change audit log, staged rollout (shadow mode), aur metric \"policy_version\" per instance taaki convergence dikh sake."
+  }
+ },
+ {
+  "id": "RATE-045",
+  "project_slug": "p01-rate-limiter",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "What happens to correctness if Redis fails over from primary to replica?",
+  "answer_hinglish": "Is repo mein single Redis hai -- Sentinel ya replica setup implement nahi hai. Lekin production (SYSTEM_DESIGN.md ka 10x step) mein primary + replica + Sentinel hoga, toh behaviour samajhna zaroori hai.\n\nRedis replication asynchronous hai. Primary ne `INCRBY` kiya, client ko reply diya, aur replica tak pahunchne se pehle primary crash ho gaya -- woh writes lost. Failover ke baad naya primary (purana replica) thode purane counters dekhta hai. Effect: kuch identities ko unke actual usage se thoda zyada quota mil jata hai -- brief overshoot. Token bucket mein tokens zyada dikhenge. Rate limiting soft state hai, toh yeh acceptable hai -- FAILURE_SCENARIOS #4 ki tarah (restart pe counters reset).\n\nFailover window (typically kuch seconds) ke dauraan connections fail honge ya `READONLY` error aayega (agar client abhi bhi purane primary jo ab replica hai usse baat kare). `redis_limiter.py` broad `RedisError` ko bhi `BackendUnavailable` mein map karta hai -- comment: \"e.g. READONLY replica, OOM -> treat as unavailable too\". Toh fail-open policies degraded allow, `login_bruteforce` 503.\n\nScript cache: naye primary pe script cache khali ho sakta hai -> NOSCRIPT -> redis-py auto reload (`test_survives_script_cache_flush`).\n\nClock: naye primary ka `TIME` thoda alag; `max(elapsed, 0)` guard negative case handle karta hai.\n\nAgar strong guarantee chahiye: `WAIT` command (sync replicas) -- lekin har check pe latency badhegi; rate limiting ke liye worth nahi.",
+  "why_needed": "HA setup mein correctness kahan compromise hoti hai yeh jaanna senior-level expectation hai.",
+  "real_world_analogy": "Cashier ki shift change: purana cashier jaate waqt last 3 entries register mein copy karna bhool gaya -- naya cashier thoda kam count se start karta hai.",
+  "how_it_works": "Async replication -> lost acknowledged writes on failover; Sentinel promotes replica; clients reconnect; NOSCRIPT reload.",
+  "in_this_project": "Implemented nahi: Sentinel/replica. Implemented: RedisError -> BackendUnavailable mapping, NOSCRIPT recovery, negative elapsed guard.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py::check",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md",
+   "projects/01-rate-limiter/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: redis_limiter.py\nexcept (RedisConnectionError, RedisTimeoutError, OSError) as exc:\n    raise BackendUnavailable(str(exc)) from exc\nexcept RedisError as exc:  # e.g. READONLY replica, OOM -> treat as unavailable too\n    raise BackendUnavailable(str(exc)) from exc",
+  "code_language": "python",
+  "advantages": [
+   "Soft state tolerates lost writes",
+   "Failure path already defined (fail-open/closed)"
+  ],
+  "disadvantages": [
+   "Brief overshoot after failover",
+   "Seconds of degraded mode"
+  ],
+  "common_mistakes": [
+   "Sochna ki replication synchronous hai",
+   "Failover ke dauraan 500 errors aane dena"
+  ],
+  "follow_up_questions": [
+   "Would you use WAIT for stronger guarantees?",
+   "How does the client discover the new primary?",
+   "How long is a typical Sentinel failover?"
+  ],
+  "concepts": [
+   "replication",
+   "failover",
+   "sentinel",
+   "consistency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Availability (async replication, fast failover) vs exactness (sync replication, slower). Rate limiting soft state hai toh availability choose.",
+   "failure_scenarios": "Split-brain: purana primary kuch der writes accept karta raha (min-replicas-to-write se limit). Failover ke baad login brute-force window mein 503s -- user-facing impact.",
+   "alternatives": "Managed Redis (ElastiCache/MemoryDB with durable log), Redis Cluster with replicas, ya local fallback limiter during failover instead of plain fail-open.",
+   "scale_10x_100x": "Cluster mein har shard ka apna failover; ek shard ka failover sirf us shard ki identities ko affect karta hai -- blast radius chhota.",
+   "production_improvements": "Sentinel-aware client config, `min-replicas-to-write`, failover drills, aur degraded metrics pe alert."
+  }
+ },
+ {
+  "id": "RATE-046",
+  "project_slug": "p01-rate-limiter",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do concurrency, the asyncio event loop and the Redis connection pool interact inside one app instance?",
+  "answer_hinglish": "Har uvicorn worker ek single-threaded asyncio event loop hai. Har incoming request ek coroutine hai. Jab coroutine `await script(...)` karti hai, woh Redis connection pool se ek connection leti hai, command bhejti hai, aur loop baaki coroutines chalata hai jab tak reply nahi aata. Isliye ek process saikdon concurrent requests sambhal leta hai.\n\nPool size `redis_max_connections=200` per process. Agar 300 coroutines ek saath Redis call karein toh 200 connections busy, baaki 100 ko wait karna padega. Yahan pool type matter karta hai: redis-py ka default async `ConnectionPool` exhausted hone pe turant `MaxConnectionsError` raise karta hai. Hamara code use `RedisError` -> `BackendUnavailable` -> fail-open samajhta -- matlab exactly traffic spike ke time rate limiter band. Isliye `main.py` mein `BlockingConnectionPool` hai jo `timeout=redis_pool_timeout` (0.1s) tak free connection ka wait karta hai.\n\nDoosra interaction: event loop lag. Agar koi code loop ko block kare (synchronous logging, CPU heavy kaam), toh Redis ka reply aa chuka hota hai lekin coroutine resume nahi hoti -- `socket_timeout` fire ho jata hai aur hum galti se \"Redis down\" decide karte hain. Yahi doosra load-test bug tha (blocking stdout logging), fix: `QueueHandler`/`QueueListener` aur timeout 50ms se 250ms.\n\nRegression test `test_small_pool_waits_instead_of_failing_open`: 5-connection pool, 100 concurrent requests, koi degraded nahi aur exactly 20 allowed.",
+  "why_needed": "Async Python mein \"Redis slow\" aur \"humara process slow\" ko alag karna production debugging ka core skill hai.",
+  "real_world_analogy": "Ek receptionist (event loop) jo bahut saare phone calls juggle karti hai; agar woh ek call pe lambi kahani sunne lag jaye (blocking call), toh baaki callers ko lagta hai line dead hai.",
+  "how_it_works": "Coroutine awaits -> pool.get_connection -> (Blocking) wait or raise -> send -> await reply under socket_timeout. Loop stalls inflate observed latency.",
+  "in_this_project": "`main.py` BlockingConnectionPool comment; `config.py` timeout comments; `shared/bpcommon/logging.py::configure_logging`; TESTING.md bugs 1 and 2.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/main.py::create_app",
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "shared/bpcommon/logging.py::configure_logging",
+   "projects/01-rate-limiter/tests/test_api.py::test_small_pool_waits_instead_of_failing_open"
+  ],
+  "code_example": "# real: main.py\nclient = redis or Redis(connection_pool=BlockingConnectionPool.from_url(\n    settings.redis_url, socket_timeout=settings.redis_socket_timeout,\n    socket_connect_timeout=settings.redis_connect_timeout,\n    max_connections=settings.redis_max_connections, timeout=settings.redis_pool_timeout,\n))",
+  "code_language": "python",
+  "advantages": [
+   "High concurrency with few threads",
+   "Bounded Redis connections",
+   "Waits instead of failing open"
+  ],
+  "disadvantages": [
+   "Any blocking call stalls everything",
+   "Pool wait adds latency under spikes"
+  ],
+  "common_mistakes": [
+   "Default pool assume karna ki wait karega",
+   "Timeouts bahut tight rakhna bina loop lag soche"
+  ],
+  "follow_up_questions": [
+   "How do you measure event-loop lag?",
+   "What is the right pool size per worker?",
+   "What happens with multiple workers per container?"
+  ],
+  "concepts": [
+   "asyncio",
+   "connection pool",
+   "event loop",
+   "timeouts"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Blocking pool: no false fail-open but requests can queue; non-blocking: fast failure but wrong semantics here. Pool size vs Redis max clients.",
+   "failure_scenarios": "Pool wait + socket timeout dono stack hote hain: worst case 0.1s + 0.25s per policy. Loop stall -> mass false timeouts.",
+   "alternatives": "Sync redis client in threadpool (worse), or uvloop for faster loop, or multiple workers with smaller pools.",
+   "scale_10x_100x": "10x traffic: zyada replicas/workers -> Redis connections = workers x pool size; Redis `maxclients` (default 10000) ka dhyan.",
+   "production_improvements": "Event-loop lag metric, pool wait-time metric, aur alert jab degraded decisions badhein jabki Redis latency normal ho."
+  }
+ },
+ {
+  "id": "RATE-047",
+  "project_slug": "p01-rate-limiter",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How do you write deterministic tests for time-based, concurrent rate limiting code?",
+  "answer_hinglish": "Do cheezein non-deterministic hoti hain: time aur scheduling. Maine dono ko control kiya.\n\nTime: `RateLimiter.check` mein `now_ms` parameter hai jo Lua scripts ko `ARGV[3]` ke roop mein jata hai. Tests fixed `T0 = 1_700_000_000_000` use karte hain (1 second boundary pe aligned), aur phir `T0 + 100`, `T0 + 999`, `T0 + 1000` jaise exact moments pe calls karte hain. Isliye \"retry_after == 900\" ya \"boundary pe 6 requests pass\" jaise exact assertions possible hain -- `time.sleep` ki zaroorat nahi, test fast aur flaky-free. Production path (`now_ms=None` -> Redis TIME) alag test se cover hota hai.\n\nConcurrency: `asyncio.gather` se 200 tasks ek saath launch, teen alag Redis clients (teen pools) ke through. Sab same `now_ms`, toh time ka koi asar nahi -- sirf interleaving test hoti hai. Correct implementation ke liye exact assertion (`== 50`). Race demo (naive) ke liye exact number nahi, sirf `> LIMIT`, kyunki race ka result har run mein alag hai -- flaky exact assertion galat hoti.\n\nIsolation: tests Redis DB 15 use karte hain (`RL_TEST_REDIS_URL`), aur `redis` fixture har test se pehle aur baad `flushdb` karta hai. Redis na mile toh test skip, fail nahi.\n\nFailure simulation: `redis://127.0.0.1:1` -- us port pe kuch nahi sunta, toh connection refused -- Redis down ka deterministic simulation.",
+  "why_needed": "Flaky tests concurrency code mein trust khatam kar dete hain; determinism design ka hissa hona chahiye.",
+  "real_world_analogy": "Science experiment mein temperature aur time control karte ho taaki sirf ek variable test ho.",
+  "how_it_works": "Inject clock -> fixed timestamps. gather -> max interleaving. Assert exact for correct code, inequality for racy code.",
+  "in_this_project": "`tests/conftest.py` (REDIS_URL DB 15, flushdb, skip), `tests/test_algorithms.py::T0`, `tests/test_failure_modes.py::DEAD`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/tests/conftest.py::redis",
+   "projects/01-rate-limiter/tests/test_algorithms.py",
+   "projects/01-rate-limiter/tests/test_failure_modes.py::dead_redis",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# real: tests/test_algorithms.py\nT0 = 1_700_000_000_000  # aligned to a 1s boundary (divisible by 1000)\n\nasync def run(lim, policy, now, key=\"u1\", cost=1):\n    return await lim.check(key, policy, policy.default, cost=cost, now_ms=now)",
+  "code_language": "python",
+  "advantages": [
+   "Fast, no sleeps",
+   "Exact assertions",
+   "Real Redis, not mocks"
+  ],
+  "disadvantages": [
+   "Needs a running Redis",
+   "Injected time path differs slightly from prod path"
+  ],
+  "common_mistakes": [
+   "time.sleep based tests",
+   "Racy behaviour pe exact count assert karna",
+   "Shared DB without flush"
+  ],
+  "follow_up_questions": [
+   "Why use real Redis instead of fakeredis?",
+   "How do you test the production time path?",
+   "How would you test across real processes?"
+  ],
+  "concepts": [
+   "testing",
+   "determinism",
+   "time injection"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-048",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "Explain your k6 load test results. Why is the allowed path slower than the hot-key path?",
+  "answer_hinglish": "TESTING.md ke real numbers (Windows 11, Docker Desktop, 12 vCPU VM jo ~25 aur containers ke saath shared tha, 3 single-worker uvicorn replicas, 1 Redis; k6 1.4.2, 64 VUs, 20s, compose network ke andar):\n\n- baseline `/healthz` (no limiter): 993 req/s, p50 51.9ms, p99 224.5ms\n- allowed path (50k fake IPs, 2 Lua calls/request): 500 req/s, p50 97.4ms, p99 427.4ms\n- hot key (1 IP, mostly 429): 722 req/s, p50 79.4ms, p99 271.2ms\n- errors: 0 in all\n\nAllowed path slower kyun? `/api/resource` ka route group `default` = `ip_global` + `user_plan`. Allowed request dono policies check karti hai -- 2 Lua round-trips. Hot key mode mein ek IP 300/min jaldi cross kar leta hai, toh zyada requests `ip_global` pe hi deny ho jaati hain (first-denial-stop) -- sirf 1 Lua call, aur handler bhi nahi chalta. Plus 50k distinct IPs = zyada keys create/expire.\n\nAbsolute numbers ko interpret kaise karein: server-side handler time logs se p50 0.77ms, p99 12.9ms tha. Client-side 50-100ms ka gap single-worker uvicorn processes pe queueing hai contended VM pe -- limiter ka cost nahi. Isliye main claim karta hoon \"relative comparison\", \"X req/s production capacity\" nahi. Baseline vs allowed ka difference batata hai ki limiter ka relative overhead dikhta hai jab CPU contended hai.",
+  "why_needed": "Load test numbers ko honestly interpret karna (environment, bottleneck) senior skill hai.",
+  "real_world_analogy": "Ek hi kitchen mein do dishes: ek ke liye do counters pe jaana padta hai (allowed), doosri pehle counter pe hi reject ho jati hai (hot key) -- doosri jaldi niptati hai.",
+  "how_it_works": "Per request Redis calls = policies checked until first denial. Throughput bound by single-worker CPU and VM contention.",
+  "in_this_project": "`loadtest/k6_benchmark.js` (MODE baseline/allowed/hot, instances hit directly with X-Real-IP), TESTING.md throughput table.",
+  "implementation_files": [
+   "projects/01-rate-limiter/loadtest/k6_benchmark.js",
+   "projects/01-rate-limiter/TESTING.md",
+   "projects/01-rate-limiter/ratelimiter/policies.json"
+  ],
+  "code_example": "// real: loadtest/k6_benchmark.js\nconst ip = MODE === 'hot' ? '203.0.113.7'\n  : `10.${Math.floor(Math.random() * 200)}.${Math.floor(Math.random() * 250)}.1`;\nconst r = http.get(`http://${host}:8000/api/resource`,\n  { headers: { 'X-Real-IP': ip }, responseCallback: http.expectedStatuses(200, 429) });",
+  "code_language": "javascript",
+  "advantages": [
+   "Realistic HTTP path measured",
+   "Three modes isolate costs",
+   "Zero errors observed"
+  ],
+  "disadvantages": [
+   "Contended dev machine; numbers not portable",
+   "Single worker per replica"
+  ],
+  "common_mistakes": [
+   "Dev laptop numbers ko production capacity bolna",
+   "429 ko error count karna (k6 expectedStatuses se avoid kiya)"
+  ],
+  "follow_up_questions": [
+   "Why was the baseline p50 already 52ms?",
+   "How would you run this to get production-grade numbers?",
+   "What would multiple uvicorn workers change?"
+  ],
+  "concepts": [
+   "load testing",
+   "k6",
+   "latency percentiles"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-049",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "What latency does the rate limiter add per request, and how would you reduce it?",
+  "answer_hinglish": "Har policy check ek Redis round-trip (EVALSHA) hai. `/api/resource` pe 2, `/api/search` pe 3. Same datacenter mein ek Redis round-trip typically sub-millisecond se 1-2ms order ka hota hai (generic ballpark), aur script execution microseconds. Is project mein server-side handler time p50 0.77ms, p99 12.9ms measure hua (TESTING.md, contended VM). Plus API key lookup cache miss pe ek aur GET.\n\nReduce karne ke options, impact order mein:\n\n1) Pipelining: saari policy scripts ek pipeline mein bhejo -- N round-trips ki jagah 1. Semantics badal jati hai thodi: first-denial-stop nahi rahega (saari policies consume hongi), jab tak ki combined script na ho.\n\n2) Combined multi-key Lua script: saari policies ek script mein, check-all-then-commit -- ek round-trip aur atomic bhi. Cluster mein saari keys same slot chahiye -- IP aur user keys alag hash tags pe hain, toh mushkil.\n\n3) Edge pe ip_global: SYSTEM_DESIGN.md 10x step -- har request se ek Lua call hata do.\n\n4) Local pre-check: process-local token bucket jo obvious abuse (ek IP 10k req/s) ko Redis tak pahunchne hi na de. Correctness central Redis se, local sirf extra shield.\n\n5) Caches already hain: policies (5s) aur API keys (30s) -- yeh pehle se per-request calls bachate hain.\n\n6) Event loop health: blocking calls hatao (logging fix) -- warna latency limiter ki nahi, process ki hoti hai.",
+  "why_needed": "Limiter har request ke hot path pe hai; uska latency budget sabko affect karta hai.",
+  "real_world_analogy": "Teen alag counters pe line lagne ke bajaye ek single window jahan teeno checks ek saath ho jayein.",
+  "how_it_works": "Latency ~= sum over checked policies of (pool wait + RTT + script time) + auth lookup on cache miss.",
+  "in_this_project": "`CHECK_LATENCY` histogram (`rate_limit_check_seconds`) per algorithm; `evaluate` sequential loop; SYSTEM_DESIGN.md scaling table.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/metrics.py::CHECK_LATENCY",
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::evaluate",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# illustrative (NOT in repo): pipeline all policy scripts in one round-trip\nasync with redis.pipeline(transaction=False) as pipe:\n    for policy in policies:\n        script(keys=[build_key(policy, key)], args=args_for(policy), client=pipe)\n    results = await pipe.execute()   # note: every policy consumes, no early stop",
+  "code_language": "python",
+  "advantages": [
+   "Clear latency metric per algorithm",
+   "Several known optimisations available"
+  ],
+  "disadvantages": [
+   "Sequential checks add up",
+   "Optimisations change semantics or add coupling"
+  ],
+  "common_mistakes": [
+   "Pipelining ko atomic samajhna",
+   "Limiter latency measure kiye bina optimize karna"
+  ],
+  "follow_up_questions": [
+   "How does NOSCRIPT behave inside a pipeline?",
+   "What is your latency SLO for the limiter?",
+   "When does a local pre-check become unsafe?"
+  ],
+  "concepts": [
+   "latency",
+   "pipelining",
+   "optimization"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Round-trips vs semantics: pipeline fast but loses early stop; combined script atomic but coupled; edge limiting cheap but coarse.",
+   "failure_scenarios": "Pipelined scripts mein agar ek NOSCRIPT aaye toh redis-py ka auto-retry pipeline mein seedha kaam nahi karta -- scripts pehle load karni padti hain.",
+   "alternatives": "Envoy local + global rate limit, in-process approximate counters with periodic sync.",
+   "scale_10x_100x": "100x: local pre-check + Cluster; round-trip count har request pe ek tak laana target.",
+   "production_improvements": "Per-route limiter latency SLO, histogram alerts (p99 > 50ms FAILURE_SCENARIOS alert), aur profiling of event loop lag."
+  }
+ },
+ {
+  "id": "RATE-050",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What does the Lua micro-benchmark show, and why can't you use its numbers as Redis capacity?",
+  "answer_hinglish": "`loadtest/bench_lua.py` har algorithm ke liye 20k checks chalata hai, concurrency 50, 1000 distinct identities, host se Docker port ke through Redis pe. TESTING.md ke real results:\n\nfixed_window 1167 checks/s (p50 28.70ms), sliding_log 1593, sliding_counter 1883, token_bucket 2020, leaky_bucket 2118 checks/s (p50 ~17.7ms).\n\nIn numbers ko Redis capacity nahi bol sakte, kyunki bottleneck Redis nahi hai. Single-threaded Python client (asyncio, ek process) aur Windows pe Docker Desktop ka port proxy limit kar rahe hain. Ek Redis core typically 10^5 order simple ops/s handle karta hai (generic figure, SYSTEM_DESIGN.md) -- 2000 checks/s toh uska chhota sa hissa hai. TESTING.md khud kehta hai: \"lower bound, useful only for comparing algorithms relative to each other\".\n\nAur relative comparison bhi saavdhaani se: fixed_window sabse pehle chala (pehla run warm-up effects -- connection setup, script load -- ho sakte hain), isliye uska number sabse kam dikh raha hai, jabki theory mein woh sabse sasta script hai. Ek fair benchmark order randomize karta, warm-up run deta, aur multiple repetitions leta.\n\nSahi capacity test: Redis host ke paas multiple client processes, `redis-benchmark` ya `memtier_benchmark`, aur Redis CPU % monitor karna -- jab Redis CPU 100% ho tab woh capacity hai.",
+  "why_needed": "Benchmark numbers ka galat interpretation interview mein credibility khatam karta hai.",
+  "real_world_analogy": "Ek patli pipe se tanki bharne ka time naapke tanki ki capacity bolna -- pipe bottleneck hai, tanki nahi.",
+  "how_it_works": "Throughput = min(client capacity, network/proxy, server capacity). Yahan client side min hai.",
+  "in_this_project": "`loadtest/bench_lua.py` (BlockingConnectionPool, Semaphore, latencies sorted); TESTING.md Lua micro-benchmark section.",
+  "implementation_files": [
+   "projects/01-rate-limiter/loadtest/bench_lua.py",
+   "projects/01-rate-limiter/TESTING.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# real output from TESTING.md\nfixed_window       1167 checks/s   p50=28.70ms  p99=86.26ms\nsliding_log        1593 checks/s   p50=22.66ms  p99=52.77ms\nsliding_counter    1883 checks/s   p50=19.18ms  p99=45.57ms\ntoken_bucket       2020 checks/s   p50=17.57ms  p99=43.69ms\nleaky_bucket       2118 checks/s   p50=17.68ms  p99=36.14ms",
+  "code_language": "text",
+  "advantages": [
+   "Quick algorithm comparison",
+   "Reproducible script"
+  ],
+  "disadvantages": [
+   "Client-bound, not Redis-bound",
+   "Order effects not controlled"
+  ],
+  "common_mistakes": [
+   "In numbers ko production capacity bolna",
+   "Benchmark order/warm-up ignore karna"
+  ],
+  "follow_up_questions": [
+   "How would you find Redis' true capacity?",
+   "Why might fixed_window appear slowest?",
+   "What does SLOWLOG tell you here?"
+  ],
+  "concepts": [
+   "benchmarking",
+   "bottleneck analysis"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-051",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why must Lua scripts stay short, and which script here is the most expensive?",
+  "answer_hinglish": "Redis script ko atomic chalata hai -- matlab script chalte waqt poora Redis server (us shard pe) koi aur command process nahi karta. Ek 5ms script = 5ms tak saare clients blocked. Isliye scripts O(1) ya O(log n) honi chahiye. Redis ka `lua-time-limit` / `busy-reply-threshold` (default 5 seconds) ke baad bhi script kill nahi hoti automatically -- Redis sirf BUSY errors dena shuru karta hai aur `SCRIPT KILL` (agar script ne write nahi kiya) chahiye.\n\nIs project ke scripts: fixed_window -- GET + INCRBY + maybe PEXPIRE: O(1). sliding_counter -- 2 GET + INCRBY + PEXPIRE: O(1). token_bucket / leaky_bucket -- HMGET + HSET + PEXPIRE: O(1).\n\nSabse heavy: sliding_log. `ZREMRANGEBYSCORE` O(log N + M) jahan M = removed entries, `ZCARD` O(1), ZADD O(log N) aur woh bhi `cost` baar loop mein. N max `limit` tak hai. Login pe limit 5 hai, toh negligible. Lekin agar koi admin sliding log ko 100000/hour pe laga de, toh ek identity ka ZSET 100k members tak, aur ek call jo bahut saare purane entries ek saath hataye woh noticeable time le sakti hai. Isliye TRADEOFFS #2 mein likha hai \"sliding log cleanup is the heaviest one\" aur SYSTEM_DESIGN mein \"use it only for small limits\".\n\nEk improvement jo main add karunga: policy validation mein sliding_log ke liye max limit cap (jaise 1000), aur `cost` ka upper bound.",
+  "why_needed": "Ek slow script poore shared Redis ko -- har tenant ke liye -- stall kar deti hai.",
+  "real_world_analogy": "Single-lane bridge: ek truck dheere chale toh peeche saari gaadiyan rukti hain.",
+  "how_it_works": "Redis single-threaded command execution; EVAL is one command; long script = head-of-line blocking for all clients.",
+  "in_this_project": "`lua/sliding_log.lua` ZREMRANGEBYSCORE + loop ZADD; TRADEOFFS #2; SYSTEM_DESIGN memory note.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_log.lua",
+   "projects/01-rate-limiter/TRADEOFFS.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- real: sliding_log.lua (the O(log N + M) part)\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now - window)\n...\nfor i = 1, cost do\n  redis.call('ZADD', KEYS[1], now, ARGV[5] .. ':' .. i)\nend",
+  "code_language": "lua",
+  "advantages": [
+   "Most scripts O(1)",
+   "Atomicity without locks"
+  ],
+  "disadvantages": [
+   "Unbounded limit or cost makes sliding_log heavy",
+   "No hard script timeout kill for write scripts"
+  ],
+  "common_mistakes": [
+   "Scripts mein KEYS/SCAN jaise O(N) commands",
+   "Policy validation mein limit/cost caps na rakhna"
+  ],
+  "follow_up_questions": [
+   "How do you find slow scripts in production?",
+   "What does SCRIPT KILL do after a write?",
+   "How would you cap sliding log size?"
+  ],
+  "concepts": [
+   "lua performance",
+   "head-of-line blocking",
+   "complexity"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Exactness (sliding log) ka price O(limit) memory aur O(log N + M) time; approximate O(1). Small-limit use cases ke liye hi exact.",
+   "failure_scenarios": "Ek badi sliding log identity Redis ko ms tak block kare toh saare policies ki latency badhti hai -> timeouts -> mass degraded decisions.",
+   "alternatives": "Sliding counter for big limits; ZADD with multiple members in one call (variadic) instead of loop; cap cost.",
+   "scale_10x_100x": "100x pe ek shard pe hot sliding log identity us shard ke saare tenants ko slow karegi; Cluster blast radius limit karta hai, eliminate nahi.",
+   "production_improvements": "`SLOWLOG GET`, `LATENCY DOCTOR` monitoring; Pydantic validator: sliding_log limit <= N; cost upper bound."
+  }
+ },
+ {
+  "id": "RATE-052",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would you scale this rate limiter to 100x the traffic?",
+  "answer_hinglish": "Pehle bottlenecks identify karo: (1) app instances CPU, (2) Redis single node ops/s aur memory, (3) per-request round-trips, (4) hot keys. SYSTEM_DESIGN.md mein scaling path hai, maine usi pe answer build kiya.\n\nApp tier stateless hai -- bas replicas badhao (aur har container mein multiple uvicorn workers). Yeh easy part hai.\n\n10x: Redis primary + replica + Sentinel (HA). `ip_global` ko edge pe move karo (nginx `limit_req` ya CDN) -- har request se ek Lua call kam, aur flood traffic app tak pahunchta hi nahi.\n\n100x: Redis Cluster sharded by identity. Keys already `{identity}` hash tag use karti hain, toh ek identity ki saari keys ek slot pe -- sliding counter ka two-key script valid rahega. (Caveat: window-suffix keys script ke andar banti hain, KEYS mein declare nahi -- cluster migration se pehle fix.) Local pre-check: har instance pe process-local token bucket jo obvious abuse (jaise ek IP se 10k req/s) ko Redis tak pahunchne se pehle rok de. Hot keys ke liye approximate/batched counting -- jaise local counting aur har 100ms Redis mein batch INCRBY.\n\nRound-trips: multiple policies ko pipeline ya combined script mein laao.\n\nObservability: per-shard Redis CPU/latency, `rate_limit_check_seconds` p99, degraded decisions.\n\nHonest: is repo mein Cluster, Sentinel, edge limiting, local pre-check -- koi implement nahi hai. Design unke liye ready hai (stateless app, hash tags, Protocol-based backend jisme hybrid limiter plug ho sakta hai).",
+  "why_needed": "Scaling question har system design interview ka core hai.",
+  "real_world_analogy": "Ek toll booth se highway pe 10 booths, phir alag alag highways (shards), aur entry pe hi bade trucks ko alag lane (edge filtering).",
+  "how_it_works": "Scale app horizontally; scale Redis by sharding on identity; cut per-request Redis work via edge + local pre-check + batching.",
+  "in_this_project": "SYSTEM_DESIGN.md scaling table; `redis_limiter.py::build_key` hash tag; `limiter/base.py::RateLimiter` Protocol for a future hybrid backend.",
+  "implementation_files": [
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md",
+   "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py::build_key",
+   "projects/01-rate-limiter/ratelimiter/limiter/base.py::RateLimiter",
+   "projects/01-rate-limiter/DEPLOYMENT.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear incremental path",
+   "Data model already cluster-friendly"
+  ],
+  "disadvantages": [
+   "Each step adds ops complexity",
+   "Approximations reduce exactness"
+  ],
+  "common_mistakes": [
+   "Sirf 'add more servers' bolna bina Redis bottleneck ke",
+   "Hot keys ignore karna"
+  ],
+  "follow_up_questions": [
+   "How do you handle one tenant that generates 30% of traffic?",
+   "How would you migrate from single Redis to Cluster without downtime?",
+   "What accuracy do you lose with batching?"
+  ],
+  "concepts": [
+   "scalability",
+   "sharding",
+   "redis cluster",
+   "edge"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Exactness vs throughput: central exact counting har request pe Redis maangta hai; local/batched counting throughput deta hai lekin bounded error.",
+   "failure_scenarios": "Ek shard down: sirf us shard ki identities degraded; resharding ke dauraan MOVED/ASK redirects latency badhate hain.",
+   "alternatives": "Managed gateways (Envoy global RLS), CDN rate limiting, or per-region quotas.",
+   "scale_10x_100x": "10x: HA + edge. 100x: Cluster + local pre-check + batching + fewer round-trips. 1000x: per-region quotas, approximate sketches.",
+   "production_improvements": "Load test at each step, shard-level dashboards, automated failover drills, policy-level cost caps."
+  }
+ },
+ {
+  "id": "RATE-053",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "What is a hot key problem in a rate limiter, and how would you handle it?",
+  "answer_hinglish": "Hot key: ek single key pe disproportionate traffic. Rate limiter mein yeh tab hota hai jab ek identity bahut zyada requests bhejti hai -- jaise ek bada enterprise tenant, ek NAT IP jiske peeche hazaaron users hain, ya ek attacker IP. Har request us ek key pe Lua script chalati hai.\n\nSingle Redis pe yeh mostly theek hai -- ek key pe O(1) script bahut fast hai. k6 hot-key mode (ek IP, mostly 429) mein 722 req/s aur 0 errors aaye, aur woh allowed path se fast tha kyunki first denial pe stop hota hai.\n\nProblem Redis Cluster mein aati hai: ek key = ek slot = ek shard. Ek identity ka saara traffic ek shard pe jata hai, chahe cluster mein 50 shards hon. Woh shard CPU pe saturate ho sakta hai aur us shard ki doosri identities bhi slow ho jaati hain.\n\nSolutions: (1) Local pre-check -- har app instance pe local token bucket jo already-denied identity ko Redis tak bhejna hi band kare (jaise \"is IP ko pichhle 1s mein Redis ne deny kiya, retry_after tak locally deny karo\"). Denials cache karna safe hai kyunki retry_after known hai. (2) Key splitting -- hot identity ka limit N sub-keys mein baanto (`{tenant}:0..N-1`), har request random sub-key pe, har sub-key limit/N. Approximate hai. (3) Batching -- local count karo aur periodically INCRBY. (4) Edge pe coarse limit.\n\nIs repo mein inme se kuch implement nahi hai; local deny-cache sabse simple aur sabse effective pehla step hoga.",
+  "why_needed": "Sharded systems mein average load nahi, sabse hot key capacity decide karti hai.",
+  "real_world_analogy": "Mall ki ek hi dukaan pe sale -- poore mall mein bheed nahi, lekin us ek dukaan ka cashier collapse.",
+  "how_it_works": "Key -> slot -> shard mapping fixed hai; ek key ka load split nahi hota jab tak key khud split na ho.",
+  "in_this_project": "k6 hot mode (`MODE=hot`, IP 203.0.113.7) results in TESTING.md; `evaluate` first-denial stop; SYSTEM_DESIGN 100x row mentions hot keys.",
+  "implementation_files": [
+   "projects/01-rate-limiter/loadtest/k6_benchmark.js",
+   "projects/01-rate-limiter/TESTING.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md",
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::evaluate"
+  ],
+  "code_example": "# illustrative (NOT in repo): local deny cache in front of Redis\ndeny_until: dict[str, float] = {}\n\nasync def check(key, policy, limit, **kw):\n    if deny_until.get(key, 0) > time.monotonic():\n        return cached_denial(key)                 # no Redis call\n    d = await redis_limiter.check(key, policy, limit, **kw)\n    if not d.allowed:\n        deny_until[key] = time.monotonic() + d.retry_after_ms / 1000\n    return d",
+  "code_language": "python",
+  "advantages": [
+   "Local deny cache is exact-safe for denials",
+   "Key splitting spreads load"
+  ],
+  "disadvantages": [
+   "Splitting introduces approximation",
+   "Local caches per instance add memory"
+  ],
+  "common_mistakes": [
+   "Allowed decisions ko locally cache karna (overshoot)",
+   "Hash tag mein low-cardinality value"
+  ],
+  "follow_up_questions": [
+   "Is caching denials always safe?",
+   "How would you pick N for key splitting?",
+   "How do you detect hot keys in Redis?"
+  ],
+  "concepts": [
+   "hot key",
+   "sharding",
+   "local cache"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Local deny cache: safe and cheap, but denial lifts only at retry_after per instance. Key splitting: spreads load, loses exactness.",
+   "failure_scenarios": "Hot shard saturation affects unrelated tenants on that shard -> noisy neighbour; timeouts -> degraded decisions for innocent users.",
+   "alternatives": "`redis-cli --hotkeys` (with LFU policy) to detect; client-side caching (Redis 6 tracking); dedicated shard for top tenants.",
+   "scale_10x_100x": "100x pe top tenants ke liye dedicated handling (sub-keys ya alag cluster) aur local deny cache standard.",
+   "production_improvements": "Hot key detection dashboards, per-tenant traffic metrics, automatic sub-key splitting above a threshold."
+  }
+ },
+ {
+  "id": "RATE-054",
+  "project_slug": "p01-rate-limiter",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "Why are policies and API key lookups cached in-process, and what does each cache cost?",
+  "answer_hinglish": "Do caches hain, dono hot path se Redis calls hatane ke liye.\n\nPolicy cache (`PolicyStore`): har request ko apne route group ki policies chahiye. Bina cache ke har request pe `HGETALL rl:config:policies` -- extra round-trip. Policies rarely badalti hain, toh har instance 5 seconds (`RL_POLICY_CACHE_TTL_SECONDS`) tak cached copy use karta hai. Cost: change propagate hone mein up to 5s. Bonus: Redis down ho toh last known policies chalti rehti hain.\n\nAPI key cache (`ApiKeyStore`): har authenticated request pe key lookup chahiye. Cache 30s (`RL_API_KEY_CACHE_TTL_SECONDS`), key = SHA-256 digest, value = `(expiry_monotonic, record or None)`. Fayda: ek round-trip kam, aur Redis blip ke dauraan already-seen keys kaam karti rehti hain. Cost: revoked key har instance pe up to 30s chalti hai (`revoke` sirf local instance ka cache turant saaf karta hai). Negative caching bhi hai: unknown keys ka `None` cache hota hai taaki bogus key flood Redis ko hammer na kare.\n\nMemory bound: `_MAX_ENTRIES = 50_000`; full hone pe poora cache `clear()` -- crude, code comment khud kehta hai \"an LRU would be the production choice\". Clear ke baad ek burst of Redis misses aata hai.\n\n`time.monotonic()` use hota hai, wall clock nahi -- system clock change se cache expiry galat nahi hoti.\n\nNet effect: steady state mein `/api/resource` request pe sirf 2 Redis calls (policies), auth aur config ke liye zero.",
+  "why_needed": "Hot path pe har avoidable network call latency aur Redis load badhata hai.",
+  "real_world_analogy": "Receptionist frequently aane wale visitors ke naam yaad rakhti hai, har baar register nahi kholti -- lekin kisi ka pass cancel hua toh use kuch der baad pata chalega.",
+  "how_it_works": "Dict cache with monotonic expiry; check-cache -> miss -> Redis -> store (including negative results).",
+  "in_this_project": "`services/policy_store.py::_refresh`, `services/api_keys.py::ApiKeyStore.lookup`, `_MAX_ENTRIES`; config defaults in `config.py`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::ApiKeyStore",
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py::PolicyStore",
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings"
+  ],
+  "code_example": "# real: api_keys.py\ncached = self._cache.get(digest)\nif cached and cached[0] > time.monotonic():\n    return cached[1]\n...\nif len(self._cache) >= self._MAX_ENTRIES:\n    self._cache.clear()  # crude bound; an LRU would be the production choice\nself._cache[digest] = (time.monotonic() + self._ttl, record)",
+  "code_language": "python",
+  "advantages": [
+   "Fewer Redis calls",
+   "Resilience to short Redis outages",
+   "Negative cache blocks bogus-key floods"
+  ],
+  "disadvantages": [
+   "Staleness (5s config, 30s revocation)",
+   "Crude eviction causes miss bursts"
+  ],
+  "common_mistakes": [
+   "time.time() se expiry (clock jumps)",
+   "Unbounded cache (memory leak via random keys)"
+  ],
+  "follow_up_questions": [
+   "How would you make revocation instant?",
+   "Why not functools.lru_cache?",
+   "What happens right after the cache is cleared?"
+  ],
+  "concepts": [
+   "caching",
+   "negative cache",
+   "staleness"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-055",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "Why does the app trust X-Real-IP only when RL_TRUST_FORWARDED_FOR is enabled?",
+  "answer_hinglish": "Per-IP limits tabhi kaam karti hain jab IP sahi ho. App ke paas do sources hain: TCP connection ka peer address (`request.client.host`) aur headers jaise `X-Real-IP` / `X-Forwarded-For`. Headers client control karta hai -- koi bhi `X-Real-IP: 9.9.9.1` bhej sakta hai. Agar app blindly header trust kare, toh attacker har request mein naya fake IP daal ke `ip_global` aur `login_bruteforce` dono bypass kar dega -- unlimited password guessing.\n\nLekin load balancer ke peeche `request.client.host` hamesha nginx ka IP hota hai -- saare users ek IP lagenge. Isliye trusted proxy chahiye.\n\n`client_ip` function: agar `settings.trust_forwarded_for` true hai toh `x-real-ip` header use karo, warna socket peer. Nginx config `proxy_set_header X-Real-IP $remote_addr;` -- yeh client ke bheje header ko OVERWRITE karta hai with actual TCP peer. Toh nginx ke peeche header trustworthy hai. Compose mein trust sirf un instances pe enabled hai jo sirf nginx ke through reachable hain (DEPLOYMENT.md: \"never expose app ports directly\").\n\nTest `test_untrusted_forwarded_header_is_ignored`: trust false, 21 requests har ek alag fake `X-Real-IP` ke saath -- 21st 429, matlab spoofing ka koi asar nahi.\n\nCaveat: k6 benchmark instances ko directly X-Real-IP ke saath hit karta hai (fake 50k IPs) -- yeh test mode hai aur sirf compose network ke andar possible hai.",
+  "why_needed": "IP spoofing via headers per-IP limiting ko poori tarah bekaar kar deta hai.",
+  "real_world_analogy": "Visitor khud apna naam card pe likh ke de toh trust nahi; reception ka guard ID dekh ke likhe toh trust.",
+  "how_it_works": "Trust boundary: only the proxy's header is trusted, and only when the app is unreachable except via that proxy; proxy overwrites the header.",
+  "in_this_project": "`api/deps.py::client_ip`; `deploy/nginx.conf` proxy_set_header; `config.py` `trust_forwarded_for: bool = False`; SECURITY.md threat table.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/api/deps.py::client_ip",
+   "projects/01-rate-limiter/deploy/nginx.conf",
+   "projects/01-rate-limiter/tests/test_api.py::test_untrusted_forwarded_header_is_ignored",
+   "projects/01-rate-limiter/SECURITY.md"
+  ],
+  "code_example": "# real: api/deps.py\ndef client_ip(request: Request) -> str:\n    settings = request.app.state.settings\n    if settings.trust_forwarded_for:\n        real = request.headers.get(\"x-real-ip\")\n        if real:\n            return real.strip()\n    return request.client.host if request.client else \"unknown\"",
+  "code_language": "python",
+  "advantages": [
+   "Spoof-proof by default",
+   "Works behind a trusted proxy"
+  ],
+  "disadvantages": [
+   "Misconfig (trust on but directly exposed) reopens the hole",
+   "Multi-hop proxies need X-Forwarded-For parsing"
+  ],
+  "common_mistakes": [
+   "X-Forwarded-For ka first value trust karna",
+   "Proxy header append kare overwrite ki jagah"
+  ],
+  "follow_up_questions": [
+   "How would you handle a CDN plus nginx (two hops)?",
+   "Why is X-Forwarded-For's leftmost value untrustworthy?",
+   "What does Uvicorn's --forwarded-allow-ips do?"
+  ],
+  "concepts": [
+   "ip spoofing",
+   "trusted proxy",
+   "X-Real-IP"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-056",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "Why are API keys stored as SHA-256 hashes, and why not bcrypt?",
+  "answer_hinglish": "API keys Redis mein plaintext store nahi hoti. `hash_key(raw)` = `sha256(raw).hexdigest()`, aur Redis key `rl:apikey:<digest>` hai. Agar Redis ka dump leak ho jaye (backup, misconfigured exposure), attacker ko sirf hashes milenge -- woh unse API call nahi kar sakta kyunki server raw key maangta hai aur hash ulta compute nahi hota.\n\nRaw key sirf ek baar dikhti hai -- `POST /admin/api-keys` ke response mein -- \"Store this key now; only its hash is kept server-side\". Server kabhi raw key wapas nahi de sakta; khoyi toh nayi banao.\n\nbcrypt/argon2 kyun nahi? Woh passwords ke liye hain, jo human-chosen aur low-entropy hote hain -- unhe jaan-boojh ke slow hash chahiye taaki brute force mehenga ho. Hamari keys `\"rlk_\" + secrets.token_urlsafe(24)` hain -- 24 random bytes = 192 bits entropy. Itne bade space ko brute force karna fast hash ke saath bhi infeasible hai. Aur API key har request pe verify hoti hai -- bcrypt ka ~100ms har request pe unacceptable latency aur CPU hai. Plus deterministic hash chahiye taaki direct `GET` lookup ho sake (bcrypt salted hai, toh lookup by hash possible nahi).\n\n`key_id` = digest ke pehle 16 hex chars -- yeh logs aur rate limit keys (`api_key:<key_id>`) mein use hota hai, raw key kabhi nahi.",
+  "why_needed": "Credential storage ka basic security hygiene; interviewers \"why not bcrypt\" zaroor poochte hain.",
+  "real_world_analogy": "Bank aapka PIN nahi, sirf uska fingerprint rakhta hai -- fingerprint chori ho bhi jaye toh usse ATM nahi chalta.",
+  "how_it_works": "Store H(key); on request compute H(presented) and look up. High-entropy secrets make fast hashes safe.",
+  "in_this_project": "`services/api_keys.py` module docstring explains SHA-256 vs bcrypt; `create` uses `secrets.token_urlsafe(24)`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::hash_key",
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::create",
+   "projects/01-rate-limiter/SECURITY.md"
+  ],
+  "code_example": "# real: services/api_keys.py\ndef hash_key(raw_key: str) -> str:\n    return hashlib.sha256(raw_key.encode()).hexdigest()\n...\nraw_key = raw_key or \"rlk_\" + secrets.token_urlsafe(24)",
+  "code_language": "python",
+  "advantages": [
+   "Leak-resistant storage",
+   "O(1) lookup",
+   "Fast verification"
+  ],
+  "disadvantages": [
+   "Lost keys cannot be recovered",
+   "No per-key salt (fine for high entropy)"
+  ],
+  "common_mistakes": [
+   "API keys ke liye bcrypt (slow, no lookup)",
+   "Human-chosen secrets ke liye plain SHA-256"
+  ],
+  "follow_up_questions": [
+   "Would you add an HMAC with a server-side pepper?",
+   "How do you rotate keys?",
+   "Why the rlk_ prefix?"
+  ],
+  "concepts": [
+   "hashing",
+   "api keys",
+   "credential storage"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-057",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "What is a negative cache and why does ApiKeyStore cache unknown keys?",
+  "answer_hinglish": "Negative cache ka matlab: \"yeh cheez exist nahi karti\" -- is result ko bhi cache karna. `ApiKeyStore.lookup` mein jab Redis se key nahi milti, toh bhi `self._cache[digest] = (expiry, None)` store hota hai. Agli baar same bogus key aaye toh Redis call nahi, seedha `None` -> 401.\n\nKyun? Attack scenario: attacker random API keys ka flood bhejta hai (key guessing ya sirf load). Bina negative cache ke har request Redis GET karti -- rate limiter ka auth layer hi Redis ko hammer karne ka zariya ban jata. Same key repeat ho toh negative cache Redis ko bachata hai.\n\nLimitation honest: agar attacker har request mein naya random key bheje, toh har ek pehli baar miss hai -- negative cache help nahi karta, aur cache bharta jata hai. Isliye `_MAX_ENTRIES = 50_000` bound hai (full hone pe clear). Is case ke liye real defence hai invalid-key requests pe bhi per-IP limit -- abhi `resolve_identity` 401 rate limit dependency se pehle deta hai, toh invalid keys ko `ip_global` count nahi karta. Yeh ek gap hai jo main fix karunga: 401 se pehle ya saath mein per-IP \"auth failures\" policy.\n\nDoosri cost: key create ki aur creation se pehle kisi ne usi key se request ki (practically impossible with random keys) toh 30s tak 401. Real risk nahi.",
+  "why_needed": "Auth path DoS vector na bane; repeated invalid lookups cheap hone chahiye.",
+  "real_world_analogy": "Guard ko yaad hai \"yeh aadmi pichhle 5 minute mein fake pass ke saath aaya tha\" -- dobara register check nahi karta.",
+  "how_it_works": "Cache stores (expiry, None) for misses; lookups return None from cache within TTL.",
+  "in_this_project": "`services/api_keys.py::ApiKeyStore` docstring: \"Unknown keys are cached too (negative cache)\"; SECURITY.md threat row.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::ApiKeyStore",
+   "projects/01-rate-limiter/ratelimiter/api/deps.py::resolve_identity",
+   "projects/01-rate-limiter/SECURITY.md"
+  ],
+  "code_example": "# real: api_keys.py\nrecord = None\nif data:\n    obj = json.loads(data)\n    record = ApiKeyRecord(key_id=obj[\"key_id\"], user_id=obj[\"user_id\"], plan=Plan(obj[\"plan\"]))\nself._cache[digest] = (time.monotonic() + self._ttl, record)   # record may be None",
+  "code_language": "python",
+  "advantages": [
+   "Repeated bogus keys cost no Redis calls",
+   "Simple"
+  ],
+  "disadvantages": [
+   "Unique random bogus keys bypass it and fill the cache",
+   "Invalid-key requests are not IP-limited before 401"
+  ],
+  "common_mistakes": [
+   "Sirf positive results cache karna",
+   "Unbounded negative cache"
+  ],
+  "follow_up_questions": [
+   "How would you rate limit failed auth attempts?",
+   "Should negative TTL be shorter than positive TTL?",
+   "What if a key is created right after a negative lookup?"
+  ],
+  "concepts": [
+   "negative cache",
+   "dos",
+   "authentication"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-058",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "Why does require_admin use hmac.compare_digest to check the admin token?",
+  "answer_hinglish": "Normal string comparison (`a == b`) pehle mismatching character pe ruk jata hai. Matlab agar token ka pehla character galat hai toh comparison jaldi fail, agar pehle 10 sahi hain toh thoda der se. Yeh timing difference bahut chhota hai (nanoseconds), lekin bahut saari requests ke statistics se attacker character-by-character token guess kar sakta hai -- isse timing attack kehte hain.\n\n`hmac.compare_digest(a, b)` constant-time comparison hai -- poore string compare karta hai chahe mismatch kahin bhi ho, toh response time token ke baare mein kuch leak nahi karta.\n\n`require_admin` dependency: `X-Admin-Token` header missing ya mismatch -> `Forbidden` (403). Admin router pe `dependencies=[Depends(require_admin)]` router level pe laga hai, toh saare `/admin/*` endpoints protected hain. Test `test_admin_requires_token`: no token 403, wrong token 403, sahi 200.\n\nNetwork pe yeh attack practical hai ya nahi debatable hai (jitter bahut), lekin fix free hai, toh hamesha karna chahiye.\n\nHonest limitations (SECURITY.md): yeh shared token hai, per-operator identity nahi, audit log nahi. Default `change-me-admin-token` sirf local ke liye; production mein `RL_ADMIN_TOKEN` env se set karna mandatory. Aur `/admin/*` ko public internet se door rakhna (internal network/VPN) -- token ke alawa.",
+  "why_needed": "Secret comparison mein timing leak ek classic security interview point hai.",
+  "real_world_analogy": "Taala jo galat chaabi pe turant atak jaye vs jo poori chaabi ghuma ke hi bataye -- doosre se andaza nahi lagta ki kitne daant sahi the.",
+  "how_it_works": "Constant-time compare: XOR all bytes and accumulate; time independent of mismatch position.",
+  "in_this_project": "`api/deps.py::require_admin`; `api/routes.py` admin router dependencies; SECURITY.md.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/api/deps.py::require_admin",
+   "projects/01-rate-limiter/ratelimiter/api/routes.py",
+   "projects/01-rate-limiter/tests/test_api.py::test_admin_requires_token"
+  ],
+  "code_example": "# real: api/deps.py\nasync def require_admin(request: Request, x_admin_token: str | None = Header(default=None)) -> None:\n    expected = request.app.state.settings.admin_token\n    if not x_admin_token or not hmac.compare_digest(x_admin_token, expected):\n        raise Forbidden(\"Admin token required\")",
+  "code_language": "python",
+  "advantages": [
+   "No timing leak",
+   "Router-level protection"
+  ],
+  "disadvantages": [
+   "Shared token, no per-operator audit",
+   "Default token if env not set"
+  ],
+  "common_mistakes": [
+   "`==` for secrets",
+   "Admin endpoints public internet pe expose karna"
+  ],
+  "follow_up_questions": [
+   "How would you replace this with proper RBAC?",
+   "Should a missing token be 401 or 403?",
+   "How do you rotate the admin token?"
+  ],
+  "concepts": [
+   "timing attack",
+   "constant-time comparison",
+   "admin auth"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-059",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "How can attackers evade per-IP rate limits, and what does this design do about it?",
+  "answer_hinglish": "Evasion techniques: (1) Header spoofing -- fake X-Forwarded-For/X-Real-IP. (2) IP rotation -- botnets, residential proxies, cloud IPs. (3) IPv6 -- ek user ke paas poora /64 prefix hota hai, yaani 2^64 addresses; per-address limit bekaar. (4) API key farming -- naye free accounts aur keys banana. (5) Distributed low-and-slow -- har IP limit ke neeche, lekin total bahut zyada.\n\nProject kya karta hai: Header spoofing -- `client_ip` sirf trusted proxy ke peeche header maanta hai (`test_untrusted_forwarded_header_is_ignored`). IP rotation -- per-user aur per-API-key scopes IP se independent hain (SECURITY.md: \"Rotating IPs to evade limits -> per-user and per-API-key scopes\"); `user_plan` user ki saari keys ka total count karta hai, toh naye keys se user quota nahi badhta. Anonymous user-scoped policy `anon-ip` pe fall back karta hai -- \"no key never means no limit\".\n\nKya nahi karta (honest): IPv6 /64 normalization nahi hai -- SECURITY.md documented gap. Account farming (naye users) ke liye signup-level controls chahiye -- is service ka scope nahi. Distributed low-and-slow ke liye global anomaly detection, bot management (CDN/WAF), CAPTCHA, ya login pe per-username limits chahiye -- `login_bruteforce` abhi sirf per IP hai, per target account nahi. Credential stuffing (bahut IPs, bahut accounts) ke liye per-account limit important hai.\n\nRate limiting ek layer hai, complete bot defence nahi.",
+  "why_needed": "Senior interviews mein threat modelling expected hai, sirf happy-path limits nahi.",
+  "real_world_analogy": "Ek dukaan \"per customer 2 items\" rule rakhti hai; log kapde badal ke aate hain (IP rotation) -- isliye membership card (user/API key) se count karna padta hai.",
+  "how_it_works": "Defence in depth across identity dimensions: IP, user, key, (missing: account-target, /64, behavioural).",
+  "in_this_project": "SECURITY.md threats + \"Not covered\" section; `domain/models.py::Scope`; `rate_limit_service.py::_identity_key`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/SECURITY.md",
+   "projects/01-rate-limiter/ratelimiter/domain/models.py::Scope",
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::_identity_key",
+   "projects/01-rate-limiter/ratelimiter/api/deps.py::client_ip"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Multiple identity dimensions",
+   "Spoofing closed by default"
+  ],
+  "disadvantages": [
+   "No IPv6 prefix grouping",
+   "No per-target-account login limit",
+   "No behavioural detection"
+  ],
+  "common_mistakes": [
+   "Sirf per-IP pe rely karna",
+   "Anonymous traffic ko user policies se exempt karna"
+  ],
+  "follow_up_questions": [
+   "How would you add a per-username login limit without enabling account lockout DoS?",
+   "How do you limit IPv6 fairly?",
+   "Where does a WAF fit?"
+  ],
+  "concepts": [
+   "threat modelling",
+   "evasion",
+   "ipv6",
+   "credential stuffing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Stricter identity grouping (/64, per-account) catches more abuse but increases false positives (shared NATs, account lockout DoS).",
+   "failure_scenarios": "Per-account login limit attacker victim ko lock out karne ke liye use kar sakta hai (lockout DoS) -- isliye per-account limits soft (CAPTCHA/delay) honi chahiye, hard block nahi.",
+   "alternatives": "CDN bot management, device fingerprinting, CAPTCHA challenges, risk scoring.",
+   "scale_10x_100x": "Bade scale pe botnets hazaaron IPs use karte hain; per-IP limits kam effective, behavioural/global signals zyada important.",
+   "production_improvements": "IPv6 /64 grouping in client_ip, per-username login policy with progressive delays, failed-auth policy on 401s."
+  }
+ },
+ {
+  "id": "RATE-060",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Why does login fail closed and API key authentication fail closed, while other policies fail open?",
+  "answer_hinglish": "Fail mode ka sawaal: Redis down hai, limiter decide nahi kar sakta -- request allow karein ya reject? Answer use case pe depend karta hai, isliye `fail_mode` per policy hai.\n\nNormal APIs (`ip_global`, `user_plan`, `search_burst`, `reports_smooth`) fail OPEN: Redis outage ki wajah se poora product down karna galat hai. Kuch der bina limit ke chalna better hai. Response pe `X-RateLimit-Status: degraded` header aur metric `degraded_allow`.\n\n`login_bruteforce` fail CLOSED: agar Redis down hote hi login unlimited ho jaye, toh attacker ke liye Redis ko overload/DoS karna hi brute force ka raasta ban jata hai. Password guessing ka cost (account takeover) outage ke cost se zyada hai. Response 503 + `Retry-After: 1`, metric `degraded_deny`.\n\nAPI key auth hamesha fail CLOSED (policy setting nahi, code mein): `ApiKeyStore.lookup` Redis error pe `ServiceUnavailable` (503) raise karta hai. Kyun? Hum valid aur forged key mein fark nahi kar sakte. Allow karna = har forged key authenticated. 401 dena bhi galat -- client sochega key invalid hai aur shayad delete kar de. 500 bhi galat (unhandled). 503 sahi semantic hai: \"temporary, retry\". Yeh doosre load-test bug ke fix ka part tha -- pehle yeh 500 ban raha tha. Test `test_api_key_auth_fails_closed_with_503_not_500`.\n\nCached keys (30s) Redis outage mein bhi kaam karti hain -- graceful degradation.",
+  "why_needed": "Failure policy security vs availability ka explicit business decision hai.",
+  "real_world_analogy": "Mall ka CCTV band ho gaya: normal dukaanein khuli rahengi (fail open), lekin jewellery vault band (fail closed).",
+  "how_it_works": "BackendUnavailable -> check_one -> allowed = fail_mode is OPEN; auth path raises 503 directly.",
+  "in_this_project": "`policies.json` `login_bruteforce` `fail_mode: closed`; `rate_limit_service.py::check_one`; `api_keys.py::lookup`; tests in `test_failure_modes.py`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::check_one",
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::lookup",
+   "projects/01-rate-limiter/tests/test_failure_modes.py::test_api_key_auth_fails_closed_with_503_not_500",
+   "projects/01-rate-limiter/ratelimiter/policies.json"
+  ],
+  "code_example": "# real: api_keys.py\nexcept RedisError as exc:\n    # Authentication FAILS CLOSED: we can't tell a valid key from a forged one,\n    # so we must not let the request through as if it were authenticated.\n    raise ServiceUnavailable(\"Authentication backend unavailable\",\n                             headers={\"Retry-After\": \"1\"}) from exc",
+  "code_language": "python",
+  "advantages": [
+   "Per-policy risk-based choice",
+   "Auth never silently bypassed",
+   "Correct status codes"
+  ],
+  "disadvantages": [
+   "Fail-open means no protection during outages",
+   "Fail-closed login = login outage when Redis is down"
+  ],
+  "common_mistakes": [
+   "Ek global fail mode sab pe",
+   "Auth backend error ko 401 ya 500 banana"
+  ],
+  "follow_up_questions": [
+   "How would you keep login available with Redis down but still safe?",
+   "Who should decide fail mode -- engineering or product?",
+   "What alerts protect fail-open policies?"
+  ],
+  "concepts": [
+   "fail-open",
+   "fail-closed",
+   "security",
+   "availability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Security vs availability per endpoint. Fail-closed login trades availability of login for safety.",
+   "failure_scenarios": "Redis outage = login outage (503) for uncached users; attacker can't exploit but legit users can't log in.",
+   "alternatives": "Local in-memory fallback limiter for login during outage (per-instance, approximate but non-zero protection) instead of hard 503.",
+   "scale_10x_100x": "Bade scale pe Redis HA se outage rare; fallback limiter per instance 'limit x instances' overshoot deta hai -- login ke liye phir bhi bahut better than unlimited.",
+   "production_improvements": "Degraded mode with local fallback limiter, alert on `rate_limit_backend_errors_total`, runbook for Redis outage."
+  }
+ },
+ {
+  "id": "RATE-061",
+  "project_slug": "p01-rate-limiter",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How does policy validation stop a bad configuration from silently disabling limits?",
+  "answer_hinglish": "Policies runtime pe admin API se badal sakti hain, toh galat config ek security incident ban sakta hai (jaise limit 0 ya algorithm ke liye zaroori param missing, jisse script crash ho aur fail-open ho jaye). Isliye kai layers:\n\n1) Pydantic `PlanLimit`: `limit: int = Field(gt=0)`, `window_seconds` aur `rate_per_second` `gt=0`. Negative ya zero reject (`test_limit_must_be_positive`).\n\n2) `Policy._check_params` model validator: windowed algorithms (fixed_window, sliding_log, sliding_counter) ko har plan mein `window_seconds` chahiye; bucket algorithms ko `rate_per_second`. Default aur saare plans check hote hain. Tests `test_window_algorithm_requires_window`, `test_bucket_algorithm_requires_rate`; HTTP level `test_invalid_policy_rejected` -> 422.\n\n3) Name regex `^[a-z0-9_\\-]{1,64}$` -- key injection ya ajeeb Redis keys nahi.\n\n4) `PUT /admin/policies/{name}`: body name URL name se match hona chahiye (warna 422), aur `upsert` sirf existing default policies ko tune karne deta hai (`KeyError` -> 404). Naya policy add karne ke liye route group change bhi chahiye, jo code review se jata hai.\n\n5) `PolicyStore._refresh`: agar Redis mein koi override invalid JSON/schema ho (kisi ne seedha redis-cli se likha), toh woh ignore hota hai aur error log -- default policy chalti rahti hai (FAILURE_SCENARIOS #7).\n\n6) Startup pe route groups validate: unknown policy reference -> `ValueError` (app start hi nahi hoga).\n\nMissing: limit ke upper bounds (jaise sliding_log cap) aur audit log.",
+  "why_needed": "Config-as-data runtime changes ko safe banana padta hai; validation pehli defence line hai.",
+  "real_world_analogy": "Bank form jisme amount field negative accept nahi karta aur signature field khaali ho toh form submit hi nahi hota.",
+  "how_it_works": "Pydantic field constraints + model_validator(mode='after') + store-level rules + read-time validation of overrides.",
+  "in_this_project": "`domain/models.py::Policy._check_params`, `PlanLimit`; `api/routes.py::update_policy`; `services/policy_store.py::upsert`, `_refresh`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/domain/models.py::Policy",
+   "projects/01-rate-limiter/ratelimiter/domain/models.py::PlanLimit",
+   "projects/01-rate-limiter/ratelimiter/api/routes.py::update_policy",
+   "projects/01-rate-limiter/tests/test_policy_validation.py",
+   "projects/01-rate-limiter/tests/test_api.py::test_invalid_policy_rejected"
+  ],
+  "code_example": "# real: domain/models.py\n@model_validator(mode=\"after\")\ndef _check_params(self) -> \"Policy\":\n    windowed = self.algorithm in {Algorithm.FIXED_WINDOW, Algorithm.SLIDING_LOG, Algorithm.SLIDING_COUNTER}\n    for label, lim in [(\"default\", self.default), *[(p.value, l) for p, l in self.plans.items()]]:\n        if windowed and lim.window_seconds is None:\n            raise ValueError(f\"{self.algorithm} needs window_seconds (plan {label})\")\n        if not windowed and lim.rate_per_second is None:\n            raise ValueError(f\"{self.algorithm} needs rate_per_second (plan {label})\")\n    return self",
+  "code_language": "python",
+  "advantages": [
+   "Invalid configs rejected at write and read time",
+   "Clear 422 errors"
+  ],
+  "disadvantages": [
+   "No upper bounds",
+   "No audit trail of who changed what"
+  ],
+  "common_mistakes": [
+   "Sirf write pe validate karna, Redis se read pe nahi",
+   "Admin ko arbitrary new policies banane dena bina route mapping"
+  ],
+  "follow_up_questions": [
+   "What upper bounds would you add?",
+   "How would you audit policy changes?",
+   "Why validate again on read?"
+  ],
+  "concepts": [
+   "validation",
+   "pydantic",
+   "configuration safety"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-062",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens when Redis goes down completely?",
+  "answer_hinglish": "Redis down (connection refused ya timeout) hone pe flow yeh hai:\n\n1) `RedisRateLimiter.check` mein redis-py `ConnectionError`/`TimeoutError`/`OSError` raise karta hai. Hum use `BackendUnavailable` mein wrap karte hain.\n\n2) `RateLimitService.check_one` `BackendUnavailable` pakadta hai: metric `rate_limit_backend_errors_total{policy}` badhata hai, warning log karta hai, aur policy ke `fail_mode` ke hisaab se `Decision(degraded=True)` banata hai -- open hai toh allowed (remaining = limit), closed hai toh denied (retry 1000ms). Decision metric `degraded_allow` ya `degraded_deny`.\n\n3) `raise_if_denied`: allowed + degraded -> 200 aur header `X-RateLimit-Status: degraded`. Denied + degraded -> 503 + `Retry-After: 1`.\n\nResult: `/api/resource` (fail-open policies) kaam karta rehta hai bina limits ke; `/api/login` (`login_bruteforce`, fail-closed) 503. Test `test_http_fail_open_and_fail_closed_routes` dead Redis (`redis://127.0.0.1:1`) ke saath exactly yahi assert karta hai, aur `/admin/stats` mein `backend_errors.login_bruteforce >= 1`.\n\nSaath mein: API key wali requests -- cached keys (30s) kaam karti hain, uncached keys 503 (auth fail closed). Policies last known cache se chalti hain.\n\nManual: `docker compose stop redis`, phir curl -- LEARNING_GUIDE step 8.\n\nOps: alert `rate(rate_limit_backend_errors_total[1m]) > 0` -> page, kyunki fail-open matlab protection band hai.",
+  "why_needed": "Dependency failure pe defined behaviour production readiness ka basic test hai.",
+  "real_world_analogy": "Society ka visitor register kho gaya: normal visitors ko andar jaane do (note karke), lekin bank locker room band.",
+  "how_it_works": "Exception translation at backend boundary -> per-policy fail mode -> HTTP mapping -> metrics/alerts.",
+  "in_this_project": "`rate_limit_service.py::check_one`, `raise_if_denied`; `tests/test_failure_modes.py`; FAILURE_SCENARIOS #1; alerts section.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::check_one",
+   "projects/01-rate-limiter/tests/test_failure_modes.py::test_http_fail_open_and_fail_closed_routes",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: rate_limit_service.py\nexcept BackendUnavailable as exc:\n    BACKEND_ERRORS.labels(policy.name).inc()\n    allowed = policy.fail_mode is FailMode.OPEN\n    DECISIONS.labels(policy.name, policy.algorithm.value,\n                     \"degraded_allow\" if allowed else \"degraded_deny\").inc()\n    return Decision(allowed=allowed, limit=limit.limit, remaining=limit.limit if allowed else 0,\n                    retry_after_ms=0 if allowed else 1000, reset_ms=0, policy=policy.name,\n                    algorithm=policy.algorithm, degraded=True)",
+  "code_language": "python",
+  "advantages": [
+   "Defined, tested behaviour",
+   "Visible to clients and ops"
+  ],
+  "disadvantages": [
+   "Fail-open = no protection during outage",
+   "Each request still pays the timeout"
+  ],
+  "common_mistakes": [
+   "Redis errors ko 500 banne dena",
+   "Degraded mode silently, bina metric/header"
+  ],
+  "follow_up_questions": [
+   "Each request still waits for the timeout -- how would you avoid that (circuit breaker)?",
+   "Why expose the degraded header to clients?",
+   "What alert would you set?"
+  ],
+  "concepts": [
+   "failure handling",
+   "fail-open",
+   "degraded mode"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-063",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens when Redis restarts?",
+  "answer_hinglish": "Do cheezein kho jaati hain: script cache aur (agar persistence off hai) saara data.\n\nScript cache: Redis restart ke baad loaded Lua scripts ka cache khali hota hai. Hamara pehla `EVALSHA` `NOSCRIPT` error paata hai. redis-py ka `Script` object yeh pakad ke script dobara load karke chala deta hai -- application ko pata bhi nahi chalta. Test `test_survives_script_cache_flush` `SCRIPT FLUSH` se yeh simulate karta hai -- flush ke baad bhi check allowed. FAILURE_SCENARIOS #3.\n\nCounters: saare counters aur buckets reset -- clients ko thodi der fresh quota milta hai (token buckets full, windows empty). Yeh accepted hai kyunki rate limit state soft state hai (FAILURE_SCENARIOS #4, design decision). Worst case ek window ka extra quota.\n\nPolicy overrides (`rl:config:policies`): bina persistence ke gayab -- instances defaults (policies.json) pe wapas. Local cache 5s tak purani overrides yaad rakhega, phir refresh pe defaults.\n\nAPI keys (`rl:apikey:*`): bina persistence ke gayab -- cache expire hone ke baad saare clients 401. Yeh sabse badi problem hai, aur isliye production mein ya toh AOF/RDB on karna, ya API keys ko durable DB mein rakhna chahiye (honest gap, DATABASE_DESIGN.md infra Redis bina persistence chalta hai).\n\nRestart ke dauraan (seconds): connection errors -> degraded mode, jaise Redis down.",
+  "why_needed": "Restart common event hai (deploys, patching); kya automatically recover hota hai aur kya nahi yeh jaanna zaroori hai.",
+  "real_world_analogy": "Shop ka computer restart hua: billing software khud reload ho gaya (script cache), lekin aaj ki tally reset (counters) -- aur agar customer list backup nahi thi toh woh bhi gayi (API keys).",
+  "how_it_works": "NOSCRIPT -> redis-py loads script -> retries. Data loss depends on persistence config.",
+  "in_this_project": "`tests/test_algorithms.py::test_survives_script_cache_flush`; FAILURE_SCENARIOS #3 and #4; `redis_limiter.py` register_script comment.",
+  "implementation_files": [
+   "projects/01-rate-limiter/tests/test_algorithms.py::test_survives_script_cache_flush",
+   "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py::register_script",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: tests/test_algorithms.py\nasync def test_survives_script_cache_flush(redis):\n    lim, p = RedisRateLimiter(redis), make_policy(Algorithm.TOKEN_BUCKET, 2, rate=1)\n    assert (await run(lim, p, T0)).allowed\n    await redis.script_flush()\n    assert (await run(lim, p, T0)).allowed",
+  "code_language": "python",
+  "advantages": [
+   "Script reload automatic",
+   "Counter loss is harmless"
+  ],
+  "disadvantages": [
+   "API keys and overrides lost without persistence"
+  ],
+  "common_mistakes": [
+   "SHA hardcode karke SCRIPT LOAD sirf startup pe karna",
+   "API keys ko soft state jaisa treat karna"
+  ],
+  "follow_up_questions": [
+   "Which data in this Redis actually needs persistence?",
+   "What does AOF everysec risk?",
+   "How would a restart look in metrics?"
+  ],
+  "concepts": [
+   "redis restart",
+   "NOSCRIPT",
+   "persistence"
+  ],
+  "advanced": null
+ }
+]

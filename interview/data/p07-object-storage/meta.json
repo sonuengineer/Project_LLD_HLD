@@ -1,0 +1,194 @@
+{
+ "project_slug": "p07-object-storage",
+ "project": "S3-like Object Storage System",
+ "source_dir": "projects/07-object-storage",
+ "summary": "An S3-like object store over HTTP (FastAPI): buckets and objects with streaming uploads/downloads in constant memory, integrity checks while streaming (MD5 ETag, SHA-256, Content-MD5, signed payload hash -> 400 BadDigest), single-range GETs (206/416) and If-None-Match (304), versioning with the 'null' version, suspended state, delete markers, undelete and permanent version delete with promotion, multipart uploads (retryable parts, ordering, 5 MiB minimum, 10,000 parts, S3 composite ETag, abort), presigned URLs bound to method/key/expiry and the signer's authority, simplified SigV4 request signing with a 15-minute replay window, owner/grant/public-read/admin access control, quotas that count every version, lifecycle rules (expiration, noncurrent expiration via a lag() window function, lone delete markers, stale multipart abort), garbage collection of queued deletions and orphan blobs with a grace period, and usage analytics. Metadata lives in Postgres (partial unique index = one latest version per key, per-key advisory locks, text_pattern_ops listing index); bytes live behind a pluggable StorageAdapter -- a local filesystem adapter (temp + fsync + atomic rename, sharded dirs) and an S3-compatible boto3 adapter with a bounded streaming queue, tested against a real SeaweedFS endpoint including a 20MB multipart upload. Writes go bytes first, metadata second, so crashes leave only garbage that GC removes. Measured: taking the bucket row lock only for quota'd buckets plus a secret cache took 1KB PUTs from 53 to 72 ops/s, after which a single Python process is CPU-bound (c=4: 76 PUT/s at 122% CPU), so the stateless API scales by adding processes. A code review then fixed ten findings with regression tests (28 tests total): presign max expiry enforced at use, quota locks for multipart parts, a real completion quota check, a deletion grace period for in-flight downloads, bucket-scoped list_parts, an access-key revoke endpoint, per-blob GC error handling and directory fsync.",
+ "pitch": {
+  "intro_30s": "Maine S3 jaisa ek object storage system banaya hai: buckets, objects, versioning with delete markers, multipart uploads, presigned URLs aur request signing. Metadata Postgres mein hai aur bytes ek pluggable storage adapter mein -- local disk ya koi bhi S3-compatible store, jo maine real SeaweedFS ke against test kiya. Sabse important decision: pehle bytes, phir metadata, taaki crash pe sirf garbage bache jo GC saaf kare -- kabhi dangling metadata nahi.",
+  "explain_2min": "Object storage ka model simple hai: bucket + key + immutable bytes + metadata, HTTP pe. Folders sirf illusion hain -- `delimiter=/` se listing common prefixes banati hai.\n\nMere design mein do stores hain. Postgres metadata rakhta hai: objects table mein har version ek row hai, `is_latest` flag ke saath, aur ek partial unique index guarantee karta hai ki ek key ka sirf ek latest version ho -- 20 parallel PUTs ke baad bhi. Bytes storage adapter mein random hex blob key ke naam se jaate hain, kabhi object key se derive nahi hote -- isliye `../../etc/passwd` jaisi key sirf data hai, path traversal possible hi nahi.\n\nPUT ka flow: request sign hoti hai (simplified SigV4: method, path, query, date, body hash ka HMAC; 15 minute replay window). Body stream hoti hai ek `HashingStream` se jo MD5, SHA-256 aur size limit ek hi pass mein compute karta hai -- constant memory. Content-MD5 ya signed body hash match nahi hua toh 400 BadDigest aur blob delete. Phir ek chhoti transaction: per-key advisory lock, quota ho toh bucket lock, versions flip, commit. Isliye 200 milte hi koi bhi instance naya version padhega -- strong read-after-write.\n\nVersioning S3 jaisi hai: null version, enabled, suspended, delete markers aur undelete. Multipart mein parts retry ho sakte hain, ordering aur 5 MiB minimum check hota hai, aur ETag S3 ka composite formula hai -- jo object ka MD5 nahi hota, isliye main SHA-256 bhi store karta hoon. Presigned URLs method, key aur expiry se bound hain aur signer ki authority carry karte hain.\n\nBackground worker lifecycle rules chalata hai aur GC: queued deletions aur orphan blobs, grace period ke saath. Performance: bucket lock har PUT pe tha, use sirf quota wale buckets tak simit kiya -- 53 se 72 PUT/s; uske baad process CPU-bound tha, toh answer hai zyada stateless API processes.",
+  "deep_5min": "Main ek PUT ki life se shuru karta hoon, kyunki saare hard decisions wahin dikhte hain.\n\nClient (mera `ObjClient`, jo ek SDK jaisa hai) request sign karta hai: string to sign = METHOD, raw path, canonical query, `x-obj-date`, aur body ka SHA-256 ya `UNSIGNED-PAYLOAD`. Secret network pe kabhi nahi jaata, sirf HMAC. Server `authenticate` mein date ko 900 second ke window mein check karta hai (replay protection), secret 60 second ke cache se laata hai, aur `hmac.compare_digest` se compare karta hai. Phir `authorize`: owner, admin, read/write grants, aur public_read sirf object GET ke liye -- anonymous listing kabhi nahi.\n\nAb bytes. Pehla bada decision: metadata aur data alag. Postgres transactions, constraints aur window functions deta hai; blob store sasta durable bytes. Doosra: blob key random hai. Teesra, aur sabse important: bytes pehle, metadata baad mein. Do stores ke beech atomic transaction nahi hai, toh maine woh failure mode choose kiya jo harmless hai. Crash beech mein hua toh orphan blob bachega -- koi usse dekh nahi sakta, GC grace period ke baad hata dega. Ulta order mein metadata ek non-existent blob ko point karta -- user-visible corruption. Grace period isliye zaroori hai kyunki 'unreferenced' blob ek in-flight upload bhi ho sakta hai; `test_gc_respects_grace_period_for_in_flight_uploads` yahi prove karta hai.\n\nStreaming: `HashingStream` body ko adapter tak pass karta hai, har chunk pe MD5, SHA-256 aur byte count; limit cross hui toh turant `TooLarge` -> 413. Local adapter temp file mein likhta hai, fsync karta hai, phir `os.replace` -- reader ko kabhi half blob nahi dikhta; directories `ab/cd/` se sharded. S3 adapter mein problem tha ki boto3 sync hai aur file-like object maangta hai -- maine ek bounded queue reader banaya (8 chunks max) jo backpressure deta hai; boto3 8MB se upar khud multipart karta hai, aur 20MB test real SeaweedFS pe pass hota hai.\n\nUpload ke baad digests verify hote hain, phir short transaction. Concurrency ka decision: `pg_advisory_xact_lock(hashtextextended(bucket/key))` -- sirf same key ke writers serialize hote hain. Aur safety net: partial unique index `(bucket, key) WHERE is_latest`, taaki code bug ho tab bhi do latest versions na ban sakein. Bucket row lock sirf tab jab quota ho, kyunki quota check-then-insert race karta hai. Pehle yeh lock har PUT pe tha aur measure kiya toh bucket ke saare writes ek line mein the -- 53 PUT/s. Sirf quota buckets pe lock, plus secret cache aur kam thread hops -> 72 PUT/s. Phir concurrency vary ki: c=4 pe 76/s at 122% CPU, c=16 pe 55/s. Matlab single Python process CPU-bound hai; API stateless hai toh production answer hai zyada processes.\n\nVersioning `commit_version` mein hai: enabled mein naya uuid version aur purana `is_latest=false`; disabled/suspended mein `'null'` version replace hota hai aur purana blob `blob_deletions` queue mein. Deletes kabhi inline blob delete nahi karte -- queue isi transaction mein likhi jaati hai, toh deletion intent atomic hai aur request blob store pe depend nahi karti. Delete marker se undelete, aur version delete pe next newest promote hota hai.\n\nMultipart: parts upsert hote hain (retry replaces), completion pe order, ETag aur 5 MiB minimum check, aur ETag = md5 of part md5s + '-N'. Meri completion parts ko re-stream karti hai naye blob mein -- simple aur backend-agnostic, lekin double I/O; real S3 server-side compose karta hai. Bonus: re-stream se full-object SHA-256 milta hai.\n\nLifecycle worker: current expiration (delete jaisa, versioned mein marker), noncurrent expiration jahan age successor ke created_at se `lag()` window function se nikalti hai, lone delete markers, aur stale multipart abort. Tests mein simulated clock ka ek subtlety tha -- marker real time pe stamp hota hai, toh day 31 pe ek hi pass mein teen cheezein hati; test mein yeh documented hai.\n\nTesting se do real bugs mile: `sum(bigint)` Postgres mein NUMERIC deta hai jo Python Decimal banke JSON error response tod raha tha; aur HTTP client `../` dot segments normalize kar raha tha, toh hostile key wali request alag URL pe ja rahi thi -- client ke `quote_key` mein `%2E` encoding se fix.\n\nCode review se aur gaps mile aur fix hue (har ek ka regression test `test_review_fixes.py` mein): presign max expiry sirf `/presign` pe check hoti thi, multipart parts quota race karte the, completion quota check kabhi fail hi nahi hota tha, GC overwritten blob ko turant delete karke slow GET tod sakta tha, aur revoke endpoint hi nahi tha.  Honest gaps: secrets plaintext (HMAC verify ke liye chahiye; production mein KMS), SSE nahi, object lock nahi, simplified SigV4 bina key derivation ke, aur JSON API S3 XML protocol nahi.",
+  "architecture_walkthrough": "1) `api/routes.py` -- FastAPI routes: buckets (create/delete/versioning/acl/quota/lifecycle/stats), objects (PUT/GET/HEAD/DELETE, listing, versions), multipart, `/presign`, admin endpoints. Routes thin hain: auth + authorize, phir services call.\n\n2) `services/signing.py` + `services/auth.py` -- canonical request, HMAC signing, presigned URL strings, `quote_key`; `authenticate` (signed header / presigned / anonymous) aur `authorize` (owner, grants, public_read, admin). 60s secret cache.\n\n3) `services/objects.py` -- domain logic: `put_object` (stream -> verify -> short txn), `commit_version` (versioning states), `delete_object` (markers, permanent delete + promotion), `list_objects` (prefix/delimiter/pagination with LIKE escaping), multipart functions, `_check_quota`, `_verify_digests`, `parse_range`.\n\n4) `services/maintenance.py` -- `run_lifecycle`, `run_gc` (queued deletions + orphan scan with grace), `bucket_stats` analytics.\n\n5) `storage/base.py` -- `StorageAdapter` protocol aur `HashingStream`. `storage/local.py` -- temp + fsync + atomic rename, sharded dirs, GC helpers. `storage/s3.py` -- boto3 adapter with `_QueueReader` bounded queue.\n\n6) Postgres (`migrations/versions/0001_initial.py`) -- access_keys, buckets (DNS name CHECK), bucket_grants, objects (UNIQUE bucket/key/version_id, partial unique latest, text_pattern_ops listing index, versions index, blob index), multipart_uploads/parts (part 1..10000), lifecycle_rules, blob_deletions.\n\n7) `worker.py` -- har 300s lifecycle + GC; multiple instances safe kyunki lifecycle idempotent aur GC references re-check karta hai.\n\n8) `client.py` -- signing client; `seed.py` demo; `bench/throughput.py` benchmarks. Deployment: docker compose (postgres, seaweedfs, migrate, api, worker); API stateless, coordination sirf Postgres mein.",
+  "difficult_decisions": [
+   "Bytes first, metadata second: do stores ke beech 2PC nahi, toh crash pe orphan blob (harmless, GC-able) accept kiya instead of dangling metadata. Iske saath GC grace period zaroori bana taaki in-flight uploads delete na hon.",
+   "Random blob keys: path traversal structurally impossible aur overwrites kabhi in-place nahi; cost hai indirection aur yeh ki blob store bina database ke unreadable hai -- backups dono ke saath.",
+   "Concurrency: per-key advisory lock + DB partial unique index as safety net; bucket row lock sirf quota buckets pe. Unconditional bucket lock ne har bucket ke writes serialize kar diye the (53 PUT/s measured).",
+   "Deletions queued in `blob_deletions` usi transaction mein -- request latency aur success blob store pe depend nahi karti; trade-off: space der se free hota hai aur worker monitor karna padta hai.",
+   "Multipart completion by re-streaming parts into a new blob: simple aur kisi bhi backend pe kaam karta hai, full-object SHA-256 bhi deta hai; cost double I/O at completion. Server-side composition future improvement hai.",
+   "UNSIGNED-PAYLOAD allow kiya streaming uploads ke liye (body do baar hash na karna pade); us case mein body integrity Content-MD5 / checksum headers aur TLS pe depend karti hai."
+  ],
+  "biggest_challenges": [
+   "Real bug (TESTING.md #1): quota error ke details mein `sum(bigint)` ka result tha jo Postgres NUMERIC -> Python Decimal deta hai, aur JSON error response serialize nahi ho pa raha tha. `_check_quota` mein `int(...)` cast se fix.",
+   "Real bug (TESTING.md #2): `../../etc/passwd` jaisi keys ke saath HTTP client RFC 3986 dot-segment removal kar raha tha, toh request kisi aur URL pe pahunchti thi. Fix client ke `quote_key` mein: '.' aur '..' segments ko `%2E` encode karna.",
+   "Performance: 1KB PUTs 53 ops/s pe atke the. Investigation se pata chala har PUT bucket row `FOR UPDATE` le raha tha. Lock sirf quota buckets pe, secret cache, kam thread hops -> 72 PUT/s (local), S3 adapter 44 -> 57. Phir concurrency sweep se proof mila ki c=4 ke baad process CPU-bound hai (76/s, CPU 122%).",
+   "boto3 sync hai aur hamara body async stream -- constant memory ke liye bounded queue reader with backpressure banana pada, aur error propagation dono threads ke beech sahi karni padi; real SeaweedFS pe 20MB upload se verify kiya.",
+   "Lifecycle test mein simulated clock: delete marker real time pe stamp hota hai, toh 'day 31' pass mein current expiry, noncurrent expiry aur lone marker removal teeno ek saath hue. Test ko yeh behaviour samajh ke assert karna pada (real time mein yeh alag dinon pe hota)."
+  ],
+  "failure_scenarios": [
+   "Body corrupted in transit ya proxy ne body badli: Content-MD5 / x-obj-checksum-sha256 / signed payload hash mismatch -> 400 BadDigest, naya blob delete, koi metadata nahi (`test_integrity_checks_reject_corrupted_uploads`, `test_signed_body_cannot_be_swapped`).",
+   "Process crash blob write aur metadata commit ke beech: orphan blob, GC grace period ke baad delete; in-flight uploads grace se bache rehte hain (`test_gc_*`).",
+   "20 concurrent PUTs same key pe: advisory lock + partial unique index -> exactly ek latest version; unversioned bucket mein 19 purane blobs queue mein (`test_concurrent_writes_to_same_key`).",
+   "Blob store down ya slow: PUT 500 metadata change se pehle (bytes first); deletes queue mein jaate hain toh DELETE request phir bhi succeed karti hai.",
+   "Leaked presigned URL: sirf woh method + key, expiry tak (max 7 din -- review ke baad yeh limit URL USE time pe bhi enforce hoti hai, offline-minted lambi URLs reject); signer ka key `DELETE /admin/access-keys/{id}` se revoke karke jaldi kill (doosre instances pe 60s secret cache ke baad).",
+   "Accidental delete versioned bucket mein: delete marker; marker version delete karke undelete."
+  ],
+  "improvements": [
+   "Bytes ko API se hatao: presigned URLs seedha blob store/CDN pe, aur multipart completion server-side composition se (re-streaming ki double I/O khatam).",
+   "Metadata scaling: bucket (ya hash of bucket/key) se shard, listing ke liye dedicated index, read replicas for listing; GC orphan scan ko incremental banana (abhi poora blob store list hota hai).",
+   "Security: access key secrets KMS se encrypt at rest, server-side encryption of blobs, object lock/WORM, full SigV4 with derived/scoped keys. (Presign max expiry at use time: review mein fix ho chuka.)",
+   "Correctness hardening done in review: multipart part uploads pe bucket lock ke saath quota check, rename ke baad directory fsync, queued deletions pe `deletion_grace_seconds` (300s). Aage: lifecycle bulk deletes ko per-key lock ke andar lana, aur orphan scan incremental.",
+   "S3 XML wire protocol compatibility taaki boto3/aws-cli seedha baat kar sakein; If-Match aur If-Modified-Since jaise conditional headers."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Object storage model and flat namespace",
+   "steps": [
+    "1. Concept: object = bucket + key + immutable bytes + metadata; block vs file vs object table `SYSTEM_DESIGN.md` mein padho.",
+    "2. Why here: S3-like API ka poora design isi model pe tika hai -- no in-place edit, folders = prefixes.",
+    "3. API: `API_DOCUMENTATION.md` -- PUT/GET/HEAD/DELETE objects, listing with `prefix`, `delimiter`, `start_after`, `max_keys`.",
+    "4. Implementation: `services/objects.py::list_objects` -- common prefix banane aur `\\U0010ffff` se folder skip karne ka logic.",
+    "5. Demonstrate: `pytest tests/test_objects.py -k listing` -- `common_prefixes == ['docs/', 'img/']` aur `100%_` LIKE escaping.",
+    "6. Interviewer next: 'folder rename kitna mehenga hai?', 'pagination cursor kaise kaam karta hai?'"
+   ],
+   "files": [
+    "projects/07-object-storage/SYSTEM_DESIGN.md",
+    "projects/07-object-storage/objstore/services/objects.py::list_objects",
+    "projects/07-object-storage/tests/test_objects.py::test_listing_prefix_delimiter_pagination"
+   ]
+  },
+  {
+   "concept": "Metadata/data split and crash-safe write ordering",
+   "steps": [
+    "1. Concept: do stores, koi distributed transaction nahi -> order se decide karo kaunsi galat state bachegi.",
+    "2. Why here: dangling metadata user-visible corruption hai; orphan blob sirf garbage.",
+    "3. Code: `services/objects.py` module docstring aur `put_object` -- storage.put pehle, `s.begin()` txn baad mein, failure pe `storage.delete(blob_key)`.",
+    "4. Detail: random `new_blob_key()`, `blob_deletions` queue usi txn mein, GC grace period.",
+    "5. Demonstrate: `pytest tests/test_maintenance.py -k gc` -- orphan delete hota hai, fresh blob bachta hai.",
+    "6. Interviewer next: 'upload grace period se lamba chale toh?', 'backup kaise consistent loge?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/services/objects.py::put_object",
+    "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+    "projects/07-object-storage/tests/test_maintenance.py::test_gc_respects_grace_period_for_in_flight_uploads"
+   ]
+  },
+  {
+   "concept": "Streaming integrity checks",
+   "steps": [
+    "1. Concept: checksums upload ke dauraan hi compute karo; MD5 ETag, SHA-256, Content-MD5, signed payload hash.",
+    "2. Why here: corrupted ya swapped body kabhi commit nahi honi chahiye, aur 5 GiB object memory mein nahi aa sakta.",
+    "3. Code: `storage/base.py::HashingStream` -- size count, TooLarge, md5/sha update, yield.",
+    "4. Detail: `_verify_digests` Content-MD5 base64 -> hex compare, `x-obj-checksum-sha256`, `Caller.signed_sha256`.",
+    "5. Demonstrate: `pytest -k \"integrity or swapped\"` -- 400 BadDigest aur blobs dir khaali.",
+    "6. Interviewer next: 'multipart ETag MD5 kyun nahi?', 'UNSIGNED-PAYLOAD pe body integrity kaise?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/storage/base.py::HashingStream",
+    "projects/07-object-storage/objstore/services/objects.py::_verify_digests",
+    "projects/07-object-storage/tests/test_objects.py::test_signed_body_cannot_be_swapped"
+   ]
+  },
+  {
+   "concept": "Versioning, delete markers and one-latest-per-key",
+   "steps": [
+    "1. Concept: disabled ('null' version), enabled, suspended; delete marker = soft delete.",
+    "2. Why here: accidental delete se recovery, S3-compatible behaviour.",
+    "3. Code: `commit_version` branches aur `delete_object` (marker vs permanent version delete + promotion).",
+    "4. Detail: migration ka `uq_objects_latest ON objects (bucket, key) WHERE is_latest` aur `key_lock_sql` advisory lock.",
+    "5. Demonstrate: `pytest -k \"versioning or concurrent\"` -- undelete flow, 20 writers -> 1 latest, 19 queued blobs.",
+    "6. Interviewer next: 'advisory lock vs SELECT FOR UPDATE?', 'quota versions ko kaise count karta hai?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/services/objects.py::commit_version",
+    "projects/07-object-storage/objstore/services/objects.py::delete_object",
+    "projects/07-object-storage/migrations/versions/0001_initial.py",
+    "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key"
+   ]
+  },
+  {
+   "concept": "Multipart uploads",
+   "steps": [
+    "1. Concept: initiate -> parts (retryable, parallel) -> complete with part list -> ya abort.",
+    "2. Why here: bade objects resumable banana; single PUT limit 5 GiB.",
+    "3. Code: `upload_part` (ON CONFLICT upsert, old blob queue), `complete_multipart`.",
+    "4. Detail: ordering/duplicate check, ETag match, 5 MiB min except last, composite ETag formula, re-streaming into a new blob.",
+    "5. Demonstrate: `pytest -k multipart` aur `seed.py` jo 5 MiB part ke saath demo karta hai.",
+    "6. Interviewer next: 'server-side composition kaise karoge?', 'abandoned uploads ka kya?' (lifecycle abort)."
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/services/objects.py::upload_part",
+    "projects/07-object-storage/objstore/services/objects.py::complete_multipart",
+    "projects/07-object-storage/tests/test_objects.py::test_multipart_upload",
+    "projects/07-object-storage/seed.py"
+   ]
+  },
+  {
+   "concept": "Request signing and presigned URLs",
+   "steps": [
+    "1. Concept: HMAC over canonical request; secret kabhi nahi bhejte; date se replay window; presign = same idea in query string with expiry.",
+    "2. Why here: browsers/third parties ko secret diye bina limited access.",
+    "3. Code: `services/signing.py` (`string_to_sign`, `presign`, `quote_key`) aur `services/auth.py::authenticate`.",
+    "4. Detail: `hmac.compare_digest`, 900s clock skew, `/presign` route signer ki authority check karta hai, max 7 din.",
+    "5. Demonstrate: `pytest -k \"presigned or auth_failures\"` -- method/key tamper 401, expired 401, bob presign 403.",
+    "6. Interviewer next: 'leaked URL ka blast radius?', 'real SigV4 derived keys kyun use karta hai?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/services/signing.py::string_to_sign",
+    "projects/07-object-storage/objstore/services/auth.py::authenticate",
+    "projects/07-object-storage/objstore/api/routes.py::presign",
+    "projects/07-object-storage/tests/test_objects.py::test_presigned_urls"
+   ]
+  },
+  {
+   "concept": "Storage abstraction: local FS and S3 adapters",
+   "steps": [
+    "1. Concept: `StorageAdapter` protocol -- put/get/delete/exists/list_older_than.",
+    "2. Why here: same API local dev disk pe aur production S3-compatible store pe.",
+    "3. Code: `storage/local.py` (temp + fsync + os.replace, `ab/cd/` sharding) aur `storage/s3.py` (`_QueueReader`).",
+    "4. Detail: bounded queue backpressure (8 chunks), boto3 managed multipart above 8MB, errors propagate via `finish(exc)`.",
+    "5. Demonstrate: SeaweedFS chalao (README command) aur `pytest tests/test_s3_adapter.py` -- 20MB upload SHA-256 match.",
+    "6. Interviewer next: 'aiobotocore kyun nahi?', 'replication/erasure coding kahan hoga?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/storage/base.py::StorageAdapter",
+    "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+    "projects/07-object-storage/objstore/storage/s3.py::_QueueReader",
+    "projects/07-object-storage/tests/test_s3_adapter.py"
+   ]
+  },
+  {
+   "concept": "Lifecycle rules, GC and quotas",
+   "steps": [
+    "1. Concept: expiration, noncurrent expiration, lone delete markers, abort stale multipart; GC for queued + orphan blobs; quota = all versions + pending parts.",
+    "2. Why here: versioned storage bina cleanup ke hamesha badhti hai; billing reality saare versions count karti hai.",
+    "3. Code: `services/maintenance.py::run_lifecycle` aur `_check_quota`.",
+    "4. Detail: `lag(created_at) OVER (PARTITION BY key ORDER BY created_at DESC)` = noncurrent since; quota check sirf bucket `FOR UPDATE` lock ke andar.",
+    "5. Demonstrate: `pytest tests/test_maintenance.py` -- simulated clock `FUTURE(10)`, `FUTURE(31)`; `pytest -k quota`.",
+    "6. Interviewer next: 'simulated clock mein teen cheezein ek pass mein kyun hati?', 'multiple workers safe hain?'"
+   ],
+   "files": [
+    "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+    "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+    "projects/07-object-storage/tests/test_maintenance.py::test_lifecycle_expiration_noncurrent_and_markers",
+    "projects/07-object-storage/tests/test_objects.py::test_quota_counts_all_versions"
+   ]
+  },
+  {
+   "concept": "Performance investigation and scaling",
+   "steps": [
+    "1. Concept: measure first -- throughput vs concurrency, CPU % of wall, lock contention.",
+    "2. Why here: 1KB PUTs 53 ops/s pe atke the; bucket row lock har write serialize kar raha tha.",
+    "3. Code: `put_object` mein `if bucket['quota_bytes'] is not None:` ke andar hi `FOR UPDATE`; `auth.py::_secret` cache.",
+    "4. Detail: TESTING.md -- after: 72 PUT/s local, 57 S3; c=4 76/s at CPU 122%, c=16 55/s -> CPU-bound single process.",
+    "5. Demonstrate: `python bench/throughput.py both`.",
+    "6. Interviewer next: '100x pe kya badlega?' (more API processes, shard metadata, CDN, presign direct to blob store)."
+   ],
+   "files": [
+    "projects/07-object-storage/bench/throughput.py",
+    "projects/07-object-storage/TESTING.md",
+    "projects/07-object-storage/objstore/services/auth.py::_secret",
+    "projects/07-object-storage/SYSTEM_DESIGN.md"
+   ]
+  }
+ ]
+}

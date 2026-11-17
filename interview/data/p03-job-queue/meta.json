@@ -1,0 +1,195 @@
+{
+ "project_slug": "p03-job-queue",
+ "project": "Distributed Job Queue",
+ "source_dir": "projects/03-job-queue",
+ "summary": "A reliable background job system: Redis holds the queue mechanics (job hashes plus ready / delayed / active / dead sorted sets, every state transition one atomic Lua script), worker processes claim jobs in batches under leases with fencing tokens, retry with exponential backoff and full jitter, send poison and permanently-failing jobs to a dead letter queue, fire recurring schedules safely from every worker, and drain gracefully on SIGTERM. Postgres-backed handlers use a processed_jobs ledger in the same transaction as the side effect, turning at-least-once delivery into effectively-once effects -- proven by a real kill -9 worker-process test. Measured throughput went from 158 to 577 jobs/s per worker process after batch claiming.",
+ "pitch": {
+  "intro_30s": "Maine ek distributed job queue banaya hai -- jaise Sidekiq ya Celery, lekin scratch se, taaki internals deeply samajh sakun. Redis mein saari queue mechanics hain, har state change ek atomic Lua script hai. Workers leases ke saath jobs claim karte hain, crash hone pe jobs automatically recover hoti hain, fencing tokens zombie workers ko rokte hain, aur Postgres idempotency ledger se duplicate side effects nahi hote. Real kill -9 test se yeh prove kiya hai.",
+  "explain_2min": "Problem simple hai: HTTP request ke andar slow ya flaky kaam -- email, reports, third-party calls -- nahi karna chahiye. Toh API job ko Redis mein enqueue karti hai aur turant 201 return karti hai; worker processes background mein kaam karte hain.\n\nDesign ke teen pillars hain. Pehla, atomic transitions: har queue ke liye sorted sets hain -- ready (score = (9 - priority) * 1e13 + seq, taaki priority aur FIFO ek ZPOPMIN mein mil jaye), delayed (run_at), active (lease deadline), dead. Enqueue, claim, ack, fail, extend, requeue, cancel, schedule -- har ek ek Lua script hai, toh job kabhi half-moved state mein nahi atakti.\n\nDoosra, at-least-once delivery with leases: claim job delete nahi karta, active zset mein ~35s ki lease ke saath daalta hai, worker har lease/3 pe extend karta hai. Worker mara toh har worker pe chalne wala reaper expired lease dekh ke job retry mein daal deta hai. Attempt counter fencing token hai -- zombie worker ka late ack reject hota hai.\n\nTeesra, effectively-once side effects: handler ek Postgres transaction mein processed_jobs ledger aur effect dono insert karta hai; dobara delivery pe ledger conflict -> skip.\n\nPlus jittered exponential backoff, DLQ with PermanentError aur replay, idempotent enqueue keys, schedules jo multiple workers pe bhi ek hi baar fire hote hain, heartbeats aur graceful drain. 30 tests (code review ke baad lease-keeper error handling, corrupt-job dead-lettering, O(1) schedule catch-up aur finished/cancelled job expiry ke regression tests add hue), including ek test jo real worker OS process ko commit ke baad kill karta hai. Batch claiming ke baad throughput 158 se 577 jobs/s per process gaya.",
+  "deep_5min": "Main ek job ki poori journey se samjhata hoon, aur beech mein hard decisions.\n\nEnqueue: producer POST /jobs bhejta hai bearer token ke saath (hmac.compare_digest). Pydantic validation -- type regex, priority 0-9, max_attempts 1-50, timeout up to 1 hour. JobQueue.enqueue job id uuid se banata hai aur enqueue.lua chalata hai: agar idempotency key di hai aur pehle se exist karti hai toh wahi job id return, API 200 deti hai 201 ki jagah -- client retries safe. Warna job hash banta hai, aur future run_at ho toh delayed zset, warna ready zset with score (9 - priority) * 1e13 + seq. Seq global counter hai, timestamp nahi, taaki same millisecond mein bhi FIFO strict rahe; aur max score 1e14 ke aas paas hai jo 2^53 se kaafi neeche hai, toh doubles exact hain.\n\nClaim: worker ka main loop dekhta hai kitne slots free hain aur claim.lua ko utna max_jobs deta hai. Script pehle due delayed jobs promote karti hai (bounded 100, taaki Redis block na ho), phir ZPOPMIN se best jobs, har ek pe attempts++ (yahi fencing token), lease = min(timeout, 30s) + 5s grace, active zset mein deadline score, aur job hash inline return. Yeh batch + inline wala design ek real performance investigation se aaya: pehle har claim ek job aur alag HGETALL tha -- 158 jobs/s ek process pe. Diagnosis tha serial round trips; fix ke baad 577 jobs/s, aur 4 processes pe 440 se 1,227. Numbers dev laptop ke Docker Desktop pe hain, isliye main unhe relative improvement ki tarah present karta hoon.\n\nExecute: har job ek asyncio task hai, asyncio.wait_for se timeout. Saath mein _keep_lease task har lease/3 pe extend_lease.lua chalata hai -- token-checked. Lease ko 30s pe cap karne ka decision important tha: 1 ghante ki job ho tab bhi crash ~35s mein detect hota hai. Cost yeh hai ki agar handler event loop block kare (demo.cpu_block, time.sleep), extensions miss hoti hain aur job redeliver ho jati hai -- isliye maine woh anti-pattern ek demo handler ke roop mein document kiya.\n\nSuccess: ack.lua check karta hai status active aur attempts == token; tabhi succeeded, 24h EXPIRE, completed zset capped. Failure: fail.lua -- attempts bache hain toh delayed with full-jitter backoff (random 0..min(max, base*2^(n-1)), thundering herd se bachne ke liye), khatam ya PermanentError toh dead letter queue. Unknown job type bhi PermanentError.\n\nCrash: yahan sabse interesting part. Worker A ne Postgres mein email commit kiya aur ack se pehle mar gaya. Har worker ka reaper har 2s active zset mein expired deadlines dhoondta hai aur fail.lua reason lease_expired chalata hai; fail.lua dobara atomically check karta hai ki lease sach mein expire hai -- kyunki beech mein extension ho sakti thi. Worker B attempt 2 claim karta hai; handler ka INSERT processed_jobs ON CONFLICT DO NOTHING RETURNING kuch nahi lautata, toh effect skip aur result duplicate: true. Agar A sirf paused tha aur baad mein ack bhejta hai, token 1 vs current 2 -> rejected, stale_acks counter badhta hai. Yeh sab test_kill_minus_nine_worker_process real subprocess ko kill karke prove karta hai: attempts 2, worker proc-B, exactly ek email row.\n\nDoosre hard decisions: schedules -- har worker scheduler chalata hai, schedule_tick.lua compare-and-advance se sirf ek jeetata hai, plus per-slot idempotency key; downtime ke baad burst nahi, ek run aur realign. Strict priority across queues simple hai lekin low queue starve ho sakti hai -- documented trade-off, fix dedicated pools ya weighted claiming. Redis vs Postgres SKIP LOCKED: maine Redis chuna speed aur rich structures ke liye, cost hai ki enqueue producer ke DB transaction ke saath atomic nahi -- outbox se fix hoga. Aur honest limitations: polling (max 1s idle latency), interval schedules not cron, Lua job keys dynamically bante hain toh Redis Cluster ke liye hash tags chahiye.",
+  "architecture_walkthrough": "API (jobqueue/main.py + api/routes.py): FastAPI, bpcommon setup_app se request ids, Prometheus HTTP metrics, shared error shape. Router-level bearer auth. Endpoints: jobs (enqueue/get/list/cancel), queues stats, DLQ list/requeue/requeue-all, workers, schedules, handlers, aur /dashboard HTML.\n\nQueue core (core/queue.py + core/lua/*.lua): JobQueue thin client hai jo aath Lua scripts register karta hai -- enqueue, claim, ack, fail, extend_lease, requeue_dead, cancel, schedule_tick. Redis layout: jq:job:{id} hash, jq:job:{id}:errors list (last 20), jq:q:{queue}:ready/delayed/active/dead/completed zsets, stats hash, jq:idem:{key}, jq:schedules, jq:seq, jq:workers aur alive keys. Saare time Redis TIME se, tests mein injected now_ms.\n\nBackoff (core/backoff.py): full jitter exponential.\n\nWorker (worker/worker.py, worker/__main__.py): ek process = ek asyncio loop, N slots. Main loop batch claim karta hai free slots ke barabar, adaptive idle polling 50ms se 1s. Har job ke saath lease keeper. Background: heartbeat (workers hash + TTL alive key), reaper (har 2s, har queue), scheduler (har 1s). SIGTERM pe stop claiming, grace tak drain, baaki cancel aur leases pe chhod do.\n\nHandlers (handlers/__init__.py, builtin.py): Registry by name (no pickle, no code in jobs), JobContext with sessionmaker, PermanentError. email.send idempotent consumer reference; demo handlers for flaky, poison, sleep, cpu_block.\n\nPostgres (db/models.py, migrations/): processed_jobs ledger (job_id PK) aur email_outbox (dedupe_key unique), Alembic async env, compose mein one-shot migrate service.\n\nDeployment: ek image do roles, compose mein redis (AOF everysec), postgres, migrate, api (127.0.0.1:58003), worker x3 with stop_grace_period 30s.",
+  "difficult_decisions": [
+   "Har state transition ek Lua script: MULTI/EXEC reads ka result nahi deta aur WATCH contention pe retry storm karta hai; Lua se read-decide-write atomic aur ek round trip. Cost: Redis block hota hai script ke dauraan, isliye saare loops bounded (max_promote 100, max_jobs = free slots).",
+   "Lease 30s pe cap + har lease/3 extension, timeout jitna lamba lease nahi: crash detection ~35s chahe job 1 ghante ki ho. Cost: extension traffic aur blocked event loop pe duplicate execution risk.",
+   "Attempt counter as fencing token: koi extra state nahi aur handler ko attempt number vaise bhi chahiye. Known edge: DLQ requeue attempts reset karta hai -- production mein alag never-reset lease_epoch better.",
+   "Reaper aur scheduler har worker pe, koi central service nahi: no SPOF, aur fail.lua / schedule_tick.lua ke atomic rechecks concurrency safe banate hain.",
+   "Redis mechanics ke liye, Postgres effects ke liye: idempotency ledger ko effect ke saath same transaction mein hona chahiye, isliye ledger Postgres mein. Cost: enqueue producer ke DB write ke saath atomic nahi (outbox future work).",
+   "Batch claim with inline job hash: 3.6x throughput (158 -> 577 jobs/s per process), cost: crash ke baad N jobs lease expiry tak atki."
+  ],
+  "biggest_challenges": [
+   "Throughput investigation: 16 slots ke bawajood 1 worker process sirf 158 jobs/s (4 processes 440). Diagnosis: claim loop serial tha, har job ke liye claim + HGETALL do round trips. Fix: claim.lua mein max_jobs aur hash inline -- 577 jobs/s aur 1,227 jobs/s (TESTING.md, Docker Desktop on Windows 11).",
+   "Heartbeat TTL bug: TTL int(interval * 3) se seconds mein banta tha; test ka 0.2s interval -> 0 -> Redis ne SET EX 0 reject kiya aur heartbeat loop crash. Fix: px= milliseconds with max(..., 1), aur loop try/except mein.",
+   "Flaky cross-queue priority test: completions ko ek polling instant pe count karta tha; fix tha started_at timestamps compare karna -- ordering ka direct evidence.",
+   "Crash ko sach mein prove karna: in-process cancel kaafi nahi tha, isliye test_crash_process.py real worker subprocess ko commit ke baad kill karta hai (chhoti leases env se) aur doosra process job duplicate: true ke saath finish karta hai, exactly 1 email row.",
+   "Reaper vs lease extension race: reaper ne job expired dekhi, beech mein worker ne extend kiya -- fail.lua mein reaper path pe lease_until > now recheck se healthy job reap hone se bachi."
+  ],
+  "failure_scenarios": [
+   "Worker kill -9 after commit before ack: lease expire, reaper retry, attempt 2 ledger conflict dekhta hai -> exactly ek side effect (real subprocess test).",
+   "Zombie worker (GC pause / partition) lease ke baad jaagta hai: uska ack/fail/extend token mismatch se reject; Redis state naye owner ka. External effects ke liye idempotency zaroori.",
+   "Poison message: max_attempts ke baad DLQ; PermanentError (bad payload, unknown type) turant DLQ; fix ke baad requeue with attempts reset.",
+   "Handler event loop block kare (cpu_block): extensions aur heartbeats ruk jaate hain, leases expire, jobs duplicate execute -- stale_acks aur reaped counters se detect.",
+   "Redis down: API enqueue 500 (producer idempotency key ke saath retry kare), workers claim_failed log karke back off; Redis data loss se bachne ke liye AOF everysec + replica.",
+   "Deploy / SIGTERM: claiming band, in-flight jobs grace tak drain, baaki cancel aur lease expiry se recover."
+  ],
+  "improvements": [
+   "Transactional outbox producer side pe, taaki business write aur enqueue atomic hon.",
+   "Push wakeups (pub/sub hint ya BZPOPMIN) polling ke saath fallback, idle latency 1s se ms tak.",
+   "Redis Cluster readiness: per-queue hash tags, job key aur seq/idem keys queue slot mein, saari keys KEYS mein declared.",
+   "Never-reset lease_epoch fencing ke liye, aur lease lost hone pe handler cancel karna.",
+   "Prometheus queue metrics (queue age, dead rate, reaped, stale_acks), payload size limits, per-producer scoped tokens, per-tenant fairness, cron schedules, throttled DLQ replay."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Why a background queue and delivery semantics",
+   "steps": [
+    "1. Concept: slow/flaky kaam request path se hatao; at-most-once vs at-least-once vs exactly-once ka fark samjho.",
+    "2. Why here: signup welcome email jaise kaam user ko block na karein aur fail hone pe retry hon -- SYSTEM_DESIGN.md 'Why a background queue'.",
+    "3. API: POST /jobs (api/routes.py::enqueue) 201 return karta hai turant; worker baad mein chalata hai.",
+    "4. Implementation: claim job delete nahi karta, lease ke saath active mein rakhta hai -> at-least-once.",
+    "5. Demo: seed.py chalao aur dashboard pe jobs ko queued -> active -> succeeded jaate dekho.",
+    "6. Interviewer next: 'Exactly-once kyun impossible hai aur aap kaise approximate karte ho?'"
+   ],
+   "files": [
+    "projects/03-job-queue/SYSTEM_DESIGN.md",
+    "projects/03-job-queue/jobqueue/api/routes.py",
+    "projects/03-job-queue/seed.py",
+    "projects/03-job-queue/LEARNING_GUIDE.md"
+   ]
+  },
+  {
+   "concept": "Redis data model and priority + FIFO score",
+   "steps": [
+    "1. Concept: sorted sets ordering ke liye, hash job data ke liye.",
+    "2. Why here: priority, delay aur lease deadline teeno ek score se express hote hain.",
+    "3. API: JobQueue.k(queue, kind) aur job_key; layout core/queue.py docstring mein.",
+    "4. Implementation: enqueue.lua score (9 - priority) * 1e13 + seq; 2^53 precision reasoning DATABASE_DESIGN.md mein.",
+    "5. Demo: pytest -q tests/test_queue_core.py -k priority_then_fifo (order high1, high2, mid, low1, low2).",
+    "6. Interviewer next: 'Timestamp ki jagah seq kyun? Retry pe FIFO position ka kya hota hai?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/core/queue.py",
+    "projects/03-job-queue/jobqueue/core/lua/enqueue.lua",
+    "projects/03-job-queue/DATABASE_DESIGN.md",
+    "projects/03-job-queue/tests/test_queue_core.py"
+   ]
+  },
+  {
+   "concept": "Atomic transitions with Lua scripts",
+   "steps": [
+    "1. Concept: Redis script isolated chalti hai; read-decide-write ek unit.",
+    "2. Why here: claim ke beech crash hone pe job ready se nikal ke active mein na pahunche toh lost.",
+    "3. API: SCRIPTS list aur register_script (EVALSHA + NOSCRIPT fallback).",
+    "4. Implementation: claim.lua -- promotion, batch ZPOPMIN, attempts++, lease, inline HGETALL.",
+    "5. Demo: test_concurrent_claimers_get_each_job_exactly_once (20 claimers x 1000 jobs, zero duplicates).",
+    "6. Interviewer next: 'MULTI/EXEC ya WATCH kyun nahi? Script beech mein fail ho toh?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+    "projects/03-job-queue/jobqueue/core/queue.py",
+    "projects/03-job-queue/ARCHITECTURE.md"
+   ]
+  },
+  {
+   "concept": "Leases, reaper and fencing tokens",
+   "steps": [
+    "1. Concept: visibility timeout; zombie worker; monotonic fencing token.",
+    "2. Why here: crashed worker ki jobs recover honi chahiye aur paused worker ki late writes reject.",
+    "3. API: extend_lease, reap_expired, ack/fail with token.",
+    "4. Implementation: lease = min(timeout, 30s) + grace; _keep_lease har lease/3; fail.lua reaper path lease_until recheck; ack.lua attempts == token.",
+    "5. Demo: test_visibility_timeout_reaper_and_fencing aur test_extended_lease_is_not_reaped.",
+    "6. Interviewer next: 'Fencing kya protect nahi karta? Lease 30s pe cap kyun?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+    "projects/03-job-queue/jobqueue/core/lua/ack.lua",
+    "projects/03-job-queue/jobqueue/core/lua/extend_lease.lua",
+    "projects/03-job-queue/jobqueue/worker/worker.py"
+   ]
+  },
+  {
+   "concept": "Idempotent consumer (effectively-once)",
+   "steps": [
+    "1. Concept: dedupe ledger + effect ek hi transaction mein.",
+    "2. Why here: at-least-once mein crash after commit before ack se duplicate execution hoga.",
+    "3. API: JobContext.sessionmaker; ProcessedJob model.",
+    "4. Implementation: send_email -- INSERT ON CONFLICT DO NOTHING RETURNING; conflict pe duplicate: true; email_outbox.dedupe_key unique defence in depth.",
+    "5. Demo: pytest -q tests/test_crash_process.py (real worker process kill -9, attempts 2, 1 email row).",
+    "6. Interviewer next: 'External payment API ke liye kya karoge?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/handlers/builtin.py",
+    "projects/03-job-queue/jobqueue/db/models.py",
+    "projects/03-job-queue/tests/test_crash_process.py",
+    "projects/03-job-queue/migrations/versions/0001_initial.py"
+   ]
+  },
+  {
+   "concept": "Retries, backoff with jitter, DLQ",
+   "steps": [
+    "1. Concept: exponential backoff, full jitter, poison message, dead letter queue.",
+    "2. Why here: dependency outage pe synchronized retries (thundering herd) na hon aur kharab jobs loop na karein.",
+    "3. API: retry_delay_ms, PermanentError, /dlq aur /dlq/{id}/requeue.",
+    "4. Implementation: fail.lua retry vs dead vs force_dead; requeue_dead.lua attempts reset.",
+    "5. Demo: test_retry_with_backoff_then_dead_letter, test_backoff_is_bounded_and_jittered, test_dlq_requeue_flow.",
+    "6. Interviewer next: '1 ghante ki outage mein default retry budget kaafi hai? DLQ safely replay kaise?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/core/backoff.py",
+    "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+    "projects/03-job-queue/jobqueue/core/lua/requeue_dead.lua",
+    "projects/03-job-queue/jobqueue/handlers/__init__.py"
+   ]
+  },
+  {
+   "concept": "Worker runtime: slots, timeouts, heartbeats, graceful shutdown",
+   "steps": [
+    "1. Concept: asyncio concurrency, cooperative cancellation, liveness signals.",
+    "2. Why here: ek process N jobs chalaye, hung jobs timeout hon, deploy pe jobs lost na hon.",
+    "3. API: python -m jobqueue.worker --queues critical,default,low --concurrency N.",
+    "4. Implementation: Worker.run batch claim + adaptive idle; _execute wait_for + except ordering; _heartbeat_loop px TTL; _shutdown drain.",
+    "5. Demo: test_heartbeat_and_graceful_shutdown aur test_end_to_end_success_retry_poison_timeout.",
+    "6. Interviewer next: 'Handler event loop block kare toh kya hoga (demo.cpu_block)?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/worker/worker.py",
+    "projects/03-job-queue/jobqueue/worker/__main__.py",
+    "projects/03-job-queue/jobqueue/handlers/builtin.py",
+    "projects/03-job-queue/tests/test_worker.py"
+   ]
+  },
+  {
+   "concept": "Schedules on many workers",
+   "steps": [
+    "1. Concept: leaderless compare-and-advance, misfire policy.",
+    "2. Why here: har worker scheduler chalata hai (HA) lekin job ek hi baar fire honi chahiye.",
+    "3. API: POST /schedules, JobQueue.tick_schedules.",
+    "4. Implementation: schedule_tick.lua next_run aage badhata hai jab tak future na aaye; purana raw return; per-slot idempotency key.",
+    "5. Demo: test_schedule_fires_once_even_with_many_schedulers (5 schedulers -> 1 job, downtime -> no burst).",
+    "6. Interviewer next: 'Advance ke baad enqueue se pehle crash ho toh? Cron kaise add karoge?'"
+   ],
+   "files": [
+    "projects/03-job-queue/jobqueue/core/lua/schedule_tick.lua",
+    "projects/03-job-queue/jobqueue/core/queue.py",
+    "projects/03-job-queue/TRADEOFFS.md"
+   ]
+  },
+  {
+   "concept": "Performance and scaling",
+   "steps": [
+    "1. Concept: round trips vs server CPU; Little's law; bounded work.",
+    "2. Why here: serial claim loop ne slots idle rakhe.",
+    "3. API: bench/throughput.py --jobs 5000 --workers 4 --concurrency 16.",
+    "4. Implementation: claim_many with max_jobs = free slots, hash inline.",
+    "5. Demo: TESTING.md table -- 158 -> 577 jobs/s (1 process), 440 -> 1,227 (4 processes).",
+    "6. Interviewer next: '100x pe kya badlega? Redis Cluster hash tags aur dynamic job keys ka issue?'"
+   ],
+   "files": [
+    "projects/03-job-queue/bench/throughput.py",
+    "projects/03-job-queue/TESTING.md",
+    "projects/03-job-queue/SYSTEM_DESIGN.md",
+    "projects/03-job-queue/README.md"
+   ]
+  }
+ ]
+}

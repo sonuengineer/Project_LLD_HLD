@@ -1,0 +1,1408 @@
+[
+ {
+  "id": "FLOW-087",
+  "project_slug": "p10-workflow-engine",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "How would you add multi-tenancy to this workflow engine, and how do Temporal namespaces solve isolation?",
+  "answer_hinglish": "Seedha jawab: is project mein multi-tenancy implement nahi hai -- `SECURITY.md` clearly bolta hai \"not supported (single namespace); Temporal uses namespaces for isolation\". Saare workflows ek hi `workflows` table mein hain, `workflow_id` globally unique hai, aur koi bhi caller kisi bhi workflow ko signal ya cancel kar sakta hai.\n\nProduction mein main isko teen layers mein add karunga. Pehla, data model: `workflows` ka primary key `(namespace, workflow_id)` banana, aur `history_events`, `activity_tasks`, `timers` sab mein namespace column. Isse do tenants ka `order-123` collide nahi karega, aur idempotent start bhi per-namespace ho jayega. Doosra, authorization: API pe service auth (mTLS ya JWT) aur har request ka namespace caller ki identity se derive karna, body se nahi. Teesra, resource isolation: per-namespace task queues aur rate limits, taaki ek noisy tenant ke 10,000 workflows doosre tenant ka `needs_task` backlog block na karein -- abhi `claim_workflow_task` `ORDER BY workflow_id` karta hai, toh koi fairness nahi hai.\n\nTemporal mein namespace ek first-class unit hai: har namespace ki apni retention period, apni archival config, apne search attributes, aur authorizer plugin namespace-level permissions check karta hai. Workers ek specific namespace + task queue se hi poll karte hain. Bahut strong isolation chahiye (regulated tenants) toh alag cluster ya alag database bhi diya jata hai -- yeh \"silo\" model hai, namespace \"pool\" model hai.\n\nInterview mein main honestly bolunga: demo internal single-tenant service hai; multi-tenant banane ka sabse sasta pehla step namespace column + auth-derived namespace hai.",
+  "why_needed": "SaaS ya platform team ka shared workflow engine kai teams/customers serve karta hai; bina isolation ek team doosri ka workflow cancel kar sakti hai ya uske data padh sakti hai.",
+  "real_world_analogy": "Ek building mein kai offices: lift aur bijli shared (pool), par har office ka apna taala aur apna mail box (namespace). Bank vault chahiye toh alag building (silo).",
+  "how_it_works": "Namespace = har table ke key ka prefix + auth boundary + quota boundary. Request aate hi identity -> namespace resolve, phir har query `WHERE namespace = :ns` ke saath. Per-namespace retention aur task queues noisy-neighbour rokte hain.",
+  "in_this_project": "`SECURITY.md` mein multi-tenancy \"not supported (single namespace)\" listed hai. `migrations/versions/0001_initial.py` mein `workflows.workflow_id text PRIMARY KEY` hai -- globally unique, koi tenant column nahi. `api.py::signal` aur `api.py::cancel` kisi auth ke bina sirf workflow_id lete hain. `config.py` ka `admin_token` sirf operator route `retry-task` protect karta hai -- tenant identity nahi deta.",
+  "implementation_files": [
+   "projects/10-workflow-engine/SECURITY.md",
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py",
+   "projects/10-workflow-engine/flowengine/api.py::cancel",
+   "projects/10-workflow-engine/flowengine/store.py::claim_workflow_task",
+   "projects/10-workflow-engine/flowengine/config.py::admin_token"
+  ],
+  "code_example": "-- illustrative migration (NOT in repo): namespace-scoped keys\nALTER TABLE workflows ADD COLUMN namespace text NOT NULL DEFAULT 'default';\nALTER TABLE workflows DROP CONSTRAINT workflows_pkey CASCADE;\nALTER TABLE workflows ADD PRIMARY KEY (namespace, workflow_id);\nCREATE INDEX ix_workflows_pending_ns ON workflows (namespace, task_queue, needs_task) WHERE status = 'running';",
+  "code_language": "sql",
+  "advantages": [
+   "Tenants ke business ids collide nahi karte",
+   "Per-tenant retention, quotas aur permissions possible",
+   "Noisy-neighbour control"
+  ],
+  "disadvantages": [
+   "Har query aur index mein extra column",
+   "Cross-tenant admin tooling complex",
+   "Migration existing data ke liye painful"
+  ],
+  "common_mistakes": [
+   "Namespace request body se lena (caller koi bhi namespace bhej dega)",
+   "Sirf API pe check karna, workers ko kisi bhi namespace ka task claim karne dena",
+   "Per-tenant fairness bhool jana"
+  ],
+  "follow_up_questions": [
+   "Pool vs silo isolation kab choose karoge?",
+   "Per-namespace fairness claim query mein kaise laoge?",
+   "Namespace-level encryption keys kaise manage karoge?"
+  ],
+  "concepts": [
+   "multi-tenancy",
+   "namespaces",
+   "isolation",
+   "noisy neighbour"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Shared tables (pool) saste aur simple hain par blast radius bada; alag DB/cluster (silo) strong isolation deta hai par operational cost multiply hota hai.",
+   "failure_scenarios": "Agar auth se namespace derive nahi hua toh cross-tenant signal/cancel possible. Ek tenant ka backlog shared pollers ko starve kar sakta hai kyunki claim ORDER BY workflow_id hai.",
+   "alternatives": "Row-level security (Postgres RLS) namespace pe; per-tenant schema; per-tenant cluster (Temporal Cloud jaisa).",
+   "scale_10x_100x": "10x tenants: namespace column + quotas kaafi. 100x: namespaces ko history shards/DBs pe distribute karna, big tenants ko dedicated shards.",
+   "production_improvements": "mTLS + identity-to-namespace mapping, per-namespace rate limits, per-namespace retention + archival, audit log of signal/cancel calls."
+  }
+ },
+ {
+  "id": "FLOW-088",
+  "project_slug": "p10-workflow-engine",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "How does this project protect against XSS in the dashboard and SQL injection in the store?",
+  "answer_hinglish": "Do classic web risks hain aur dono yahan handle hain. XSS ke liye `flowengine/dashboard.html` mein ek `esc()` helper hai jo `& < > \"` ko HTML entities mein convert karta hai, aur workflow_id, type, error, worker_id jaisi saari user-controlled values `innerHTML` mein jaane se pehle `esc()` se guzarti hain. History panel `textContent` use karta hai, jo HTML parse hi nahi karta -- woh by design safe hai. Yeh important hai kyunki workflow_id aur signal payload client deta hai; koi `<script>` wala workflow_id bana de toh dashboard dekhne wale operator ke browser mein code chal sakta tha.\n\nSQL injection ke liye `store.py` aur `api.py` dono SQLAlchemy `text()` ke saath bound parameters (`:w`, `:s`, `:q`) use karte hain. JSON values `CAST(:a AS jsonb)` se jaati hain, string concatenation se nahi. `api.py::list_workflows` mein query string dynamic banti hai, par sirf fixed SQL fragment (`WHERE status = :s`) append hota hai; status value phir bhi parameter hai.\n\nHonest observation: `tests/conftest.py::effects` test helper `WHERE kind = '{kind}'` f-string se banata hai. Yeh sirf tests mein hai aur input hardcoded hai, isliye real risk nahi, par code review mein main isko bhi parameterise karwata -- bad pattern copy hote hain. `SECURITY.md` \"Dashboard XSS: all values escaped\" aur \"SQL injection: parameterised queries throughout\" claim karta hai, jo production code ke liye sahi hai.",
+  "why_needed": "Dashboard operators use karte hain jinke paas high privilege hota hai; unke browser mein XSS matlab engine ka control. SQL injection matlab poori history/DB compromise.",
+  "real_world_analogy": "Parameterised query aise hai jaise form mein 'naam' wala box -- aap usmein kuch bhi likho, woh naam hi maana jayega, command nahi. Escaping aise hai jaise poster pe kisi ki likhi baat ko quote marks mein chhapna.",
+  "how_it_works": "Bound parameters DB driver alag se bhejta hai, SQL parser unhe kabhi code nahi samajhta. `esc()` special characters ko entities mein badalta hai taaki browser unhe text dikhaye, tags nahi.",
+  "in_this_project": "`flowengine/dashboard.html` ka `esc` function aur `showHist` mein `textContent`. `flowengine/store.py` mein har query `text(...)` + dict params. `flowengine/api.py::list_workflows` ka status filter parameterised. Gap: `tests/conftest.py::effects` mein f-string SQL.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/dashboard.html::esc",
+   "projects/10-workflow-engine/flowengine/store.py::_append",
+   "projects/10-workflow-engine/flowengine/api.py::list_workflows",
+   "projects/10-workflow-engine/tests/conftest.py::effects",
+   "projects/10-workflow-engine/SECURITY.md"
+  ],
+  "code_example": "# real, flowengine/store.py (_append) -- values are bound parameters, never concatenated\nawait s.execute(text(\"INSERT INTO history_events (workflow_id, event_id, event_type, attrs) \"\n                     \"VALUES (:w, :e, :t, CAST(:a AS jsonb))\"),\n                {\"w\": workflow_id, \"e\": last, \"t\": et, \"a\": _j(attrs)})\n\n# fix for tests/conftest.py::effects (suggested)\nq = \"SELECT kind, count(*) FROM activity_effects\" + (\" WHERE kind = :k\" if kind else \"\")\nrows = await s.execute(text(q + \" GROUP BY kind\"), {\"k\": kind})",
+  "code_language": "python",
+  "advantages": [
+   "Simple, consistent pattern pure store mein",
+   "Dashboard pe untrusted ids safe render"
+  ],
+  "disadvantages": [
+   "Manual escaping bhoolna aasaan (koi framework auto-escape nahi)",
+   "Test code mein inconsistency"
+  ],
+  "common_mistakes": [
+   "innerHTML mein raw values daalna",
+   "Table/column names ko parameter samajhna (wo bind nahi hote)",
+   "Tests mein f-string SQL ko 'sirf test hai' bolke ignore karna"
+  ],
+  "follow_up_questions": [
+   "Content-Security-Policy header add karoge?",
+   "ORDER BY column ko user se lena ho toh kaise safe karoge?",
+   "JSONB attrs mein stored XSS ka kya?"
+  ],
+  "concepts": [
+   "XSS",
+   "SQL injection",
+   "output escaping",
+   "parameterised queries"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-089",
+  "project_slug": "p10-workflow-engine",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "What abuse vectors exist through workflow inputs and signal payloads (size, volume, unbounded endpoints), and how would you harden them?",
+  "answer_hinglish": "Inputs aur signals \"data\" hain, code nahi, isliye code execution ka risk nahi -- par resource abuse ka risk zaroor hai. Teen vectors main dekhta hoon.\n\nPehla, payload size: `StartIn.input` aur `SignalIn.payload` `Any` type hain, koi size limit nahi. Har signal `SignalReceived` event ban ke `history_events` mein permanently jaata hai, aur har workflow task poori history padh ke replay karta hai. Toh koi 5MB ke 1000 signals bhej de toh DB bloat bhi hoga aur har replay slow -- TESTING.md dikhata hai 2,001 events pe replay 102-132 ms le leta hai, payload bhaari ho toh aur zyada.\n\nDoosra, volume: signal endpoint pe koi rate limit nahi. Har signal `needs_task = true` set karta hai, toh signal flood = workflow-task flood = CPU-bound replay storm. Temporal isi wajah se history size/count limits rakhta hai (warning thresholds aur hard limit pe workflow terminate).\n\nTeesra, unbounded reads: `/workflows/{id}/history` mein pagination nahi hai, poori history ek response mein aati hai. `list_workflows` mein `limit` le=1000 tak capped hai, jo achha hai.\n\nHardening: pydantic mein payload size validate karna (ya request body limit at proxy), per-workflow signal count/size limit `store.signal` mein (lock ke andar last_event_id check karke reject), API pe rate limiting (Project 1 ka limiter reuse), history endpoint pe `after_event_id` + `limit` pagination, aur bade blobs ko object storage mein rakh ke history mein sirf reference.",
+  "why_needed": "Workflow engine ki history permanent aur replay-critical hai; usmein kachra bhar gaya toh woh workflow hamesha ke liye slow ho jata hai.",
+  "real_world_analogy": "Register mein har visitor ki entry likhni hai. Koi har minute 100 visitors bheje, ya har entry 10 page ki ho, toh register bhar jayega aur har audit mein poora register padhna padega.",
+  "how_it_works": "History append-only aur replay full hai, toh har byte jo history mein jaata hai woh har future workflow task mein dobara padha jayega. Isliye input pe limit lagana storage aur CPU dono bachata hai.",
+  "in_this_project": "`flowengine/api.py::StartIn` mein `input: Any` aur `SignalIn` mein `payload: Any` -- size validation nahi. `store.signal` har signal ko history mein append karta hai aur `needs_task = true`. `api.py::history` unpaginated hai. `list_workflows` ka `limit` `Query(100, ge=1, le=1000)` bounded hai. Yeh sab limits is project mein implement nahi hain.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/api.py::SignalIn",
+   "projects/10-workflow-engine/flowengine/api.py::StartIn",
+   "projects/10-workflow-engine/flowengine/store.py::signal",
+   "projects/10-workflow-engine/flowengine/api.py::history",
+   "projects/10-workflow-engine/TESTING.md"
+  ],
+  "code_example": "# illustrative hardening for store.signal (NOT in repo)\nMAX_EVENTS, MAX_PAYLOAD = 10_000, 64 * 1024\nasync def signal(sm, workflow_id, name, payload):\n    if len(_j(payload)) > MAX_PAYLOAD:\n        raise Unprocessable(\"signal payload too large\")\n    async with sm() as s, s.begin():\n        wf = await _lock(s, workflow_id)\n        if wf[\"last_event_id\"] >= MAX_EVENTS:\n            raise Conflict(\"history limit reached; use continue-as-new\")\n        ...",
+  "code_language": "python",
+  "advantages": [
+   "Limits replay cost ko bounded rakhte hain",
+   "DB growth predictable"
+  ],
+  "disadvantages": [
+   "Legit bade payloads ko alag storage chahiye",
+   "Limit cross hone pe workflow ka kya karna hai -- policy chahiye"
+  ],
+  "common_mistakes": [
+   "Sirf API gateway pe body size limit, per-workflow event count nahi",
+   "Bade documents history mein embed karna",
+   "History endpoint unpaginated chhodna"
+  ],
+  "follow_up_questions": [
+   "Temporal history size limits kya karte hain?",
+   "Payload ko object storage mein offload kaise karoge?",
+   "Signal flood ko rate limit kis key pe karoge?"
+  ],
+  "concepts": [
+   "payload limits",
+   "rate limiting",
+   "history bloat",
+   "pagination"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict limits safety dete hain par legit use cases (bade batch inputs) ko claim-check pattern pe shift karna padta hai.",
+   "failure_scenarios": "Signal flood -> needs_task har baar true -> CPU-bound replays queue up; badi history -> har replay mehenga; unpaginated history -> API memory spike.",
+   "alternatives": "Claim-check (blob store + reference), per-workflow signal quota, gateway rate limits, Temporal ki tarah blob size limit + history count limit.",
+   "scale_10x_100x": "10x pe history size directly replay CPU aur DB storage multiply karta hai; limits ke bina ek bad client poore cluster ko slow kar sakta hai.",
+   "production_improvements": "Pydantic size validators, rate limiter per (caller, workflow_id), history pagination, metrics on history length per workflow, alerts on outliers."
+  }
+ },
+ {
+  "id": "FLOW-090",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why replay deterministic code against history instead of simply storing the workflow's state after each step?",
+  "answer_hinglish": "Yeh is project ka central design decision hai. Alternative simple lagta hai: har step ke baad state (variables, current step) DB mein save karo, crash pe wahin se resume. Problem yeh hai ki Python coroutine ka state -- local variables, call stack, kahan await pe ruka hai -- serialize nahi hota. Toh state store karne ke liye aapko workflow ko explicit state machine mein likhna padta (Step Functions JSON, ya `if step == 3` wala code). Code readable nahi rehta, try/except compensation natural nahi rehta.\n\nReplay approach mein hum sirf facts store karte hain (`ActivityCompleted seq 2 result X`). State hamesha derive hoti hai: code ko shuru se chalao aur results feed karo. Fayde: workflow plain async Python hai (`order_processing` mein normal try/except saga), koi bhi worker kisi bhi workflow ko continue kar sakta hai, poora audit trail free mein, aur races deterministic (`test_race_signal_first_wins`).\n\nCost do hain. Ek, determinism rules -- `ctx.now()`, `ctx.random()`, no I/O; galti hui toh NonDeterminismError. Do, CPU: har workflow task full replay karta hai, aur TESTING.md mein measured hai 21 events ~0.5 ms, 201 ~3.4 ms, 2,001 ~102 ms -- super-linear. `TRADEOFFS.md` #1 aur #2 yahi likhte hain.\n\nMain bolunga: developer ergonomics aur correctness ke liye replay jeeta; CPU cost ko production engines sticky cache aur continue-as-new se manage karte hain. Ek middle ground bhi hai -- snapshotting -- par Python coroutines ke saath woh possible nahi.",
+  "why_needed": "Interviewer yeh dekhna chahta hai ki aap event sourcing ka 'kyun' samajhte ho, sirf 'kya' nahi.",
+  "real_world_analogy": "Chess game ka board photo (state) vs moves ki list (history). Moves ki list se board kabhi bhi dobara bana sakte ho, kisi bhi table pe, aur pata bhi hai kaise yahan pahunche.",
+  "how_it_works": "Store: append-only events. Execute: `replay()` coroutine start karta hai, events order mein feed karta hai, code wahin pahunch jaata hai jahan pichhli baar tha, phir naye commands nikalte hain. Coroutine discard ho jaata hai (`task.cancel()` in finally).",
+  "in_this_project": "`flowengine/runtime.py::replay` docstring yahi loop describe karta hai; `replay` ke `finally` mein coroutine cancel hota hai -- \"next task replays from scratch\". `TRADEOFFS.md` points 1-2, `bench/bench.py::replay_cost` cost measure karta hai. `test_worker_crash_another_worker_resumes_from_history` prove karta hai ki memory mein kuch nahi chahiye.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/bench/bench.py::replay_cost",
+   "projects/10-workflow-engine/tests/test_engine.py::test_worker_crash_another_worker_resumes_from_history"
+  ],
+  "code_example": "# real, flowengine/runtime.py (end of replay)\nfinally:\n    if not task.done():\n        task.cancel()     # the coroutine is discarded; next task replays from scratch",
+  "code_language": "python",
+  "advantages": [
+   "Workflow plain code hai, state machine nahi",
+   "Workers stateless, crash-proof",
+   "Full audit trail + deterministic races"
+  ],
+  "disadvantages": [
+   "Determinism discipline zaroori",
+   "Replay CPU history ke saath badhta hai",
+   "Code changes versioning maangte hain"
+  ],
+  "common_mistakes": [
+   "Replay ko 'har baar activities dobara chalana' samajhna -- activities replay nahi hoti, sirf results feed hote hain",
+   "Determinism cost ko ignore karna",
+   "State aur history dono store karke unhe out-of-sync kar dena"
+  ],
+  "follow_up_questions": [
+   "Sticky cache replay ko kaise bachata hai?",
+   "Snapshot kyun nahi le sakte Python coroutine ka?",
+   "Continue-as-new kab use karoge?"
+  ],
+  "concepts": [
+   "event sourcing",
+   "replay",
+   "durable execution",
+   "state machine"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Replay: ergonomic code + stateless workers vs CPU cost + determinism rules. Stored state: cheap resume vs explicit state machines aur serialization problems.",
+   "failure_scenarios": "Replay mein bad deploy = NonDeterminismError (workflow blocked). Stored state mein bad deploy = purana state naye code se mismatch, silent corruption possible.",
+   "alternatives": "AWS Step Functions (state machine JSON), Azure Durable Functions (replay, jaisa yeh), Camunda (BPMN + DB state), Airflow (DAG task state).",
+   "scale_10x_100x": "10x: sticky cache se replay sirf cache miss pe. 100x: history sharding + continue-as-new, kyunki ek workflow ki history bhi bound karni padti hai.",
+   "production_improvements": "Sticky worker cache, continue-as-new, history length alerts, replay tests in CI against recorded production histories."
+  }
+ },
+ {
+  "id": "FLOW-091",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "What are the trade-offs of using one Postgres database for history, task queues, timers and worker registry?",
+  "answer_hinglish": "Is project mein Postgres hi sab kuch hai: `history_events` (event store), `workflows.needs_task` (workflow-task queue), `activity_tasks` (activity queue with `visible_at` backoff), `timers` (durable timers), aur `workers` (registry). `TRADEOFFS.md` #3 isko explicitly trade-off bolta hai.\n\nSabse bada fayda: transactions. `complete_workflow_task` ek hi transaction mein history events append karta hai, activity tasks insert karta hai, timers insert karta hai aur `needs_task` clear karta hai. Agar queue alag system (Redis/Kafka) hota toh yeh dual-write ban jaata -- event likha par task enqueue nahi hua, ya ulta -- aur outbox pattern chahiye hota. Yahan woh problem exist hi nahi karti. Doosra fayda: inspect karna easy -- ek SQL query se workflow ka poora state dikh jaata hai, dashboard bhi wahi karta hai.\n\nCost: Postgres bottleneck banta hai. TESTING.md ke hisaab se ek 4-activity workflow ~97 SQL statements leta hai, aur processes badhane pe throughput 4.9 -> 7.6 -> 8.3 workflows/s pe flatten hota dikh raha hai (shared Postgres, Docker Desktop on Windows). Polling se idle queries bhi aati hain. Aur queue tables pe heavy UPDATE churn se dead tuples/vacuum pressure hota hai (yeh general Postgres behaviour hai, measured nahi).\n\nProduction answer: chhote/medium scale pe yeh bilkul theek hai (bahut log pg-boss, river jaise Postgres queues use karte hain). Bade scale pe Temporal ki tarah history ko shards mein baanto aur matching (task queues) ko alag in-memory service banao.",
+  "why_needed": "Interviewer check karta hai ki aap 'ek DB' ko lazy choice nahi, conscious consistency choice ki tarah defend kar sakte ho.",
+  "real_world_analogy": "Chhoti dukaan mein ek hi register mein stock, orders aur udhaar -- sab consistent, ek jagah. Dukaan mall ban jaaye toh alag departments aur alag registers chahiye.",
+  "how_it_works": "Har state change ek Postgres transaction hai jo workflow row lock leta hai; queues `FOR UPDATE SKIP LOCKED` se claim hoti hain; backoff `visible_at` column se; timers `fire_at` index se poll hote hain.",
+  "in_this_project": "`flowengine/store.py::complete_workflow_task` ek transaction mein events + `activity_tasks` + `timers` likhta hai. `TRADEOFFS.md` #3 aur TESTING.md ka \"97 SQL statements per workflow\". `migrations/versions/0001_initial.py` mein saari tables.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "",
+  "code_language": "python",
+  "advantages": [
+   "Atomic multi-table updates, koi dual-write nahi",
+   "Ek system operate karna",
+   "SQL se debugging"
+  ],
+  "disadvantages": [
+   "Single DB throughput ceiling",
+   "Polling overhead",
+   "Queue churn se vacuum pressure"
+  ],
+  "common_mistakes": [
+   "Queue ko Redis mein daal ke transactional guarantee kho dena bina outbox ke",
+   "97 statements ko ignore karke 'Postgres slow hai' bolna -- pehle statements kam karo",
+   "Sabhi workers ka pool size DB max_connections se zyada"
+  ],
+  "follow_up_questions": [
+   "97 statements kaise kam karoge?",
+   "Outbox pattern kab chahiye hota?",
+   "Kab Cassandra jaisa store consider karoge?"
+  ],
+  "concepts": [
+   "single datastore",
+   "transactions",
+   "dual write",
+   "Postgres as queue"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-092",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why does the workflow task use an optimistic commit (check last_event_id) instead of holding a row lock during replay?",
+  "answer_hinglish": "Do options the. Pessimistic: workflow row `FOR UPDATE` lock lo, replay karo, commit karo -- sab ek transaction mein. Optimistic (jo yahan hai): claim karte waqt lease lo aur history `last_event_id = N` tak padho, transaction band karo, replay transaction ke bahar karo, phir commit ke waqt row lock lo aur check karo ki `last_event_id` abhi bhi N hai. Agar nahi -- matlab beech mein signal, activity completion ya timer aa gaya -- toh result discard, `needs_task` true rehta hai, aur task naye events ke saath dobara chalega.\n\nOptimistic kyun? Replay pure CPU hai aur history badi ho toh 100 ms+ le sakta hai (TESTING.md: 2,001 events pe 102-132 ms). Agar us poore time row lock pakda rahe toh `store.signal`, `complete_activity`, `fire_due_timers` -- sab jo workflow row lock karte hain -- block ho jaate. Matlab activity worker ka completion commit bhi ruk jaata. Aur long transactions Postgres mein connection pin karti hain aur vacuum ko rokti hain.\n\nCost: occasional wasted replay. Jab signal race karta hai toh ek replay bekaar jaata hai. `TRADEOFFS.md` #5 yahi likhta hai: \"No long locks during replay; occasionally wasted replays when signals race\". Kyunki replay deterministic hai, dobara chalana hamesha safe hai -- koi side effect nahi.\n\nYeh `test_stale_workflow_task_is_discarded_when_history_moves` prove karta hai: claim, replay, beech mein signal, phir `complete_workflow_task` False return karta hai aur koi activity task create nahi hota.",
+  "why_needed": "Locking strategy throughput aur latency pe seedha asar daalti hai; interviewer optimistic concurrency control ka practical use dekhna chahta hai.",
+  "real_world_analogy": "Google Doc offline edit: aap version 5 pe kaam karte ho; save karte waqt agar server pe version 6 aa chuka hai toh aapka save reject, refresh karke dobara. Poore editing time document lock nahi kiya.",
+  "how_it_works": "`claim_workflow_task` lease + snapshot (N). `replay` bahar. `complete_workflow_task` -> `_lock` -> compare `current[\"last_event_id\"] != wf[\"last_event_id\"]` -> mismatch pe sirf apni lease release (`AND locked_by = :k`) aur False.",
+  "in_this_project": "`flowengine/store.py::complete_workflow_task` ki pehli lines; `store.py` module docstring \"Workflow task protocol (optimistic)\". `Worker.run_workflow_task_once` mein `stats[\"stale\"] += 1` jab commit reject ho. Test: `tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/worker.py::run_workflow_task_once",
+   "projects/10-workflow-engine/tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves",
+   "projects/10-workflow-engine/TRADEOFFS.md"
+  ],
+  "code_example": "# real, flowengine/store.py complete_workflow_task\ncurrent = await _lock(s, wid)\nif current[\"last_event_id\"] != wf[\"last_event_id\"] or current[\"status\"] != \"running\":\n    # Only release the lease if it is still ours (another worker may have claimed it after expiry)\n    await s.execute(text(\"UPDATE workflows SET locked_by = NULL, lease_until = NULL WHERE workflow_id = :w \"\n                         \"AND locked_by = :k\"), {\"w\": wid, \"k\": wf[\"locked_by\"]})\n    return False",
+  "code_language": "python",
+  "advantages": [
+   "Row lock milliseconds ke liye, replay ke duration ke liye nahi",
+   "Activity completions aur signals block nahi hote",
+   "Deterministic replay ki wajah se retry safe"
+  ],
+  "disadvantages": [
+   "Signal-heavy workflows mein wasted replays",
+   "Extra state (last_event_id) maintain karna"
+  ],
+  "common_mistakes": [
+   "Version check ke bina commit -- stale commands append ho jaate",
+   "Replay ke andar DB transaction open rakhna",
+   "Mismatch pe needs_task clear kar dena (event lost)"
+  ],
+  "follow_up_questions": [
+   "Hot workflow pe har replay reject hota rahe toh (livelock)?",
+   "Lease aur last_event_id dono kyun chahiye?",
+   "Temporal mein yeh check kahan hota hai?"
+  ],
+  "concepts": [
+   "optimistic concurrency",
+   "compare-and-set",
+   "lock duration",
+   "wasted work"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-093",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why does a NonDeterminismError leave the workflow running and blocked instead of failing it?",
+  "answer_hinglish": "Non-determinism ka matlab hai ki naya code purani history se match nahi karta -- almost hamesha yeh code bug ya bad deploy hai, workflow ki business failure nahi. Agar hum workflow ko `failed` kar dete toh woh terminal hai: customer ka order beech mein mar gaya, compensation bhi nahi chalegi, aur rollback karne se bhi wapas nahi aayega.\n\nIsliye `complete_workflow_task` mein jab `outcome is None` (replay hi fail hua) hota hai, hum sirf `error` column mein message likhte hain, `needs_task = false` aur lease clear karte hain -- status `running` rehta hai aur history mein kuch append nahi hota. Comment explicitly bolta hai: \"it stays running and blocked so it can resume once correct code is deployed (Temporal does the same)\". Temporal mein bhi default behaviour yahi hai: workflow task fail hota hai aur retry hota rehta hai jab tak code fix na ho.\n\n`test_nondeterministic_deploy_is_detected_and_workflow_survives` poori kahani prove karta hai: v1 se ek step chala, v2 deploy hua jismein ek naya activity step pehle insert hai, worker ne `nondeterminism` stat badhaya, status `running` aur error mein `NonDeterminismError`. Phir v1 wapas (rollback), `store.retry_workflow_task(...)` (needs_task = true), aur workflow `done` result ke saath complete.\n\nTrade-off: blocked workflows chupchap pade reh sakte hain, isliye `error` field pe alerting zaroori hai (`DEPLOYMENT.md` rule 3). Blocked hone ke baad `needs_task` false hai; fix deploy karne ke baad automatic re-trigger nahi hai. Pehle iske liye manual SQL UPDATE hi rasta tha -- review mein yeh gap mila aur ab operator endpoint `POST /workflows/{id}/retry-task` (X-Admin-Token) hai, test `test_retry_task_requeues_only_running_workflows`.",
+  "why_needed": "Bad deploys inevitable hain; system ka behaviour aisa hona chahiye ki rollback se recovery ho, data loss se nahi.",
+  "real_world_analogy": "Train ka signal kharab ho gaya toh train ko scrap nahi karte; platform pe rok dete ho, signal theek karo, train aage chal padti hai.",
+  "how_it_works": "Worker `NonDeterminismError` pakadta hai -> `complete_workflow_task(sm, wf, None, error)` -> error set, needs_task false, status untouched. Fixed code + needs_task true -> agla replay normal.",
+  "in_this_project": "`flowengine/worker.py::run_workflow_task_once` ka `except NonDeterminismError` branch; `flowengine/store.py::complete_workflow_task` ka `if outcome is None` block. Test: `tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives`. `TRADEOFFS.md` #6.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/worker.py::run_workflow_task_once",
+   "projects/10-workflow-engine/tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/DEPLOYMENT.md",
+   "projects/10-workflow-engine/flowengine/store.py::retry_workflow_task"
+  ],
+  "code_example": "# real, flowengine/store.py\nif outcome is None:\n    # Replay itself failed (e.g. non-determinism after a bad deploy): the workflow is NOT failed -- it stays\n    # running and blocked so it can resume once correct code is deployed (Temporal does the same).\n    await s.execute(text(\"UPDATE workflows SET error = :e, needs_task = false, locked_by = NULL, lease_until = NULL \"\n                         \"WHERE workflow_id = :w\"), {\"e\": error, \"w\": wid})\n    return True",
+  "code_language": "python",
+  "advantages": [
+   "Bad deploy reversible hai",
+   "History untouched, koi corruption nahi",
+   "Temporal ke semantics se match"
+  ],
+  "disadvantages": [
+   "Silent blocked workflows -- monitoring zaroori",
+   "Fix ke baad operator ko retry-task call karna padta hai (automatic nahi)",
+   "Timers/signals beech mein aate rahe toh har baar fail"
+  ],
+  "common_mistakes": [
+   "Non-determinism pe workflow ko fail/terminate kar dena",
+   "error field pe alert na lagana",
+   "Rollback ke baad needs_task reset bhool jana"
+  ],
+  "follow_up_questions": [
+   "Fix deploy hone ke baad blocked workflows ko kaise resume karoge?",
+   "Kuch workflows genuinely fail karne hon toh?",
+   "CI mein yeh pehle hi kaise pakdoge?"
+  ],
+  "concepts": [
+   "non-determinism",
+   "bad deploy",
+   "rollback",
+   "fail-safe"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Block-and-wait reversibility deta hai par operational visibility maangta hai; fail-fast simple hai par irreversible.",
+   "failure_scenarios": "Deploy ke baad bahut saare workflows blocked -> backlog aur SLA miss; agar koi monitor nahi karta toh hafton pade rahenge.",
+   "alternatives": "Temporal ka workflow task retry loop; per-workflow 'reset to event N' (Temporal reset API); workflow versioning se problem hi avoid karna.",
+   "scale_10x_100x": "10x/100x pe ek bad deploy hazaron workflows block karega -- canary workers aur replay-check CI mandatory ho jaate hain.",
+   "production_improvements": "Alert on count(error IS NOT NULL), bulk retry-task / automatic re-queue on deploy, replay tests against production histories in CI."
+  }
+ },
+ {
+  "id": "FLOW-094",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why does the determinism check compare only command and activity types, not arguments? What does that miss?",
+  "answer_hinglish": "`replay()` mein jab history ka `ActivityScheduled` event aata hai toh code ka command same `seq` pe dhoondha jaata hai aur sirf `activity_type` compare hota hai. `TimerStarted` ke liye sirf `kind == \"start_timer\"` check hota hai, duration nahi. Arguments (amount, email, template) compare nahi hote.\n\nKyun? Teen reasons. Ek, cheap -- string compare, koi serialization nahi. Do, Temporal bhi yahi karta hai: command type aur activity type match hona chahiye, input nahi, kyunki arguments legitimately change ho sakte hain (jaise ek bug fix jo email template ka naam theek kare) aur us change se running workflows ko block karna overkill hai. Teen, arguments mein aksar workflow ke derived values hote hain; compare karne ke liye unhe canonical serialize karna padta.\n\nKya miss hota hai: same type ka step insert karna. `FAILURE_SCENARIOS.md` bug 5 aur test comment yahi bolta hai -- agar v2 mein ek naya `notify` step pehle insert ho jaaye toh replay pe seq 1 ka type `notify` hi hai, check pass, aur purane result naye step ko mil jaate hain. Workflow galat data ke saath chalta rahega. Isliye test `archive_document` (different type) insert karta hai. Argument changes bhi undetected: amount 100 se 200 ho gaya toh history mein charged 100 hai par code sochta hai 200.\n\n`TRADEOFFS.md` #7 isko \"Cheap and matches Temporal; argument changes go undetected\" bolta hai. Mitigation: versioning (`patched()`), aur CI mein replay tests.",
+  "why_needed": "Determinism check ki limitations pata na hon toh developer false confidence mein deploy kar deta hai.",
+  "real_world_analogy": "Attendance mein sirf roll number check kiya, naam nahi. Roll 5 pe koi aur baith gaya toh pata nahi chalega.",
+  "how_it_works": "Seq numbers command order se assign hote hain (`_next`). History event ka seq aur type -> code ka command at same seq -> type equal? Sirf yahi.",
+  "in_this_project": "`flowengine/runtime.py::replay` ka `if et in (\"ActivityScheduled\", \"TimerStarted\")` block. `tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives` ka comment same-type insert ke baare mein. `FAILURE_SCENARIOS.md` bug 5, `TRADEOFFS.md` #7, README known limitations.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives",
+   "projects/10-workflow-engine/FAILURE_SCENARIOS.md",
+   "projects/10-workflow-engine/TRADEOFFS.md"
+  ],
+  "code_example": "# real, flowengine/runtime.py\ncmd = ctx.commands.get(a[\"seq\"])\nwant = a.get(\"activity_type\") if et == \"ActivityScheduled\" else None\nif cmd is None or (et == \"ActivityScheduled\" and cmd.attrs[\"activity_type\"] != want) \\\n        or (et == \"TimerStarted\" and cmd.kind != \"start_timer\"):\n    raise NonDeterminismError(...)",
+  "code_language": "python",
+  "advantages": [
+   "Sasta aur simple",
+   "Argument-level bug fixes running workflows ko block nahi karte",
+   "Temporal ke behaviour se consistent"
+  ],
+  "disadvantages": [
+   "Same-type insert undetected",
+   "Argument/duration changes silently accept",
+   "False confidence"
+  ],
+  "common_mistakes": [
+   "Maan lena ki replay-check pass = deploy safe",
+   "Test mein same activity type insert karke 'detection works' assume karna",
+   "Timer duration change ko safe samajhna bina soche"
+  ],
+  "follow_up_questions": [
+   "Args ka hash bhi compare karna ho toh kya trade-off?",
+   "patched() is gap ko kaise cover karta hai?",
+   "Timer duration change kab dangerous hai?"
+  ],
+  "concepts": [
+   "determinism check",
+   "command matching",
+   "versioning",
+   "false negatives"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-095",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why are activities at-least-once with an idempotency key instead of using distributed transactions with external systems?",
+  "answer_hinglish": "Activity ka kaam external world mein side effect karna hai -- payment provider, email service. Inke saath distributed transaction (2PC) practically possible nahi: Stripe ya SMTP server aapke Postgres ke saath XA transaction mein participate nahi karte. Toh exactly-once delivery ki guarantee nahi di ja sakti.\n\nIs project ka model: activity at-least-once chalti hai. Worker crash ho, lease expire ho, ya result commit hone se pehle network gire -- activity dobara chalegi. Isliye har activity ko `ActivityContext.idempotency_key = \"<workflow_id>:<seq>\"` milta hai jo retries aur redeliveries mein same rehta hai. Activity author is key ko downstream ko deta hai (payment provider ka Idempotency-Key header) ya apne DB mein unique key ki tarah use karta hai. Example activities `effect()` helper se `activity_effects` mein `INSERT ... ON CONFLICT DO NOTHING` karti hain -- effect ek hi baar.\n\nTests isko prove karte hain: `test_retries_with_backoff_then_success_effect_once` mein charge 3 attempts leta hai par `{\"charge\": 1}`; heartbeat test mein worker crash ke baad attempt 2 par `{\"long_task\": 1}`.\n\nTrade-off (`TRADEOFFS.md` #9): engine simple aur available rehta hai, koi coordinator nahi; par responsibility activity author pe hai -- agar woh key ignore kare toh duplicates honge. Engine ise enforce nahi kar sakta. Ek subtle point: key `workflow_id:seq` hai, run_id nahi -- toh agar future mein same workflow_id reuse hua (naya run) toh keys collide karengi; abhi `start_workflow` workflow_id reuse allow nahi karta, isliye safe hai.",
+  "why_needed": "Exactly-once ka myth interviews mein common trap hai; sahi jawab hai at-least-once + idempotent effects.",
+  "real_world_analogy": "Courier ka tracking number: courier do baar bhi aaye toh receiver dekhta hai 'yeh parcel number pehle hi mila', dobara sign nahi karta.",
+  "how_it_works": "Key deterministic hai (workflow_id + command seq), toh har attempt ko same key milti hai. Downstream unique constraint ya provider dedupe pehli successful effect ke baad baaki ko no-op kar deta hai.",
+  "in_this_project": "`flowengine/worker.py::_execute` key banata hai `f\"{task['workflow_id']}:{task['seq']}\"`. `flowengine/activities.py::ActivityContext` mein `idempotency_key`. `flowengine/examples/activities.py::effect` ON CONFLICT DO NOTHING. Tests: `test_retries_with_backoff_then_success_effect_once`, `test_activity_heartbeat_timeout_detects_dead_worker`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/activities.py::ActivityContext",
+   "projects/10-workflow-engine/flowengine/worker.py::_execute",
+   "projects/10-workflow-engine/flowengine/examples/activities.py::effect",
+   "projects/10-workflow-engine/tests/test_engine.py::test_retries_with_backoff_then_success_effect_once",
+   "projects/10-workflow-engine/TRADEOFFS.md"
+  ],
+  "code_example": "# real, flowengine/examples/activities.py\nasync def effect(ctx: ActivityContext, kind: str, payload: dict) -> bool:\n    async with ctx.sm() as s, s.begin():\n        row = await s.scalar(text(\"INSERT INTO activity_effects (idempotency_key, kind, payload) VALUES (:k, :t, CAST(:p AS jsonb)) \"\n                                  \"ON CONFLICT DO NOTHING RETURNING idempotency_key\"),\n                             {\"k\": ctx.idempotency_key, \"t\": kind, \"p\": json.dumps(payload)})\n    return row is not None",
+  "code_language": "python",
+  "advantages": [
+   "Koi distributed coordinator nahi",
+   "External APIs ke idempotency features ke saath natural fit",
+   "Engine simple"
+  ],
+  "disadvantages": [
+   "Activity author pe responsibility",
+   "Non-idempotent downstream (purane APIs) ke saath duplicates possible"
+  ],
+  "common_mistakes": [
+   "Random uuid4() ko idempotency key banana (har retry naya)",
+   "Effect check aur effect ko alag transactions mein karna",
+   "Key mein attempt number daal dena"
+  ],
+  "follow_up_questions": [
+   "Downstream idempotency support na kare toh?",
+   "Key mein run_id kyun nahi?",
+   "Result return karne se pehle crash ho toh kya hota hai?"
+  ],
+  "concepts": [
+   "at-least-once",
+   "idempotency key",
+   "exactly-once effects",
+   "2PC"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-096",
+  "project_slug": "p10-workflow-engine",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why build a workflow engine instead of using Temporal, AWS Step Functions, Airflow or Camunda? When would you pick each?",
+  "answer_hinglish": "Honest jawab: production mein main khud ka engine nahi banata -- Temporal (ya managed Temporal Cloud) use karta. Yeh project learning ke liye hai: durable execution ke internals (event history, replay, determinism, leases, fencing) ko itna samajhna ki Temporal ke behaviour ko predict aur debug kar sakoon. README khud ise \"Temporal-style\" bolta hai aur limitations list karta hai: no sticky cache, no versioning API, no child workflows, single Postgres.\n\nKaunsa kab: Temporal -- jab business process code mein likhna ho, long-running (din/mahine), signals, compensations, high reliability; cost hai cluster operate karna (ya Cloud ka bill) aur determinism discipline. AWS Step Functions -- AWS-native, serverless, state machine JSON/ASL mein; chhote orchestration ke liye great, par complex logic JSON mein awkward aur per-transition pricing. Airflow -- data pipelines aur batch DAGs, schedule-driven; per-request business workflows (har order ek workflow) ke liye nahi bana, latency seconds-minutes. Camunda/Zeebe -- BPMN, jahan business analysts diagram se process define karte hain aur human tasks heavy hain.\n\nKab khud ka banaoge? Jab requirements bahut chhoti hon (2-3 step saga) aur already Postgres hai -- tab ek simple outbox + state table kaafi hai, poora engine nahi. Ya jab extreme constraints hon (embedded, air-gapped). Isliye interview mein main bolunga: 'Maine yeh banaya taaki Temporal ko black box nahi, glass box ki tarah samjhoon.'",
+  "why_needed": "Senior interviews mein build-vs-buy judgement dekha jaata hai; 'maine banaya' ke saath 'production mein kya use karunga' bolna maturity dikhata hai.",
+  "real_world_analogy": "Car ka engine khol ke dobara jodna mechanic banne ke liye zaroori hai; par office jaane ke liye aap company ki banayi car hi chalate ho.",
+  "how_it_works": "Decision factors: process ki lambai, kaun define karta hai (dev vs analyst), cloud lock-in, ops capacity, latency, aur failure semantics.",
+  "in_this_project": "`README.md` \"Known limitations\" aur title \"Temporal-style\". `SYSTEM_DESIGN.md` workflow vs job queue table. `TRADEOFFS.md` poore design choices. Engine ~250 lines `runtime.py` + ~290 lines `store.py` -- learning-sized.",
+  "implementation_files": [
+   "projects/10-workflow-engine/README.md",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/flowengine/runtime.py"
+  ],
+  "code_example": "",
+  "code_language": "python",
+  "advantages": [
+   "Internals ki deep understanding",
+   "Temporal debugging/tuning mein direct fayda",
+   "Interview stories with real bugs"
+  ],
+  "disadvantages": [
+   "Production-grade features missing",
+   "Khud ka engine maintain karna mehenga",
+   "Ecosystem/tooling nahi"
+  ],
+  "common_mistakes": [
+   "Har problem ke liye Airflow use karna (per-entity workflows ke liye galat)",
+   "2-step process ke liye Temporal cluster lagana",
+   "Khud ka engine production mein daal dena bina versioning/sharding ke"
+  ],
+  "follow_up_questions": [
+   "Temporal Cloud vs self-hosted kab?",
+   "Step Functions ka pricing model kaise design ko affect karta hai?",
+   "Airflow aur Temporal ko saath kab use karte ho?"
+  ],
+  "concepts": [
+   "build vs buy",
+   "Temporal",
+   "Step Functions",
+   "Airflow",
+   "Camunda"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Managed service ops cost hatata hai par lock-in aur per-action pricing laata hai; self-hosted Temporal flexible par Cassandra/ES/cluster ops heavy.",
+   "failure_scenarios": "Custom engine mein bug = aapki zimmedari (is project ne 4 engine bugs tests se pakde); mature engines mein yeh years ki hardening hai.",
+   "alternatives": "Temporal, Cadence, Azure Durable Functions, Step Functions, Airflow/Dagster/Prefect, Camunda/Zeebe, Restate, DBOS (Postgres-based durable execution).",
+   "scale_10x_100x": "10x/100x pe khud ka engine sharding, matching service, versioning sab maangta -- yahi Temporal already deta hai.",
+   "production_improvements": "Real system: Temporal Cloud ya self-hosted Temporal; is project ke learnings ko determinism linting, replay tests in CI aur idempotent activities mein apply karna."
+  }
+ },
+ {
+  "id": "FLOW-097",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "How do you safely deploy a change to workflow code when workflows are already running?",
+  "answer_hinglish": "Running workflows ki history purane code ne likhi hai, aur replay naye code se hoga. Agar naya code alag commands produce kare (step insert/remove/reorder) toh NonDeterminismError aur workflow blocked. Toh deploy process mein teen cheezein chahiye.\n\nPehla, detect before deploy: `POST /workflows/{id}/replay-check` current code ko recorded history pe replay karta hai aur `{deterministic: bool}` deta hai. `DEPLOYMENT.md` rule 1 kehta hai isse CI mein chalao. Better: production se kuch real histories export karke test suite mein replay karo (Temporal ka \"replayer\" bhi yahi karta hai).\n\nDoosra, versioning: purane runs purana path lein, naye runs naya. Temporal mein `workflow.patched(\"add-fraud-check\")` -- naye run mein marker event record hota hai aur true return karta hai; purani history mein marker nahi toh false, aur code purana path chalta hai. Is project mein yeh implement nahi hai -- README \"No workflow versioning API (patched())\" bolta hai. Workaround: naya workflow type register karo (`order_processing_v2`) aur naye starts usse karo, purane drain hone do.\n\nTeesra, safe changes pehchano: activity ke andar ka code change hamesha safe hai (activities replay nahi hoti). Workflow ke end mein naya step add karna jo abhi tak koi run nahi pahuncha woh bhi effectively safe. Args change type-level check pass karega par semantically galat ho sakta hai.\n\nAgar galti ho bhi jaaye: workflow fail nahi hota, blocked rehta hai; rollback karo aur `needs_task` reset karo -- `test_nondeterministic_deploy_is_detected_and_workflow_survives` yahi dikhata hai.",
+  "why_needed": "Long-running workflows (din/mahine) ka matlab hai har deploy pe running workflows hongi; yeh durable execution ka sabse bada operational risk hai.",
+  "real_world_analogy": "Chalti train ka route change: jo trains already nikal chuki hain unhe purane route pe jaane do, naye route pe sirf nayi trains bhejo.",
+  "how_it_works": "replay-check = dry-run replay without writes. Versioning = history mein marker se branch decide karna, deterministically. Type versioning = naya registry name.",
+  "in_this_project": "`flowengine/api.py::replay_check` endpoint; `DEPLOYMENT.md` rule 1; README known limitations (no `patched()`). Worker mein `stats[\"nondeterminism\"]` counter. Test: `tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/api.py::replay_check",
+   "projects/10-workflow-engine/DEPLOYMENT.md",
+   "projects/10-workflow-engine/README.md",
+   "projects/10-workflow-engine/tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives"
+  ],
+  "code_example": "# CI step (illustrative): replay every running workflow against the new build\nfor wid in $(curl -s \"$API/workflows?status=running&limit=1000\" | jq -r '.workflows[].workflow_id'); do\n  curl -s -X POST \"$API/workflows/$wid/replay-check\" | jq -e '.deterministic' >/dev/null || { echo \"NON-DET: $wid\"; exit 1; }\ndone",
+  "code_language": "bash",
+  "advantages": [
+   "Bad deploy CI mein pakda jaata hai",
+   "Versioning se old aur new runs saath chal sakte hain",
+   "Rollback path exist karta hai"
+  ],
+  "disadvantages": [
+   "replay-check API process mein naya code hona chahiye (canary API instance)",
+   "Versioning branches code mein jama hoti hain",
+   "Same-type insert type-level check se nahi pakda jaata"
+  ],
+  "common_mistakes": [
+   "Sirf unit tests chala ke deploy karna, replay tests nahi",
+   "Workflow code mein step reorder karna 'refactor' samajh ke",
+   "Purane version branches bahut jaldi hata dena jab runs abhi bhi chal rahe hon"
+  ],
+  "follow_up_questions": [
+   "patched() internally kaise kaam karta hai?",
+   "Versioning branches kab delete kar sakte ho?",
+   "replay-check ko API process ke bajay CI job mein kaise chalaoge?"
+  ],
+  "concepts": [
+   "workflow versioning",
+   "replay testing",
+   "patched",
+   "safe deploys"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Type-versioning (v2 workflow) simple par do code paths maintain; patched() fine-grained par code mein if-branches badhte hain.",
+   "failure_scenarios": "replay-check sirf un workflows ko cover karta hai jo aap check karte ho; ek rare path wali history miss ho gayi toh production mein block.",
+   "alternatives": "Temporal patched/deprecate_patch, worker versioning (build ids) jahan purane runs purane worker build pe pin rehte hain, blue-green worker pools.",
+   "scale_10x_100x": "100x running workflows pe har ek ko replay-check karna mehenga -- sample + representative histories ka corpus rakhna padta hai.",
+   "production_improvements": "Build-id based worker versioning, replay corpus in CI, deploy-time metric on nondeterminism count, automated rollback trigger."
+  }
+ },
+ {
+  "id": "FLOW-098",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "What would you monitor and alert on for this workflow engine in production?",
+  "answer_hinglish": "Workflow engine mein problems aksar \"kuch nahi ho raha\" ki shakal mein aati hain -- workflows chupchap ruk jaate hain. Isliye signals specifically choose karne padte hain. `DEPLOYMENT.md` rule 3 chaar cheezein list karta hai, aur main unhe aise explain karunga.\n\nEk, non-determinism: `workflows.error IS NOT NULL AND status = 'running'` -- yeh bad deploy ka sabse direct signal hai. Worker bhi `workflow_nondeterminism` error log aur `stats[\"nondeterminism\"]` counter deta hai.\n\nDo, workflow-task backlog: `/stats` endpoint `workflow_task_backlog` deta hai (running workflows with `needs_task`). Yeh badhta rahe toh workers kam hain ya replay slow hai.\n\nTeen, activity attempts climbing: `activity_tasks.attempt` aur `last_error`. Bahut saare `ActivityTimeout` errors matlab workers crash ho rahe hain ya activities hang. Logs mein `activity_failed`, `activity_timeout` structured events hain.\n\nChaar, timer lag: `timers WHERE NOT fired AND fire_at < now() - interval '...'` -- agar timers time pe fire nahi ho rahe toh timer loop atka hai.\n\nPlus: worker liveness via `/workers` (`seconds_since_heartbeat`), HTTP metrics `/metrics` (bpcommon ka Prometheus setup -- requests aur latency), aur DB metrics (connections, slow queries). Ek gap: engine-specific Prometheus metrics (backlog gauge, replay duration histogram) abhi nahi hain; worker stats sirf in-memory dict hai. Production mein main replay duration histogram zaroor add karunga kyunki replay cost history ke saath badhta hai.",
+  "why_needed": "Durable engine ki failures silent hoti hain; bina alerts ke blocked workflows hafton pade reh sakte hain.",
+  "real_world_analogy": "Hospital ward mein sirf 'patient chilla raha hai' pe dhyan dena kaafi nahi; pulse aur BP monitor chahiye jo chupchap girne pe bhi beep kare.",
+  "how_it_works": "DB queries + /stats + structured JSON logs (bpcommon.logging) + HTTP Prometheus metrics. Alerts thresholds pe: error count > 0, backlog trend, timer lag > X seconds.",
+  "in_this_project": "`flowengine/api.py::stats` (counts by status + backlog), `api.py::workers` (heartbeat age), `Worker.stats` dict, log events `workflow_nondeterminism`, `activity_failed`, `activity_timeout` in `worker.py`. `DEPLOYMENT.md` rule 3.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/api.py::stats",
+   "projects/10-workflow-engine/flowengine/api.py::workers",
+   "projects/10-workflow-engine/flowengine/worker.py::Worker",
+   "projects/10-workflow-engine/DEPLOYMENT.md"
+  ],
+  "code_example": "-- real-world alert queries (illustrative)\nSELECT count(*) FROM workflows WHERE status = 'running' AND error IS NOT NULL;           -- non-determinism\nSELECT count(*) FROM timers WHERE NOT fired AND fire_at < now() - interval '30 seconds'; -- timer lag\nSELECT activity_type, max(attempt) FROM activity_tasks WHERE status IN ('scheduled','started') GROUP BY 1;",
+  "code_language": "sql",
+  "advantages": [
+   "Silent failures visible",
+   "DB se direct ground truth",
+   "Existing /stats reuse"
+  ],
+  "disadvantages": [
+   "Engine metrics Prometheus mein nahi",
+   "Polling queries khud load dalti hain"
+  ],
+  "common_mistakes": [
+   "Sirf error rate monitor karna, stuck work nahi",
+   "Timer lag ko ignore karna",
+   "Worker heartbeat ko liveness ka sach maan lena bina lease expiry dekhe"
+  ],
+  "follow_up_questions": [
+   "Replay duration histogram kahan instrument karoge?",
+   "Backlog alert ka threshold kaise decide karoge?",
+   "Dead worker rows ko kaise clean karoge?"
+  ],
+  "concepts": [
+   "observability",
+   "alerting",
+   "backlog",
+   "timer lag"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-099",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Walk through the docker-compose deployment: migrations, API, workers, scaling and graceful shutdown.",
+  "answer_hinglish": "`docker-compose.yml` mein chaar services hain. `postgres` (17-alpine, named volume `pgdata`, `pg_isready` healthcheck). `migrate` -- same image, `alembic upgrade head` chalata hai aur tab chalta hai jab postgres healthy ho. `api` -- `migrate` ke `service_completed_successfully` hone ke baad start, sirf `127.0.0.1:58010` pe expose (internal service, public nahi). `worker` -- `python -m flowengine --activity-concurrency 16`, `replicas: 2`, aur `stop_grace_period: 15s`.\n\nOrdering important hai: migration ek baar, alag one-shot container mein, taaki do API/worker replicas parallel mein migration na chalayein.\n\nScaling: workers stateless hain, toh `docker compose up -d --scale worker=4` kaafi hai -- koi rebalancing, koi sticky assignment nahi; SKIP LOCKED automatically kaam baant deta hai. TESTING.md dikhata hai processes add karne se throughput badhta hai (4.9 -> 7.6 -> 8.3 workflows/s), par shared Postgres pe flatten hota hai.\n\nGraceful shutdown: Docker SIGTERM bhejta hai; `worker.main` mein signal handler `w.stop()` call karta hai. `Worker.run` ka finally pehle current workflow task complete karne deta hai (`shutdown_grace` 10s), phir in-flight activities ko 10s tak drain karta hai, phir deregister. `stop_grace_period: 15s` isliye hai ki Docker SIGKILL se pehle drain ka time mile. `DEPLOYMENT.md` rule 2: grace period >= longest activity jo aap drain karna chahte ho. Agar activity usse lambi hai toh SIGKILL aayega, lease expire hogi aur doosra worker retry karega -- correctness safe, bas ek wasted attempt.",
+  "why_needed": "Interviewer dekhna chahta hai ki aap deploy order, migrations aur shutdown semantics ko distributed system ke angle se samajhte ho.",
+  "real_world_analogy": "Restaurant shift change: naya staff aane se pehle kitchen setup (migration) ek baar; jaane wala cook haath ka order poora karke jaata hai (graceful), beech mein nahi bhaagta.",
+  "how_it_works": "Compose depends_on conditions ordering enforce karti hain; SIGTERM -> stop event -> drain -> deregister; SIGKILL fallback pe lease-based recovery.",
+  "in_this_project": "`docker-compose.yml` services aur `stop_grace_period: 15s`; `flowengine/worker.py::main` mein `loop.add_signal_handler(sig, w.stop)`; `Worker.run` finally block; `DEPLOYMENT.md`; `Dockerfile` non-root user (SECURITY.md).",
+  "implementation_files": [
+   "projects/10-workflow-engine/docker-compose.yml",
+   "projects/10-workflow-engine/flowengine/worker.py::main",
+   "projects/10-workflow-engine/flowengine/worker.py::run",
+   "projects/10-workflow-engine/DEPLOYMENT.md",
+   "projects/10-workflow-engine/Dockerfile"
+  ],
+  "code_example": "# real, docker-compose.yml (worker)\nworker:\n  <<: *img\n  environment: *env\n  command: [\"python\", \"-m\", \"flowengine\", \"--activity-concurrency\", \"16\"]\n  deploy: {replicas: 2}\n  stop_grace_period: 15s",
+  "code_language": "yaml",
+  "advantages": [
+   "Migration ek baar, race-free",
+   "Horizontal scaling ek command",
+   "Shutdown pe wasted retries kam"
+  ],
+  "disadvantages": [
+   "Grace period se lambi activities phir bhi kill hoti hain",
+   "Single Postgres container -- HA nahi"
+  ],
+  "common_mistakes": [
+   "Har container startup pe migration chalana",
+   "stop_grace_period worker ke shutdown_grace se chhota rakhna",
+   "Worker ko SIGTERM handle na karna"
+  ],
+  "follow_up_questions": [
+   "Kubernetes mein yeh kaise map hoga (preStop, terminationGracePeriodSeconds)?",
+   "Migration jo workers ke purane code ke saath incompatible ho toh?",
+   "Postgres HA kaise doge?"
+  ],
+  "concepts": [
+   "deployment",
+   "migrations",
+   "graceful shutdown",
+   "horizontal scaling"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-100",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "Describe the scaling path of this engine at 10x and 100x load.",
+  "answer_hinglish": "Pehle current baseline: TESTING.md ke hisaab se (Postgres in Docker Desktop on Windows) ek worker process ~4.9 workflows/s, 4 processes ~8.3 workflows/s, aur ek 4-activity workflow ~97 SQL statements leta hai. Ek process CPU-bound hai (80% wall). Toh bottlenecks do hain: worker CPU (replay + Python overhead) aur shared Postgres.\n\n10x: `SYSTEM_DESIGN.md` ka plan -- (1) zyada worker processes, kyunki processes scale karte hain, in-process workers nahi; (2) per-type task queues taaki slow activities fast ones ko block na karein (code per-activity `task_queue` already support karta hai); (3) sticky cache -- jis worker ne workflow last chalaya woh state memory mein rakhe aur sirf naye events apply kare, full replay sirf cache miss pe. Saath mein SQL statements kam karna: batch history reads, fewer round trips, aur polling interval tune ya LISTEN/NOTIFY.\n\n100x: ek Postgres nahi chalega. Workflows ko `workflow_id` hash se shards mein baanto -- Temporal ke \"history shards\" -- har shard ka apna DB/partition, aur har workflow ke saare writes ek shard pe (row lock semantics intact). Task queues ke liye alag matching service jo in-memory hai aur push-based delivery karti hai (long-poll), DB polling nahi. Timers ke liye per-shard timer queues. Aur long histories ke liye continue-as-new taaki replay cost bounded rahe.\n\nMain honest rahunga: is project mein sticky cache, sharding, matching service, continue-as-new -- kuch bhi implement nahi hai; yeh documented path hai.",
+  "why_needed": "System design rounds mein 'aaj kya hai' se 'kal kaise badhega' tak ka roadmap expected hota hai, measurements ke saath.",
+  "real_world_analogy": "Ek counter wala bank: pehle aur cashiers (workers), phir alag counters per kaam (task queues), phir alag branches (shards) jahan har customer ka account ek hi branch mein.",
+  "how_it_works": "Scale ke liye contention points tod do: CPU (processes, sticky cache), DB (statements kam, shards), polling (push), history length (continue-as-new).",
+  "in_this_project": "`SYSTEM_DESIGN.md` \"Scaling path\" table; `TESTING.md` benchmarks; `bench/bench.py::throughput_processes`; `runtime.py::execute_activity` ka `task_queue` param; `store.py::claim_workflow_task` single DB.",
+  "implementation_files": [
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/bench/bench.py::throughput_processes",
+   "projects/10-workflow-engine/flowengine/runtime.py::execute_activity"
+  ],
+  "code_example": "",
+  "code_language": "python",
+  "advantages": [
+   "Measured baseline se roadmap",
+   "Har step independent deploy ho sakta hai"
+  ],
+  "disadvantages": [
+   "Sharding ke saath cross-shard queries (list/stats) mehenge",
+   "Matching service = naya stateful component"
+  ],
+  "common_mistakes": [
+   "Pehle hi sharding karna bina statements kam kiye",
+   "In-process concurrency badhana CPU-bound system mein",
+   "History growth ko ignore karna"
+  ],
+  "follow_up_questions": [
+   "Shard count kaise choose karoge, aur resharding?",
+   "Sticky cache ka invalidation kaise?",
+   "97 statements ko kahan se kam karoge?"
+  ],
+  "concepts": [
+   "scaling",
+   "sharding",
+   "sticky cache",
+   "matching service"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Processes add karna sasta par DB pe load badhata hai; sharding throughput deta hai par operational complexity aur cross-shard visibility cost.",
+   "failure_scenarios": "Shard DB down = us shard ke workflows ruk jaate hain (baaki chalte hain); matching service crash = tasks re-dispatch, DB source of truth rehta hai.",
+   "alternatives": "Vertical Postgres scaling + read replicas for visibility, Citus for distributed Postgres, Cassandra jaisa Temporal karta hai.",
+   "scale_10x_100x": "10x: processes + sticky cache + per-type queues. 100x: N history shards, matching service with long-poll, per-shard timers, continue-as-new.",
+   "production_improvements": "Engine metrics (replay ms, backlog per queue), load tests per change, autoscaling workers on backlog, separate visibility store (Elasticsearch) for listing."
+  }
+ },
+ {
+  "id": "FLOW-101",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "You need a production-grade charge_payment activity against a real payment provider. What changes compared to the demo activity?",
+  "answer_hinglish": "Demo `charge_payment` sirf `card` string dekh ke fail/flaky simulate karta hai aur `activity_effects` mein row likhta hai. Real provider ke saath paanch cheezein badalti hain.\n\nEk, idempotency pass-through: `ctx.idempotency_key` (`workflow_id:seq`) ko provider ke Idempotency-Key header mein bhejo. Retry ya redelivery pe provider wahi charge return karega, naya nahi banayega. Yeh engine ke at-least-once model ka natural partner hai.\n\nDo, error classification: card declined, invalid card, insufficient funds -- `NonRetryableError` raise karo (ya error type ko `RetryPolicy.non_retryable_errors` mein list karo), kyunki retry se kuch nahi badlega. Network timeout, 5xx, 429 -- normal exception, retry with backoff. Galat classification = ya toh customer ko 3 baar decline, ya transient error pe permanent fail.\n\nTeen, timeouts: HTTP client timeout `start_to_close` se chhota rakho, warna `asyncio.wait_for` activity ko cancel karega aur aapko pata nahi chalega request gayi ya nahi. Ambiguous outcome pe retry hi sahi hai -- idempotency key bachayegi.\n\nChaar, retry policy: payment ke liye `maximum_attempts` sochke -- unlimited nahi; `maximum_interval` provider ke rate limits ke hisaab se.\n\nPaanch, result: workflow ko sirf zaroori data return karo (charge_id, amount), poora provider response nahi -- woh history mein permanently jaata hai aur plaintext hai (SECURITY.md: secrets history mein mat daalo; card number kabhi nahi, token/reference hi).\n\nBonus: refund activity ka bhi apna key hai (different seq), toh compensation bhi idempotent hai.",
+  "why_needed": "Activities hi asli duniya ko chhooti hain; engine ki saari guarantees bekaar hain agar activity duplicate charge kar de.",
+  "real_world_analogy": "Bank mein cheque deposit: cheque number (idempotency key) se bank do baar credit nahi karta; 'signature mismatch' pe dobara jama karne ka fayda nahi (non-retryable); 'server down' pe kal phir aao (retryable).",
+  "how_it_works": "Attempt N -> provider call with key -> success: return minimal result; transient: raise -> fail_activity schedules retry with visible_at backoff; permanent: NonRetryableError -> ActivityFailed -> workflow compensation.",
+  "in_this_project": "`flowengine/examples/activities.py::charge_payment` demo version; `flowengine/activities.py::NonRetryableError`; `flowengine/store.py::fail_activity` non-retryable check; `flowengine/worker.py::_execute` jo `NonRetryableError` ko `etype` mein map karta hai. `SECURITY.md` plaintext history note.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/activities.py::charge_payment",
+   "projects/10-workflow-engine/flowengine/activities.py::NonRetryableError",
+   "projects/10-workflow-engine/flowengine/store.py::fail_activity",
+   "projects/10-workflow-engine/flowengine/worker.py::_execute",
+   "projects/10-workflow-engine/SECURITY.md"
+  ],
+  "code_example": "# illustrative (httpx client, provider-agnostic)\n@activity(\"charge_payment\")\nasync def charge_payment(ctx, amount, card_token):\n    try:\n        r = await http.post(\"/charges\", json={\"amount\": amount, \"source\": card_token},\n                            headers={\"Idempotency-Key\": ctx.idempotency_key}, timeout=10)\n    except httpx.TransportError as e:\n        raise ConnectionError(str(e))                    # retryable; the key makes the retry safe\n    if r.status_code in (402, 400):\n        raise NonRetryableError(r.json().get(\"decline_code\", \"declined\"))\n    r.raise_for_status()                                 # 5xx/429 -> retry with backoff\n    return {\"charge_id\": r.json()[\"id\"], \"amount\": amount}",
+  "code_language": "python",
+  "advantages": [
+   "Duplicate charges impossible (provider dedupe)",
+   "Sahi errors pe hi retry",
+   "History lean aur secret-free"
+  ],
+  "disadvantages": [
+   "Error classification provider-specific mapping maangta hai",
+   "Provider ki idempotency window limited hoti hai (typically hours/days)"
+  ],
+  "common_mistakes": [
+   "HTTP timeout start_to_close se bada rakhna",
+   "Har exception ko retryable maan lena",
+   "Raw card data activity args mein bhejna (history mein permanently)"
+  ],
+  "follow_up_questions": [
+   "Provider ki idempotency key expiry ke baad retry ho toh?",
+   "Ambiguous timeout pe workflow ko kya dikhega?",
+   "Refund compensation fail ho jaaye toh?"
+  ],
+  "concepts": [
+   "idempotency key",
+   "error classification",
+   "timeouts",
+   "payment integration"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Aggressive retries availability badhate hain par provider rate limits aur customer experience pe asar; strict non-retryable mapping kam retries par misclassification risk.",
+   "failure_scenarios": "Timeout ke baad provider ne charge kar diya par humein pata nahi -- retry same key se wahi charge laata hai. Agar key window expire ho gayi toh reconciliation chahiye.",
+   "alternatives": "Provider webhooks + signal (workflow signal pe wait kare), async payment intents, outbox se provider call.",
+   "scale_10x_100x": "10x pe provider rate limits bottleneck -- dedicated task queue `payments` with limited activity_concurrency workers.",
+   "production_improvements": "Per-provider error mapping table, reconciliation job, metrics per error type, circuit breaker around provider."
+  }
+ },
+ {
+  "id": "FLOW-102",
+  "project_slug": "p10-workflow-engine",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What operational concerns arise when workflows run for weeks or months?",
+  "answer_hinglish": "`customer_onboarding` ka comment hai \"durable timer: days in real life\" -- yeh engine mahine-bhar chalne wale workflows ke liye hai. Lambi umar chaar problems laati hai.\n\nEk, code evolution: mahine mein aap kai deploys karoge, aur har running workflow ko har naye code se replay hona hai. Toh versioning discipline (naya workflow type ya `patched()`, jo is project mein implement nahi hai) aur CI replay checks mandatory hain.\n\nDo, history growth: har signal/timer/activity event jodta hai. Agar workflow loop mein hai (har din reminder) toh history badhti hi jaayegi aur replay cost super-linear hai (TESTING.md: 2,001 events ~102-132 ms). Production fix continue-as-new hai -- yahan implement nahi hai.\n\nTeen, far-future timers: `ctx.sleep(30 days)` sirf `timers` table mein row hai (`fire_at`), koi process memory mein wait nahi karta -- isliye restarts ka koi asar nahi. Par `fire_at` worker ki clock se compute hota hai (`datetime.now(timezone.utc)` in `complete_workflow_task`) jabki leases DB `now()` use karte hain -- clock skew ho toh timer thoda jaldi/der se. Mahino mein yeh negligible, par seconds-level timers ke liye noticeable (observation).\n\nChaar, data aur dependencies: activity ka external API mahine mein badal sakta hai, input schema purana ho sakta hai, aur retention -- `DEPLOYMENT.md` rule 4 bolta hai closed workflows ki history N din baad archive karo; running ones ki history toh chahiye hi.\n\nPlus visibility: dashboard pe 'running' workflows ka list bada hota jaata hai; filter by age/type chahiye.",
+  "why_needed": "Durable execution ka value hi long-running processes mein hai; unki operational costs samajhna senior-level expectation hai.",
+  "real_world_analogy": "Lambi train journey: beech mein driver badalte hain (deploys), log chadhte-utarte hain (events), aur timetable alag shehron ki ghadiyon se match karna padta hai (clock skew).",
+  "how_it_works": "Long wait = DB row (timer) ya pending signal waiter, koi resource nahi. Har wake-up pe full replay, isliye history size hi asli cost hai.",
+  "in_this_project": "`flowengine/examples/workflows.py::customer_onboarding` (`ctx.sleep(inp[\"tips_after\"])`), `flowengine/store.py::complete_workflow_task` (timer `fire_at` worker clock se), `flowengine/store.py::fire_due_timers`, `DEPLOYMENT.md` retention rule, README known limitations (no continue-as-new).",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::customer_onboarding",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/store.py::fire_due_timers",
+   "projects/10-workflow-engine/DEPLOYMENT.md",
+   "projects/10-workflow-engine/README.md"
+  ],
+  "code_example": "# real, flowengine/store.py (timer creation uses the worker's clock)\nnow = datetime.now(timezone.utc)\n...\nfire_at = now + timedelta(seconds=c.attrs[\"seconds\"])",
+  "code_language": "python",
+  "advantages": [
+   "Waiting workflows sirf DB rows hain, compute zero",
+   "Restarts/deploys timers ko affect nahi karte"
+  ],
+  "disadvantages": [
+   "Versioning burden",
+   "History growth",
+   "Clock skew sensitivity"
+  ],
+  "common_mistakes": [
+   "Infinite loop workflow bina continue-as-new",
+   "Workflow code mein 30 din ka asyncio.sleep (non-durable)",
+   "Running workflows ki history archive kar dena"
+  ],
+  "follow_up_questions": [
+   "fire_at DB now() se kaise compute karoge?",
+   "Continue-as-new kab trigger karoge?",
+   "Mahino purane input schema ko kaise handle karoge?"
+  ],
+  "concepts": [
+   "long-running workflows",
+   "durable timers",
+   "history growth",
+   "versioning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-103",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Explain Temporal's history shards and matching service in depth, and what flowengine would need to adopt them.",
+  "answer_hinglish": "Temporal server mein chaar services hain: Frontend (API gateway), History, Matching, aur internal Worker. History service workflows ko fixed number of shards mein baantti hai -- shard = hash(workflow_id) mod N, aur N cluster create karte waqt fix hota hai. Har shard ek time pe ek history host ka owner hota hai (membership ring), aur us shard ke saare workflows ki mutable state, history appends, timers aur transfer tasks wahi process karta hai. Isse ek workflow ke writes serialize hote hain bina global lock ke -- jaise humara workflow row lock, par distributed.\n\nShard ke andar \"transfer queue\" hai: jab history mein ActivityScheduled likha jaata hai, usi transaction mein ek transfer task bhi likha jaata hai (outbox jaisa) jo baad mein Matching service ko activity task push karta hai. Timer queue durable timers fire karti hai.\n\nMatching service task queues manage karti hai, partitions mein baanti hui. Workers long-poll karte hain; task aaya toh seedha in-memory \"sync match\" se waiting poller ko de diya jaata hai, DB mein persist kiye bina. Poller nahi hai tab task persist hota hai (backlog).\n\nflowengine mein: single Postgres = ek shard; `needs_task` + `activity_tasks` table = matching; `_timer_loop` = timer queue; aur hum ek hi transaction mein history + task insert karte hain, isliye transfer queue ki zaroorat nahi. Adopt karne ke liye: workflow_id hash se N databases/partitions, har shard ka owner process (lease-based), shard ke andar outbox se tasks matching tak, aur matching ek alag long-poll service. Yeh is project mein implement nahi hai -- `SYSTEM_DESIGN.md` 100x row mein documented hai.",
+  "why_needed": "Temporal-style project ke saath interviewer naturally poochhega 'yeh real Temporal se kaise alag hai aur scale kaise karega'.",
+  "real_world_analogy": "Bade bank mein har account number ek fixed branch (shard) ka; branch ka manager (owner host) us account ka har transaction serialize karta hai. Token counter (matching) customers ko khaali cashier se jodta hai -- line mein koi wait kar raha hai toh seedha bhej do.",
+  "how_it_works": "Fixed shard count + consistent ownership; per-shard transactional writes; outbox (transfer queue) for cross-service delivery; sync match for low latency; DB backlog only when no poller.",
+  "in_this_project": "`flowengine/store.py::complete_workflow_task` (history + activity task + timer same tx -- humare paas transfer queue nahi), `flowengine/store.py::claim_activity` (DB polling = our matching), `flowengine/worker.py::_timer_loop`. `SYSTEM_DESIGN.md` scaling path, README \"Single Postgres is the bottleneck\".",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/store.py::claim_activity",
+   "projects/10-workflow-engine/flowengine/worker.py::_timer_loop",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md",
+   "projects/10-workflow-engine/README.md"
+  ],
+  "code_example": "# illustrative shard routing (NOT in repo)\nN_SHARDS = 16\ndef shard_of(workflow_id: str) -> int:\n    return zlib.crc32(workflow_id.encode()) % N_SHARDS       # fixed forever: resharding = migration\nsm = SHARD_SESSIONMAKERS[shard_of(wid)]\nawait store.signal(sm, wid, \"approve\", payload)",
+  "code_language": "python",
+  "advantages": [
+   "Horizontal write scaling",
+   "Per-workflow serialization without global lock",
+   "Sync match se low latency"
+  ],
+  "disadvantages": [
+   "Fixed shard count",
+   "Cross-shard listing ke liye alag visibility store",
+   "Ownership/membership complexity"
+  ],
+  "common_mistakes": [
+   "Shard count baad mein badalne ka plan na rakhna",
+   "History aur task dispatch ko alag transactions mein likhna bina outbox ke",
+   "Matching ko source of truth maan lena"
+  ],
+  "follow_up_questions": [
+   "Shard owner crash ho toh kya hota hai?",
+   "Sync match fail ho toh task kahan jaata hai?",
+   "Visibility (list workflows) sharded system mein kaise?"
+  ],
+  "concepts": [
+   "history shards",
+   "matching service",
+   "transfer queue",
+   "sync match"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fixed N shards simple routing deta hai par resharding nahi; dynamic sharding flexible par complex. Sync match latency kam karta hai par in-memory state ko recover karna padta hai.",
+   "failure_scenarios": "Shard ownership split-brain -> do hosts same shard likhein; Temporal range ids (fencing tokens) se purane owner ke writes reject karta hai.",
+   "alternatives": "Citus/Vitess se Postgres shard karna, Cassandra (Temporal default), FoundationDB, ya Kafka partitions as shards.",
+   "scale_10x_100x": "100x pe hi yeh zaroori hai; 10x pe processes + sticky cache kaafi. Shards ki sankhya expected peak ke hisaab se upfront choose.",
+   "production_improvements": "Shard ownership with fencing tokens, per-shard metrics, separate visibility store, matching partitions per hot task queue."
+  }
+ },
+ {
+  "id": "FLOW-104",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Child workflows, queries and schedules are missing. What are they and how would you add each to this engine?",
+  "answer_hinglish": "README ke known limitations mein likha hai: \"no child workflows, queries, or schedules (cron)\". Teeno ka matlab aur design:\n\nChild workflow: ek workflow doosra workflow start kare aur uska result await kare -- jaise `order_processing` har item ke liye ek `fulfil_item` child. Add karne ke liye naya command `start_child` (seq ke saath), complete_workflow_task mein `ChildWorkflowStarted` event + `store.start_workflow` (child id deterministic, e.g. `parent:seq`, taaki idempotent start reuse ho), aur jab child close ho toh parent ki history mein `ChildWorkflowCompleted/Failed` append + parent ka `needs_task = true`. Parent cancel pe child ko bhi cancel (parent close policy).\n\nQuery: running workflow ka state padhna bina history badle -- \"abhi kitne emails gaye?\". Implementation: history load karo, replay karo (jaise `replay-check` endpoint karta hai), aur `ctx` pe registered query handler ko call karo; kuch append nahi. Key rule: query handler read-only aur deterministic.\n\nSchedule (cron): har din 9 baje naya run. Ek `schedules` table (cron expr, next_fire_at, workflow_type, input) aur timer loop jaisa poller jo `start_workflow(workflow_id = f\"{sched}:{fire_time}\")` call kare -- deterministic id se duplicate fire bhi idempotent ho jaata hai.\n\nTeeno existing pieces reuse karte hain: idempotent start, history events, needs_task, replay. Is project mein yeh implement nahi hai; yeh design hai.",
+  "why_needed": "Real workflows composable hote hain aur operators ko running state dekhni hoti hai; interviewer feature gaps ke design dekhta hai.",
+  "real_world_analogy": "Child = manager ka kaam team member ko dena aur report ka wait; query = manager ka 'status kya hai?' poochhna bina kaam badle; schedule = har subah alarm.",
+  "how_it_works": "Har feature ek naya command/event type ya ek naya poller hai; durability history se aur idempotency deterministic ids se aati hai.",
+  "in_this_project": "README \"Known limitations\"; reuse points: `flowengine/store.py::start_workflow` (idempotent on workflow_id), `flowengine/api.py::replay_check` (read-only replay -- query ka base), `flowengine/worker.py::_timer_loop` (schedules ke liye pattern).",
+  "implementation_files": [
+   "projects/10-workflow-engine/README.md",
+   "projects/10-workflow-engine/flowengine/store.py::start_workflow",
+   "projects/10-workflow-engine/flowengine/api.py::replay_check",
+   "projects/10-workflow-engine/flowengine/worker.py::_timer_loop",
+   "projects/10-workflow-engine/flowengine/runtime.py::WorkflowContext"
+  ],
+  "code_example": "# illustrative: query via read-only replay (NOT in repo)\n@router.get(\"/workflows/{workflow_id}/query/{name}\")\nasync def query(workflow_id: str, name: str, request: Request):\n    wf = await store.describe(request.app.state.sm, workflow_id)\n    events = await store.history(request.app.state.sm, workflow_id)\n    ctx_holder = {}\n    await replay(WORKFLOWS[wf[\"workflow_type\"]], workflow_id, str(wf[\"run_id\"]), events, on_ctx=ctx_holder.setdefault)\n    return {\"result\": ctx_holder[\"ctx\"].queries[name]()}   # needs replay() to expose ctx + ctx.queries registry",
+  "code_language": "python",
+  "advantages": [
+   "Existing primitives reuse",
+   "Deterministic ids se idempotency free"
+  ],
+  "disadvantages": [
+   "Child events parent aur child dono shards/rows lock karte hain",
+   "Query har baar full replay (sticky cache ke bina mehenga)"
+  ],
+  "common_mistakes": [
+   "Child id random rakhna (replay pe naya child)",
+   "Query handler mein state mutate karna",
+   "Schedule ko plain cron se chalana jo double-fire kare"
+  ],
+  "follow_up_questions": [
+   "Parent aur child ke lock ordering mein deadlock?",
+   "Query ko sticky cache se kaise sasta karoge?",
+   "Missed schedule fires (catch-up) policy?"
+  ],
+  "concepts": [
+   "child workflows",
+   "queries",
+   "schedules",
+   "composition"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Child workflows composition dete hain par cross-workflow coordination (do row locks) laate hain; queries via replay simple par CPU-heavy.",
+   "failure_scenarios": "Parent close hua aur child completion aaye -> event closed history mein (activities ke liye yeh review mein fix hua -- `_closed()` guard; child completions ko bhi wahi guard chahiye); scheduler crash -> deterministic id se dobara fire safe.",
+   "alternatives": "Child ki jagah activities + signals; queries ki jagah workflow ka state activity se DB mein likhna; schedules ke liye external cron jo start API call kare.",
+   "scale_10x_100x": "100x pe child events cross-shard ho jaate hain -- Temporal isko transfer tasks se async karta hai.",
+   "production_improvements": "Parent close policies (terminate/abandon/request-cancel), query caching via sticky workers, schedule overlap policies."
+  }
+ },
+ {
+  "id": "FLOW-105",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "End to end, what is exactly-once in this engine and what is only at-least-once?",
+  "answer_hinglish": "Yeh precise bolna padta hai, kyunki \"exactly-once\" loosely bolna interview mein red flag hai.\n\nExactly-once (engine level, DB transactions se): (1) history append -- har event gap-free id ke saath ek hi baar, kyunki `_append` workflow row lock ke andar hai aur PK `(workflow_id, event_id)` hai. (2) Command scheduling -- `activity_tasks UNIQUE(workflow_id, seq)` aur optimistic commit (`last_event_id` check) ensure karte hain ki ek command do baar schedule na ho, chahe do workers same workflow replay karein. (3) Activity result recording -- `complete_activity` fenced update (`status = 'started' AND attempt = :a`) ke baad hi `ActivityCompleted` append karta hai, toh ek attempt ka result hi history mein jaata hai. (4) Timer firing -- `UPDATE timers SET fired = true ... AND NOT fired`. (5) Workflow start -- workflow_id PK.\n\nAt-least-once: activity execution. Worker crash, lease expiry, ya complete commit fail -- activity dobara chalegi. Workflow code ka execution bhi many-times hai (har replay), par woh pure hai toh koi asar nahi.\n\nEffectively-once (application ki zimmedari): side effects. `idempotency_key = workflow_id:seq` + downstream dedupe (`activity_effects` ON CONFLICT DO NOTHING). Tests exact effect counts assert karte hain, jaise 20 workflows on 2 workers pe `{\"reserve\": 20, \"charge\": 20, \"ship\": 20, \"email\": 20}`.\n\nReview mein mila gap (ab fixed): pehle workflow close hone ke baad bhi running activity ka completion history mein append ho jaata tha, aur cancel sirf 'scheduled' tasks cancel karta tha -- closed workflow ki started activity reap hoke retry ho sakti thi. Fix: cancel/close 'started' bhi cancel karte hain aur `complete_activity`/`fail_activity` mein `_closed()` guard -- post-close kuch append nahi hota (tests `test_cancel_stops_running_activity_and_it_is_never_retried`, `test_late_activity_completion_after_close_appends_nothing`). Activity execution phir bhi at-least-once hi hai.",
+  "why_needed": "Distributed systems interviews mein delivery semantics ka precise vocabulary sabse zyada test hota hai.",
+  "real_world_analogy": "Post office: registry book mein entry exactly once (DB), postman ek letter do baar la sakta hai (at-least-once), aap envelope number dekh ke dusri copy phenk dete ho (effectively-once).",
+  "how_it_works": "DB transactions + unique constraints + fencing internal state ko exactly-once banate hain; external world ke saath sirf at-least-once + idempotency possible hai.",
+  "in_this_project": "`flowengine/store.py::_append`, `complete_workflow_task`, `complete_activity` (fenced), `fire_due_timers` (`AND NOT fired`), `migrations/versions/0001_initial.py` (UNIQUE (workflow_id, seq)). Test: `tests/test_engine.py::test_two_workers_process_many_workflows_without_duplicates`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_activity",
+   "projects/10-workflow-engine/flowengine/store.py::fire_due_timers",
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py",
+   "projects/10-workflow-engine/tests/test_engine.py::test_two_workers_process_many_workflows_without_duplicates",
+   "projects/10-workflow-engine/flowengine/store.py::cancel",
+   "projects/10-workflow-engine/tests/test_review_fixes.py::test_late_activity_completion_after_close_appends_nothing"
+  ],
+  "code_example": "# real, flowengine/store.py (complete_activity): fenced, so only the owning attempt records a result\nres = await s.execute(text(\"UPDATE activity_tasks SET status = 'completed', lease_until = NULL WHERE id = :i \"\n                           \"AND status = 'started' AND attempt = :a\"), {\"i\": task[\"id\"], \"a\": task[\"attempt\"]})\nif res.rowcount == 0:\n    return False          # fenced: our lease expired and another attempt owns it",
+  "code_language": "python",
+  "advantages": [
+   "Internal state hamesha consistent",
+   "Clear boundary: engine vs activity author"
+  ],
+  "disadvantages": [
+   "External effects ki guarantee activity author pe",
+   "Non-heartbeating activity cancel ke baad bhi apna external effect kar sakti hai"
+  ],
+  "common_mistakes": [
+   "'Temporal exactly-once activities deta hai' bolna",
+   "Workflow code mein side effect karna kyunki 'woh ek baar chalta hai'",
+   "Fencing ke bina completion likhna"
+  ],
+  "follow_up_questions": [
+   "`_closed()` guard ke bina post-close completion kya bigaadta tha?",
+   "Fencing token aur attempt number mein kya fark?",
+   "Kafka ka exactly-once isse kaise alag hai?"
+  ],
+  "concepts": [
+   "exactly-once",
+   "at-least-once",
+   "effectively-once",
+   "fencing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strong internal guarantees Postgres transactions se sasti hain; external exactly-once ke liye 2PC/XA impractical, isliye idempotency.",
+   "failure_scenarios": "Activity succeed hui par complete commit se pehle worker crash -> lease expire -> retry -> idempotency key se same effect. Workflow closed hone ke baad late completion -> ab drop (task cancelled), pehle extra event aata tha.",
+   "alternatives": "Transactional outbox jahan activity ka effect aur result same DB tx mein; Kafka transactions for stream processing.",
+   "scale_10x_100x": "Scale pe semantics same rehte hain; sharding ke baad bhi har workflow ke writes ek shard pe, isliye guarantees local rehti hain.",
+   "production_improvements": "Heartbeat response mein explicit cancel reason, late-result-dropped metric, downstream systems tak attempt/fencing token pass karna."
+  }
+ },
+ {
+  "id": "FLOW-106",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "How could long activities resume from their last heartbeat checkpoint instead of restarting? Is that implemented?",
+  "answer_hinglish": "Is project mein yeh implement nahi hai. Abhi heartbeat do kaam karta hai: lease extend karna aur progress `heartbeat_details` column mein store karna. `long_task` har chunk ke baad `ctx.heartbeat({\"done\": i + 1})` bhejta hai, aur heartbeat test `heartbeat_details->>'done'` padh ke dekhta hai ki 3 chunks ho gaye. Par jab worker A crash hota hai aur worker B attempt 2 claim karta hai, toh `ActivityContext` mein previous details ka koi field hi nahi hai -- B chunk 0 se dobara shuru karta hai. 10 chunks ke liye theek hai, par 3 ghante ka data export ho toh poora kaam waste.\n\nTemporal mein yeh feature hai: `activity.info().heartbeat_details` next attempt ko last recorded details deta hai, aur activity wahan se continue karti hai.\n\nAdd karna simple hai: (1) `ActivityContext` mein `heartbeat_details: Any = None` field; (2) `Worker._execute` mein `task[\"heartbeat_details\"]` pass karo -- `claim_activity` `RETURNING *` already column return karta hai; (3) `claim_activity` heartbeat_details ko reset nahi karta, toh value attempts ke across survive karti hai -- good; (4) activity code `start = (ctx.heartbeat_details or {}).get(\"done\", 0)` se loop shuru kare.\n\nImportant caveat: checkpoint \"jitna kaam hua\" ka hint hai, guarantee nahi. Crash heartbeat ke baad aur agle chunk ke beech hua ho toh last chunk ka kaam ho chuka par details purani -- isliye chunk-level kaam bhi idempotent hona chahiye (e.g. chunk key `idempotency_key:chunk_i`).",
+  "why_needed": "Lambi activities (batch processing, exports) mein restart ka cost bahut bada hota hai; checkpointing practical necessity hai.",
+  "real_world_analogy": "Video game ka checkpoint: game crash hua toh shuru se nahi, last save point se. Par last save ke baad jo kiya woh dobara karna padega.",
+  "how_it_works": "Heartbeat -> DB mein details. Next claim -> row mein details already hain -> context mein pass -> activity skip karti hai completed chunks.",
+  "in_this_project": "`flowengine/examples/activities.py::long_task` heartbeat bhejta hai; `flowengine/store.py::heartbeat` details store karta hai; `flowengine/activities.py::ActivityContext` mein details field nahi hai; `tests/test_engine.py::test_activity_heartbeat_timeout_detects_dead_worker` progress padhta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/activities.py::long_task",
+   "projects/10-workflow-engine/flowengine/store.py::heartbeat",
+   "projects/10-workflow-engine/flowengine/activities.py::ActivityContext",
+   "projects/10-workflow-engine/flowengine/worker.py::_execute",
+   "projects/10-workflow-engine/tests/test_engine.py::test_activity_heartbeat_timeout_detects_dead_worker"
+  ],
+  "code_example": "# proposed change (NOT in repo)\n# activities.py\n@dataclass\nclass ActivityContext:\n    ...\n    heartbeat_details: Any = None\n# worker.py::_execute -> ActivityContext(..., heartbeat_details=task.get(\"heartbeat_details\"))\n# examples/activities.py\nasync def long_task(ctx, chunks, chunk_seconds):\n    start = (ctx.heartbeat_details or {}).get(\"done\", 0)\n    for i in range(start, chunks):\n        ...",
+  "code_language": "python",
+  "advantages": [
+   "Crash pe kaam waste nahi",
+   "Existing column/heartbeat reuse"
+  ],
+  "disadvantages": [
+   "Activity code ko resume-aware likhna padta hai",
+   "Checkpoint stale ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Checkpoint ko exact maan ke chunk ko non-idempotent rakhna",
+   "Har item pe heartbeat (DB load) -- batch karo",
+   "claim pe details reset kar dena"
+  ],
+  "follow_up_questions": [
+   "Heartbeat frequency kaise choose karoge?",
+   "Heartbeat throttling Temporal kaise karta hai?",
+   "Details mein kitna data rakhna theek hai?"
+  ],
+  "concepts": [
+   "heartbeat",
+   "checkpointing",
+   "resumable activities",
+   "idempotent chunks"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Frequent heartbeats = fresh checkpoint + fast detection, par DB writes zyada; rare = sasta par zyada rework.",
+   "failure_scenarios": "Crash after work but before heartbeat -> chunk repeated; heartbeat succeed par lease kho diya (fenced, returns False) -> activity ko rukna chahiye, long_task yahi karta hai.",
+   "alternatives": "Activity ko chhote activities mein todna (workflow mein loop), external job system with its own checkpoints.",
+   "scale_10x_100x": "100x activities x frequent heartbeats = heartbeat writes dominate DB; throttle (Temporal default batching) zaroori.",
+   "production_improvements": "Heartbeat throttling, details size limit, resume support in context, metric for rework (chunks repeated)."
+  }
+ },
+ {
+  "id": "FLOW-107",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Temporal SDKs use a custom deterministic event loop. How does flowengine get determinism from standard asyncio instead, and where can that break?",
+  "answer_hinglish": "Temporal Python SDK workflow code ko ek custom asyncio event loop pe chalata hai (sandbox ke saath) -- woh loop sirf workflow ke futures schedule karta hai, real time nahi deta, aur threads/IO ko block karta hai. Har activation pe woh \"run until no more progress\" karta hai.\n\nflowengine standard asyncio loop pe hi chalta hai aur ek chhota trick use karta hai: `_settle()`. Workflow coroutine ek Task hai; settle `asyncio.sleep(0)` teen baar karta hai (taaki pending callbacks chal jaayein) aur phir state tuple compare karta hai -- `(task.done(), len(ctx.commands), done futures count)`. State na badle toh maana jaata hai coroutine sirf unresolved ctx futures pe ruka hai. Determinism isliye aata hai ki futures sirf replay loop resolve karta hai, events ke recorded order mein, aur har resolve ke baad settle.\n\nKahan toot sakta hai: (1) Agar workflow code real `asyncio.sleep(1)` ya network await kare toh settle usse \"ruka hua\" samjhega, replay aage badh jaayega -- result non-deterministic. Custom loop yeh block karta, humara nahi; sirf convention (`SYSTEM_DESIGN.md` rules) hai. (2) Agar ek await chain mein teen se zyada hops lage aur state tuple same dikhe toh settle jaldi return ho sakta hai -- loop tab tak chalta hai jab tak state badle, isliye practical mein theek hai, par yeh heuristic hai, proof nahi. (3) Wall clock, `random`, global state access -- koi sandbox nahi rokta.\n\nBenefit: code chhota (~250 lines runtime) aur normal asyncio primitives (`gather`, `wait`) kaam karte hain -- `email_campaign` gather use karta hai.",
+  "why_needed": "Determinism engine ki foundation hai; interviewer dekhna chahta hai ki aap mechanism aur uski limits dono jaante ho.",
+  "real_world_analogy": "Exam hall mein invigilator (custom loop) phone use karne hi nahi deta; humare yahan sirf rule board laga hai 'phone mana hai' -- honest student ke saath kaam karta hai.",
+  "how_it_works": "Single coroutine Task + futures controlled by replay + settle heuristic = deterministic progression, provided code awaits only ctx futures.",
+  "in_this_project": "`flowengine/runtime.py::_settle` aur `flowengine/runtime.py::replay`; docstring \"A workflow is ordinary async Python that may only await things it gets from the WorkflowContext\". `tests/test_runtime.py::test_parallel_activities_with_gather` dikhata hai gather kaam karta hai. Sandbox/linting is project mein implement nahi hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::_settle",
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/tests/test_runtime.py::test_parallel_activities_with_gather",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# real, flowengine/runtime.py\nasync def _settle(task: asyncio.Task, ctx: WorkflowContext) -> None:\n    last = None\n    while True:\n        for _ in range(3):\n            await asyncio.sleep(0)\n        state = (task.done(), len(ctx.commands), sum(f.done() for f in ctx._futures.values()))\n        if state == last or task.done():\n            return\n        last = state",
+  "code_language": "python",
+  "advantages": [
+   "Standard asyncio, chhota code",
+   "gather/wait jaise primitives free"
+  ],
+  "disadvantages": [
+   "Koi enforcement nahi -- convention-based",
+   "Settle heuristic hai"
+  ],
+  "common_mistakes": [
+   "Workflow mein asyncio.sleep use karna ctx.sleep ki jagah",
+   "datetime.now() workflow mein",
+   "Workflow code mein DB/HTTP call"
+  ],
+  "follow_up_questions": [
+   "Workflow code mein non-ctx await detect kaise karoge?",
+   "Temporal sandbox kya restrict karta hai?",
+   "Settle ko exact kaise banaoge?"
+  ],
+  "concepts": [
+   "deterministic event loop",
+   "asyncio",
+   "sandbox",
+   "settle"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Custom loop strong guarantees + complexity; standard loop + heuristic simplicity + reliance on discipline.",
+   "failure_scenarios": "Hidden real await -> replay result wall-time dependent -> intermittent NonDeterminismError ya galat branch, sabse mushkil debug.",
+   "alternatives": "Custom AbstractEventLoop jo sirf ctx futures allow kare; static lint rules (no datetime.now / random in @workflow); import sandbox.",
+   "scale_10x_100x": "Scale se mechanism nahi badalta, par zyada developers = zyada chance koi rule tode -- enforcement ki value badhti hai.",
+   "production_improvements": "Custom loop that raises on non-ctx awaits, lint in CI, replay tests, runtime warning when settle sees pending non-ctx tasks."
+  }
+ },
+ {
+  "id": "FLOW-108",
+  "project_slug": "p10-workflow-engine",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Orchestration vs choreography for sagas: when would you choose an event-driven Kafka choreography over this orchestrated engine?",
+  "answer_hinglish": "Orchestration (yeh project): ek central workflow (`order_processing`) decide karta hai kaun sa step kab, aur failure pe kaun si compensation -- poora flow ek file mein readable hai. Choreography: koi central controller nahi; services events publish karti hain (`OrderPlaced`, `PaymentCharged`, `ShipmentFailed`) aur doosri services react karti hain -- Kafka (Project 5 jaisa log) iska typical backbone hai.\n\nOrchestration ke fayde: flow ek jagah, compensation logic explicit try/except mein, history/dashboard pe ek workflow ka poora timeline, timeouts aur waiting (signals, timers) native. `SYSTEM_DESIGN.md` bolta hai durable orchestration ki wajah se compensations crash ke baad bhi guaranteed chalti hain -- hand-written sagas ki sabse badi kamzori.\n\nChoreography ke fayde: services loosely coupled, koi central dependency nahi, naya consumer bina orchestrator change kiye add ho sakta hai, aur throughput high (Kafka partitions). Kamzori: flow kisi ek jagah likha nahi -- \"order ka abhi kya hua?\" ke liye events trace karne padte hain; compensation ka logic multiple services mein bikhra; cyclic event dependencies aur \"kis service ne react nahi kiya\" debug karna mushkil; timeouts ke liye har service ko apne timers chahiye.\n\nMeri rule of thumb: jahan business process multi-step hai, ordering matter karta hai, compensations aur human waits hain (payments, onboarding, approvals) -- orchestration. Jahan facts broadcast karne hain aur consumers independent hain (analytics, notifications, search indexing) -- choreography. Practical systems dono mix karte hain: orchestrated workflow ek activity se event publish kare.",
+  "why_needed": "Saga design questions mein yeh classic comparison hai; senior answer dono ka context batata hai.",
+  "real_world_analogy": "Orchestra mein conductor sabko cue deta hai (orchestration); jazz jam mein har musician doosron ko sun ke react karta hai (choreography). Shaadi ka function conductor wala chahiye, jam session nahi.",
+  "how_it_works": "Orchestration: central state machine (yahan replayed code) commands bhejta hai, results wapas. Choreography: event log pe pub/sub, har service local state + local reactions.",
+  "in_this_project": "`flowengine/examples/workflows.py::order_processing` saga as code -- reserve, charge, ship with refund/release compensations; `SYSTEM_DESIGN.md` \"Long-running transactions (sagas)\"; tests `test_saga_compensation_when_shipping_fails` aur `test_non_retryable_failure_runs_compensation`. Choreography is project mein nahi hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::order_processing",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md",
+   "projects/10-workflow-engine/tests/test_engine.py::test_saga_compensation_when_shipping_fails"
+  ],
+  "code_example": "# real, flowengine/examples/workflows.py -- the whole saga in one readable place\ntry:\n    ship = await ctx.execute_activity(\"ship_order\", inp[\"order_id\"], inp.get(\"fail_shipping\", False), retry=FAST)\nexcept ActivityError as e:\n    await ctx.execute_activity(\"refund_payment\", charge[\"charge_id\"], inp[\"amount\"], retry=FAST)\n    await ctx.execute_activity(\"release_inventory\", res[\"reservation_id\"], retry=FAST)\n    return {\"status\": \"compensated\", \"reason\": e.message}",
+  "code_language": "python",
+  "advantages": [
+   "Orchestration: readable flow, explicit compensation, built-in timers/visibility",
+   "Choreography: loose coupling, high throughput"
+  ],
+  "disadvantages": [
+   "Orchestration: central dependency (engine)",
+   "Choreography: flow invisible, distributed compensation logic"
+  ],
+  "common_mistakes": [
+   "Har cheez choreography se karna aur phir 'order ka status kya hai' ka jawab na hona",
+   "Orchestrator ko business logic ke bajay data transform ka dher bana dena",
+   "Choreography mein idempotent consumers bhoolna"
+  ],
+  "follow_up_questions": [
+   "Hybrid design kaisa dikhega?",
+   "Choreography mein saga timeout kaun enforce karega?",
+   "Orchestrator down ho toh kya services chalti rahengi?"
+  ],
+  "concepts": [
+   "saga",
+   "orchestration",
+   "choreography",
+   "event-driven"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Orchestration visibility aur control deta hai par coupling to engine; choreography decoupling deta hai par global reasoning mushkil.",
+   "failure_scenarios": "Orchestration: engine/DB down = naye steps ruk jaate hain (state safe). Choreography: ek consumer silently fail = saga half-done bina kisi ko pata chale.",
+   "alternatives": "Hybrid: workflow orchestrates core path, events publish for side consumers; process managers in event-driven systems.",
+   "scale_10x_100x": "Choreography Kafka partitions se aasaani se scale; orchestration ke liye engine sharding chahiye (Temporal-scale).",
+   "production_improvements": "Orchestrated core + outbox-published domain events, correlation ids across events, saga dashboards."
+  }
+ },
+ {
+  "id": "FLOW-109",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Beginner",
+  "question": "Write a pure replay test proving that replacing a durable timer with an activity is detected as non-determinism. What happens in the reverse case?",
+  "answer_hinglish": "Task: `tests/test_runtime.py` mein hand-built history ke saath ek test likhna. Yeh tests DB ke bina chalte hain, isliye fast hain aur exactly replay logic ko target karte hain.\n\nSetup: purane code ne `ctx.sleep(60)` kiya tha, toh history mein `WorkflowStarted` aur `TimerStarted(seq=1)` hai. Naya code seq 1 pe `execute_activity(\"send_reminder\")` produce karta hai. `replay()` jab `TimerStarted` event dekhta hai, woh `ctx.commands[1]` nikalta hai aur check karta hai `cmd.kind != \"start_timer\"` -- yahan kind `schedule_activity` hai, toh `NonDeterminismError`. Test `pytest.raises` se yeh assert karta hai.\n\nReverse case interesting hai -- aur yeh ek real bug tha jo interview bank likhte waqt code review mein mila: history mein `ActivityScheduled(seq=1, activity_type=\"reserve\")` aur naya code seq 1 pe `ctx.sleep(5)`. Replay code pehle `cmd.attrs[\"activity_type\"]` padhta tha -- par timer command ke attrs mein sirf `seconds` hai, toh `NonDeterminismError` nahi, `KeyError` aata tha. Worker ka `run_workflow_task_once` sirf `NonDeterminismError` pakadta hai, toh KeyError `_workflow_loop` ke generic `except Exception` mein log hota, `error` column set nahi hota, aur lease expire hoke task baar-baar retry hota -- operator ko dashboard pe kuch nahi dikhta.\n\nFix ek line tha: `cmd.attrs.get(\"activity_type\")`. Regression test ab repo mein hai: `tests/test_review_fixes.py::test_timer_where_history_has_activity_is_nondeterminism_not_keyerror` (`pytest.raises(NonDeterminismError)`, jo KeyError pe fail hota). Story: bug -> root cause -> one-line fix -> test jo purane code pe fail hota hai.",
+  "why_needed": "Determinism detection engine ka safety net hai; uske har branch ke tests chahiye, warna bad deploy galat tarike se fail hota hai.",
+  "real_world_analogy": "Fire alarm test: sirf dhuan wala sensor test kiya, garmi wala nahi -- aag lagi toh pata chala alarm bajta hi nahi.",
+  "how_it_works": "History events order mein feed hote hain; Scheduled/Started events pe code ke command ka kind/type compare hota hai (`.get` se, taaki kind mismatch bhi NonDeterminismError bane). Mismatch -> NonDeterminismError -> workflow blocked, error set.",
+  "in_this_project": "`tests/test_runtime.py` ka `ev()` helper aur `test_non_determinism_detected_when_code_changes` pattern; reverse case ka real regression test `tests/test_review_fixes.py::test_timer_where_history_has_activity_is_nondeterminism_not_keyerror`. Check logic `flowengine/runtime.py::replay` ke `if et in (\"ActivityScheduled\", \"TimerStarted\")` block mein. Worker side: `flowengine/worker.py::run_workflow_task_once`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/tests/test_runtime.py::test_non_determinism_detected_when_code_changes",
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/flowengine/worker.py::run_workflow_task_once",
+   "projects/10-workflow-engine/tests/test_review_fixes.py::test_timer_where_history_has_activity_is_nondeterminism_not_keyerror"
+  ],
+  "code_example": "# exercise: tests/test_runtime.py (timer -> activity direction; uses the existing ev() helper)\nasync def test_timer_replaced_by_activity_is_detected():\n    async def changed(ctx, inp):\n        await ctx.execute_activity(\"send_reminder\")        # used to be: await ctx.sleep(60)\n        return \"ok\"\n    h = [ev(\"WorkflowStarted\", input={}), ev(\"TimerStarted\", seq=1, seconds=60)]\n    with pytest.raises(NonDeterminismError):\n        await replay(changed, \"wf\", \"run\", h)\n\n# real, tests/test_review_fixes.py (activity -> timer direction; raised KeyError before the fix)\nasync def test_timer_where_history_has_activity_is_nondeterminism_not_keyerror():\n    async def now_sleeps(ctx, inp):\n        await ctx.sleep(5)\n    h = [{\"event_type\": \"WorkflowStarted\", \"attrs\": {\"input\": {}}, \"created_at\": T},\n         {\"event_type\": \"ActivityScheduled\", \"attrs\": {\"seq\": 1, \"activity_type\": \"reserve\"}, \"created_at\": T}]\n    with pytest.raises(NonDeterminismError):\n        await replay(now_sleeps, \"wf\", \"run\", h)",
+  "code_language": "python",
+  "advantages": [
+   "DB ke bina millisecond tests",
+   "Real bug pakda aur ab regression test se pinned",
+   "Regression protection"
+  ],
+  "disadvantages": [
+   "Hand-built histories real histories se thodi alag (args, created_at)"
+  ],
+  "common_mistakes": [
+   "Sirf happy direction test karna",
+   "pytest.raises(Exception) likhna -- KeyError bhi pass ho jaata",
+   "History events mein seq galat dena"
+  ],
+  "follow_up_questions": [
+   "Fix se pehle KeyError worker mein kaise behave karta tha?",
+   "Real production histories se replay tests kaise banaoge?",
+   "Timer duration change ko detect karna chahiye?"
+  ],
+  "concepts": [
+   "replay tests",
+   "non-determinism",
+   "edge cases",
+   "pytest"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-110",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Implement a Temporal-style ctx.patched(change_id) so new runs take a new code path while running workflows keep the old one.",
+  "answer_hinglish": "Requirement: `order_processing` mein charge se pehle `fraud_check` add karna hai, par jo orders already chal rahe hain unki history mein woh step nahi -- unhe purana path lena hai, warna NonDeterminismError.\n\nTemporal semantics: `patched(id)` -- (1) agar history mein `MarkerRecorded(id)` hai toh True; (2) agar hum abhi history replay kar rahe hain (aur marker nahi mila) toh False -- yeh purana run hai; (3) agar replay khatam ho chuka (naya code path pe naye commands ban rahe hain) toh marker record karo aur True.\n\nImplementation choices: marker ko `seq` nahi dena, warna baad ke saare seq numbers shift ho jaate aur purane runs ka matching toot jaata. Isliye markers alag list mein, `Command(0, \"marker\", ...)` ke roop mein `new_commands` ke aage. `replay()` mein history pre-scan karke markers ka set banta hai, aur `_replaying` flag tab tak True rehta hai jab tak aakhri event feed na ho. `MarkerRecorded` event replay loop mein bas skip hota hai. `complete_workflow_task` mein `marker` kind ka event append hota hai -- koi task/timer nahi.\n\nEdge: purana run jo `patched()` tak tab pahunche jab saari history feed ho chuki (jaise aakhri event signal tha) -- woh naya path lega. Yeh sahi hai kyunki uske aage ke commands abhi history mein hain hi nahi. Cleanup: jab saare purane runs close ho jaayein, `patched` hata ke sirf naya path rakho (Temporal ka `deprecate_patch` step). Is project mein yeh feature abhi implement nahi hai -- README isko gap bolta hai.",
+  "why_needed": "Running workflows ke saath code evolve karna versioning ke bina impossible hai; yeh durable execution ka sabse practical production feature hai.",
+  "real_world_analogy": "Purane passport holders ke liye purana form, naye applicants ke liye naya form; har file pe stamp (marker) laga hai ki kaunsa version use hua.",
+  "how_it_works": "Marker = history mein recorded decision. Replay pe decision history se padha jaata hai, isliye har replay same branch leta hai -- determinism preserved.",
+  "in_this_project": "Change points: `flowengine/runtime.py::WorkflowContext` (naya method), `flowengine/runtime.py::replay` (prescan + flag + skip), `flowengine/store.py::complete_workflow_task` (marker event). README \"No workflow versioning API (patched())\". Test pattern: `tests/test_runtime.py` hand-built histories.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::WorkflowContext",
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/README.md",
+   "projects/10-workflow-engine/tests/test_runtime.py"
+  ],
+  "code_example": "# runtime.py -- WorkflowContext\ndef patched(self, change_id: str) -> bool:\n    if change_id in self._markers:            # recorded earlier in this run\n        return True\n    if self._replaying:                       # old run, history predates the change\n        return False\n    self._markers.add(change_id)\n    self.new_markers.append(change_id)        # __init__: _markers=set(), new_markers=[], _replaying=False\n    return True\n\n# runtime.py -- replay()\nctx._markers = {e[\"attrs\"][\"change_id\"] for e in history if e[\"event_type\"] == \"MarkerRecorded\"}\nctx._replaying = len(history) > 1\nawait _settle(task, ctx)\nfor i, ev in enumerate(history[1:], start=1):\n    if i == len(history) - 1:\n        ctx._replaying = False\n    ...\n    if et == \"MarkerRecorded\":\n        continue\nnew = [Command(0, \"marker\", {\"change_id\": m}) for m in ctx.new_markers] + \\\n      [c for s, c in sorted(ctx.commands.items()) if s not in recorded]\n\n# store.complete_workflow_task -- inside the loop over outcome.new_commands\nelif c.kind == \"marker\":\n    events.append((\"MarkerRecorded\", {\"change_id\": c.attrs[\"change_id\"]}))\n\n# usage + tests\nif ctx.patched(\"fraud-check\"):\n    await ctx.execute_activity(\"fraud_check\", inp[\"card\"])\nold = [ev(\"WorkflowStarted\", input=I), ev(\"ActivityScheduled\", seq=1, activity_type=\"reserve_inventory\")]\nassert \"fraud_check\" not in [c.attrs.get(\"activity_type\") for c in (await replay(wf, \"w\", \"r\", old)).new_commands]",
+  "code_language": "python",
+  "advantages": [
+   "Purane aur naye runs saath chal sakte hain",
+   "Decision history mein recorded -- deterministic",
+   "Seq numbering untouched"
+  ],
+  "disadvantages": [
+   "Code mein version branches jama hoti hain",
+   "Cleanup discipline chahiye"
+  ],
+  "common_mistakes": [
+   "Marker ko seq dena (purane runs ka matching shift)",
+   "patched() ko wall-clock date pe base karna",
+   "Saare purane runs close hone se pehle branch hata dena"
+  ],
+  "follow_up_questions": [
+   "deprecate_patch step kyun chahiye?",
+   "Ek workflow mein do patches ka order matter karta hai?",
+   "Worker build-id versioning isse kaise alag hai?"
+  ],
+  "concepts": [
+   "versioning",
+   "patched",
+   "markers",
+   "replay"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "In-code patches fine-grained hain par code complexity badhate hain; naya workflow type clean hai par purane type ko drain hone tak maintain karna padta hai.",
+   "failure_scenarios": "Marker record hua par commit stale hua (signal race) -- result discard, agla replay dobara decide karega, consistent. Branch jaldi delete kiya toh purane runs NonDeterminismError mein block.",
+   "alternatives": "Workflow type versioning (order_processing_v2), Temporal worker versioning (build ids pinned per run), getVersion API (Cadence/Temporal Java).",
+   "scale_10x_100x": "Bahut saare long-running runs pe patches mahino tak rehte hain -- patch inventory aur 'oldest running run per patch' metric chahiye.",
+   "production_improvements": "Lint rule: workflow file change without patch -> CI replay corpus must pass; dashboard showing which runs lack each marker."
+  }
+ },
+ {
+  "id": "FLOW-111",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "How does the retry-task admin operation resume a workflow blocked by a NonDeterminismError after the fix is deployed, and why was it added?",
+  "answer_hinglish": "Problem: `complete_workflow_task` non-determinism pe `error` set karta hai aur `needs_task = false` kar deta hai. Fixed code deploy hone ke baad koi bhi cheez workflow ko dobara pick nahi karti jab tak naya event (signal/timer/activity completion) na aaye. Code review mein mila ki iske liye koi API thi hi nahi -- `test_nondeterministic_deploy_is_detected_and_workflow_survives` khud raw SQL `UPDATE workflows SET needs_task = true` chalata tha. Operational gap.\n\nFix do layer mein (ab repo mein): `store.retry_workflow_task(sm, workflow_id)` -- workflow row lock, status `running` nahi toh `Conflict` ('workflow is cancelled' etc.), warna `needs_task = true`, aur return `{workflow_id, requeued: True, previous_error}`. `error` clear nahi hota; agla successful `complete_workflow_task` khud `error = NULL` karta hai, aur fix kaam na kare toh naya error overwrite hota hai -- operator ko evidence milta rehta hai. API: `POST /workflows/{id}/retry-task` (`api.py::retry_task`), header `X-Admin-Token` ko `settings.admin_token` se compare karta hai -- pehle yeh config field kahin use nahi hoti thi. Docstring: pehle `replay-check` chalao.\n\nTests: `test_retry_task_requeues_only_running_workflows` (blocked -> requeued + previous_error; cancelled workflow pe exception) aur non-determinism test ab raw UPDATE ki jagah `store.retry_workflow_task` use karta hai.\n\nToken check `hmac.compare_digest` se hota hai (constant-time; pehle `!=` tha, jo timing se batata hai ki kitne leading characters match hue -- review mein pakda aur fix kiya). Aage ke improvements: bulk version (`WHERE error LIKE 'NonDeterminismError%'`) deploy pipeline ke last step ke liye.",
+  "why_needed": "Blocked-not-failed design tabhi useful hai jab unblock karne ka safe, auditable tarika ho; raw SQL production mein risky hai.",
+  "real_world_analogy": "Machine jam hui toh mechanic theek karta hai, phir 'restart' button dabata hai -- seedha wiring nahi chhedta.",
+  "how_it_works": "retry-task -> admin token check -> lock row, running? -> needs_task = true -> claim_workflow_task pick karta hai -> naye code se replay -> success pe error NULL; fail pe error naya.",
+  "in_this_project": "`flowengine/store.py::retry_workflow_task`, `flowengine/api.py::retry_task` (X-Admin-Token), `flowengine/config.py::admin_token`, `store.py::complete_workflow_task` (outcome None branch), tests `tests/test_review_fixes.py::test_retry_task_requeues_only_running_workflows` aur `tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives`; SECURITY.md API auth row.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::retry_workflow_task",
+   "projects/10-workflow-engine/flowengine/api.py::retry_task",
+   "projects/10-workflow-engine/flowengine/config.py::admin_token",
+   "projects/10-workflow-engine/tests/test_review_fixes.py::test_retry_task_requeues_only_running_workflows",
+   "projects/10-workflow-engine/tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives"
+  ],
+  "code_example": "# real, flowengine/store.py\nasync def retry_workflow_task(sm, workflow_id: str) -> dict:\n    async with sm() as s, s.begin():\n        wf = await _lock(s, workflow_id)\n        if wf[\"status\"] != \"running\":\n            raise Conflict(f\"workflow is {wf['status']}\")\n        await s.execute(text(\"UPDATE workflows SET needs_task = true WHERE workflow_id = :w\"), {\"w\": workflow_id})\n    return {\"workflow_id\": workflow_id, \"requeued\": True, \"previous_error\": wf[\"error\"]}\n\n# real, flowengine/api.py\n@router.post(\"/workflows/{workflow_id}/retry-task\", tags=[\"operations\"])\nasync def retry_task(workflow_id: str, request: Request, x_admin_token: str | None = Header(default=None)):\n    if not x_admin_token or not hmac.compare_digest(x_admin_token, request.app.state.settings.admin_token):\n        raise Unauthorized(\"admin token required\")\n    return await store.retry_workflow_task(request.app.state.sm, workflow_id)",
+  "code_language": "python",
+  "advantages": [
+   "No more raw SQL to resume a blocked workflow",
+   "Refuses closed workflows (Conflict)",
+   "Returns previous_error as evidence; admin_token finally used"
+  ],
+  "disadvantages": [
+   "Shared static token (constant-time compare, but no per-operator identity or audit)",
+   "Per-workflow only -- no bulk retry after a bad deploy"
+  ],
+  "common_mistakes": [
+   "error clear kar dena (evidence lost)",
+   "Status check ke bina needs_task = true (closed workflows bhi)",
+   "replay-check chalaye bina retry karna -- workflow phir block"
+  ],
+  "follow_up_questions": [
+   "Bulk retry kaise rate-limit karoge?",
+   "Temporal ka reset API isse kaise alag hai?",
+   "Retry ke baad bhi fail ho toh alert?"
+  ],
+  "concepts": [
+   "operations",
+   "admin API",
+   "non-determinism recovery",
+   "conditional update"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-112",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Make the determinism check optionally compare activity arguments, so inserting a same-type step (bug 5) is detected.",
+  "answer_hinglish": "Background: `FAILURE_SCENARIOS.md` bug 5 -- type-level check same activity type ka inserted step nahi pakadta. Accha news: `complete_workflow_task` `ActivityScheduled` event mein `args` already store karta hai (`{\"seq\", \"activity_type\", \"args\", \"retry\"}`). Toh compare karne ke liye data history mein hai, sirf check missing hai.\n\nDesign: `replay(..., strict_args=False)` keyword. Default off rakha kyunki Temporal-compatible behaviour hai aur argument-level bug fixes (template name change) running workflows ko block nahi karne chahiye. Strict mode CI ke replay-check mein ya specific workflow types ke liye on karo.\n\nNormalisation zaroori hai: history se args JSONB round-trip ke baad aate hain (tuples lists ban jaate hain, datetime string ban jaata hai via `_j` ka `default=str`). Isliye dono sides `json.loads(json.dumps(x, default=str))` se normalise -- exactly wahi transformation jo store karte waqt hua. Hand-built test histories mein `args` nahi hota, isliye check sirf tab jab `\"args\" in a`.\n\nKeyError gap (timer command mein activity_type nahi hota) review mein pehle hi fix ho chuka hai -- `cmd.attrs.get(\"activity_type\")` aur test `test_timer_where_history_has_activity_is_nondeterminism_not_keyerror` -- isliye strict mode bhi `.get` hi use karta hai.\n\nTest: v1 `notify(\"x\", \"step 1\")`; v2 pehle `notify(\"x\", \"audit\")` insert karta hai. Default mode mein replay pass (bug 5 reproduce), strict mode mein `NonDeterminismError`. Yeh dono asserts ek test mein -- documentation ki tarah kaam karte hain.",
+  "why_needed": "Same-type insert silently galat results deta hai (purane step ka result naye step ko) -- sabse dangerous non-determinism kyunki error hi nahi aata.",
+  "real_world_analogy": "Sirf parcel ka size check karna vs size + address dono check karna -- same size ka galat parcel ab pakda jaayega.",
+  "how_it_works": "History event attrs.args (normalised) == code command attrs.args (normalised)? Strict mode mein mismatch -> NonDeterminismError.",
+  "in_this_project": "`flowengine/store.py::complete_workflow_task` ActivityScheduled event mein `args` likhta hai; check `flowengine/runtime.py::replay` mein; `flowengine/api.py::replay_check` strict mode use kar sakta hai. Bug 5: `FAILURE_SCENARIOS.md`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/api.py::replay_check",
+   "projects/10-workflow-engine/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# runtime.py\nimport json\n\ndef _norm(v):\n    return json.loads(json.dumps(v, default=str))     # same transformation store._j applied\n\nasync def replay(fn, workflow_id, run_id, history, *, strict_args: bool = False) -> ReplayResult:\n    ...\n        if et in (\"ActivityScheduled\", \"TimerStarted\"):\n            cmd = ctx.commands.get(a[\"seq\"])\n            want = a.get(\"activity_type\") if et == \"ActivityScheduled\" else None\n            got = None if cmd is None else (cmd.attrs.get(\"activity_type\") or cmd.kind)\n            if cmd is None or (et == \"ActivityScheduled\" and cmd.attrs.get(\"activity_type\") != want) \\\n                    or (et == \"TimerStarted\" and cmd.kind != \"start_timer\"):\n                raise NonDeterminismError(f\"command {a['seq']}: history has {et} {want or ''} but code produced {got}\")\n            if strict_args and et == \"ActivityScheduled\" and \"args\" in a \\\n                    and _norm(cmd.attrs[\"args\"]) != _norm(a[\"args\"]):\n                raise NonDeterminismError(f\"command {a['seq']}: {want} args changed\")\n            recorded.add(a[\"seq\"])\n            continue\n\n# tests/test_runtime.py\nasync def test_strict_args_detects_same_type_insert():\n    async def v2(ctx, inp):\n        await ctx.execute_activity(\"notify\", \"x\", \"audit\")      # inserted, same type\n        await ctx.execute_activity(\"notify\", \"x\", \"step 1\")\n    h = [ev(\"WorkflowStarted\", input={}), ev(\"ActivityScheduled\", seq=1, activity_type=\"notify\", args=[\"x\", \"step 1\"])]\n    assert (await replay(v2, \"w\", \"r\", h)).status == \"blocked\"             # default: not detected (bug 5)\n    with pytest.raises(NonDeterminismError):\n        await replay(v2, \"w\", \"r\", h, strict_args=True)",
+  "code_language": "python",
+  "advantages": [
+   "Bug 5 class of errors detectable",
+   "No schema change -- args already in history",
+   "Opt-in, backward compatible"
+  ],
+  "disadvantages": [
+   "Legit arg changes strict mode mein block",
+   "Bade args compare karna CPU cost"
+  ],
+  "common_mistakes": [
+   "Normalise kiye bina compare (tuple vs list mismatch)",
+   "Strict mode ko default on karna bina migration plan",
+   "Args mein non-deterministic values (timestamps) daalna"
+  ],
+  "follow_up_questions": [
+   "Args ki jagah hash store karoge toh?",
+   "Strict mode sirf CI mein kyun?",
+   "Retry policy change ko bhi compare karna chahiye?"
+  ],
+  "concepts": [
+   "determinism check",
+   "argument comparison",
+   "normalisation",
+   "backward compatibility"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict detection safety deta hai par evolvability kam karta hai; isliye opt-in aur CI-first.",
+   "failure_scenarios": "False positives: float formatting, dict ordering (JSON equality handles ordering), datetime strings. False negatives: activity ke andar logic change (activities replay nahi hoti).",
+   "alternatives": "Args hash (sha256 of canonical JSON) store karna -- chhota aur privacy-friendly; Temporal-style versioning se problem avoid.",
+   "scale_10x_100x": "Badi histories pe har event pe normalise = replay cost badhta hai; hash precompute karke compare sasta.",
+   "production_improvements": "CI mein strict replay corpus, production mein lenient; mismatch pe warning metric bina block kiye (shadow mode)."
+  }
+ },
+ {
+  "id": "FLOW-113",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a new trial-to-paid subscription workflow using existing activities, a signal with timeout, and compensation-free error handling, plus an end-to-end test.",
+  "answer_hinglish": "Business flow: user signup -> trial start email -> trial period mein `payment_method_added` signal ka wait -> signal aaya toh charge aur 'subscribed' email; nahi aaya toh 'trial_expired' email; charge permanently fail ho (declined card) toh 'payment_failed' email.\n\nYeh `customer_onboarding` aur `payment_and_refund` ke patterns combine karta hai aur sirf existing activities use karta hai: `create_account`, `send_email`, `charge_payment`. Naya activity likhne ki zaroorat nahi, toh idempotency `effect()` se free milti hai.\n\nDeterminism points: trial length `inp[\"trial_seconds\"]` se, `datetime.now()` nahi; wait `ctx.wait_signal(..., timeout=...)` jo internally durable timer banata hai; signal agar trial start email se pehle hi aa jaaye toh buffer ho jaata hai (`_signal_queues`), lost nahi. Charge ke liye `try/except ActivityError` -- `charge_payment` \"declined\" pe `NonRetryableError` raise karta hai, toh ek hi attempt ke baad workflow ko ActivityError milega.\n\nTest end-to-end real worker + Postgres ke saath, `tests/conftest.py` ke `worker`, `wait_status`, `effects` helpers se. Teen runs: ek ko signal (active), ek ko kuch nahi (expired), ek ko declined card. Asserts result status aur exact effect counts pe -- yahi is repo ki testing style hai (TESTING.md: \"tests assert exact effect counts\").\n\nWorkflow ko `flowengine/examples/workflows.py` mein `@workflow(\"trial_subscription\")` ke saath register karna hai -- examples package import hote hi worker aur API dono ko dikh jaayega.",
+  "why_needed": "Interviewer dekhta hai ki aap engine ke primitives se naya business process sahi tarah compose kar sakte ho.",
+  "real_world_analogy": "Gym trial: 7 din mein card do toh membership, warna 'trial khatam' message -- aur receptionist ko 7 din yaad rakhne ki zaroorat nahi, register mein entry hai.",
+  "how_it_works": "Activities sequence + wait_signal(timeout) race (history order decides) + ActivityError branch. Har step history mein, crash-safe.",
+  "in_this_project": "Patterns: `flowengine/examples/workflows.py::payment_and_refund` (signal with timeout), `customer_onboarding` (early signal buffering). Activities: `flowengine/examples/activities.py::charge_payment`, `send_email`, `create_account`. Test helpers: `tests/conftest.py::wait_status`, `tests/conftest.py::effects`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::payment_and_refund",
+   "projects/10-workflow-engine/flowengine/examples/activities.py::charge_payment",
+   "projects/10-workflow-engine/tests/conftest.py::wait_status",
+   "projects/10-workflow-engine/tests/conftest.py::effects",
+   "projects/10-workflow-engine/tests/test_engine.py::test_payment_and_refund_signal_vs_timer"
+  ],
+  "code_example": "# flowengine/examples/workflows.py\n@workflow(\"trial_subscription\")\nasync def trial_subscription(ctx, inp):\n    acct = await ctx.execute_activity(\"create_account\", inp[\"email\"], retry=FAST)\n    await ctx.execute_activity(\"send_email\", inp[\"email\"], \"trial_started\", retry=FAST)\n    pm = await ctx.wait_signal(\"payment_method_added\", timeout=inp[\"trial_seconds\"])\n    if pm is None:\n        await ctx.execute_activity(\"send_email\", inp[\"email\"], \"trial_expired\", retry=FAST)\n        return {\"status\": \"expired\", \"account_id\": acct[\"account_id\"]}\n    try:\n        charge = await ctx.execute_activity(\"charge_payment\", inp[\"price\"], pm[\"card\"], retry=FAST)\n    except ActivityError as e:\n        await ctx.execute_activity(\"send_email\", inp[\"email\"], \"payment_failed\", retry=FAST)\n        return {\"status\": \"payment_failed\", \"reason\": e.message}\n    await ctx.execute_activity(\"send_email\", inp[\"email\"], \"subscribed\", retry=FAST)\n    return {\"status\": \"active\", \"charge_id\": charge[\"charge_id\"]}\n\n# tests/test_engine.py\nasync def test_trial_subscription_paths(sm):\n    for wid, t in ((\"tr-paid\", 30), (\"tr-expired\", 0.3), (\"tr-declined\", 30)):\n        await store.start_workflow(sm, \"trial_subscription\", wid, {\"email\": f\"{wid}@x.io\", \"trial_seconds\": t, \"price\": 9})\n    await store.signal(sm, \"tr-paid\", \"payment_method_added\", {\"card\": \"ok\"})          # early: buffered\n    await store.signal(sm, \"tr-declined\", \"payment_method_added\", {\"card\": \"declined\"})\n    async with worker(sm):\n        paid, exp, dec = [await wait_status(sm, w) for w in (\"tr-paid\", \"tr-expired\", \"tr-declined\")]\n    assert paid[\"result\"][\"status\"] == \"active\" and exp[\"result\"][\"status\"] == \"expired\"\n    assert dec[\"result\"] == {\"status\": \"payment_failed\", \"reason\": \"card declined\"}\n    assert await effects(sm) == {\"account\": 3, \"email\": 6, \"charge\": 1}",
+  "code_language": "python",
+  "advantages": [
+   "Sirf existing primitives",
+   "Har path ka exact effect count test",
+   "Early signal handled by buffering"
+  ],
+  "disadvantages": [
+   "Trial reminders (din 5 pe email) ke liye extra timer logic chahiye"
+  ],
+  "common_mistakes": [
+   "Trial end ko datetime.now() se calculate karna",
+   "Declined card ko retryable chhodna (3 baar decline)",
+   "Signal payload validate na karna (pm['card'] missing -> workflow fail)"
+  ],
+  "follow_up_questions": [
+   "Trial ke beech reminder email kaise add karoge (do timers)?",
+   "User trial ke dauraan cancel kare toh?",
+   "Monthly renewal ke liye continue-as-new kyun?"
+  ],
+  "concepts": [
+   "workflow composition",
+   "signals with timeout",
+   "error handling",
+   "end-to-end test"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-114",
+  "project_slug": "p10-workflow-engine",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "When wait_signal's signal wins, the timeout timer still fires later. Implement timer cancellation without breaking running workflows.",
+  "answer_hinglish": "Observation: `wait_signal(name, timeout)` andar `self.sleep(timeout)` se timer banata hai. Signal jeet gaya toh woh future ko ignore karta hai, par `timers` table ki row abhi bhi `fired = false` hai. Baad mein `fire_due_timers` `TimerFired` append karta hai aur `needs_task = true` -- ek bekaar workflow task (full replay) aur history mein extra event. `_resolve` mein `if fut.done(): return` hai, isliye correctness break nahi hoti, sirf waste. `document_approval` ka escalate_after 3600 jaisa timeout ho toh ek ghante baad yeh ghost wake-up aayega.\n\nFix design: naya command `cancel_timer` -> event `TimerCanceled(seq)` + timer row `fired = true`. Sabse important constraint: yeh command `seq` consume NAHI kar sakta. Agar kare toh signal-jeete purane runs mein agla activity seq ek aage shift ho jaayega aur replay NonDeterminismError dega. Isliye cancel commands alag list mein (`Command(0, ...)`), jaise patched ke markers.\n\nDeterminism: code tabhi cancel command produce kare jab history mein us seq ka `TimerFired` ya `TimerCanceled` already na ho -- isliye replay start pe history se `_closed_timers` set banta hai. Race: timer fire ho raha tha jab hum replay kar rahe the -> `last_event_id` badla -> optimistic commit reject -> agla replay `TimerFired` dekhega aur cancel produce nahi karega. Store side mein `UPDATE timers SET fired = true ... AND NOT fired` workflow row lock ke andar chalta hai, aur `fire_due_timers` bhi pehle workflow row lock karta hai, toh dono serialize hote hain.\n\nTest: pure replay -- signal pehle aaya toh new_commands mein `cancel_timer` hai; history mein `TimerCanceled` hai toh dobara nahi.",
+  "why_needed": "Ghost wake-ups CPU (full replay) aur history size dono waste karte hain; scale pe yeh significant hai.",
+  "real_world_analogy": "Alarm laga ke so gaye, phir khud hi jaldi uth gaye -- alarm band karna bhool gaye toh ghante baad bajega aur ghar wale uth jaayenge.",
+  "how_it_works": "Signal win -> cancel command (no seq) -> commit: TimerCanceled event + timer row fired=true -> fire_due_timers usse kabhi pick nahi karta.",
+  "in_this_project": "`flowengine/runtime.py::wait_signal` (timer ignore hota hai), `flowengine/runtime.py::_resolve` (done future pe return), `flowengine/store.py::fire_due_timers`, `flowengine/store.py::complete_workflow_task`. Test pattern: `tests/test_runtime.py::test_race_signal_first_wins`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/runtime.py::wait_signal",
+   "projects/10-workflow-engine/flowengine/runtime.py::_resolve",
+   "projects/10-workflow-engine/flowengine/store.py::fire_due_timers",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/tests/test_runtime.py::test_race_signal_first_wins"
+  ],
+  "code_example": "# runtime.py -- WorkflowContext (__init__: self.timer_cancels = []; self._closed_timers = set())\nasync def wait_signal(self, name, timeout=None):\n    ...\n    timer = self.sleep(timeout)\n    tseq = self._seq\n    done, _ = await asyncio.wait({fut, timer}, return_when=asyncio.FIRST_COMPLETED)\n    if fut in done:\n        if tseq not in self._closed_timers:\n            self._closed_timers.add(tseq)\n            self.timer_cancels.append(tseq)          # no seq consumed: old histories still match\n        return fut.result()\n    ...\n\n# runtime.py -- replay()\nctx._closed_timers = {e[\"attrs\"][\"seq\"] for e in history if e[\"event_type\"] in (\"TimerFired\", \"TimerCanceled\")}\n...   in the loop:  elif et == \"TimerCanceled\": continue\nnew = [Command(0, \"cancel_timer\", {\"seq\": s}) for s in ctx.timer_cancels] + [...existing new commands...]\n\n# store.complete_workflow_task\nelif c.kind == \"cancel_timer\":\n    events.append((\"TimerCanceled\", {\"seq\": c.attrs[\"seq\"]}))\n    await s.execute(text(\"UPDATE timers SET fired = true WHERE workflow_id = :w AND seq = :s AND NOT fired\"),\n                    {\"w\": wid, \"s\": c.attrs[\"seq\"]})\n\n# test\nh = [ev(\"WorkflowStarted\", input={}), ev(\"TimerStarted\", seq=1, seconds=60), ev(\"SignalReceived\", name=\"approve\", payload=1)]\nr = await replay(signal_or_timeout, \"wf\", \"run\", h)\nassert [c.kind for c in r.new_commands] == [\"cancel_timer\"] and r.status == \"completed\"",
+  "code_language": "python",
+  "advantages": [
+   "Ghost wake-ups khatam",
+   "History cleaner",
+   "Running workflows compatible (no seq shift)"
+  ],
+  "disadvantages": [
+   "Naya event type aur store branch",
+   "Purane runs ke already-pending timers phir bhi fire honge (theek hai)"
+  ],
+  "common_mistakes": [
+   "Cancel command ko seq dena",
+   "Timer row DELETE karna bina event (history aur DB out of sync)",
+   "History check ke bina har replay pe cancel produce karna"
+  ],
+  "follow_up_questions": [
+   "Workflow close hone pe saare pending timers cancel kyun nahi?",
+   "Temporal mein timer cancel kaise hota hai?",
+   "Kitna replay CPU bachega estimate kaise karoge?"
+  ],
+  "concepts": [
+   "durable timers",
+   "timer cancellation",
+   "backward compatibility",
+   "wasted work"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Extra event type complexity vs bekaar replays; seq-free commands compatibility dete hain par seq ke 'har command ek number' invariant ko todte hain.",
+   "failure_scenarios": "Cancel aur fire ka race -- workflow row lock + optimistic commit se serialize; agar commit reject hua toh agla replay sahi decision leta hai.",
+   "alternatives": "Workflow close pe saare unfired timers mark karna (simpler, partial fix); timer row pe 'owner future' check jo fire karne se pehle workflow state dekhe.",
+   "scale_10x_100x": "100x pe har signal-with-timeout workflow ek extra replay deta -- cancellation se workflow tasks noticeably kam.",
+   "production_improvements": "Metric: TimerFired events whose future was already done (ghost fires), alert agar high; workflow close pe timer cleanup."
+  }
+ }
+]

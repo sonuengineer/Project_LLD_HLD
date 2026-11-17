@@ -1,0 +1,195 @@
+{
+ "project_slug": "p04-webhooks",
+ "project": "Webhook Delivery System",
+ "source_dir": "projects/04-webhooks",
+ "summary": "Stripe-style webhook infrastructure: customers register endpoints that subscribe to event types; internal services publish events with an idempotency key, and the event plus one delivery row per subscribed endpoint commit in a single Postgres transaction (transactional outbox, no dual write). Dispatchers claim due deliveries with FOR UPDATE SKIP LOCKED under a lease, use the attempts column as a fencing token, and send Standard Webhooks HMAC-SHA256 signed requests (id.timestamp.body, whsec_ secrets, reference test vector) with dual signatures during secret rotation. Delivery is at-least-once with a stable webhook-id for receiver dedupe, a jittered 9-attempt retry schedule (~11h), Retry-After on 429/503, 410 and consecutive-failure auto-disable, a per-endpoint Redis token bucket that refunds attempts and fails open, timeouts, and SSRF protection checked at send time after DNS resolution with no redirects. Every attempt is logged and dead deliveries can be replayed from the API or dashboard. A measured performance investigation (phase timing, two rejected hypotheses) took one dispatcher from 48 to 111 deliveries/s, and 3 dispatchers to 189/s, by cutting DB round trips.",
+ "pitch": {
+  "intro_30s": "Maine Stripe jaisa webhook delivery system banaya hai. Services event publish karti hain, aur hum har subscribed customer endpoint pe signed HTTP request bhejte hain -- retries, rate limits, SSRF protection aur secret rotation ke saath. Postgres hi outbox aur queue dono hai: event aur deliveries ek transaction mein, dispatchers SKIP LOCKED se claim karte hain. Performance investigation se throughput 48 se 111 deliveries/s kiya, aur 3 dispatchers pe 189/s.",
+  "explain_2min": "Webhook ka matlab hai jab humare system mein kuch hota hai, hum customer ke server ko khud batate hain -- polling ki zaroorat nahi. Lekin push karne ka matlab reliability humari zimmedari: customer down ho, slow ho, ya koi fake webhook bheje.\n\nMere design mein teen parts hain. Pehla, API: customer endpoint register karta hai (URL, event types, rate limit) aur use ek `whsec_` secret milta hai. Internal services `POST /events` karti hain idempotency key ke saath. Publish ek hi transaction mein event aur har subscribed endpoint ke liye delivery row likhta hai -- yeh transactional outbox hai, toh 'event save hua par queue message kho gaya' wala dual-write problem hota hi nahi.\n\nDoosra, dispatchers: yeh N processes hain jo `FOR UPDATE SKIP LOCKED` se due deliveries claim karte hain, lease set karte hain, aur `attempts` ko fencing token ki tarah increment karte hain. Har delivery pe per-endpoint Redis token bucket, send-time SSRF check (DNS resolve, private IPs block, redirects nahi), Standard Webhooks HMAC signature, aur timeouts. HTTP call kabhi DB transaction ke andar nahi hota. Result ek single SQL statement mein record hota hai -- fenced update, attempt log, aur endpoint health.\n\nTeesra, policies: at-least-once delivery, stable `webhook-id` taaki customer dedupe kare; jittered retry schedule ~11 ghante; 429/503 pe Retry-After; 410 pe endpoint disable; 20 consecutive failures pe auto-disable; dead deliveries replay. Rate limit pe throttle hua toh attempt refund hota hai kyunki woh customer ki galti nahi.\n\n41 tests hain (code review ke baad loop resilience, crash -> internal_error attempt, Retry-After cap, IP pinning aur lowercase event types ke regression tests add hue) jo real Postgres aur real receiver ke saath signing end to end chalaate hain, crash + zombie scenario, aur 3 dispatchers exactly-once in happy path. Aur maine throughput ko phase timing se debug karke 48 se 111/s kiya.",
+  "deep_5min": "Main ek event ki poori journey se samjhaata hoon, aur har step pe hardest decision.\n\n1. Publish. Ek service `POST /events {type: order.paid, payload, idempotency_key}` karti hai. Route dependency ek transaction kholti hai. `publish()` pehle key se existing event dhoondhta hai; nahi mila toh `INSERT ... ON CONFLICT (idempotency_key) DO NOTHING RETURNING id`. Agar RETURNING khaali aaya toh matlab concurrent request race jeet gayi -- hum winner return karte hain (200). Phir `event_types && ARRAY[type, '*']` se subscribed endpoints, aur har ek ke liye `deliveries` row. Commit. Hardest decision yahan: Postgres ko hi queue banana. Redis ya Kafka use karta toh DB commit aur broker publish do writes hote, aur unke beech crash = lost webhook. Outbox ke saath ek transaction mein sab. Cost: DB load per delivery -- jo maine baad mein measure kiya.\n\n2. Claim. Dispatcher loop `CLAIM_SQL` chalata hai: inner SELECT due rows (pending aur due, ya in_flight jinka lease expire ho gaya) `ORDER BY next_attempt_at LIMIT 20 FOR UPDATE OF d2 SKIP LOCKED`, outer UPDATE unhe `in_flight` karta hai, `attempts + 1`, `locked_until = now() + 30s`, aur CTE ke through event payload aur endpoint secret/url bhi same round trip mein return. SKIP LOCKED se N dispatchers disjoint batches lete hain. Transaction turant commit -- lock milliseconds ka. Uske baad ownership lease se, aur safety fencing se: record tabhi accept hoga jab `attempts` abhi bhi wahi ho jo humne claim kiya tha.\n\n3. Rate limit. Redis Lua token bucket per endpoint, Redis TIME se clock, shared across dispatchers. Token nahi mila toh delivery wapas pending, `attempts - 1` -- refund, kyunki throttling humari policy hai. Redis down toh fail open.\n\n4. Send. Pehle SSRF: URL ka host send time pe resolve, har IP `is_global` check, IPv4-mapped IPv6 unwrap. Registration pe check sirf UX hai -- DNS rebinding se domain baad mein internal IP pe point ho sakta hai. Aur validated IP pe hi connect karte hain (Host header + TLS SNI original hostname), taaki check aur connect ke beech dobara DNS na ho -- yeh TOCTOU review mein mila aur fix hua. Redirects follow nahi karte. Phir Standard Webhooks headers: `webhook-id` (event id, retries mein stable), `webhook-timestamp` (har attempt naya), `webhook-signature` = `v1,` + base64 HMAC-SHA256 of `id.timestamp.body`, rotation ke dauraan do signatures. Mera implementation spec ke official test vector se match karta hai. Timeouts 3s connect / 10s total.\n\n5. Record. `RECORD_SQL` ek statement: fenced delivery update, attempt log insert (sirf agar update hua), aur endpoint health -- failure pe counter +1, threshold ya 410 pe disable, aur routine success pe endpoint row touch hi nahi. Retry delay schedule se +-20% jitter, 429/503 pe `max(schedule, Retry-After)`.\n\n6. Receiver. Customer raw body verify kare, timestamp 5 minute tolerance, `webhook-id` pe dedupe, aur duplicate pe bhi 200 -- kyunki exactly-once to a third party impossible hai: 2xx raste mein kho sakta hai.\n\nPerformance story: v1 48 deliveries/s tha. Phase timing ne dikhaya HTTP 1.7ms, `_record` 116ms concurrency 20 pe. Do hypotheses test ki: hot endpoint row (20 endpoints pe spread: 50 -> 52, partial) aur WAL fsync (`synchronous_commit=off`: no change, rejected). Asli problem round trips the. CTE claim aur single-statement record se 111/s, 3 dispatchers pe 189/s -- shared Windows Docker machine pe. Ab process CPU 82% of wall, toh next lever more processes. Ek pehla measurement 7,526/s aaya tha jo publish ke saath overlap mein galat naap raha tha -- discard kiya aur honest drain benchmark banaya.\n\nTesting aur honesty: 41 tests real Postgres pe chalte hain; dispatcher ka HTTP client demo receiver se `httpx.ASGITransport` ke through juda hai, toh signing aur verification end to end bina sockets ke chalti hai, aur failure modes `MockTransport` se -- 500, 410, 429 with Retry-After, timeouts, SSRF blocked, auto-disable, rate-limit refund, crash plus zombie, rotation. Limitations main khud batata hoon: secrets plaintext hain (sign karne ke liye chahiye; KMS envelope encryption next step), single admin token hai, retention/partitioning nahi hai, ordering guarantee nahi hai, aur slow endpoints ke liye bulkheads/circuit breaker abhi sirf design mein hain. Scale path clear hai: pehle more dispatchers, PgBouncer, GIN index aur partitions; 100x pe outbox ko Kafka mein relay karke Postgres ko source of truth rakhna.",
+  "architecture_walkthrough": "API (FastAPI, `webhooks/main.py`, `api/routes.py`): endpoints CRUD, secret rotation, `POST /events`, deliveries list/detail with attempt log, replay routes, `/stats`, aur `/dashboard`. Single bearer token, constant-time compare.\n\nServices: `services/events.py` (publish = outbox fan-out with idempotency), `services/endpoints.py` (register, update, rotate secret, URL validation), `services/signing.py` (Standard Webhooks sign/verify), `services/ssrf.py` (URL syntax + send-time DNS checks), `services/ratelimit.py` (Redis Lua token bucket, fail-open).\n\nPostgres (`db/models.py`, Alembic migration 0001): `endpoints`, `events` (JSONB payload, unique idempotency key), `deliveries` (one row per event x endpoint, outbox + queue, partial index on due rows, lease + fencing columns), `delivery_attempts` (immutable log).\n\nDispatcher (`dispatcher/dispatcher.py`, `python -m webhooks.dispatcher`, N replicas): loop of CLAIM_SQL batch -> per delivery rate limit -> SSRF -> sign -> httpx POST -> RECORD_SQL. Stateless, graceful SIGTERM.\n\nRedis: only per-endpoint token buckets.\n\nDemo receiver (`receiver/app.py`): reference consumer that verifies raw body, checks tolerance, dedupes on webhook-id; tests plug it into the dispatcher via httpx ASGITransport.\n\nBench (`bench/`): drain benchmark with Docker, in-process benchmark, phase timing profiler.",
+  "difficult_decisions": [
+   "Postgres as outbox AND queue instead of Redis/Kafka: ek transaction mein event + deliveries (no dual write, SQL queryability), cost = DB load per delivery; Kafka relay ko 100x ke liye rakha.",
+   "HTTP call ko DB transaction se bahar rakhna: claim short transaction + lease (30s) + attempts fencing token, taaki slow customers DB locks/connections na pakdein aur zombies purane results na likh sakein.",
+   "SSRF check registration pe nahi, har send pe DNS resolve karke; redirects bilkul follow nahi -- DNS rebinding aur 302 bypass ki wajah se.",
+   "Rate-limited delivery ka attempt refund karna -- warna backlog flush mein healthy customer ki deliveries throttle hote hote dead ho jaati.",
+   "Ordering guarantee na dena: per-endpoint FIFO head-of-line blocking laata; `created_at` + fetch latest state recommend kiya.",
+   "Record ko ek statement banana aur routine success pe endpoint row skip karna -- measured round trips aur hot-row contention ke basis pe."
+  ],
+  "biggest_challenges": [
+   "Throughput 48 deliveries/s pe atka tha jabki HTTP send sirf 1.7ms tha; phase timing (`bench/phase_timing.py`) se pata chala `_record` concurrency 20 pe 116ms le raha tha -- per-delivery DB round trips asli bottleneck the.",
+   "Do galat hypotheses: hot endpoint row lock sirf partial nikla (20 endpoints pe spread: 50 -> 52/s), aur WAL fsync `synchronous_commit=off` se test kiya -- koi change nahi, reject. Data se kill karna padha.",
+   "Pehla benchmark 7,526/s print kiya kyunki publish aur drain overlap mein naap raha tha -- meaningless, discard karke backlog-first drain benchmark (`bench_drain.py`) banaya.",
+   "Drain benchmark hang hua: seed ka purana `*` endpoint subscribed aur fail ho raha tha, toh pending kabhi zero nahi hua -- har run ko `docker compose down -v` se fresh state pe shift kiya.",
+   "Zombie dispatcher ka scenario test karna: lease 0.2s, A claim karke 'crash', B deliver kare, phir A ka late result fencing se stale reject ho -- yeh deterministic test banana tricky tha."
+  ],
+  "failure_scenarios": [
+   "Customer endpoint 5xx/timeouts: jittered retry schedule (5s ... 6h, 9 attempts ~11h), har attempt log; 20 consecutive failures pe endpoint auto-disable, deliveries wait, re-enable + replay-dead se recovery.",
+   "Dispatcher crash mid-delivery: row in_flight rehti hai, 30s lease expire hone pe doosra dispatcher re-claim (attempts+1); zombie ka late write `attempts` fencing se stale.",
+   "2xx lost after customer processed: hum retry karte hain same `webhook-id` ke saath; receiver dedupe karta hai -- isliye exactly-once impossible, at-least-once + idempotent receiver.",
+   "Redis down: token bucket fail-open, deliveries chalti rehti hain; customers ka 429/Retry-After aur timeouts second line of defence.",
+   "Postgres down: publish 500 (idempotency key ke saath retry safe); dispatcher ka `run()` loop error log karke 30s tak exponential backoff se retry karta hai (review fix -- pehle process exit hota tha); in-flight records lease se recover.",
+   "Endpoint DNS internal IP pe point kare (rebinding): send-time check `blocked`, koi request nahi jaati, delivery dead without retry.",
+   "Poison delivery (processing hamesha crash kare): crash ek `internal_error` attempt ki tarah record hota hai taaki retry schedule aur DLQ apply hon, aur claim-time backstop final attempt ke baad lease-expired rows ko dead kar deta hai (test_crashing_delivery_eventually_goes_dead). Review se pehle aisi row in_flight mein unbounded attempts ke saath ghoomti rehti thi."
+  ],
+  "improvements": [
+   "Signing secrets ko KMS envelope encryption se encrypt karna aur `/secret` access restrict karna (abhi plaintext, documented gap).",
+   "Per-tenant scoped API keys aur multi-tenancy (abhi single admin token).",
+   "Per-endpoint bulkheads (concurrency cap) aur circuit breaker, aur batch-level head-of-line blocking hatane ke liye continuous dispatch loop.",
+   "SSRF: validated IP pinning ho chuka (review fix, test_connection_is_pinned_to_the_validated_ip); aage network-level egress deny for internal CIDRs ya egress proxy as defence in depth.",
+   "Retention: `delivery_attempts` monthly partitions, old events/deliveries pruning; GIN index on `endpoints.event_types`.",
+   "Dispatcher Prometheus metrics, aur DB-clock based retry scheduling."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Webhooks and polling vs push",
+   "steps": [
+    "1. Concept: webhook = server customer ke URL pe HTTP POST karta hai jab event hota hai; polling = client baar baar puchhta hai.",
+    "2. Why here: push model mein retries, signing, ordering, endpoint failures humari zimmedari -- yeh poora project wahi ownership hai.",
+    "3. API: `POST /endpoints` (URL + event_types) aur `POST /events`; customer ko body `{id,type,created_at,data}` + 3 headers milte hain (API_DOCUMENTATION.md).",
+    "4. Implementation: `Dispatcher.deliver` compact JSON body banata hai aur `_send` POST karta hai.",
+    "5. Demo: `python seed.py` 20 events publish karta hai aur receiver ke counts print karta hai.",
+    "6. Interviewer next: 'customer down ho toh?', 'kaise pata webhook asli hai?'"
+   ],
+   "files": [
+    "projects/04-webhooks/SYSTEM_DESIGN.md",
+    "projects/04-webhooks/API_DOCUMENTATION.md",
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::deliver",
+    "projects/04-webhooks/seed.py"
+   ]
+  },
+  {
+   "concept": "Transactional outbox and the dual-write problem",
+   "steps": [
+    "1. Concept: DB + broker do writes atomic nahi; beech mein crash = lost ya ghost message. Outbox = dono same DB transaction mein.",
+    "2. Why here: event accept = delivery ka promise; promise atomic hona chahiye.",
+    "3. API: `POST /events` with optional `idempotency_key`; 201 new, 200 replay.",
+    "4. Implementation: `publish()` event INSERT + subscribed endpoints (`&&` overlap) + bulk Delivery rows; route `session` dependency commit karti hai.",
+    "5. Demo: `pytest tests/test_publish_api.py::test_publish_is_atomic` -- commit se pehle crash, dono tables khaali.",
+    "6. Interviewer next: 'Kafka relay kab chahiye?', 'CDC vs polling relay?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/services/events.py::publish",
+    "projects/04-webhooks/webhooks/api/routes.py::session",
+    "projects/04-webhooks/tests/test_publish_api.py::test_publish_is_atomic"
+   ]
+  },
+  {
+   "concept": "Postgres as a queue: SKIP LOCKED, partial index, lease, fencing",
+   "steps": [
+    "1. Concept: FOR UPDATE SKIP LOCKED se competing consumers disjoint rows lete hain; lease time-bound ownership; fencing token zombie writes rokta hai.",
+    "2. Why here: multiple dispatchers bina coordinator ke, aur HTTP call transaction ke bahar.",
+    "3. API/code: `CLAIM_SQL` (CTE UPDATE ... RETURNING joined with events/endpoints) aur `RECORD_SQL` (`WHERE attempts = :attempt AND status = 'in_flight'`).",
+    "4. Implementation detail: partial index `ix_deliveries_due` sirf pending/in_flight rows; lease `now() + 30s` DB clock se.",
+    "5. Demo: `pytest tests/test_dispatcher.py -k \"three_dispatchers or crashed_dispatcher\"`.",
+    "6. Interviewer next: 'bina SKIP LOCKED kya hota?', 'lease timeout se chhota ho toh?', 'replay attempts=0 fencing ko kaise affect karta hai?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+    "projects/04-webhooks/migrations/versions/0001_initial.py",
+    "projects/04-webhooks/tests/test_dispatcher.py::test_crashed_dispatcher_lease_expires_and_zombie_result_is_rejected"
+   ]
+  },
+  {
+   "concept": "Delivery semantics and idempotency",
+   "steps": [
+    "1. Concept: at-least-once + idempotent receiver = effectively-once effect; exactly-once delivery to a third party impossible (lost 2xx).",
+    "2. Why here: retries, crashes, lease expiry aur replays sab duplicates laate hain.",
+    "3. API: publish `idempotency_key` (upstream) aur `webhook-id` header = event id (downstream).",
+    "4. Implementation: `ON CONFLICT DO NOTHING RETURNING` race handling; receiver `app.state.seen` dedupe, duplicate pe 200.",
+    "5. Demo: `pytest tests/test_dispatcher.py::test_receiver_dedupes_replayed_delivery tests/test_publish_api.py::test_publish_idempotency_key`.",
+    "6. Interviewer next: 'receiver dedupe ko business write ke saath atomic kaise banaye?', 'same key different payload?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/services/events.py::publish",
+    "projects/04-webhooks/webhooks/receiver/app.py::webhook",
+    "projects/04-webhooks/TRADEOFFS.md"
+   ]
+  },
+  {
+   "concept": "HMAC signing per Standard Webhooks, replay protection, rotation",
+   "steps": [
+    "1. Concept: HMAC-SHA256 over `id.timestamp.body`, base64, `v1,` prefix; key = base64-decoded secret without `whsec_`.",
+    "2. Why here: public URLs pe koi bhi POST kar sakta hai; timestamp replay window limit karta hai; rotation zero downtime.",
+    "3. API: `POST /endpoints/{id}/rotate-secret {grace_seconds}`.",
+    "4. Implementation: `sign`, `signature_header` (multiple secrets), `verify` (any-of-any, compare_digest, tolerance 300s); `_active_secrets`.",
+    "5. Demo: `pytest tests/test_signing_ssrf.py -k \"reference_vector or replay or rotation\"`.",
+    "6. Interviewer next: 'raw body kyun?', 'Ed25519 kyun nahi?', 'leaked secret pe grace kitna?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/services/signing.py::verify",
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_active_secrets",
+    "projects/04-webhooks/tests/test_signing_ssrf.py::test_standard_webhooks_reference_vector"
+   ]
+  },
+  {
+   "concept": "Retries, Retry-After, 410, auto-disable, rate-limit refund",
+   "steps": [
+    "1. Concept: jittered schedule avoids thundering herd; receiver back-pressure respect; dead endpoints ko capacity se hatao.",
+    "2. Why here: customer outages common; backlog flush customer ko gira na de.",
+    "3. Config: `retry_schedule_seconds` [5..6h], `auto_disable_after_failures` 20, `rate_limit_per_second` per endpoint.",
+    "4. Implementation: `_next_delay` (+-20%, max with Retry-After on 429/503), `_record` (410/blocked -> dead), RECORD_SQL auto-disable, `_reschedule_without_attempt` (attempts-1), Lua token bucket fail-open.",
+    "5. Demo: `pytest tests/test_dispatcher.py -k \"backoff or 429 or 410 or auto_disable or rate_limit\"`.",
+    "6. Interviewer next: 'fixed schedule vs exponential?', 'fail-open kyun?', 'auto-disable count vs time?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_next_delay",
+    "projects/04-webhooks/webhooks/services/ratelimit.py::EndpointRateLimiter",
+    "projects/04-webhooks/webhooks/config.py",
+    "projects/04-webhooks/tests/test_dispatcher.py::test_per_endpoint_rate_limit_does_not_burn_attempts"
+   ]
+  },
+  {
+   "concept": "SSRF protection for outbound webhooks",
+   "steps": [
+    "1. Concept: customer URL + humare server ki network position = internal access (metadata service, Redis).",
+    "2. Why here: dispatcher ka kaam hi arbitrary URLs pe request bhejna hai.",
+    "3. API: endpoint create/update pe `validate_url_syntax` (https only in prod, no credentials) -> 422.",
+    "4. Implementation: `assert_public_destination` send time pe getaddrinfo, `_is_public` (is_global, IPv4-mapped unwrap), `follow_redirects=False`; validated IP pe connect (Host + SNI preserved); blocked -> dead.",
+    "5. Demo: `pytest tests/test_signing_ssrf.py -k ssrf tests/test_dispatcher.py::test_ssrf_destination_blocked_at_send_time`.",
+    "6. Interviewer next: 'DNS rebinding?', 'check aur connect ke beech TOCTOU? (IP pinning se band)', 'network-level egress controls?'"
+   ],
+   "files": [
+    "projects/04-webhooks/webhooks/services/ssrf.py::assert_public_destination",
+    "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_send",
+    "projects/04-webhooks/tests/test_signing_ssrf.py::test_ssrf_blocks_internal_destinations",
+    "projects/04-webhooks/SECURITY.md"
+   ]
+  },
+  {
+   "concept": "Performance investigation: round trips, phase timing, rejected hypotheses",
+   "steps": [
+    "1. Concept: measure honestly, decompose per phase, test hypotheses with controlled experiments, fix dominant cost, re-measure.",
+    "2. Why here: v1 sirf 48 deliveries/s; HTTP 1.7ms tha, DB round trips nahi dikh rahe the bina timing ke.",
+    "3. Tools: `bench/bench_drain.py` (backlog first, then drain, fresh `down -v`), `bench/phase_timing.py` (CONC/BATCH env), `bench/local_dispatch.py`.",
+    "4. Findings: `_record` 116ms at concurrency 20; hot row partial (50 -> 52/s), synchronous_commit=off no change; v2 CTE claim + 1-statement record -> 111/s, 3 dispatchers 189/s; CPU 82% of wall.",
+    "5. Demo: `python bench/phase_timing.py` aur `python bench/bench_drain.py 3000 3` (stack running).",
+    "6. Interviewer next: '7,526/s kyun discard?', 'next lever?', 'production pe kaise profile karoge?'"
+   ],
+   "files": [
+    "projects/04-webhooks/TESTING.md",
+    "projects/04-webhooks/bench/phase_timing.py",
+    "projects/04-webhooks/bench/bench_drain.py"
+   ]
+  },
+  {
+   "concept": "Scaling and production hardening",
+   "steps": [
+    "1. Concept: stateless workers scale out; DB per-message cost, tenant isolation aur retention scale pe dominate karte hain.",
+    "2. Why here: Postgres queue ka ceiling aur noisy neighbours real limits hain.",
+    "3. Plan: 10x -> more dispatchers, PgBouncer, GIN on event_types, attempts partitions; 100x -> outbox relay to Kafka, bulkheads, circuit breakers, HTTP/2 pooling.",
+    "4. Gaps today: plaintext secrets, single token, no retention, no bulkheads, poison-delivery loop, dispatcher metrics not exported.",
+    "5. Demo: `docker compose up -d --scale dispatcher=4` aur `/stats` + `/dashboard` dekho.",
+    "6. Interviewer next: 'ordering chahiye toh?', 'multi-region?', 'fair scheduling?'"
+   ],
+   "files": [
+    "projects/04-webhooks/SYSTEM_DESIGN.md",
+    "projects/04-webhooks/DEPLOYMENT.md",
+    "projects/04-webhooks/TRADEOFFS.md",
+    "projects/04-webhooks/webhooks/dashboard.html"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,1027 @@
+[
+ {
+  "id": "MRDS-022",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does RandomSet give O(1) add, remove and uniform random sampling? Why not just use a Python set?",
+  "answer_hinglish": "Python `set` aur `dict` mein add/remove O(1) hai, lekin \"ek random element do\" O(1) mein nahi ho sakta -- `random.choice(list(s))` poora set copy karta hai, O(n). Active expiry har 100ms 20 random keys maangti hai aur sampled eviction har write pe 5; lakhon keys pe O(n) sampling event loop ko maar degi.\n\n`RandomSet` do structures saath rakhta hai: `_items` list (random index se O(1) access) aur `_index` dict (item -> list mein position).\n- `add`: agar nahi hai toh `_index[item] = len(_items)` aur list mein append. O(1) amortized.\n- `discard`: index nikalo, list ka last element pop karo, aur agar hataya gaya item last nahi tha toh last element ko khali jagah pe rakh do aur uska index update karo. Koi shifting nahi -- yahi \"swap-remove\" trick hai. O(1).\n- `sample(k)`: `random.randrange(n)` k baar -- O(k), with replacement (Redis bhi with replacement sample karta hai). Agar `n <= k` toh poori list.\n\nYeh classic interview problem hai: \"Insert Delete GetRandom O(1)\". Order preserve nahi hota, lekin hume order chahiye bhi nahi.\n\nminidis mein `Keyspace._volatile` ek `RandomSet` hai jisme sirf TTL wali keys hain -- `set_expire_at` add karta hai, `persist` aur `_remove` discard karte hain. `__slots__` use kiya hai taaki per-instance dict overhead na ho.",
+  "why_needed": "Sampling-based algorithms (active expiry, approximate LRU) tabhi sasti hain jab sampling khud O(1) ho.",
+  "real_world_analogy": "Jaise numbered seats wala hall: random seat number bolo toh turant banda mil jaata hai. Koi chala gaya toh last seat wale ko uski seat pe bitha do -- kisi ko khisakna nahi padta.",
+  "how_it_works": "Invariant: har item ke liye `_items[_index[item]] == item`, aur `len(_items) == len(_index)`. Swap-remove is invariant ko maintain karta hai: last element nayi position pe aur uska index update.",
+  "in_this_project": "`randomset.py::RandomSet` (add, discard, sample, clear). `keyspace.py` mein `self._volatile: RandomSet[bytes] = RandomSet()` `__post_init__` mein; `active_expire_cycle` `sample(20)` aur `_pick_victim` `sample(samples)` use karte hain.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/randomset.py::RandomSet",
+   "projects/02-mini-redis/minidis/randomset.py::discard",
+   "projects/02-mini-redis/minidis/keyspace.py::active_expire_cycle"
+  ],
+  "code_example": "# real: minidis/randomset.py\ndef discard(self, item):\n    idx = self._index.pop(item, None)\n    if idx is None:\n        return\n    last = self._items.pop()\n    if idx < len(self._items):\n        self._items[idx] = last\n        self._index[last] = idx\n\ndef sample(self, k):\n    n = len(self._items)\n    if n == 0:\n        return []\n    if n <= k:\n        return list(self._items)\n    return [self._items[random.randrange(n)] for _ in range(k)]  # with replacement, like Redis",
+  "code_language": "python",
+  "advantages": [
+   "Teeno operations O(1)",
+   "Simple aur well-known structure",
+   "Uniform sampling"
+  ],
+  "disadvantages": [
+   "Do structures = roughly double memory per volatile key",
+   "With-replacement sample mein duplicates (caller ko dedupe karna padta hai)",
+   "Order nahi rehta"
+  ],
+  "common_mistakes": [
+   "discard mein last element hi delete ho raha ho (idx == len) wala case bhool jana",
+   "random.choice(list(set)) use karna",
+   "Index map update bhool jana"
+  ],
+  "follow_up_questions": [
+   "Redis random key kaise nikalta hai bina aisi structure ke?",
+   "Sample with vs without replacement ka asar?",
+   "Iska memory overhead kitna hai?"
+  ],
+  "concepts": [
+   "data structures",
+   "random sampling",
+   "O(1)"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Extra memory (list + dict) vs O(1) sampling. Alternative tha har sample pe O(n) list banana -- memory kam, CPU bahut zyada. Sampling-heavy workload ke liye extra memory sahi trade hai.",
+   "failure_scenarios": "Agar kahin `expires` dict update ho aur `_volatile` nahi (ya ulta), toh sampling stale keys degi ya kuch keys kabhi expire nahi hongi. Isliye `set_expire_at`, `persist`, `_remove`, `flush` -- sab dono ko saath update karte hain.",
+   "alternatives": "Redis dict ke random bucket pick karta hai (`dictGetRandomKey` / `dictGetSomeKeys`) -- hash table internals pe access hai, isliye alag structure nahi chahiye. Python mein dict buckets expose nahi hote.",
+   "scale_10x_100x": "10x-100x volatile keys pe bhi sample O(k) hi rahega; memory linear badhegi. List resize kabhi kabhi O(n) copy karta hai (amortized O(1)).",
+   "production_improvements": "Invariant checker test (random operations ke baad `_items[_index[x]] == x`), aur memory pressure pe compact representation (keys ke bajaye integer ids)."
+  }
+ },
+ {
+  "id": "MRDS-023",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Describe the data structures inside Keyspace and what each one is for.",
+  "answer_hinglish": "`Keyspace` (keyspace.py) ek dataclass hai jisme paanch main structures hain, aur har ek ka ek specific kaam hai:\n\n1. `data: OrderedDict[bytes, Any]` -- main hash table, key -> value. Order = recency: har access pe `move_to_end`, toh pehli key sabse purani (exact LRU ke liye).\n2. `expires: dict[bytes, int]` -- sirf volatile keys ke liye absolute expiry (unix ms). Redis bhi alag expires dict rakhta hai.\n3. `_volatile: RandomSet[bytes]` -- volatile keys ka O(1) random sampling wala set (active expiry, volatile-* eviction).\n4. `sizes: dict[bytes, int]` -- har key ka estimated payload size, taaki delete pe `used_memory` exact utna ghate.\n5. `_atime: dict[bytes, int]` -- logical access clock (`itertools.count`), volatile-lru sampling ke liye \"kab access hui\".\n\nSaath mein `used_memory` (running total), `stats` (expired/evicted/hits/misses/active cycles), `is_replica` flag, injectable `clock`, aur `on_implicit_delete` callback.\n\nRule jo poore code mein follow hota hai: ek key hatani ho toh hamesha `_remove` se, kyunki woh paanchon structures ko consistent update karta hai -- `data.pop`, `used_memory` ghatao, `_atime.pop`, aur expires se hata ke `_volatile.discard`. Agar koi path sirf `data` se pop kare toh memory accounting aur sampling dono bigad jayenge. `test_memory_accounting_returns_to_zero` isi consistency ko verify karta hai.",
+  "why_needed": "Har feature (LRU, TTL, sampling, memory limit) ko alag index chahiye; inhe consistent rakhna hi storage engine ka core kaam hai.",
+  "real_world_analogy": "Jaise library: main shelf (data), due-date register (expires), random audit list (_volatile), har kitaab ka weight register (sizes), aur last issued date (_atime).",
+  "how_it_works": "Writes `store()` se: size update, `move_to_end`, `_atime` tick, aur `keep_ttl` false ho toh `persist`. Deletes `_remove()` se. TTL `set_expire_at`/`persist` se, jo `expires` aur `_volatile` dono update karte hain.",
+  "in_this_project": "`keyspace.py::Keyspace` dataclass, `store`, `_remove`, `set_expire_at`, `persist`, `flush`. `DATABASE_DESIGN.md` ki table inhi structures ko list karti hai.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::Keyspace",
+   "projects/02-mini-redis/minidis/keyspace.py::_remove",
+   "projects/02-mini-redis/minidis/keyspace.py::store",
+   "projects/02-mini-redis/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real: minidis/keyspace.py\ndef _remove(self, key: bytes) -> None:\n    self.data.pop(key, None)\n    self.used_memory -= self.sizes.pop(key, 0) + len(key) + ENTRY_OVERHEAD\n    self._atime.pop(key, None)\n    if self.expires.pop(key, None) is not None:\n        self._volatile.discard(key)",
+  "code_language": "python",
+  "advantages": [
+   "Har feature ka O(1) index",
+   "Ek central remove path",
+   "Clock injectable -> deterministic tests"
+  ],
+  "disadvantages": [
+   "Per key 4-5 dict entries = memory overhead",
+   "Consistency manually maintain karni padti hai"
+  ],
+  "common_mistakes": [
+   "Kisi path mein sirf data.pop karna",
+   "TTL set karke _volatile mein add na karna",
+   "Collections ko in-place mutate karke size adjust na karna"
+  ],
+  "follow_up_questions": [
+   "OrderedDict ki jagah plain dict kyun nahi?",
+   "Expires alag kyun, value ke saath kyun nahi?",
+   "Per-key memory overhead kitna hai?"
+  ],
+  "concepts": [
+   "storage engine",
+   "hash table",
+   "indexes"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-024",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does minidis estimate used_memory, and why is it an estimate rather than real memory usage?",
+  "answer_hinglish": "minidis `used_memory` ko ek deterministic formula se track karta hai, real allocator se nahi. Har key ke liye: `len(key) + ENTRY_OVERHEAD (64)` + value ka size. Value size `value_size()` se: string = `len(bytes)`; list/set = har element `len + ELEMENT_OVERHEAD (16)`; hash = har field `len(f) + len(v) + 2 * 16`. Running total `used_memory` mein rehta hai aur per-key size `sizes` dict mein.\n\nCollections in-place mutate hote hain (LPUSH deque mein append karta hai), toh unke liye full recompute nahi hota -- command khud `ctx.ks.adjust_size(key, delta)` call karta hai: LPUSH `sum(len(v) + ELEMENT_OVERHEAD)`, LPOP negative, HSET naya field pe `len(f)+len(v)+32` ya update pe `len(v)-len(old)`. Delete pe `_remove` exact utna hi ghatata hai. `test_memory_accounting_returns_to_zero` prove karta hai ki add/delete ke baad total wapas 0 aata hai -- accounting leak nahi karti.\n\nEstimate kyun? Python mein real object size nikalna (`sys.getsizeof` recursively) mehenga hai aur bhi poora sach nahi -- allocator fragmentation, interned objects, dict resize slack sab miss hote hain. Fixed constants sasta, deterministic aur testable hai, aur eviction drive karne ke liye kaafi hai.\n\nHonest limitation: real process RSS isse kaafi zyada ho sakta hai (Python objects ka overhead bada hai). `INFO memory` mein `used_memory_note: estimate (...)` explicitly likha hai, aur TRADEOFFS.md bolta hai production mein RSS bhi monitor karo.",
+  "why_needed": "maxmemory eviction ko ek number chahiye jo har write pe O(1) mein mile; real RSS har write pe padhna impractical hai.",
+  "real_world_analogy": "Jaise truck loading mein har box ka weight label se jodna (estimate) vs har baar truck ko weighbridge pe le jaana (real). Label sasta hai, lekin packing material ka weight miss ho sakta hai.",
+  "how_it_works": "`store()` purana size ghata ke naya jodta hai; new key pe `len(key) + ENTRY_OVERHEAD` add. `adjust_size` in-place mutations ke liye. `_remove` sab ghatata hai. `flush` 0 pe reset.",
+  "in_this_project": "`keyspace.py`: `ENTRY_OVERHEAD = 64`, `ELEMENT_OVERHEAD = 16`, `value_size`, `adjust_size`, `entry_memory` (MEMORY USAGE command). `commands/lists.py::_push` aur `hashes.py::hset` adjust_size call karte hain.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::value_size",
+   "projects/02-mini-redis/minidis/keyspace.py::adjust_size",
+   "projects/02-mini-redis/minidis/commands/lists.py::_push",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_memory_accounting_returns_to_zero"
+  ],
+  "code_example": "# real: minidis/keyspace.py\nENTRY_OVERHEAD = 64      # dict slot + key object + bookkeeping (approximation)\nELEMENT_OVERHEAD = 16    # per element inside a list/set/hash (approximation)\n\ndef value_size(value):\n    if isinstance(value, bytes):\n        return len(value)\n    if isinstance(value, (deque, set)):\n        return sum(len(e) + ELEMENT_OVERHEAD for e in value)\n    if isinstance(value, dict):\n        return sum(len(k) + len(v) + 2 * ELEMENT_OVERHEAD for k, v in value.items())",
+  "code_language": "python",
+  "advantages": [
+   "O(1) per write",
+   "Deterministic -> eviction tests reliable",
+   "Leak-free accounting provable"
+  ],
+  "disadvantages": [
+   "Real RSS se bahut alag ho sakta hai",
+   "Har mutating command ko adjust_size yaad rakhna padta hai",
+   "Fragmentation invisible"
+  ],
+  "common_mistakes": [
+   "used_memory ko RSS samajh ke capacity planning karna",
+   "Naye collection command mein adjust_size bhool jana (drift)",
+   "Store ke time poora value_size recompute karna bade collections pe (O(n))"
+  ],
+  "follow_up_questions": [
+   "Redis used_memory kaise nikalta hai?",
+   "Fragmentation ratio kya hai?",
+   "Accounting drift ko kaise detect karoge?"
+  ],
+  "concepts": [
+   "memory accounting",
+   "estimation",
+   "maxmemory"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Accuracy vs cost: exact measurement (tracemalloc, getsizeof) slow aur fir bhi incomplete; constants fast lekin approximate. Eviction ke liye monotonic, consistent signal accuracy se zyada important hai.",
+   "failure_scenarios": "Agar koi command adjust_size bhool jaye, toh used_memory drift karega -- kam dikhayega toh process OOM-killer se marega, zyada dikhayega toh bekaar evictions. Real RSS limit (container memory) estimate se pehle hit ho sakti hai.",
+   "alternatives": "Redis zmalloc ke through har allocation count karta hai (allocator-level accounting) aur `mem_fragmentation_ratio = rss/used_memory` dikhata hai. Python mein tracemalloc ya custom allocator possible but slow.",
+   "scale_10x_100x": "10x keys pe ENTRY_OVERHEAD ka error bhi 10x -- chhote values ke saath real overhead Python mein 64 bytes se kaafi zyada hota hai. Bade deployments pe constants ko calibrate karna padega (benchmark se real RSS/key nikaal ke).",
+   "production_improvements": "INFO mein process RSS bhi dikhao (psutil ya /proc), ratio alert lagao, aur periodic audit job jo sample keys ka real size measure kare. maxmemory ko container limit se kaafi neeche rakho."
+  }
+ },
+ {
+  "id": "MRDS-025",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "In protocol.encode, why must the bool check come before the int check, and what other ordering subtleties exist?",
+  "answer_hinglish": "Python mein `bool` `int` ka subclass hai: `isinstance(True, int)` True hai. Agar `encode` mein int branch pehle hoti, toh `True` hamesha `:1\\r\\n` ban jaata, RESP3 client ko bhi -- aur RESP3 ka boolean type (`#t\\r\\n`) kabhi use hi nahi hota. Isliye `encode` pehle `isinstance(value, bool)` check karta hai: proto 3 mein `#t`/`#f`, proto 2 mein `:1`/`:0`. Test `encode(True, 3) == b\"#t\\r\\n\" and encode(True, 2) == b\":1\\r\\n\"` yahi lock karta hai.\n\nDoosri ordering subtleties isi function mein:\n- `SimpleString` `str` ka subclass hai, toh uska check generic `str` se pehle hona chahiye, warna \"OK\" bulk string `$2\\r\\nOK` ban jaata (redis-py dono accept kar leta, lekin `+OK` sahi hai).\n- `RespSet` `list` ka subclass hai, toh RESP3 mein `~` set branch generic list se pehle hai; proto 2 mein woh neeche gir ke normal array ban jaata hai.\n- `None` sabse pehle: proto 3 mein `_`, proto 2 mein `$-1`. `NullArray` alag type hai kyunki RESP2 mein null array `*-1` hota hai.\n- `RespError` exception hai lekin value ki tarah encode hota hai: `-` + message.\n\nLesson: type dispatch mein subclass hamesha base class se pehle check karo. Ek aur option `functools.singledispatch` tha, lekin woh bhi MRO follow karta hai; explicit if-chain yahan readable hai.",
+  "why_needed": "Ek galat ordering se pura RESP3 boolean type silently disable ho jaata -- aise bugs sirf typed clients pe dikhte hain.",
+  "real_world_analogy": "Jaise sorting hat mein pehle 'doctor' poocho phir 'graduate' -- warna har doctor graduate wale dabbe mein chala jayega.",
+  "how_it_works": "If-chain top se neeche: None, SimpleString, RespError, bool, int, bytes, str, NullArray, dict, RespSet (proto 3), list/tuple, float. Unknown type pe `TypeError`.",
+  "in_this_project": "`protocol.py::encode`, `SimpleString`, `RespSet`, `NullArray`. `tests/test_protocol.py::test_encode_resp2_and_resp3` sab cases cover karta hai. `float` RESP3 mein `,` double, RESP2 mein bulk string.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/protocol.py::encode",
+   "projects/02-mini-redis/minidis/protocol.py::SimpleString",
+   "projects/02-mini-redis/tests/test_protocol.py::test_encode_resp2_and_resp3"
+  ],
+  "code_example": "# real, trimmed: minidis/protocol.py::encode\nif isinstance(value, bool):\n    if proto == 3:\n        return b\"#t\\r\\n\" if value else b\"#f\\r\\n\"\n    return b\":1\\r\\n\" if value else b\":0\\r\\n\"\nif isinstance(value, int):\n    return b\":\" + str(value).encode() + b\"\\r\\n\"",
+  "code_language": "python",
+  "advantages": [
+   "Commands protocol-agnostic rehte hain",
+   "Ek function mein saari encoding",
+   "Test se ordering locked"
+  ],
+  "disadvantages": [
+   "Recursive encode bade nested replies pe bahut chhote bytes objects banata hai",
+   "Ordering fragile hai -- naya subclass add karte waqt dhyan"
+  ],
+  "common_mistakes": [
+   "bool ko int ke baad check karna",
+   "SimpleString ko str ke baad check karna",
+   "Null array aur null bulk ko same maan lena"
+  ],
+  "follow_up_questions": [
+   "singledispatch se kaise likhoge?",
+   "Bade LRANGE reply ki encoding fast kaise karoge?",
+   "Kaunse commands bool return karte hain?"
+  ],
+  "concepts": [
+   "type dispatch",
+   "RESP3",
+   "Python subclassing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-026",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does BGREWRITEAOF work in minidis, and how does the rewrite buffer prevent losing writes made during the rewrite?",
+  "answer_hinglish": "AOF sirf badhta hai: 500 INCR = 500 entries, jabki state sirf `SET n 500` hai. Rewrite current state ka minimal command list banata hai aur purani file ko atomically replace karta hai.\n\n`AppendOnlyFile.rewrite(ks)` ke teen phases:\n1. `rewrite_in_progress = True`, `rewrite_buffer = []`. Phir event loop pe synchronously `minimal_commands(ks)` -- koi await nahi, toh yeh consistent point-in-time view hai. Har string `SET`, list `RPUSH`, set `SADD`, hash `HSET` (64 elements per command batch, `REWRITE_BATCH`), aur TTL ho toh `PEXPIREAT`. Already expired keys skip.\n2. Content ko `asyncio.to_thread` mein temp file (`appendonly.aof.rewrite`) mein likho + fsync. Is dauraan clients serve hote rehte hain, aur har naya write `append()` mein normal AOF mein bhi jaata hai aur `rewrite_buffer` mein bhi.\n3. Thread khatam, wapas loop pe (ab koi command beech mein nahi chal sakta): buffer ko temp file mein append + fsync, purani file close, `os.replace(tmp, path)`, nayi file `ab` mode mein kholo, size update.\n\nRewrite buffer ka reason: snapshot phase 1 ke time ka hai; phase 2 ke dauraan aaye writes us content mein nahi hain. Buffer unhe capture karke swap se pehle jod deta hai. Failure pe (`except`) `last_rewrite_ok = False` aur purani file chalu rehti hai -- kuch nahi khota.\n\nTest `test_aof_rewrite_shrinks_and_keeps_concurrent_writes`: 500 INCR + 200 element RPUSH, rewrite ke dauraan `SET during`, baad mein `SET after`; size pehle ke 1/3 se kam, aur restart pe teeno sahi.",
+  "why_needed": "Bina rewrite ke AOF disk bhar deta hai aur restart replay bahut slow ho jaata hai.",
+  "real_world_analogy": "Jaise passbook ki 500 entries ki jagah naya passbook \"opening balance: 500\" se shuru karna -- aur jab tak naya passbook ban raha hai, nayi entries ek parchi pe likh ke baad mein chipka dena.",
+  "how_it_works": "Point-in-time content (sync) + background write (thread) + delta buffer (append path) + atomic swap (sync). Old AOF bhi tab tak update hota rehta hai, toh rewrite fail ho toh bhi durability safe.",
+  "in_this_project": "`persistence/aof.py::rewrite`, `minimal_commands`, `append` (jo `rewrite_buffer` mein bhi daalta hai), `REWRITE_BATCH = 64`. `server.py::start_aof_rewrite` `_spawn` se background task banata hai. `INFO persistence` mein `aof_rewrite_in_progress`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/aof.py::rewrite",
+   "projects/02-mini-redis/minidis/persistence/aof.py::minimal_commands",
+   "projects/02-mini-redis/minidis/server.py::start_aof_rewrite",
+   "projects/02-mini-redis/tests/test_persistence.py::test_aof_rewrite_shrinks_and_keeps_concurrent_writes"
+  ],
+  "code_example": "# real, trimmed: minidis/persistence/aof.py::rewrite\ncontent = self.minimal_commands(ks)          # 1) consistent, no await\nawait asyncio.to_thread(_write)              # 2) write + fsync tmp off the loop\nwith open(tmp, \"ab\") as f:                   # 3) back on the loop: append the delta\n    f.write(b\"\".join(self.rewrite_buffer))\n    f.flush()\n    os.fsync(f.fileno())\nself._file.close()\nos.replace(tmp, self.path)\nself._file = open(self.path, \"ab\")",
+  "code_language": "python",
+  "advantages": [
+   "Concurrent writes kabhi lose nahi",
+   "Failure pe purani AOF intact",
+   "Disk I/O event loop se bahar"
+  ],
+  "disadvantages": [
+   "minimal_commands loop mein chalta hai -- bade dataset pe pause",
+   "Rewrite ke dauraan memory mein poora content + buffer",
+   "Step 3 ka buffer append aur fsync bhi loop mein (blocking)"
+  ],
+  "common_mistakes": [
+   "Rewrite buffer bhool jana",
+   "Temp file fsync kiye bina rename",
+   "Rewrite ke dauraan purani AOF mein likhna band kar dena"
+  ],
+  "follow_up_questions": [
+   "Redis 7 multi-part AOF isse kaise alag hai?",
+   "Rewrite ke beech crash ho toh?",
+   "Bade lists ko 64 ke batches mein kyun likhte ho?"
+  ],
+  "concepts": [
+   "AOF rewrite",
+   "compaction",
+   "atomic swap"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "In-loop serialization consistency deti hai bina fork ke, lekin dataset size ke proportional pause. fork + COW (Redis) pause hata deta hai lekin memory double ho sakti hai aur Windows pe available nahi.",
+   "failure_scenarios": "Crash phase 2 mein -> temp file adhoori, purani AOF intact, restart pe purani replay. Crash `os.replace` ke baad lekin directory fsync se pehle -> Linux pe rename khud lost ho sakta hai (code directory fsync nahi karta). Rewrite ke dauraan buffer unbounded grow kar sakta hai agar write rate bahut high ho.",
+   "alternatives": "Redis 7 multi-part AOF: base file (RDB format) + incremental files + manifest; rewrite naya base banata hai aur incr files rotate karta hai, buffer ki zaroorat kam. Ya snapshot + AOF since snapshot.",
+   "scale_10x_100x": "10x dataset pe minimal_commands ka pause 10x (seconds tak). 100x pe yeh unacceptable hai -- incremental/chunked serialization, ya fork-based child process, ya copy-on-write data structures chahiye.",
+   "production_improvements": "Auto-rewrite trigger (jaise aof size > 2x last rewrite size), directory fsync after replace, rewrite buffer size limit + metrics, aur RDB preamble for faster load."
+  }
+ },
+ {
+  "id": "MRDS-027",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does AOF replay distinguish a truncated tail from corruption in the middle of the file, and why treat them differently?",
+  "answer_hinglish": "`AppendOnlyFile.replay(path, apply)` poori file padh ke ek `Parser` mein feed karta hai, aur loop mein `get_command()` se commands nikal ke `apply` karta hai. Har successful command ke baad `good_offset = len(data) - parser.pending` -- matlab \"yahan tak ke bytes valid aur applied hain\".\n\nDo alag cases:\n\n1. Truncated tail: crash ke waqt aakhri command aadha likha gaya, jaise `*3\\r\\n$3\\r\\nSET\\r\\n$1\\r\\nc\\r\\n$1`. Parser ke liye yeh bilkul \"partial frame\" hai -- woh `None` return karta hai (aur bytes ka wait). Loop khatam, `truncated = len(data) - good_offset > 0`. minidis warning log karta hai (`aof_truncated_tail` with `dropped_bytes`), file ko `f.truncate(good_offset)` se kaat deta hai, aur start ho jaata hai. Redis ka `aof-load-truncated yes` bhi yahi karta hai.\n\n2. Garbage beech mein: parser ko kahin `$` ki jagah kuch aur mila -> `ProtocolError`. minidis `aof_corrupted` error log karke exception re-raise karta hai -- server start nahi hota.\n\nDifferent kyun? Tail truncation crash ka expected, benign result hai: adhoora command kabhi client ko acknowledge hua hi nahi tha (always mode mein fsync reply se pehle hota hai), toh usse kaatna data loss nahi hai. Beech ka garbage matlab disk corruption ya bug -- uske baad ke commands bhi shayad valid hain, aur silently aage badhna ek partial, galat dataset serve karega. Isliye operator ko decide karne do.\n\nTest: `test_aof_truncated_tail_is_recovered` -- a aur b sahi, adhoora c nahi, `loaded_from` mein \"truncated\".",
+  "why_needed": "Crash recovery automatic honi chahiye jahan safe hai, aur manual jahan data correctness risk mein hai.",
+  "real_world_analogy": "Jaise diary ka aakhri page aadha likha mila -- woh sentence chhod do. Lekin beech ke pages faade hue mile toh aage padhna risky hai, kisi se poochna padega.",
+  "how_it_works": "Incremental parser ka \"need more bytes\" (None) = truncated tail; \"invalid byte\" (ProtocolError) = corruption. good_offset hamesha last fully applied command ke end pe.",
+  "in_this_project": "`persistence/aof.py::replay` returns `(applied, truncated)`, `server.py::_load_from_disk` `loaded_from = \"aof (N commands, M truncated bytes)\"` set karta hai. `_apply_replay` unknown command pe bhi `ProtocolError` raise karta hai. FAILURE_SCENARIOS #2 aur #3.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/aof.py::replay",
+   "projects/02-mini-redis/minidis/server.py::_apply_replay",
+   "projects/02-mini-redis/tests/test_persistence.py::test_aof_truncated_tail_is_recovered",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: minidis/persistence/aof.py::replay\ntry:\n    while (args := parser.get_command()) is not None:\n        apply(args)\n        applied += 1\n        good_offset = len(data) - parser.pending\nexcept ProtocolError as exc:\n    log.error(\"aof_corrupted\", extra={\"offset\": good_offset, \"error\": str(exc)})\n    raise\ntruncated = len(data) - good_offset\nif truncated:\n    log.warning(\"aof_truncated_tail\", extra={\"dropped_bytes\": truncated, \"good_offset\": good_offset})\n    with open(path, \"r+b\") as f:\n        f.truncate(good_offset)",
+  "code_language": "python",
+  "advantages": [
+   "Common crash case automatically recover",
+   "Corruption pe fail-fast",
+   "Same parser reuse"
+  ],
+  "disadvantages": [
+   "Poori AOF memory mein padhi jaati hai (bade file pe RAM spike)",
+   "Corruption pe manual repair tool nahi (Redis ke paas redis-check-aof hai)"
+  ],
+  "common_mistakes": [
+   "Har parse error pe file truncate kar dena (silent data loss)",
+   "Truncated tail pe start refuse karna (har crash pe manual kaam)",
+   "good_offset ko parse se pehle update karna"
+  ],
+  "follow_up_questions": [
+   "Corrupted AOF ko repair kaise karoge?",
+   "Bade AOF ko stream karke replay kaise karoge?",
+   "Replay ke dauraan expired keys ka kya hota hai?"
+  ],
+  "concepts": [
+   "crash recovery",
+   "AOF replay",
+   "fail-fast"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Availability vs correctness: tail truncation auto-fix availability badhata hai (safe kyunki unacked), mid-file corruption pe refuse correctness bachata hai. Ek config flag se yeh choice operator ko de sakte the (Redis jaisa).",
+   "failure_scenarios": "Agar disk pe silent corruption ek valid-looking RESP bana de (jaise length digits badal jaayein), toh parser use galat command ki tarah apply kar sakta hai -- AOF mein checksum nahi hai. `read_bytes()` multi-GB AOF pe memory double karega.",
+   "alternatives": "Per-record checksum (WAL style, jaise Postgres/RocksDB), ya Redis 7 multi-part AOF with manifest. Repair tool jo last valid offset tak truncate karke report de.",
+   "scale_10x_100x": "10x AOF size pe replay time aur memory dono 10x; streaming replay (chunks mein read + feed) aur regular rewrite zaroori. RDB preamble se load fast.",
+   "production_improvements": "Streaming replay, per-entry CRC, `minidis-check-aof` CLI, metrics for truncated bytes, aur config flag `aof_load_truncated`."
+  }
+ },
+ {
+  "id": "MRDS-028",
+  "project_slug": "p02-mini-redis",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does BGSAVE work without fork in minidis, and what are the consequences?",
+  "answer_hinglish": "Real Redis `BGSAVE` pe `fork()` karta hai: child process ke paas parent ki memory ka copy-on-write view hota hai, toh child aaram se poora dataset disk pe likhta hai jabki parent clients serve karta rehta hai -- koi pause nahi (sirf fork ka). Python on Windows `fork` nahi kar sakta, toh minidis alag tarika use karta hai (`Server.start_bgsave`):\n\n1. Agar pehle se BGSAVE chal raha hai toh `False` (command pe `ERR Background save already in progress`).\n2. `payload = snapshot.dump(self.ks)` -- event loop pe synchronously poora dataset bytes mein serialize. Kyunki beech mein await nahi, yeh exact point-in-time consistent snapshot hai.\n3. `dirty_at_start = self.persistence.dirty` capture.\n4. `bgsave_in_progress = True` aur ek background task jo `asyncio.to_thread(snapshot.write_atomic, path, payload)` chalata hai -- disk write + fsync + rename thread mein.\n5. Success pe `_snapshot_done(True, saved_changes=dirty_at_start)`, failure pe log + `last_bgsave_ok = False`; finally flag reset.\n\nConsequences: serialization CPU-bound hai aur loop block karta hai -- bade dataset pe sab clients utni der rukenge. Sirf slow disk I/O background mein hai. Memory: payload bytes poore dataset jitne extra.\n\nIs design ne ek bug bhi diya: pehle BGSAVE ke baad dirty ko 0 reset karke phir kuch subtract hota tha aur counter -1 ho jaata tha. Fix: sirf `dirty_at_start` subtract karo, kyunki BGSAVE ke dauraan aaye writes file mein nahi hain aur dirty rehne chahiye (`test_writes_during_bgsave_stay_dirty`).",
+  "why_needed": "Persistence ko client latency se alag karna har in-memory DB ka core challenge hai; fork ka alternative samajhna OS concepts dikhata hai.",
+  "real_world_analogy": "Jaise dukaan ka stock: sab shelves ki photo turant le lo (serialize, dukaan 1 minute band), phir photo ko print karwane bhej do (disk write) jab tak dukaan khuli hai.",
+  "how_it_works": "Snapshot = serialize (sync, consistent) + write_atomic (thread). Dirty accounting snapshot start ke dirty ko subtract karti hai, current ko nahi.",
+  "in_this_project": "`server.py::start_bgsave`, `_snapshot_done`, `_spawn`, `_check_save_rules` (auto BGSAVE). `commands/server_cmds.py::bgsave` (BGSAVE SCHEDULE accept). Tests: `test_bgsave_writes_snapshot`, `test_writes_during_bgsave_stay_dirty`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::start_bgsave",
+   "projects/02-mini-redis/minidis/server.py::_snapshot_done",
+   "projects/02-mini-redis/tests/test_persistence.py::test_writes_during_bgsave_stay_dirty",
+   "projects/02-mini-redis/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: minidis/server.py::start_bgsave\npayload = snapshot.dump(self.ks)\ndirty_at_start = self.persistence.dirty\nself.persistence.bgsave_in_progress = True\n\nasync def _write():\n    try:\n        await asyncio.to_thread(snapshot.write_atomic, self.snapshot_path, payload)\n        self._snapshot_done(True, saved_changes=dirty_at_start)\n    except Exception:\n        log.exception(\"bgsave_failed\")\n        self._snapshot_done(False)\n    finally:\n        self.persistence.bgsave_in_progress = False",
+  "code_language": "python",
+  "advantages": [
+   "Cross-platform (Windows pe bhi)",
+   "Consistent snapshot bina locks",
+   "Slow I/O event loop se bahar"
+  ],
+  "disadvantages": [
+   "Serialization pause dataset size ke proportional",
+   "Payload memory mein ek extra copy",
+   "fork jaisa zero-pause nahi"
+  ],
+  "common_mistakes": [
+   "Serialization ko bhi thread mein daal dena (data mutate hota rahega, inconsistent snapshot + race)",
+   "Dirty counter ko BGSAVE complete pe 0 kar dena",
+   "Do BGSAVE ek saath allow karna"
+  ],
+  "follow_up_questions": [
+   "Serialization thread mein kyun nahi kiya?",
+   "fork + copy-on-write kaise kaam karta hai?",
+   "Bade dataset pe pause kaise kam karoge?"
+  ],
+  "concepts": [
+   "BGSAVE",
+   "snapshot",
+   "fork vs threads"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "In-loop serialize: consistency free, pause cost. Thread mein serialize: pause nahi lekin data concurrently mutate hoga -- consistency ke liye locks ya copy chahiye, jo GIL ke saath bhi CPU-bound hi rahega. fork: best latency, lekin OS-specific aur memory risk.",
+   "failure_scenarios": "Disk full ya permission error -> thread exception -> `last_bgsave_ok=False`, `rdb_last_bgsave_status:err`, purani dump.mdb intact (write_atomic). Process crash during write -> temp file left over, purani file safe. Bahut bada dataset -> lambi pause, clients timeout.",
+   "alternatives": "Linux pe `os.fork()` + child mein dump; incremental snapshot (keys ko chunks mein serialize, dirty tracking ke saath); persistent data structures (immutable maps) jinke snapshots O(1) hote hain.",
+   "scale_10x_100x": "10x data = 10x pause (Python serialization slow hai). 100x pe yeh seconds se minutes -- production-unfit; fork ya chunked approach mandatory.",
+   "production_improvements": "Linux pe fork path with fallback, pause duration metric (`rdb_last_bgsave_time_sec` jaisa), save rules tune karna, aur latency monitoring around saves."
+  }
+ },
+ {
+  "id": "MRDS-029",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Describe the binary snapshot format (dump.mdb). Why these choices: magic bytes, length prefixes, big-endian, end marker, CRC32?",
+  "answer_hinglish": "`dump.mdb` ka layout simple hai:\n- `MINIDIS\\x01` -- 8 byte magic; aakhri byte format version hai.\n- Records: `type (1 byte: S/L/T/H) | expire_ms (int64, -1 = none) | key (u32 length + bytes) | payload`.\n- String S: u32 len + bytes. List L aur Set T: u32 count + har element (u32 len + bytes). Hash H: u32 count + (field blob + value blob).\n- `0xFF` end marker.\n- CRC32 (u32) jo uske pehle ke saare bytes pe compute hota hai.\n\nHar choice ka reason:\n- Magic + version: galat file (ya kisi aur format ki) ko turant reject karna, aur future format change pe purane loader ko pehchaanna.\n- Length prefixes: binary safe -- key/value mein koi bhi byte.\n- Big-endian (`struct` `>I`, `>q`): fixed, platform-independent byte order; Windows pe likhi file Linux replica pe bhi same padhi jaati hai (replication isi format ko wire pe bhejta hai).\n- Absolute expiry int64 ms: snapshot kabhi bhi load ho, deadline wahi rehti hai; expired keys write aur load dono pe skip.\n- End marker: records ka end batata hai bina pehle se count likhe (streaming-friendly dump).\n- CRC32: bit flip ya truncation detect. `test_corrupted_snapshot_is_rejected` ek byte flip karke aur 3 bytes kaat ke dono pe `CorruptSnapshot` verify karta hai.",
+  "why_needed": "Persistence format ek API hai jo versions aur machines ke beech chalni chahiye; galat design se corruption silently load ho sakta hai.",
+  "real_world_analogy": "Jaise courier box: bahar company ki mohar (magic), andar har item pe label ke saath weight (length), aakhir mein 'END' slip, aur seal (CRC) -- seal tooti toh box accept nahi.",
+  "how_it_works": "`dump()` bytearray mein sab append karta hai, END, phir `zlib.crc32(out)` pack. `load()` magic + min length check, CRC verify, phir records parse jab tak END byte na mile; unknown type byte pe `CorruptSnapshot`.",
+  "in_this_project": "`persistence/snapshot.py`: `MAGIC = b\"MINIDIS\\x01\"`, `END = 0xFF`, `_U32 = struct.Struct(\">I\")`, `_I64 = struct.Struct(\">q\")`, `_blob`, `dump`, `load`. `DATABASE_DESIGN.md` mein format diagram.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::dump",
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::load",
+   "projects/02-mini-redis/DATABASE_DESIGN.md",
+   "projects/02-mini-redis/tests/test_persistence.py::test_corrupted_snapshot_is_rejected"
+  ],
+  "code_example": "# real, trimmed: minidis/persistence/snapshot.py::dump\nout = bytearray(MAGIC)\nfor key, value in ks.data.items():\n    exp = ks.expires.get(key, -1)\n    if exp != -1 and exp <= now:\n        continue  # don't persist already-expired keys\n    ...\n    out += t + _I64.pack(exp) + _blob(key) + payload\nout.append(END)\nout += _U32.pack(zlib.crc32(out))",
+  "code_language": "python",
+  "advantages": [
+   "Compact, fast load",
+   "Corruption detection",
+   "Platform-independent",
+   "Versioned"
+  ],
+  "disadvantages": [
+   "CRC poori file pe -- corruption kahan hai yeh nahi batata",
+   "Compression nahi (Redis LZF use karta hai)",
+   "Poori file memory mein build hoti hai"
+  ],
+  "common_mistakes": [
+   "Native endianness use karna",
+   "Checksum ke bina load karna",
+   "Relative TTL store karna"
+  ],
+  "follow_up_questions": [
+   "Format version 2 kaise introduce karoge?",
+   "CRC32 vs SHA256 -- kab kya?",
+   "Bahut bade dataset ke liye streaming dump kaise?"
+  ],
+  "concepts": [
+   "binary format",
+   "CRC32",
+   "serialization"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-030",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why does minidis keep expiry times in a separate expires dict instead of storing the TTL alongside each value?",
+  "answer_hinglish": "Redis bhi aisa hi karta hai: main dict ke saath ek alag `expires` dict jisme sirf volatile keys hoti hain. minidis mein `Keyspace.expires: dict[bytes, int]` key -> absolute unix ms.\n\nFayde:\n1. Memory: zyadatar keys pe TTL nahi hota. Agar har value ko `(value, expire_at)` tuple mein wrap karte, toh har key pe extra object/field ka cost lagta. Alag dict mein sirf jinke TTL hai unka cost.\n2. Fast \"is it volatile?\": `key in expires` O(1), aur `len(expires)` seedha `INFO keyspace` ka `expires=` count deta hai.\n3. Value types simple rehte hain: value hamesha `bytes | deque | set | dict` hai, koi wrapper nahi. Har command (LPUSH, HSET...) seedha native object pe kaam karta hai.\n4. Sampling: volatile keys ka alag set (`_volatile` RandomSet) maintain karna aasaan hai kyunki volatility ek alag concept hai.\n5. Persist/TTL change sasta: `PERSIST` sirf `expires.pop` hai, value touch nahi hoti.\n\nCost: do structures consistent rakhni padti hain -- key delete hui toh expires se bhi hatani hai (`_remove` yeh karta hai), aur `store()` by default TTL clear karta hai (plain SET ka Redis semantics) jab tak `keep_ttl=True` na ho. `RENAME` ko TTL manually carry karna padta hai: `when = expires.get(src)`, phir `set_expire_at(dst, when)`.",
+  "why_needed": "Storage layout memory aur code complexity dono decide karta hai; Redis ka yeh design choice interviews mein poocha jaata hai.",
+  "real_world_analogy": "Jaise library mein har kitaab pe due-date sticker lagane ke bajaye ek alag 'issued books' register -- sirf issued kitaabon ki entry.",
+  "how_it_works": "Lookup pe `expires.get(key)` check (lazy expiry). TTL set: `expires[key] = ms` + `_volatile.add`. Remove: dono se hatao.",
+  "in_this_project": "`keyspace.py`: `expires` field, `set_expire_at`, `persist`, `_is_expired`, `store(keep_ttl=...)`. `commands/keys.py::rename` TTL carry karta hai. `server.py::info` keyspace section `expires={len(self.ks.expires)}`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::set_expire_at",
+   "projects/02-mini-redis/minidis/keyspace.py::persist",
+   "projects/02-mini-redis/minidis/commands/keys.py::rename",
+   "projects/02-mini-redis/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real: minidis/commands/keys.py::rename\nwhen = ctx.ks.expires.get(src)\nctx.ks.delete(src)\nctx.ks.store(dst, value)\nif when is not None:\n    ctx.ks.set_expire_at(dst, when)",
+  "code_language": "python",
+  "advantages": [
+   "Non-volatile keys pe zero TTL overhead",
+   "Value types simple",
+   "Volatile count O(1)"
+  ],
+  "disadvantages": [
+   "Do structures sync rakhni padti hain",
+   "Har access pe ek extra dict lookup"
+  ],
+  "common_mistakes": [
+   "Delete pe expires se hatana bhool jana (stale TTL nayi key pe lag jayegi)",
+   "SET pe TTL clear na karna",
+   "RENAME mein TTL lose kar dena"
+  ],
+  "follow_up_questions": [
+   "Plain SET TTL kyun hatata hai?",
+   "INFO keyspace ka expires count kahan se aata hai?",
+   "Agar 90% keys volatile hon toh kya design badloge?"
+  ],
+  "concepts": [
+   "data modeling",
+   "expiration",
+   "memory efficiency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-031",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why is the main keyspace an OrderedDict, and what does that cost?",
+  "answer_hinglish": "`OrderedDict` ek hash table hai jo insertion order bhi yaad rakhta hai, aur `move_to_end(key)` O(1) mein kisi key ko end pe le jaata hai. minidis isko recency order ki tarah use karta hai: har `store()` aur har touching `lookup()` key ko end pe bhejta hai. Result: front pe hamesha least recently used key. `allkeys-lru` ka victim bas `next(iter(self.data))` -- exact LRU, O(1).\n\nAndar se CPython ka OrderedDict ek dict + doubly linked list hai (har entry ke prev/next pointers). Yahi wo cost hai jo Redis avoid karta hai -- millions of keys pe har key pe do extra pointers aur ek node ka memory overhead. Isliye Redis 24-bit LRU clock har object mein rakhta hai aur sampling se approximate LRU karta hai.\n\nminidis mein cost:\n1. Har read pe `move_to_end` -- read path pe bhi mutation (aur `_atime` update). TRADEOFFS.md isko explicitly bolta hai.\n2. Extra memory per key (linked list node).\n3. Side effect: iteration order badalta rehta hai. `SCAN` cursor `list(ks.data)` mein ek index hai -- agar scans ke beech reads hon, toh keys ka order shift hoke kuch keys miss ya repeat ho sakti hain. Docstring \"may be missed or repeated\" bolta hai; access-reordering is ka ek extra kaaran hai.\n\n`TYPE` command `lookup(touch=False)` use karta hai taaki metadata query recency na badle -- Redis ka `OBJECT`/`TYPE` bhi LRU touch nahi karta.",
+  "why_needed": "Exact vs approximate LRU ki memory/CPU cost discuss karne ka sabse concrete tarika yahi data structure hai.",
+  "real_world_analogy": "Jaise kapdon ki almaari jisme jo pehna woh wapas right side pe rakho -- left side pe hamesha sabse kam pehne kapde. Lekin har baar rakhne mein thoda kaam.",
+  "how_it_works": "`store`/`lookup(touch=True)` -> `data.move_to_end(key)` + `_atime[key] = next(clock)`. Eviction: `next(iter(data))`. Iteration (KEYS, SCAN, dump) is recency order mein hoti hai.",
+  "in_this_project": "`keyspace.py::Keyspace.data` (comment: \"OrderedDict order == recency order (oldest first) -> exact LRU\"), `lookup`, `_pick_victim`. `commands/keys.py::type_` touch=False. Test `test_allkeys_lru_evicts_least_recently_used`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::lookup",
+   "projects/02-mini-redis/minidis/keyspace.py::_pick_victim",
+   "projects/02-mini-redis/minidis/commands/keys.py::scan",
+   "projects/02-mini-redis/TRADEOFFS.md"
+  ],
+  "code_example": "# real: minidis/keyspace.py::lookup\ndef lookup(self, key, *, touch=True):\n    if key not in self.data or self._expire_if_needed(key):\n        self.stats.keyspace_misses += 1\n        return None\n    self.stats.keyspace_hits += 1\n    if touch:\n        self.data.move_to_end(key)\n        self._atime[key] = next(self._access_clock)\n    return self.data[key]",
+  "code_language": "python",
+  "advantages": [
+   "Exact LRU O(1)",
+   "Simple code",
+   "Victim selection deterministic (testable)"
+  ],
+  "disadvantages": [
+   "Per key linked-list memory overhead",
+   "Har read pe write (move_to_end)",
+   "SCAN order unstable"
+  ],
+  "common_mistakes": [
+   "Plain dict ko insertion-ordered dekh ke LRU samajhna (plain dict mein move_to_end nahi)",
+   "Metadata commands pe bhi recency touch karna",
+   "SCAN cursor ko stable maan lena"
+  ],
+  "follow_up_questions": [
+   "Redis approximate LRU kaise karta hai?",
+   "LFU ke liye kya structure chahiye?",
+   "SCAN ko stable kaise banaoge?"
+  ],
+  "concepts": [
+   "LRU",
+   "OrderedDict",
+   "data structures"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-032",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "How do Redis data types map to Python structures in minidis, and what is the 'empty collection' rule?",
+  "answer_hinglish": "minidis chaar Redis types support karta hai, har ek ek native Python type pe map hai:\n- String -> `bytes`. Binary safe, INCR ke liye `int(value)` parse hota hai.\n- List -> `collections.deque`. Dono ends pe O(1) push/pop (LPUSH/RPUSH/LPOP/RPOP), jaise Redis quicklist. Middle indexing O(n).\n- Set -> Python `set`. SADD/SREM/SISMEMBER O(1); SINTER/SUNION/SDIFF set operations.\n- Hash -> Python `dict`. HSET/HGET O(1).\n\n`type_name()` reverse mapping karta hai (TYPE command ke liye), aur `lookup_typed(key, typ)` galat type pe `WRONGTYPE Operation against a key holding the wrong kind of value` deta hai -- jaise string key pe LPUSH.\n\nEmpty collection rule (Redis semantics): khali list/set/hash exist nahi karta. Jab LPOP aakhri element nikaal de, HDEL aakhri field hata de, ya SREM aakhri member, toh `delete_if_empty` key ko hi hata deta hai. Isliye `EXISTS` 0 deta hai aur `TYPE` \"none\". Doosri taraf, `lookup_typed(..., create=deque)` write commands ke liye missing key pe naya khali collection banata hai aur turant fill hota hai.\n\nSorted sets, streams, bitmaps, HyperLogLog implement nahi hain -- README ki limitations mein listed.",
+  "why_needed": "Data type choice performance aur semantics dono decide karta hai; empty-collection rule ke bina EXISTS aur memory accounting galat ho jaate.",
+  "real_world_analogy": "Jaise alag dabbe alag cheezon ke liye -- khali dabba almaari mein rakhne ka koi matlab nahi, toh hata do.",
+  "how_it_works": "Commands `lookup_typed` se type-checked value lete hain, in-place mutate karte hain, `adjust_size` se memory update, aur `delete_if_empty` se cleanup.",
+  "in_this_project": "`keyspace.py`: `type_name`, `lookup_typed`, `delete_if_empty`, `WRONGTYPE`. `commands/lists.py`, `sets.py`, `hashes.py`. Tests: `test_lists`, `test_sets`, `test_hashes`, `test_wrongtype_and_errors`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::lookup_typed",
+   "projects/02-mini-redis/minidis/keyspace.py::delete_if_empty",
+   "projects/02-mini-redis/minidis/commands/lists.py::_pop",
+   "projects/02-mini-redis/tests/test_commands.py::test_wrongtype_and_errors"
+  ],
+  "code_example": "# real: minidis/keyspace.py\ndef lookup_typed(self, key, typ, *, create=None):\n    value = self.lookup(key)\n    if value is None:\n        if create is None:\n            return None\n        value = create()\n        self.store(key, value, keep_ttl=False)\n        return value\n    if not isinstance(value, typ):\n        raise WRONGTYPE\n    return value",
+  "code_language": "python",
+  "advantages": [
+   "Native structures -- simple aur correct",
+   "Redis semantics (WRONGTYPE, empty delete) preserved"
+  ],
+  "disadvantages": [
+   "Python objects memory-heavy (Redis listpack/intset jaise compact encodings nahi)",
+   "deque middle access O(n)"
+  ],
+  "common_mistakes": [
+   "Empty collection ko rehne dena",
+   "WRONGTYPE check skip karna",
+   "List ke liye Python list use karna (left push O(n))"
+  ],
+  "follow_up_questions": [
+   "Redis small hashes ko listpack mein kyun rakhta hai?",
+   "LRANGE ki complexity kya hai?",
+   "Sorted set kaise implement karoge?"
+  ],
+  "concepts": [
+   "data types",
+   "Redis semantics",
+   "Python collections"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-033",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "What exactly is stored in the AOF file, and how do expiries end up in it?",
+  "answer_hinglish": "AOF ek plain RESP stream hai -- har write command ek RESP array, execution order mein. Format client wire jaisa hi hai, isliye wahi `Parser` replay mein kaam aata hai aur file ko `cat` karke padh bhi sakte ho.\n\nLekin AOF mein \"client ne kya bheja\" nahi, balki \"state mein kya badla\" ka deterministic description jaata hai. Teen rules:\n\n1. Relative TTL absolute ban jaata hai. `SET k v EX 60` -> do entries: `SET k v` aur `PEXPIREAT k <absolute ms>`. `EXPIRE` bhi `PEXPIREAT` banta hai. DATABASE_DESIGN.md ka example literally `*3\\r\\n$9\\r\\nPEXPIREAT\\r\\n$1\\r\\nk\\r\\n$13\\r\\n1763300000000\\r\\n` dikhata hai.\n2. Implicit deletes log hote hain: lazy expiry, active expiry aur eviction -- teeno `on_implicit_delete([b\"DEL\", key])` ke through `_propagate` call karte hain, toh AOF mein `DEL k` likha jaata hai. Matlab replay pe yeh deletions bhi same order mein hoti hain.\n3. No-op writes nahi likhe jaate (`SET NX` jo fail hua -> `ctx.rewrite()`).\n\nKyun absolute? Socho AOF aaj likha, server kal restart hua. `EX 60` replay hota toh key ko phir se fresh 60 second milte -- jo key kal hi mar chuki thi woh zinda ho jaati. `PEXPIREAT` ke saath replay pe `_expire_generic` dekhta hai ki deadline past hai aur key delete kar deta hai. `test_aof_stores_absolute_expiry` check karta hai ki file mein `PEXPIREAT` hai aur `EX` kahin nahi.",
+  "why_needed": "Log-based persistence tabhi correct hai jab replay deterministic ho; time-relative commands iska sabse common trap hain.",
+  "real_world_analogy": "Jaise bank passbook mein \"30 din baad maturity\" nahi, \"15 Dec 2026 ko maturity\" likha jaata hai.",
+  "how_it_works": "Handler `ctx.rewrite(...)` se deterministic commands deta hai -> `_propagate` -> `encode_command` -> `aof.append`. Implicit deletes Keyspace callback se same path pe.",
+  "in_this_project": "`server.py::_propagate`, `keyspace.py::on_implicit_delete`, `strings.py::set_`, `keys.py::_expire_generic`. `server.py::__init__` mein `self.ks.on_implicit_delete = self._propagate`. TRADEOFFS #5: har expiring SET pe ek extra AOF entry.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_propagate",
+   "projects/02-mini-redis/minidis/keyspace.py::Keyspace",
+   "projects/02-mini-redis/minidis/commands/keys.py::_expire_generic",
+   "projects/02-mini-redis/DATABASE_DESIGN.md"
+  ],
+  "code_example": "*3\\r\\n$3\\r\\nSET\\r\\n$1\\r\\nk\\r\\n$1\\r\\nv\\r\\n\n*3\\r\\n$9\\r\\nPEXPIREAT\\r\\n$1\\r\\nk\\r\\n$13\\r\\n1763300000000\\r\\n\n*2\\r\\n$3\\r\\nDEL\\r\\n$1\\r\\nk\\r\\n          <- written later when the key expires on the master",
+  "code_language": "text",
+  "advantages": [
+   "Deterministic replay",
+   "Human-inspectable",
+   "Same format as replication stream"
+  ],
+  "disadvantages": [
+   "Expiring SET pe 2 entries",
+   "Read commands bhi DEL likhwa sakte hain (lazy expiry)",
+   "File kabhi shrink nahi hoti bina rewrite"
+  ],
+  "common_mistakes": [
+   "Relative TTL log karna",
+   "Implicit deletes log na karna (replay pe expired keys zinda)",
+   "AOF ko client input ka exact copy samajhna"
+  ],
+  "follow_up_questions": [
+   "Replay pe deadline already past ho toh?",
+   "Clock skew ka kya asar?",
+   "Rewrite ke baad expiries kaise likhi jaati hain?"
+  ],
+  "concepts": [
+   "AOF",
+   "determinism",
+   "TTL"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Absolute time determinism deta hai, lekin wall clock pe depend karta hai -- agar restart wali machine ka clock peeche hai toh keys zyada der jeeyengi. Relative TTL clock-independent hai lekin replay time pe galat.",
+   "failure_scenarios": "NTP clock jump forward -> restart/replay pe bahut keys turant expire. Agar DEL logging bhool jaate, toh replay ke baad keys jo master pe expire ho chuki thi woh `PEXPIREAT` se phir bhi delete ho jaati (past deadline), lekin eviction wale DEL ke bina evicted keys zinda ho jaati.",
+   "alternatives": "Snapshot ke saath \"logical clock\" ya monotonic offsets; ya AOF entries pe timestamp header (Redis 7 annotations jaisa) aur replay time-aware.",
+   "scale_10x_100x": "High-TTL workload (har SET EX) pe AOF size ~2x; rewrite frequency badhani padegi. Replication bandwidth bhi badhegi.",
+   "production_improvements": "`SET k v PXAT <abs>` ek hi entry mein likhna (do ke bajaye), AOF timestamps annotations, aur clock skew monitoring."
+  }
+ },
+ {
+  "id": "MRDS-034",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How would you evolve the snapshot format without breaking existing dump files?",
+  "answer_hinglish": "minidis mein \"schema\" binary format hai, aur uska version magic ke aakhri byte mein hai: `MINIDIS\\x01`. DATABASE_DESIGN.md ka plan: format change hua toh version bump karo aur purane version ka loader rakho. Abhi code mein sirf v1 hai -- `load()` `data.startswith(MAGIC)` exact match karta hai, toh koi aur version \"bad magic\" se reject hoga.\n\nMain yeh approach lunga:\n1. Magic ko do hisson mein dekho: `MINIDIS` prefix + version byte. `load()` version byte padh ke dispatcher: `{1: _load_v1, 2: _load_v2}`.\n2. Writer hamesha latest version likhe; reader saare supported versions padhe (backward compatibility). Agar file naye version ki hai aur binary purani -- clear error \"unsupported snapshot version 3\" (forward compatibility nahi, lekin safe failure).\n3. Additive changes ke liye type bytes extensible hain: naya type (jaise sorted set `Z`) ek naya record type hai. Purana loader usse `unknown type byte` pe reject karega -- jo sahi hai, silently skip karna data loss hota.\n4. Per-record metadata (jaise LFU counter) chahiye toh Redis ka trick: opcode records (Redis RDB mein `RDB_OPCODE_AUX`, `EXPIRETIME_MS` jaise) jo optional fields deti hain.\n5. Replication ka angle: master snapshot ko wire pe bhejta hai, toh mixed-version master/replica deploy mein replica ko master ka version padhna aana chahiye -- rolling upgrade mein pehle replicas upgrade karo.\n\nHar version ke liye golden test files repo mein rakho aur test karo ki naya code unhe load karta hai.",
+  "why_needed": "Persistent formats saalon tak rehte hain; version strategy ke bina upgrade = data migration crisis.",
+  "real_world_analogy": "Jaise passport ka naya design aaye toh purane passports bhi valid rehte hain -- counter pe dono padhne ki machine hoti hai.",
+  "how_it_works": "Version header -> loader dispatch -> per-version parse. CRC aur END marker sab versions mein common rakh sakte hain.",
+  "in_this_project": "`persistence/snapshot.py::MAGIC = b\"MINIDIS\\x01\"`, `load()` ka `if len(data) < len(MAGIC) + 5 or not data.startswith(MAGIC): raise CorruptSnapshot(\"bad magic / too short\")`. Replication `ReplicaLink._sync_once` same `snapshot.load` use karta hai.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::load",
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::MAGIC",
+   "projects/02-mini-redis/DATABASE_DESIGN.md",
+   "projects/02-mini-redis/minidis/replication.py::_sync_once"
+  ],
+  "code_example": "# illustrative (not in repo): version dispatch\nLOADERS = {1: _load_v1, 2: _load_v2}\n\ndef load(data, ks):\n    if not data.startswith(b\"MINIDIS\"):\n        raise CorruptSnapshot(\"bad magic\")\n    version = data[7]\n    loader = LOADERS.get(version)\n    if loader is None:\n        raise CorruptSnapshot(f\"unsupported snapshot version {version}\")\n    return loader(data, ks)",
+  "code_language": "python",
+  "advantages": [
+   "Old backups loadable rehte hain",
+   "Unsupported versions pe safe failure",
+   "Rolling upgrades possible"
+  ],
+  "disadvantages": [
+   "Har purane version ka loader maintain karna",
+   "Testing matrix badhta hai"
+  ],
+  "common_mistakes": [
+   "Version byte hi na rakhna",
+   "Unknown record types silently skip karna",
+   "Replication ko upgrade plan mein bhool jana"
+  ],
+  "follow_up_questions": [
+   "Rolling upgrade mein master pehle ya replicas?",
+   "Redis RDB versions kaise handle karta hai?",
+   "AOF format ka versioning kaise?"
+  ],
+  "concepts": [
+   "schema evolution",
+   "binary formats",
+   "compatibility"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict versioning (exact match) safe hai lekin har change pe loader. Self-describing formats (protobuf, TLV) evolution aasaan karte hain, lekin size aur parse cost badhte hain.",
+   "failure_scenarios": "Naya binary purana snapshot na padh sake -> restart pe data gayab lagega. Naya master purane replica ko v2 bheje -> replica sync fail loop. Downgrade ke baad naya format unreadable.",
+   "alternatives": "TLV / protobuf / flatbuffers based records; ya har record pe optional fields ke liye opcode approach (Redis RDB).",
+   "scale_10x_100x": "Multiple versions + bade datasets pe ek offline migration tool chahiye (v1 -> v2 convert) taaki startup slow na ho.",
+   "production_improvements": "Golden file tests per version, `minidis --check-snapshot` CLI, aur replication handshake mein version negotiation."
+  }
+ },
+ {
+  "id": "MRDS-035",
+  "project_slug": "p02-mini-redis",
+  "category": "Database Design",
+  "difficulty": "Senior/System Design",
+  "question": "minidis keeps snapshot and AOF separate, while Redis 7 combines them (RDB preamble + AOF). Compare the designs and say what you would do in production.",
+  "answer_hinglish": "minidis mein dono files alag hain: `dump.mdb` (binary snapshot) aur `appendonly.aof` (RESP log). Restart pe agar AOF enabled aur exist karti hai toh sirf AOF replay hota hai, snapshot ignore -- kyunki AOF usually zyada up-to-date hai. Ek extra detail: AOF pehli baar on kiya aur sirf snapshot hai, toh snapshot load karke `minimal_commands` se AOF seed hota hai, taaki AOF complete dataset represent kare. Clarity ke liye yeh achha hai: har mechanism alag test aur explain hota hai.\n\nProblem: AOF replay slow hai (har command re-execute), aur AOF rewrite ke bina bahut bada. Redis 4+ ne `aof-use-rdb-preamble` diya: rewrite ke time AOF file ki shuruaat RDB binary format mein hoti hai (fast load), aur uske baad sirf naye commands RESP mein. Redis 7 ne multi-part AOF banaya: ek base file (RDB ya AOF), kai incremental files, aur ek manifest jo batata hai kaunsi files kis order mein. Rewrite naya base banata hai aur purane incr files discard -- rewrite buffer ki zaroorat bhi khatam, kyunki naye writes seedha naye incr file mein jaate hain.\n\nProduction mein main yeh karunga: rewrite output (`minimal_commands`) ki jagah `snapshot.dump` format base file ke roop mein, naye writes ek incremental AOF mein, aur ek chhota manifest jo atomic rename se update ho. Load = base snapshot (fast, CRC checked) + incremental replay (truncated tail tolerant). Isse restart time dataset size pe depend karega, write history pe nahi.",
+  "why_needed": "Restart time (RTO) aur durability (RPO) dono production SLAs hain; persistence layout dono ko directly affect karta hai.",
+  "real_world_analogy": "Jaise saal ke shuru ka audited balance sheet (snapshot) + us din se ki passbook entries (AOF) -- poori zindagi ki passbook replay karne ki zaroorat nahi.",
+  "how_it_works": "Hybrid: base = point-in-time binary dump, tail = logical log since base. Manifest = files ki ordered list; manifest ka atomic swap hi commit point hai.",
+  "in_this_project": "`server.py::_load_from_disk` (AOF preferred, snapshot pe AOF seeding), `aof.py::minimal_commands` (rewrite content), `snapshot.py::dump`. TRADEOFFS #6: \"Real Redis 7 combines both (RDB preamble + AOF tail); we keep them separate for clarity.\"",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_load_from_disk",
+   "projects/02-mini-redis/minidis/persistence/aof.py::minimal_commands",
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::dump",
+   "projects/02-mini-redis/TRADEOFFS.md"
+  ],
+  "code_example": "# real: minidis/server.py::_load_from_disk\nif self.config.appendonly and self.aof_path.exists():\n    applied, truncated = AppendOnlyFile.replay(self.aof_path, self._apply_replay)\n    self.persistence.loaded_from = f\"aof ({applied} commands, {truncated} truncated bytes)\"\nelif self.snapshot_path.exists():\n    n = snapshot.load(self.snapshot_path.read_bytes(), self.ks)\n    self.persistence.loaded_from = f\"snapshot ({n} keys)\"\n    if self.config.appendonly:\n        # First start with AOF enabled on top of an existing snapshot: seed the AOF.\n        self.aof_path.write_bytes(AppendOnlyFile.minimal_commands(self.ks))",
+  "code_language": "python",
+  "advantages": [
+   "Separate: simple, independently testable",
+   "Hybrid: fast restart + fine durability"
+  ],
+  "disadvantages": [
+   "Separate: slow AOF replay, AOF aur snapshot ka double disk",
+   "Hybrid: manifest aur multiple files ki complexity"
+  ],
+  "common_mistakes": [
+   "Yeh maan lena ki dono hain toh restart pe dono load hote hain",
+   "AOF enable karte waqt existing snapshot data ko bhool jana (minidis seed karta hai)"
+  ],
+  "follow_up_questions": [
+   "Manifest crash-safe kaise banaoge?",
+   "Base file corrupt ho aur incr theek ho toh?",
+   "Is design mein replication full sync kya bhejega?"
+  ],
+  "concepts": [
+   "persistence design",
+   "RTO/RPO",
+   "hybrid logging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Simplicity (alag files) vs operational efficiency (hybrid). Hybrid mein ek format (snapshot) dono kaam karta hai -- backups aur base -- lekin crash consistency ab multi-file hai, manifest pe depend.",
+   "failure_scenarios": "Manifest update aur file rename ke beech crash -> manifest purani files point kare, ya nayi file orphan. Isliye manifest temp+fsync+rename+dir fsync. Base corrupt (CRC fail) -> purana base + purane incr chahiye, isliye cleanup lazily.",
+   "alternatives": "Pure WAL + checkpoints (Postgres/RocksDB style): periodic checkpoint + WAL segments, WAL recycle. LSM trees. Ya sirf snapshot + replication for durability (cache use-cases).",
+   "scale_10x_100x": "10x dataset pe pure AOF replay minutes le sakta hai; hybrid mein load ~ snapshot parse time + chhota tail. 100x pe snapshot bhi bada -- parallel load ya mmap-friendly format.",
+   "production_improvements": "Multi-part AOF with manifest, base = snapshot format, automatic rewrite trigger on growth ratio, startup time metric, aur backups ke liye base + incr files ka consistent copy."
+  }
+ },
+ {
+  "id": "MRDS-036",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "minidis has no locks. What race conditions can still happen for a client application, even though each command is atomic?",
+  "answer_hinglish": "Har individual command atomic hai, lekin application ke liye races khatam nahi hote -- woh ek level upar shift ho jaate hain.\n\n1. Check-then-act across commands: client `GET stock` padhta hai, apne code mein check karta hai `> 0`, phir `DECR stock`. Do clients beech mein interleave kar sakte hain aur stock negative ho sakta hai. Har command atomic tha, sequence nahi. minidis mein MULTI/EXEC, WATCH ya Lua nahi hain, toh fix single atomic command design karna hai (jaise `DECR` result check karke compensate karna, ya `SET NX` based lock).\n2. Pipelining transaction nahi: pipeline ke commands ke beech doosre clients ke commands chal sakte hain -- ek read batch ek connection ka hai, lekin doosre connections ke batches interleave hote hain.\n3. Replica reads: async replication mein replica peeche ho sakta hai -- master pe likha, replica se padha, purani value mili (read-your-writes violation).\n4. TTL races: client ne `EXISTS k` = 1 dekha, agle command tak key expire ho gayi.\n5. Server internal: background tasks (BGSAVE write thread, AOF rewrite thread) data structures ko touch nahi karte -- unhe pehle se serialized bytes milte hain. Yeh deliberate hai: thread mein `ks.data` iterate karte toh event loop ke mutations ke saath race hota.\n\nInterview line: \"Single-threaded execution gives per-command atomicity, not transactions.\"",
+  "why_needed": "Developers aksar \"Redis atomic hai\" sun ke multi-step logic mein races likh dete hain.",
+  "real_world_analogy": "Ek cashier wali dukaan mein bhi agar tum pehle stock poochho aur phir line mein lag ke kharido, tab tak koi aur aakhri piece le ja sakta hai.",
+  "how_it_works": "Atomic unit = ek `execute()` call. Uske bahar sab interleave ho sakta hai: commands between, replication lag, time passing.",
+  "in_this_project": "`server.py::execute` (atomic unit), `start_bgsave` aur `aof.rewrite` jo thread ko sirf bytes dete hain (`snapshot.dump` aur `minimal_commands` loop pe). README limitations: \"no MULTI/EXEC, Pub/Sub, Lua\".",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::execute",
+   "projects/02-mini-redis/minidis/server.py::start_bgsave",
+   "projects/02-mini-redis/minidis/persistence/aof.py::rewrite",
+   "projects/02-mini-redis/README.md"
+  ],
+  "code_example": "# illustrative (client side): racy vs atomic\n# racy: two round trips, another client can run in between\nif int(r.get(\"stock\") or 0) > 0:\n    r.decr(\"stock\")\n# atomic single command, then compensate\nif r.decr(\"stock\") < 0:\n    r.incr(\"stock\")   # undo; item was not available",
+  "code_language": "python",
+  "advantages": [
+   "Per-command atomicity free mein",
+   "Internal threads data race-free by design"
+  ],
+  "disadvantages": [
+   "Multi-command transactions nahi",
+   "Replica reads stale ho sakte hain"
+  ],
+  "common_mistakes": [
+   "Pipeline ko transaction samajhna",
+   "GET-then-SET pattern counters ke liye",
+   "Replica se read karke turant consistency expect karna"
+  ],
+  "follow_up_questions": [
+   "MULTI/EXEC isi architecture mein kaise add karoge?",
+   "WATCH (optimistic locking) kaise kaam karta hai?",
+   "Distributed lock SET NX PX se kaise?"
+  ],
+  "concepts": [
+   "race conditions",
+   "atomicity",
+   "transactions"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-037",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Explain the data-loss window of asynchronous replication in minidis. When exactly can an acknowledged write be lost?",
+  "answer_hinglish": "minidis ka master client ko reply bhejta hai bina replicas ke confirm kiye. Timeline dekho: `_handle_client` mein command execute hota hai, `_propagate` usse AOF buffer aur `_repl_pending` list mein daalta hai aur `call_soon(_flush_replication)` schedule karta hai. Phir reply client ko jaata hai. Replica tak bytes tab pahunchte hain jab flush callback chale, kernel socket buffer se bheje, network deliver kare, aur replica apply kare.\n\nLoss scenario: client ko `OK` mil gaya, lekin master us waqt crash ho gaya jab bytes abhi `_repl_pending` mein, ya master ke socket buffer mein, ya network mein the. Operator `REPLICAOF NO ONE` se replica promote karta hai -- naye master pe woh write hai hi nahi. Client sochta hai save ho gaya; data gaya. FAILURE_SCENARIOS bhi yahi bolta hai: \"writes acknowledged by the old master but not yet streamed.\"\n\nWindow kitni badi? Normally milliseconds (ek loop tick + network), lekin slow replica ya network issue pe `lag_bytes` jitna -- INFO replication mein dikhta hai. Aur agar master ka AOF `always` hai, toh master ki disk pe write safe hai -- lekin failover ke baad woh disk wala data naye master pe nahi hai, toh purana master jab wapas aaye aur replica bane, full sync uska data overwrite kar dega.\n\nMitigation (minidis mein nahi): `WAIT numreplicas timeout` (client choose kare), ya `min-replicas-to-write`. Real Redis bhi default async hai -- isliye Redis ko \"best-effort durable\" kehte hain, CP system nahi.",
+  "why_needed": "Har distributed DB interview mein \"kya acknowledged writes lose ho sakte hain?\" poocha jaata hai; honest jawab trust banata hai.",
+  "real_world_analogy": "Jaise boss ko \"haan, file bhej di\" bol diya jabki email abhi outbox mein hai, aur laptop band ho gaya.",
+  "how_it_works": "Ack path: execute -> reply. Replication path: pending list -> flush callback -> socket -> replica apply -> ACK every 1s. Dono independent; ack replication ka wait nahi karta.",
+  "in_this_project": "`server.py::_propagate`, `_flush_replication`, `_handle_client`; `replication.py` module docstring: \"A write acknowledged by the master can be lost if the master dies before streaming it.\" SYSTEM_DESIGN.md: \"WAIT is not implemented\".",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_propagate",
+   "projects/02-mini-redis/minidis/server.py::_flush_replication",
+   "projects/02-mini-redis/minidis/replication.py",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Write latency replication se independent",
+   "Replica down ho toh bhi master writes chalte hain"
+  ],
+  "disadvantages": [
+   "Failover pe acknowledged writes lose",
+   "Client ko pata nahi chalta kaunse writes replicate hue"
+  ],
+  "common_mistakes": [
+   "AOF always ko cluster-wide durability samajhna",
+   "Failover ke baad purane master ka data automatically merge hone ki ummeed"
+  ],
+  "follow_up_questions": [
+   "WAIT kaise implement karoge?",
+   "Failover se pehle lag check karna kaise help karega?",
+   "Split brain kaise hota hai?"
+  ],
+  "concepts": [
+   "async replication",
+   "durability",
+   "failover"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Latency vs durability: sync replication har write pe ek RTT add karta hai aur replica availability pe write availability depend karti hai. Async mein woh nahi, lekin RPO > 0.",
+   "failure_scenarios": "Master crash with unflushed stream; network partition jahan master likhta rahe aur replica promote ho (split brain -- dono pe alag writes); purana master wapas aaye aur full sync uske unique writes mita de.",
+   "alternatives": "WAIT N timeout (semi-sync per request), min-replicas-to-write + min-replicas-max-lag (writes reject agar replicas lagging), Raft-based consensus (Redis Raft / etcd) for strong durability.",
+   "scale_10x_100x": "Zyada write rate pe pending stream bada, window bada. Zyada replicas se loss probability kam nahi hoti agar sab async hain -- sab ek saath peeche ho sakte hain.",
+   "production_improvements": "WAIT command (replica ACK offsets already hain, toh offset >= target ka wait), failover tooling jo lowest lag wala replica chune, aur client-side idempotency keys taaki retry safe ho."
+  }
+ },
+ {
+  "id": "MRDS-038",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why don't minidis replicas expire keys themselves? How do they still avoid serving expired data?",
+  "answer_hinglish": "Agar master aur replica dono apne-apne clock se keys expire karein, toh dono ki state alag time pe badlegi aur diverge ho sakti hai. Example: replica ka clock 2 second aage hai; replica key delete kar deta hai, phir master pe `INCR k` hota hai jab key wahan abhi zinda thi -- master pe value 6 (5+1), replica pe stream ka INCR missing key pe chalega -> 1. Ab dono permanently alag. Isliye rule: sirf master expiry decide karta hai, aur expiry ko ek explicit `DEL` command ki tarah stream karta hai. Replica stream ko blindly apply karta hai, toh dono same sequence of state changes dekhte hain.\n\nLekin replica expired data serve bhi nahi karna chahiye (agar master ne abhi DEL nahi bheja -- jaise koi us key ko master pe padh hi nahi raha aur active expiry ne abhi sample nahi kiya). Solution: replica pe `_expire_if_needed` `is_replica` true hone pe `True` return karta hai (key \"gone\" maano) lekin `_remove` nahi karta. Reads ko key missing dikhti hai, physically data rehta hai. `active_expire_cycle` replica pe seedha `0` return karta hai.\n\nTest `test_master_expiry_propagates_as_del`: master pe `px=300`, 0.35s baad replica pe `EXISTS` = 0 (hidden) lekin `b\"k\" in replica.ks.data` (physically present); phir master pe GET se lazy expiry -> DEL -> replica se physically gayab. Redis 3.2+ bhi bilkul yahi karta hai.\n\nIsi path pe ek real bug mila tha -- next question (replica DEL leak).",
+  "why_needed": "Clock-independent consistency distributed systems ka basic principle hai: decisions ek jagah, effects replicate.",
+  "real_world_analogy": "Jaise exam ka result sirf board declare karta hai; school apne hisaab se 'fail' declare nahi karta, bas board ka notice aane tak result 'withheld' dikhata hai.",
+  "how_it_works": "Master: lazy/active expiry -> `_remove` -> `on_implicit_delete([DEL, key])` -> stream. Replica: reads pe hide, active expiry off, DEL aane pe physical delete.",
+  "in_this_project": "`keyspace.py::_expire_if_needed` (replica branch), `active_expire_cycle` (replica returns 0), `Keyspace.is_replica` comment. `server.py::become_replica_of` `ks.is_replica = True` set karta hai, `promote_to_master` False. Tests: `test_replica_hides_but_does_not_delete_expired_keys`, `test_master_expiry_propagates_as_del`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::_expire_if_needed",
+   "projects/02-mini-redis/minidis/keyspace.py::active_expire_cycle",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_replica_hides_but_does_not_delete_expired_keys",
+   "projects/02-mini-redis/tests/test_replication.py::test_master_expiry_propagates_as_del"
+  ],
+  "code_example": "# real: minidis/keyspace.py (comments)\n# Replicas never delete expired keys themselves; they wait for the master's DEL so\n# master and replica stay identical. They still *hide* expired keys from readers.\nis_replica: bool = False",
+  "code_language": "python",
+  "advantages": [
+   "Master-replica kabhi diverge nahi (clock skew ke bawajood)",
+   "Replica reads expired data nahi dikhate"
+  ],
+  "disadvantages": [
+   "Replica pe expired keys ki memory tab tak rehti hai jab tak master DEL na bheje",
+   "Master pe expiry slow ho toh replica memory badhti hai"
+  ],
+  "common_mistakes": [
+   "Replica pe bhi active expiry chala dena",
+   "Replica pe expired key ko reads mein dikha dena",
+   "Master ke DEL ko 'already gone' samajh ke ignore karna"
+  ],
+  "follow_up_questions": [
+   "Replica DEL leak bug kya tha?",
+   "Promote hone pe replica expired keys ka kya karta hai?",
+   "Writable replica hota toh kya problem?"
+  ],
+  "concepts": [
+   "replication",
+   "expiration",
+   "consistency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Memory vs consistency: replica pe expired keys extra memory leti hain jab tak DEL na aaye, lekin consistency guaranteed. Alternative (independent expiry) memory bachata hai, consistency todta hai.",
+   "failure_scenarios": "Master down + replica pe expired keys jama hoti rahengi (koi DEL nahi aa raha); promote ke baad `is_replica=False` hote hi lazy/active expiry unhe saaf karti hai. Clock skew replica pe 'hide' decision ko affect karta hai -- replica ka clock aage ho toh woh thoda pehle hide karega (reads ke liye), lekin data intact.",
+   "alternatives": "Replica pe logical clock jo master ke stream timestamps se chale; ya Redis 7 jaisa master time ko replica ko propagate karna.",
+   "scale_10x_100x": "Bahut zyada short-TTL keys + master pe slow active expiry -> replica memory master se zyada ho sakti hai. Master ka active expiry hz badhana padega.",
+   "production_improvements": "Replica pe `expired_but_present` metric, promote ke time ek full expiry sweep, aur master clock sanity checks."
+  }
+ },
+ {
+  "id": "MRDS-039",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do replication offsets and REPLCONF ACK work, and how is lag_bytes computed? What flaw did the review find in the offset handling, and how was it fixed?",
+  "answer_hinglish": "Master `master_repl_offset` rakhta hai: `_propagate` mein har encoded command ki length jodta hai -- matlab \"maine replication stream mein ab tak kitne bytes produce kiye\". Replica `ReplicaLink.offset` rakhta hai: stream apply karte waqt `before = parser.pending`, command parse, phir `offset += before - parser.pending` -- exactly consumed bytes. Replica ka `_ack_loop` har second `REPLCONF ACK <offset>` bhejta hai; master `_serve_replica` mein usse parse karke `client.ack_offset` set karta hai. `INFO replication` mein har replica ke liye `lag_bytes = master_repl_offset - repl_base - ack_offset` (repl_base neeche explain kiya). `test_master_reports_replica_ack_offset` check karta hai ki ek SET ke baad ACK master offset ke barabar ho jaata hai. Benchmark ke baad bhi `lag_bytes=0` verify kiya gaya tha.\n\nFlaw (code review mein mila, run karke confirm kiya, phir fix): pehle formula `master_repl_offset - ack_offset` tha. Replica full sync ke baad `self.offset = 0` set karta hai, lekin master ka `master_repl_offset` 0 se shuru nahi hota -- woh server start se ab tak ke saare propagated bytes count karta hai, chahe replica tab attached tha ya nahi. Toh agar replica late attach ho (master pe pehle writes ho chuke), `lag_bytes` hamesha un pehle ke bytes se inflated dikhega, chahe replica fully caught up ho. Test aur benchmark mein yeh nahi dikha kyunki replica fresh master se pehle hi attach tha -- review mein ek caught-up replica `lag_bytes: 570` dikha raha tha.\n\nReal Redis yeh `+FULLRESYNC <replid> <offset>` reply se solve karta hai: replica apna offset master ke current offset se initialize karta hai. minidis mein jo fix kiya (protocol change ke bina): `ClientState.repl_base` -- `_serve_replica` mein flush + `snapshot.dump` ke same synchronous step mein `client.repl_base = self.master_repl_offset`. INFO ab `lag_bytes = master_repl_offset - repl_base - ack_offset` aur `offset = repl_base + ack_offset` dikhata hai. Regression test: `test_lag_bytes_is_zero_for_caught_up_replica_attached_late` (20 early writes, phir replica attach, lag 0 hona chahiye). Replica ab bhi 0 se ginta hai, toh PSYNC ke liye FULLRESYNC-style offset abhi bhi future work hai.",
+  "why_needed": "Lag metric failover decisions aur alerting ka basis hai; galat baseline se false alarms ya galat replica promote.",
+  "real_world_analogy": "Jaise do log ek kitaab padh rahe hain aur page number compare karte hain -- lekin ek ne page 1 se gina aur doosre ne chapter 5 se, toh 'peeche hai' wali ginti galat.",
+  "how_it_works": "Byte offsets dono taraf; ACK periodic (1s), isliye lag max ~1s stale. Master side offset monotonic; replica side reset on full sync.",
+  "in_this_project": "`server.py::_propagate` (`self.master_repl_offset += len(data)`), `_serve_replica` (ACK parse, `client.repl_base = self.master_repl_offset`), `info` (lag_bytes with repl_base), `ClientState.repl_base`. `replication.py::_sync_once` (`self.offset = 0`, `offset += before - parser.pending`), `_ack_loop`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_serve_replica",
+   "projects/02-mini-redis/minidis/server.py::info",
+   "projects/02-mini-redis/minidis/replication.py::_ack_loop",
+   "projects/02-mini-redis/tests/test_replication.py::test_master_reports_replica_ack_offset",
+   "projects/02-mini-redis/tests/test_replication.py::test_lag_bytes_is_zero_for_caught_up_replica_attached_late"
+  ],
+  "code_example": "# real, trimmed: minidis/replication.py::_sync_once\nself.offset = 0\n...\nwhile True:\n    before = parser.pending\n    args = parser.get_command()\n    if args is None:\n        break\n    self.offset += before - parser.pending\n    self.server.apply_from_master(args)",
+  "code_language": "python",
+  "advantages": [
+   "Byte-level precise lag",
+   "Cheap: 1 ACK per second",
+   "Observable via INFO"
+  ],
+  "disadvantages": [
+   "Replica khud 0 se ginta hai -- lag ke liye repl_base kaafi, PSYNC ke liye nahi",
+   "ACK interval 1s -- lag reading utna stale",
+   "Replication id nahi, toh master restart detect nahi hota offsets se"
+  ],
+  "common_mistakes": [
+   "Command count ko offset maan lena (bytes nahi)",
+   "ACK ko apply se pehle count karna",
+   "Lag ko latency (seconds) samajhna -- yeh bytes hai"
+  ],
+  "follow_up_questions": [
+   "Offset ko PSYNC ke liye kaise use karoge?",
+   "lag_bytes ko seconds mein kaise convert karoge?",
+   "Baseline bug ka regression test kaise likha, aur fix ke bina woh kaise fail hota?"
+  ],
+  "concepts": [
+   "replication offsets",
+   "observability",
+   "lag"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Byte offsets precise aur protocol-agnostic hain, lekin baseline agreement chahiye. Command counts simpler lekin variable size commands ke saath bandwidth lag nahi batate.",
+   "failure_scenarios": "Fix se pehle: inflated lag_bytes -> alert fatigue, ya automation galat replica ko 'lagging' maan ke ignore karta. repl_base galat moment pe set ho (dump aur register ke beech await) toh off-by-N lag -- isliye same sync step mein set hota hai. Master restart pe master offset 0 se, replica bhi full sync pe 0 -- isliye restart case accidentally sahi hai.",
+   "alternatives": "FULLRESYNC reply mein master offset (Redis), ya replication id + offset pair, ya time-based lag (master timestamps stream mein bhejna).",
+   "scale_10x_100x": "Zyada replicas pe har ek ka ACK 1/s -- negligible. Bahut high write rate pe lag_bytes tezi se badhta hai; lag seconds metric zyada useful.",
+   "production_improvements": "repl_base fix done; aage SYNC reply mein offset (PSYNC ke liye), `master_link_down_since_seconds`, lag in seconds, aur alert on sustained lag_bytes growth (rate, not absolute)."
+  }
+ },
+ {
+  "id": "MRDS-040",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "During full sync, how does the master guarantee the replica gets every write exactly once -- no gap and no duplicate between the snapshot and the stream?",
+  "answer_hinglish": "Yeh ordering `Server._serve_replica` ki teen lines mein hai, aur teeno bina await ke ek hi event loop step mein chalti hain:\n\n1. `self._flush_replication()` -- jo bytes abhi `_repl_pending` mein pade hain (batching ki wajah se) woh purane replicas ke hain. Agar flush nahi karte, toh naya replica register hone ke baad yeh bytes usse bhi chale jaate -- lekin yeh writes snapshot mein already honge -> duplicate apply (INCR do baar!).\n2. `payload = snapshot.dump(self.ks)` -- synchronous, toh exact current state.\n3. `writer.write(header + payload)` aur `self.replicas[client.id] = client` -- isi moment ke baad ka har `_propagate` is replica ke liye bhi queue hoga.\n\nKyunki 1-3 ke beech koi `await` nahi, koi doosra client command execute nahi kar sakta. Toh har write ya toh snapshot ke pehle hua (snapshot mein hai, stream mein nahi), ya baad mein (stream mein hai, snapshot mein nahi). Gap bhi nahi, duplicate bhi nahi.\n\nTCP ordering bhi zaroori hai: snapshot bytes pehle `writer.write` hue, stream bytes baad mein same writer pe -- toh replica pehle poora snapshot padhta hai (`readexactly(len)`), phir stream. Replica side pe snapshot load ke baad hi parser stream padhta hai.\n\nCode comment literally kehta hai: \"pending bytes belong to the OLD replicas only\" aur \"consistent: built synchronously\". Yeh concurrency invariant tests mein implicitly verify hota hai (`test_full_sync_then_stream`: before-sync data aur after-sync INCR dono sahi).",
+  "why_needed": "Snapshot + log handoff har replication/CDC system ka sabse tricky hissa hai; yahan galti = silent duplicates ya missing writes.",
+  "real_world_analogy": "Jaise naye accountant ko register ki photocopy do aur usi second se use har nayi entry ka CC lagao -- photocopy se pehle ki pending chitthiyaan purane logon ko hi jaani chahiye.",
+  "how_it_works": "Single-threaded step: flush old pending -> dump -> write snapshot -> register. Atomicity event loop se aati hai, locks se nahi.",
+  "in_this_project": "`server.py::_serve_replica` (pehli 5 lines), `_flush_replication`, `_propagate`. Replica side `replication.py::_sync_once`: `readuntil(b\"\\r\\n\")` header, `readexactly` payload, `snapshot.load`, phir stream loop.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_serve_replica",
+   "projects/02-mini-redis/minidis/server.py::_flush_replication",
+   "projects/02-mini-redis/minidis/replication.py::_sync_once",
+   "projects/02-mini-redis/tests/test_replication.py::test_full_sync_then_stream"
+  ],
+  "code_example": "# real: minidis/server.py::_serve_replica\nclient.is_replica = True\nself._flush_replication()                 # pending bytes belong to the OLD replicas only\npayload = snapshot.dump(self.ks)          # consistent: built synchronously\nwriter.write(b\"$\" + str(len(payload)).encode() + b\"\\r\\n\" + payload)\nself.replicas[client.id] = client          # from now on it receives every propagated write",
+  "code_language": "python",
+  "advantages": [
+   "Exactly-once handoff bina locks",
+   "Simple reasoning: ek loop step"
+  ],
+  "disadvantages": [
+   "Snapshot dump loop ko block karta hai (bade dataset pe pause)",
+   "Payload memory mein poora",
+   "Har replica ke liye alag dump (do replicas ek saath = do dumps)"
+  ],
+  "common_mistakes": [
+   "Pending batch flush karna bhool jana (duplicate apply)",
+   "Replica ko dump se pehle register karna",
+   "dump aur register ke beech await daalna"
+  ],
+  "follow_up_questions": [
+   "Agar dump thread mein karte toh kya toot ta?",
+   "Redis fork ke saath yeh consistency kaise rakhta hai?",
+   "Do replicas ek saath SYNC karein toh?"
+  ],
+  "concepts": [
+   "snapshot handoff",
+   "exactly-once",
+   "replication"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Synchronous dump = trivial consistency, cost = pause. Redis fork + replication buffer: child dump karta hai jabki parent naye writes replica ke output buffer mein jama karta hai -- consistent aur non-blocking, lekin buffer memory badhti hai.",
+   "failure_scenarios": "Bahut bada dataset -> lamba pause -> clients timeout. Replica snapshot padhte waqt disconnect -> agla SYNC naya dump. Master ka output buffer snapshot + stream se 64MB cross kare -> `_check_replica_buffers` disconnect -> full sync loop.",
+   "alternatives": "Fork + COW; diskless replication (Redis `repl-diskless-sync`), shared dump for multiple simultaneous syncs; PSYNC to avoid dumps on reconnect.",
+   "scale_10x_100x": "10x dataset = 10x pause per sync; 10 replicas reconnect after a blip = 10 dumps. Shared dump + PSYNC zaroori.",
+   "production_improvements": "Ek dump multiple waiting replicas ke liye reuse, PSYNC backlog, aur sync duration/size metrics."
+  }
+ },
+ {
+  "id": "MRDS-041",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How does a minidis replica handle the master being down or restarting?",
+  "answer_hinglish": "`ReplicaLink._run` ek infinite loop hai jo `_sync_once()` call karta hai. `_sync_once` connect, SYNC, snapshot load, phir stream padhta rehta hai -- jab tak connection na toote. Koi bhi exception (connection refused, reset, master ne close kiya -> `ConnectionError(\"master closed the connection\")`, ya galat SYNC reply) aaye toh `_run` usse catch karke `replication_link_down` warning log karta hai, state `connecting` set karta hai, `await asyncio.sleep(backoff)` aur `backoff = min(backoff * 2, 2.0)`. Matlab retries 0.1s, 0.2s, 0.4s, 0.8s, 1.6s, phir 2s pe cap. `CancelledError` alag se re-raise hota hai taaki `stop()` kaam kare.\n\nHar successful reconnect = full sync: naya snapshot aata hai aur `snapshot.load` poora dataset replace karta hai (`ks.flush()` pehle). `full_syncs` counter badhta hai. PSYNC nahi hai, toh chhota blip bhi poora dataset transfer karwata hai.\n\nDisconnected rehte hue replica purana data serve karta rehta hai (stale reads), aur `INFO replication` mein `master_link_status:down`.\n\nTest `test_replica_resyncs_after_master_restart`: master band, replica start (retry loop), master same port pe wapas, replica `a` (snapshot se) aur baad ka `b` (stream se) dono pa leta hai.\n\nNote: backoff successful sync ke baad reset nahi hota code mein -- `backoff` variable `_run` ke loop ke bahar initialize hai, toh ek baar 2s pe pahuncha toh agle disconnects pe bhi 2s wait. Minor, lekin interview mein code-level attention dikhata hai.",
+  "why_needed": "Network failures normal hain; replica ko bina operator ke recover karna chahiye, bina master ko hammer kiye.",
+  "real_world_analogy": "Jaise phone call kati toh turant dobara try, phir thoda ruk ke, phir aur ruk ke -- lekin 2 second se zyada kabhi nahi.",
+  "how_it_works": "Retry loop with capped exponential backoff; har attempt full sync; failure ka reason structured log mein.",
+  "in_this_project": "`replication.py::ReplicaLink._run` (backoff 0.1 -> 2.0), `_sync_once`, `state`, `full_syncs`. `server.py::info` replica side `master_link_status`, `full_syncs`. FAILURE_SCENARIOS #9.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/replication.py::_run",
+   "projects/02-mini-redis/minidis/replication.py::_sync_once",
+   "projects/02-mini-redis/tests/test_replication.py::test_replica_resyncs_after_master_restart"
+  ],
+  "code_example": "# real: minidis/replication.py::_run\nbackoff = 0.1\nwhile True:\n    try:\n        await self._sync_once()\n    except asyncio.CancelledError:\n        raise\n    except Exception as exc:\n        log.warning(\"replication_link_down\", extra={\"master\": f\"{self.host}:{self.port}\", \"error\": repr(exc)})\n    self.state = \"connecting\"\n    await asyncio.sleep(backoff)\n    backoff = min(backoff * 2, 2.0)",
+  "code_language": "python",
+  "advantages": [
+   "Automatic recovery",
+   "Master ko retry storm se bachata hai",
+   "Observable via logs aur INFO"
+  ],
+  "disadvantages": [
+   "Har reconnect full sync",
+   "Backoff success ke baad reset nahi hota",
+   "Jitter nahi -- bahut replicas ek saath retry karenge"
+  ],
+  "common_mistakes": [
+   "Bina backoff tight retry loop",
+   "CancelledError ko bhi swallow kar dena (stop kabhi kaam nahi karega)",
+   "Disconnected replica ko reads se hata dena bhool jana"
+  ],
+  "follow_up_questions": [
+   "Jitter kyun add karna chahiye?",
+   "Disconnected replica ko reads serve karne chahiye ya nahi?",
+   "PSYNC isme kaise fit hoga?"
+  ],
+  "concepts": [
+   "retry",
+   "exponential backoff",
+   "replication"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-042",
+  "project_slug": "p02-mini-redis",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "minidis has no PSYNC: every reconnect is a full sync. Design partial resynchronization for it.",
+  "answer_hinglish": "Problem: 1 second ka network blip bhi poora dataset dump + transfer + load karwata hai. Bade dataset pe yeh master pe pause, network pe GBs, aur replica pe downtime. Redis 2.8+ PSYNC se yeh solve karta hai.\n\nDesign:\n1. Replication ID: master startup pe ek random 40-char id banata hai. Offset tabhi meaningful hai jab id same ho -- master restart = naya history = full sync.\n2. Backlog: master ek fixed-size ring buffer (jaise 1MB-100MB) rakhta hai jisme last N bytes of replication stream hain, saath mein `backlog_start_offset`. `_propagate` mein `master_repl_offset += len(data)` ke saath data backlog mein bhi likho -- chahe koi replica connected ho ya nahi.\n3. Handshake: replica `PSYNC <replid> <offset+1>` bhejta hai (pehli baar `PSYNC ? -1`). Master check: replid match aur requested offset backlog range mein hai -> `+CONTINUE` aur backlog se woh bytes bhejo, phir live stream. Warna `+FULLRESYNC <replid> <offset>` + snapshot -- aur replica apna offset us value pe set kare (lag_bytes baseline issue minidis mein abhi master-side `repl_base` se fix hai; replica-side offset PSYNC ke liye phir bhi chahiye).\n4. Replica ko replid + offset yaad rakhna hoga reconnect ke across (memory mein kaafi; restart ke across chahiye toh snapshot mein store).\n5. Failover: Redis 4 PSYNC2 -- promoted replica purani replid ko `replid2` ki tarah rakhta hai, toh doosre replicas naye master se partial sync kar sakein.\n\nminidis code mein hook points already hain: `_handle_client` already `PSYNC` ko `SYNC` ki tarah route karta hai, `master_repl_offset` aur replica `offset` byte-precise hain.",
+  "why_needed": "Production replication ki availability chhote network blips pe full syncs ki wajah se girti hai; PSYNC iska standard fix hai.",
+  "real_world_analogy": "Jaise movie streaming: connection toota toh wahi se resume karo jahan ruki thi, poori movie dobara download nahi -- lekin agar server ne woh hissa cache se hata diya, toh shuru se.",
+  "how_it_works": "Ring buffer keyed by global offset; resume possible iff `backlog_start <= requested_offset <= master_offset` aur replid match.",
+  "in_this_project": "Abhi: `server.py::_handle_client` mein `if name in (b\"SYNC\", b\"PSYNC\")` dono full sync; `replication.py` docstring: \"No partial resync (PSYNC + backlog) here: every reconnect is a full sync. Documented as the main production gap.\" TRADEOFFS #8, SYSTEM_DESIGN scaling path.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_handle_client",
+   "projects/02-mini-redis/minidis/server.py::_propagate",
+   "projects/02-mini-redis/minidis/replication.py",
+   "projects/02-mini-redis/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# illustrative (not in repo): backlog in _propagate\nclass Backlog:\n    def __init__(self, size):\n        self.buf = bytearray(); self.size = size; self.start = 0   # offset of buf[0]\n    def append(self, data, end_offset):\n        self.buf += data\n        if len(self.buf) > self.size:\n            drop = len(self.buf) - self.size\n            del self.buf[:drop]; self.start += drop\n    def since(self, offset):            # None -> needs full resync\n        if offset < self.start or offset > self.start + len(self.buf):\n            return None\n        return bytes(self.buf[offset - self.start:])",
+  "code_language": "python",
+  "advantages": [
+   "Blips pe sirf missing bytes transfer",
+   "Master pe dump pause avoid",
+   "Replica aur master ek hi offset space mein (aaj sirf master-side repl_base se lag sahi hai)"
+  ],
+  "disadvantages": [
+   "Backlog memory (fixed)",
+   "Replid/offset state aur handshake complexity",
+   "Backlog chhota ho toh fir bhi full sync"
+  ],
+  "common_mistakes": [
+   "Replid ke bina sirf offset compare karna (master restart pe galat data)",
+   "Backlog ko sirf replicas connected hone pe bharna",
+   "Failover pe replid continuity bhool jana"
+  ],
+  "follow_up_questions": [
+   "Backlog size kaise choose karoge?",
+   "PSYNC2 failover ke baad kaise kaam karta hai?",
+   "Replica restart ke baad partial sync possible hai?"
+  ],
+  "concepts": [
+   "PSYNC",
+   "backlog",
+   "replication"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Backlog size = memory vs blip tolerance. Size ~ write_bytes_per_sec x max_expected_disconnect_seconds. Bada backlog zyada outages cover karta hai lekin RAM khata hai.",
+   "failure_scenarios": "Disconnect backlog window se lamba -> full sync (graceful fallback). Replid mismatch (master restart) -> full sync. Bug: offset off-by-one -> duplicate ya missing command, silent divergence -- isliye tests mein random disconnects + state compare.",
+   "alternatives": "Log-structured replication (Kafka-style durable log jahan replicas offset se padhein), ya logical replication slots (Postgres) jo master ko WAL retain karne pe majboor karte hain.",
+   "scale_10x_100x": "10x write rate pe same time-window ke liye 10x backlog. 100x replicas pe ek backlog sabke liye share hota hai -- memory per replica nahi badhti.",
+   "production_improvements": "PSYNC + replid2 for failover, backlog size config + `repl_backlog_histlen` INFO, partial vs full sync counters, aur disk-backed backlog for very long outages."
+  }
+ }
+]

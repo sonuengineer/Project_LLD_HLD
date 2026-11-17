@@ -1,0 +1,1013 @@
+[
+ {
+  "id": "PAYS-022",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Walk through idempotency.begin() step by step. How does it decide between 'go ahead', replay, 422 and 409?",
+  "answer_hinglish": "`begin()` ek hi DB transaction mein chalta hai aur do return types deta hai: `None` (go ahead, handler chalao) ya `(status, body)` (replay karo); errors raise hote hain.\n\nStep 1: `request_hash(method, path, body)` = sha256 of `method + \" \" + path + \"\\n\" + raw body bytes`. `until = now + lock_seconds` (default 60s, `idempotency_lock_seconds`).\n\nStep 2: `INSERT INTO idempotency_keys (... state 'in_progress', locked_until) ... ON CONFLICT DO NOTHING RETURNING key`. Agar row insert hui (`inserted` truthy) -> hum pehle hain -> `None` return. Yeh atomic \"claim\" hai: concurrent do requests mein se sirf ek ka insert succeed hoga, kyunki PK `(merchant_id, key)` hai. Doosri request primary key conflict pe pehli ke commit ka wait karti hai (unique index insert lock), phir DO NOTHING.\n\nStep 3: insert nahi hua -> `SELECT * ... FOR UPDATE` -- row lock taaki takeover decision race-free ho.\n\nStep 4: checks order mein: hash mismatch -> `IdempotencyMismatch` 422. State `completed` -> stored `(response_status, response_body)` replay. `locked_until > now` -> `Conflict` 409 with `idempotency_in_progress`. Warna lock expired -> `UPDATE ... SET locked_until = :u` (takeover) aur `None`.\n\nOrder matter karta hai: hash check pehle hai, toh in-progress request ke saath bhi alag body bhejoge toh 422 milega, 409 nahi -- client bug pehle surface hota hai.\n\nBaaki do functions: `complete()` state `completed`, response store, `locked_until = NULL`. `abandon()` row DELETE karta hai sirf jab `state = 'in_progress'` -- taaki client same key se fresh retry kar sake.",
+  "why_needed": "Idempotency layer khud race-free honi chahiye, warna woh jis double execution ko rokne ke liye hai wahi allow kar degi.",
+  "real_world_analogy": "Library mein book issue register: pehle register mein naam likho (claim). Agar naam pehle se hai, toh dekho -- book wapas aa gayi (replay), abhi kisi ke paas hai (wait), ya woh banda gayab hai aur due date nikal gayi (takeover).",
+  "how_it_works": "INSERT ON CONFLICT DO NOTHING RETURNING = atomic claim; FOR UPDATE = serialize decision on existing row; locked_until = lease.",
+  "in_this_project": "`services/idempotency.py::begin`, `complete`, `abandon`; called from `api/routes.py::idempotent`. Lock duration `config.py` `idempotency_lock_seconds: float = 60.0`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/idempotency.py::begin",
+   "projects/09-payments/payments/services/idempotency.py::complete",
+   "projects/09-payments/payments/services/idempotency.py::abandon",
+   "projects/09-payments/payments/config.py"
+  ],
+  "code_example": "# real, payments/services/idempotency.py (trimmed)\ninserted = await s.scalar(text(\n    \"INSERT INTO idempotency_keys (merchant_id, key, request_method, request_path, request_hash, state, locked_until) \"\n    \"VALUES (:m, :k, :me, :p, :h, 'in_progress', :u) ON CONFLICT DO NOTHING RETURNING key\"), {...})\nif inserted:\n    return None\nrow = (await s.execute(text(\"SELECT * FROM idempotency_keys WHERE merchant_id = :m AND key = :k FOR UPDATE\"), ...)).mappings().one()",
+  "code_language": "python",
+  "advantages": [
+   "Claim atomic hai, koi SELECT-then-INSERT race nahi",
+   "Lease-based takeover crash ke baad progress allow karta hai"
+  ],
+  "disadvantages": [
+   "Har idempotent request pe extra 2 transactions (begin + complete)",
+   "Lease time se lambi request ke saath overlap possible"
+  ],
+  "common_mistakes": [
+   "SELECT karke phir INSERT karna -- dono requests 'not found' dekhengi",
+   "abandon mein completed rows bhi delete kar dena"
+  ],
+  "follow_up_questions": [
+   "Lease expire hone par pehli request abhi bhi chal rahi ho toh?",
+   "Hash raw bytes pe kyun, parsed JSON pe kyun nahi?",
+   "Completed keys kab delete hongi?"
+  ],
+  "concepts": [
+   "atomic claim",
+   "INSERT ON CONFLICT",
+   "lease",
+   "FOR UPDATE"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-023",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does the idempotent() route wrapper decide which outcomes to store under the key and which to abandon?",
+  "answer_hinglish": "`routes.idempotent(request, m, key, handler, status)` ek generic wrapper hai jo har mutating endpoint ka handler \"at most once per (merchant, Idempotency-Key)\" chalata hai.\n\nFlow: key validate (required, <= 255 chars). Raw `await request.body()` padho. `idempotency.begin(...)` -- replay mila toh `JSONResponse(payload, status_code=code, headers={\"Idempotent-Replayed\": \"true\"})`. Warna `handler()` chalao.\n\nOutcome rules:\n- Success: result ko `json.loads(json.dumps(result, default=str))` se JSON-safe banao (UUID, datetime ko string), `complete(..., status, payload)` -- store aur return.\n- `AppError` with `status_code < 500` AUR `!= 409`: deterministic client error (422 over-refund, 404 not found) -> error payload store hota hai. Replay pe same error milega -- consistent.\n- `AppError` 409 ya >= 500: `abandon()` -- row delete. 409 transient hai (InvalidTransition race, duplicate_payment, in-progress) -- retry pe alag result aa sakta hai.\n- Koi bhi aur `Exception` (unexpected crash): `abandon()` aur re-raise -- client same key se retry kar sake.\n\nImportant subtlety: payment ka business outcome jaise `declined` ya `requires_reconciliation` exception nahi hai -- woh normal 201 response hai jo store hota hai. Matlab same key se retry karoge toh `requires_reconciliation` hi replay hoga, chahe recovery ne baad mein resolve kar diya ho. Fresh status ke liye client ko `GET /payments/{id}` karna chahiye. Yeh Stripe jaisa hi behaviour hai: idempotency key \"response\" replay karti hai, \"current state\" nahi.\n\nAur agar process `handler()` ke beech hard-crash ho (kill -9), na complete na abandon chalega; row `in_progress` reh jaayegi jab tak lease (60s) expire na ho -- tab tak 409.",
+  "why_needed": "Kya store karna hai yeh galat hua toh ya toh client permanent error mein phans jaata hai (5xx stored) ya non-deterministic replays milte hain.",
+  "real_world_analogy": "Courier office: 'address galat hai' rejection slip file mein lag jaati hai (dobara aao toh wahi slip). 'Server down hai' pe slip nahi banti -- baad mein aao, dobara try hoga.",
+  "how_it_works": "begin -> handler -> complete/abandon based on exception type and status code; replay header for stored responses.",
+  "in_this_project": "`api/routes.py::idempotent`; `TRADEOFFS.md` #7 'Store 4xx, not 5xx, under an idempotency key'. Note docstring of idempotency.py 409 ka exception mention nahi karta; wrapper code mein `exc.status_code != 409` hai.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::idempotent",
+   "projects/09-payments/payments/services/idempotency.py",
+   "projects/09-payments/TRADEOFFS.md"
+  ],
+  "code_example": "# real, payments/api/routes.py\ntry:\n    result = await handler()\nexcept AppError as exc:\n    if exc.status_code < 500 and exc.status_code != 409:\n        payload = {\"error\": {\"code\": exc.code, \"message\": exc.message, \"details\": exc.details}}\n        await idempotency.complete(sm, m[\"id\"], key, exc.status_code, payload)\n    else:\n        await idempotency.abandon(sm, m[\"id\"], key)\n    raise\nexcept Exception:\n    await idempotency.abandon(sm, m[\"id\"], key)\n    raise",
+  "code_language": "python",
+  "advantages": [
+   "Generic -- har endpoint ek line mein idempotent",
+   "Deterministic errors consistent replay"
+  ],
+  "disadvantages": [
+   "Stored response stale ho sakta hai (requires_reconciliation replay)",
+   "Hard crash pe lease tak 409"
+  ],
+  "common_mistakes": [
+   "5xx ko store karna",
+   "Replay ko current state samajhna"
+  ],
+  "follow_up_questions": [
+   "409 ko kyun store nahi karte?",
+   "Stale replay client kaise handle kare?",
+   "Crash ke baad 60s 409 se bachne ka tareeka?"
+  ],
+  "concepts": [
+   "idempotency wrapper",
+   "error classification",
+   "replay semantics"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Response replay vs state replay: response replay simple aur Stripe-compatible hai, par client ko fresh state ke liye alag GET karna padta hai. State replay (har baar current payment lautana) zyada useful lagta hai par 'same request same response' guarantee tod deta hai.",
+   "failure_scenarios": "Agar complete() khud fail ho (DB blip) toh handler ka kaam ho chuka hai par key in_progress -- lease ke baad retry handler ko dobara chalayega; neeche ke layers (partial unique index, CAS, provider keys) double effect rokte hain par client ko 409 duplicate_payment mil sakta hai original response ke bajaye.",
+   "alternatives": "Middleware level idempotency (har POST pe automatic), ya idempotency ko business transaction ke andar same DB tx mein store karna (atomic with effects) -- yeh tab possible hai jab handler mein network call na ho.",
+   "scale_10x_100x": "Har request pe 2 extra transactions; 100x pe idempotency_keys table bahut badi -- TTL cleanup aur partitioning by created_at chahiye.",
+   "production_improvements": "complete() ko retry with backoff, crash-safe 'recovery point' (Stripe ka atomic phases approach), aur replay response mein current status link."
+  }
+ },
+ {
+  "id": "PAYS-024",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does state.transition() write the audit trail, and what guarantees does payment_events give?",
+  "answer_hinglish": "`transition()` har status change ka single entry point hai. Woh caller ke transaction ke andar do kaam karta hai: payments row ka CAS UPDATE, aur `payment_events` mein ek row: `(payment_id, from_status, to_status, reason, data jsonb)`.\n\n`from_status` RETURNING subquery `_old` se aata hai, `to_status` target, `reason` human-readable (\"capture requested\", \"issuer declined\", \"authorized (found by recovery)\", \"capture confirmed by webhook\"), aur `data` context (amount, fee, decline_code, error, provider_id). Same transaction hone ki wajah se: agar status badla toh event zaroor hai; rollback hua toh dono gaye. Status aur history kabhi disagree nahi kar sakte.\n\nGuarantees: (1) Complete timeline -- `GET /payments/{id}` events `ORDER BY id` return karta hai. Test asserts `[\"authorizing\", \"authorized\", \"capturing\", \"captured\"]`. (2) Recovery ke liye intent data -- `_last_intent()` last `authorizing/capturing/voiding` event ka `data.amount` padhta hai. (3) Debugging -- `last_error` sirf latest error rakhta hai, events poori history.\n\nAppend-only kaise? Pehle sirf convention tha -- code kabhi UPDATE/DELETE nahi karta tha, par DB trigger sirf `ledger_entries` pe tha. Code review mein yeh gap pakda gaya (audit trail jo sirf convention se immutable hai, woh audit trail nahi). Fix: migration `0002_ledger_currency_and_audit.py` ne `payment_events_no_update` trigger (BEFORE UPDATE OR DELETE -> `payment_events_immutable()` -> RAISE 'payment_events is append-only') add kiya. Regression test `test_ledger_rejects_transaction_that_balances_only_across_currencies` ke end mein ek UPDATE try karta hai aur 'append-only' error expect karta hai. Ab ledger aur events dono DB-enforced immutable hain.\n\nIndex `ix_payment_events_payment (payment_id, id)` timeline query aur `_last_intent` (ORDER BY id DESC LIMIT 1) dono ko fast karta hai.",
+  "why_needed": "Payments mein 'yeh status kaise aaya' har dispute, support ticket aur audit ka pehla sawaal hai.",
+  "real_world_analogy": "Hospital patient chart: har dawa, har test time aur reason ke saath likha jaata hai. Current condition chart ka summary hai, chart kabhi mitaya nahi jaata.",
+  "how_it_works": "UPDATE payments ... RETURNING _old; INSERT payment_events (from=_old, to, reason, data) -- same tx.",
+  "in_this_project": "`state.py::transition`; migration 0001 `payment_events` table + `ix_payment_events_payment`; migration 0002 append-only trigger `payment_events_no_update`; route `get_payment` events list; `recovery.py::_last_intent`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/state.py::transition",
+   "projects/09-payments/payments/services/recovery.py::_last_intent",
+   "projects/09-payments/payments/api/routes.py::get_payment",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/migrations/versions/0002_ledger_currency_and_audit.py",
+   "projects/09-payments/tests/test_review_fixes.py::test_ledger_rejects_transaction_that_balances_only_across_currencies"
+  ],
+  "code_example": "# real, payments/services/state.py\nawait s.execute(text(\"INSERT INTO payment_events (payment_id, from_status, to_status, reason, data) \"\n                     \"VALUES (:p, :f, :t, :r, CAST(:d AS jsonb))\"),\n                {\"p\": payment_id, \"f\": row[\"_old\"], \"t\": to, \"r\": reason, \"d\": json.dumps(data or {}, default=str)})",
+  "code_language": "python",
+  "advantages": [
+   "Atomic history",
+   "Recovery aur debugging dono ke liye data"
+  ],
+  "disadvantages": [
+   "Har transition pe extra insert",
+   "Events table fast grow karti hai"
+  ],
+  "common_mistakes": [
+   "Events ko async (queue) se likhna -- status aur history drift",
+   "Audit table ko sirf convention se append-only chhodna (yahan review ke baad trigger add hua)"
+  ],
+  "follow_up_questions": [
+   "Trigger hone ke baad bhi kaun events badal sakta hai (superuser, DISABLE TRIGGER)?",
+   "Events se payment state rebuild kar sakte ho (event sourcing)?",
+   "Events table partition kaise karoge?"
+  ],
+  "concepts": [
+   "audit trail",
+   "append-only",
+   "event log",
+   "atomic history"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-025",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Explain HttpProvider._call: deadline, retries, backoff and error classification.",
+  "answer_hinglish": "`_call(method, path, idem=None, **kw)` provider ke saath saari HTTP baatcheet ka single choke point hai.\n\nDeadline: `asyncio.wait_for(self.http.request(...), self.timeout)`. httpx timeouts per-phase hote hain (connect, read, write) -- ek slow-dripping response har phase ke andar rehke total mein bahut lamba ho sakta hai. `wait_for` poore attempt pe overall deadline lagata hai. Comment kehta hai yeh in-process ASGI transports (tests) ke liye bhi enforce hota hai. Default `provider_timeout_seconds = 1.0`.\n\nClassification: `httpx.TimeoutException` ya `asyncio.TimeoutError` -> `ProviderTimeout`. `httpx.TransportError` (connection refused/reset) -> `ProviderUnavailable`. Status < 300 -> success JSON. >= 500 ya 429 -> `ProviderUnavailable` (429 rate limit ka matlab provider ne request process hi nahi ki -- retryable; pehle 429 4xx ki tarah rejection maana jaata tha aur payment `failed` ho jaata, review fix ke baad FAILURE_SCENARIOS #23). Baaki 4xx -> `ProviderRejected(status, detail)` turant raise -- retry nahi, kyunki 4xx deterministic hai (402 capture declined, 409 not voidable, 422 exceeds).\n\nRetry: `retries=2` default, matlab total 3 attempts. Retry sirf tab jab `idem` diya ho ya method GET ho -- comment: \"Retrying is only safe because every mutating call carries an idempotency key.\" Backoff exponential: `0.05 * 2**attempt` -> 50ms, 100ms. Sab attempts fail -> last error raise (Timeout ya Unavailable), jo `payments.py` mein `AMBIGUOUS` ke roop mein pakda jaata hai.\n\nWorst-case latency: 3 x 1s + 0.15s = ~3.15s per provider call. Note: jitter nahi hai; production mein thundering herd ke liye add karna chahiye. Aur `Authorization: Bearer {api_key}` client-level header hai.",
+  "why_needed": "Provider client hi decide karta hai kya 'definite' hai aur kya 'ambiguous' -- yeh classification galat hui toh poora money-safety model toot jaata hai.",
+  "real_world_analogy": "Kisi ko phone kiya: 'number not exist' (4xx -- dobara mat karo), 'network busy' (5xx -- thodi der mein dobara), ring hota raha aur kat gaya (timeout -- pata nahi usne suna ya nahi).",
+  "how_it_works": "Loop over attempts; try request with overall deadline; classify; 4xx raise immediately; 5xx/timeout/transport store as `last`; retry if idempotent; else raise last.",
+  "in_this_project": "`provider.py::HttpProvider._call`. Tests mein `system(timeout=0.3, retries=2)` aur slow tests mein `timeout=0.2`, `retries=0`. `test_provider_flaky_500_is_retried_safely` 500 ke baad retry se captured.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/provider.py::HttpProvider",
+   "projects/09-payments/payments/services/provider.py::ProviderRejected",
+   "projects/09-payments/payments/services/provider.py::ProviderUnavailable",
+   "projects/09-payments/tests/conftest.py::system"
+  ],
+  "code_example": "# real, payments/services/provider.py (trimmed)\ntry:\n    r = await asyncio.wait_for(self.http.request(method, path, headers=headers, **kw), self.timeout)\nexcept (httpx.TimeoutException, asyncio.TimeoutError):\n    last = ProviderTimeout(f\"{method} {path} timed out\")\nexcept httpx.TransportError as exc:\n    last = ProviderUnavailable(f\"{method} {path}: {exc}\")\nelse:\n    if r.status_code < 300:\n        return r.json()\n    if r.status_code >= 500 or r.status_code == 429:   # 429: not processed -> retryable\n        last = ProviderUnavailable(...)\n    else:\n        raise ProviderRejected(r.status_code, r.json().get(\"detail\", r.text))\nif attempt < self.retries and (idem or method == \"GET\"):\n    await asyncio.sleep(0.05 * (2 ** attempt))\n    continue\nraise last",
+  "code_language": "python",
+  "advantages": [
+   "Ek jagah pe saari retry/timeout policy",
+   "Ambiguous vs definite clearly typed"
+  ],
+  "disadvantages": [
+   "No jitter, no circuit breaker",
+   "Worst case ~3s request latency user ko"
+  ],
+  "common_mistakes": [
+   "4xx pe retry karna",
+   "Mutating call bina idempotency key ke retry karna",
+   "Sirf httpx per-phase timeouts pe bharosa karna"
+  ],
+  "follow_up_questions": [
+   "Circuit breaker kahan lagaoge?",
+   "Retry budget kya hona chahiye?",
+   "429 ko retryable classify kiya -- Retry-After header honor karoge?"
+  ],
+  "concepts": [
+   "retry with backoff",
+   "deadline",
+   "error taxonomy",
+   "timeouts"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Zyada retries = zyada cases synchronously resolve, par user latency aur provider load badhta hai. Kam retries = zyada requires_reconciliation. Yahan 2 retries ek balanced default hai.",
+   "failure_scenarios": "Provider outage mein har request 3x hit karti hai -- retry storm. 429 pehle ProviderRejected (4xx) tha, toh rate limit pe payment `failed` ho jaata jabki 429 actually 'retry later' hai; review ke baad 429 `ProviderUnavailable` (retryable) hai. Par Retry-After abhi honor nahi hota aur backoff 50/100ms hai -- rate limit ke time yeh provider ko aur dabata hai.",
+   "alternatives": "Hedged requests (risky for payments), retry only in recovery worker (sync path fail-fast), ya provider SDK ka built-in retry.",
+   "scale_10x_100x": "10x traffic pe provider outage ke time retries load ko 3x karte hain; per-provider circuit breaker aur token-bucket retry budget zaroori. Connection pool size bhi tune karna padega.",
+   "production_improvements": "Jitter add karo (full jitter), circuit breaker per provider/endpoint, 429 pe Retry-After honor karo (classification fix ho chuka, delay abhi fixed hai), metrics: attempts, classification counts, latency histograms."
+  }
+ },
+ {
+  "id": "PAYS-026",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Trace create_payment end to end, including the duplicate-order path.",
+  "answer_hinglish": "`create_payment(sm, provider, merchant, amount, currency, payment_method, merchant_reference, capture, description)`:\n\n1. Currency upper-case karo, `SUPPORTED_CURRENCIES` mein nahi toh 422.\n2. `pid = payment_id or uuid.uuid4()` -- id hum khud banate hain taaki provider call se pehle hi deterministic key `auth-{pid}` ban sake. Route `payment_id = id_for(merchant_id, Idempotency-Key, \"payment\")` pass karta hai (uuid5) -- review fix: pehle har attempt pe uuid4 tha, toh crash ke baad lock takeover naya payment banata tha. Ab agar is id ka row pehle se hai (takeover), toh `authorizing` hone pe same `auth-{pid}` se `_authorize` resume hota hai, warna existing payment as-is return.\n3. Transaction A: `INSERT INTO payments (... status 'created')` aur turant `transition(created -> authorizing, \"authorization requested\")`. Commit. Ab intent durable hai.\n4. Duplicate path: agar insert `IntegrityError` deta hai (partial unique index `uq_payment_reference_live` -- same merchant + reference ka live payment pehle se hai), toh existing live payment ka id dhoondo aur `DuplicatePayment` 409 raise with `details.payment_id`. Message: \"would be a double charge\".\n5. Provider call (no transaction): `provider.authorize(amount, currency, token, reference=str(pid), idem=f\"auth-{pid}\")`. Reference = payment id -- yahi recovery mein `find_by_reference` ka handle hai.\n6. Outcomes: AMBIGUOUS -> `requires_reconciliation` + `last_error`. `ProviderRejected` -> `failed`. Response `declined` -> `declined` with `decline_code` aur `provider_payment_id`. Warna `authorized` with `amount_authorized` aur `provider_payment_id`.\n7. `capture=True` toh `capture_payment(sm, provider, merchant, pid, None)` -- full authorized amount.\n\nEk detail: decline ek business outcome hai, exception nahi -- 201 ke saath `status: declined` aata hai, aur idempotency key ke under store hota hai. Aur decline ke baad same reference se naya attempt (nayi key) allowed hai kyunki `declined` index ke WHERE se bahar hai -- `test_declines_and_retry_after_decline`.",
+  "why_needed": "Yeh project ka sabse important path hai; har line kisi failure mode ko address karti hai.",
+  "real_world_analogy": "Order form pe pehle 'processing' stamp, phir bank ko call, phir 'approved/declined' stamp. Same order ka doosra form aaya toh counter pe hi 'pehle se processing hai' bol diya.",
+  "how_it_works": "Derived id -> existing row? resume (authorizing) or return it -> else insert + intent in tx -> provider call outside tx (`_authorize`) -> CAS to outcome in tx -> optional capture.",
+  "in_this_project": "`services/payments.py::create_payment` aur `DuplicatePayment`; tests `test_duplicate_order_payment_blocked` (k2 key, same order-1 -> 409 duplicate_payment), `test_declines_and_retry_after_decline`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/payments.py::create_payment",
+   "projects/09-payments/payments/services/payments.py::DuplicatePayment",
+   "projects/09-payments/tests/test_payments.py::test_declines_and_retry_after_decline",
+   "projects/09-payments/tests/test_payments.py::test_duplicate_order_payment_blocked",
+   "projects/09-payments/payments/services/payments.py::id_for"
+  ],
+  "code_example": "# real, payments/services/payments.py (trimmed)\nexcept IntegrityError:\n    async with sm() as s:\n        existing = await s.scalar(text(\"SELECT id FROM payments WHERE merchant_id = :m AND merchant_reference = :r \"\n                                       \"AND status NOT IN ('declined', 'failed', 'voided')\"), {...})\n    raise DuplicatePayment(\"a live payment already exists for this merchant_reference (would be a double charge)\",\n                           details={\"payment_id\": str(existing)}) from None",
+  "code_language": "python",
+  "advantages": [
+   "Intent provider call se pehle durable",
+   "Duplicate order DB-level blocked"
+  ],
+  "disadvantages": [
+   "4 transactions + provider calls per payment",
+   "IntegrityError broad hai -- koi aur constraint bhi DuplicatePayment ban jaayega"
+  ],
+  "common_mistakes": [
+   "Provider se id aane ke baad hi payment row banana -- crash pe trace nahi",
+   "Decline ko exception bana dena"
+  ],
+  "follow_up_questions": [
+   "pid Idempotency-Key se uuid5 se kyun derive kiya, DB default kyun nahi?",
+   "IntegrityError ko narrow kaise karoge?",
+   "Decline ke baad retry kyun allowed hai?"
+  ],
+  "concepts": [
+   "payment creation",
+   "duplicate prevention",
+   "intent first"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-027",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Explain capture_payment, including how it coexists with a webhook that may finalize the capture first.",
+  "answer_hinglish": "`capture_payment(sm, provider, merchant, payment_id, amount)` teen phases mein:\n\nPhase 1 (tx): `get_payment` merchant-scoped (dusre merchant ka payment 404). `amount = amount or amount_authorized`. Agar status `authorized` hai toh `0 < amount <= amount_authorized` check (422). Phir CAS `authorized -> capturing` with `{\"amount\": amount}` event data. Agar status authorized nahi (already capturing/captured) toh CAS fail -> `InvalidTransition` 409.\n\nPhase 2 (no tx): `provider.capture(provider_payment_id, amount, idem=f\"capture-{payment_id}\")`.\n- AMBIGUOUS -> `capturing -> requires_reconciliation`.\n- `ProviderRejected` (jaise tok_capture_fails ka 402) -> `capturing -> authorized` with `last_error` -- payment wapas safe state mein, merchant baad mein retry ya void kar sake. `test_capture_rejected_keeps_payment_authorized`: status authorized, `\"402\" in last_error`, balances `{}`.\n\nPhase 3 (tx): yahan race hai. Provider capture karte hi `authorization.captured` webhook async bhejta hai. Webhook humare API response se PEHLE process ho sakta hai aur `finalize_capture` kar chuka ho sakta hai. Isliye code pehle current status padhta hai: `captured` hai toh bas current return (no-op). Warna `finalize_capture(... expected={\"capturing\", \"requires_reconciliation\"})` -- CAS + fee + ledger.\n\nAgar dono exactly ek saath finalize karein? Dono ka CAS same row pe hai; ek jeetega, doosre ka CAS 0 rows -> `InvalidTransition`. Aur ledger `idempotency_ref = capture:{payment_id}` UNIQUE hai -- double booking impossible. Webhook path `FOR UPDATE OF p` lock bhi leta hai.\n\nHonest gap: phase 3 ka read-then-finalize lock-free hai; webhook ke saath exact tie pe API caller 409 dekh sakta hai jabki capture successful hai. Correctness (money) safe hai, UX edge case hai.",
+  "why_needed": "Do independent paths (sync response aur async webhook) same state change karte hain; dono ko idempotent aur race-safe hona zaroori hai.",
+  "real_world_analogy": "Aapne courier ko call kiya 'delivered hua?', usi waqt SMS aa gaya 'delivered'. Dono sources ek hi baat keh rahe hain; register mein ek hi baar entry honi chahiye.",
+  "how_it_works": "CAS to capturing -> provider call -> re-read -> if captured return else finalize (CAS + ledger with unique ref).",
+  "in_this_project": "`payments.py::capture_payment`, `finalize_capture`; comment 'A provider webhook may already have finalised it'. `webhooks.py::handle` authorization.captured branch.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/payments.py::capture_payment",
+   "projects/09-payments/payments/services/payments.py::finalize_capture",
+   "projects/09-payments/payments/services/webhooks.py::handle",
+   "projects/09-payments/tests/test_payments.py::test_capture_rejected_keeps_payment_authorized"
+  ],
+  "code_example": "# real, payments/services/payments.py\nasync with sm() as s, s.begin():\n    # A provider webhook may already have finalised it\n    current = await get_payment(s, payment_id)\n    if current[\"status\"] == \"captured\":\n        return current\n    return await finalize_capture(s, current, amount, merchant, {\"capturing\", \"requires_reconciliation\"}, \"capture confirmed\")",
+  "code_language": "python",
+  "advantages": [
+   "Webhook/API order-independent",
+   "Rejected capture safe state pe lautata hai"
+  ],
+  "disadvantages": [
+   "Exact tie pe API caller ko 409 mil sakta hai",
+   "Single capture per authorization"
+  ],
+  "common_mistakes": [
+   "Webhook aur API dono mein ledger book karna bina unique ref",
+   "Capture rejection pe payment ko failed kar dena (authorization abhi valid hai)"
+  ],
+  "follow_up_questions": [
+   "Phase 3 mein FOR UPDATE kyun nahi liya?",
+   "Partial capture ke baad remainder ka kya?",
+   "Webhook amount aur API amount alag ho toh?"
+  ],
+  "concepts": [
+   "capture",
+   "webhook race",
+   "idempotent finalize",
+   "CAS"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Re-read + CAS lock-free aur simple hai; FOR UPDATE se tie case bhi clean hota (second finalizer status 'captured' dekh ke return karta) par lock hold time thoda badhta. Money correctness dono mein same hai.",
+   "failure_scenarios": "Webhook ka amount (`d['captured']`) provider se aata hai aur API path ka amount humara requested amount -- normally same; mismatch hua toh jo pehle finalize kare uska amount book hoga aur reconciliation amount_mismatch pakdega.",
+   "alternatives": "Capture ko sirf webhook se finalize karna (API sirf 'capturing' lautaye) -- simpler state ownership, par sync UX kharab. Ya API path ko hi single writer banana aur webhook sirf recovery trigger kare.",
+   "scale_10x_100x": "High volume pe webhooks aur API responses ka overlap common hoga; 409 noise metrics mein dikhega -- FOR UPDATE ya 'captured return current' path dono jagah use karna chahiye.",
+   "production_improvements": "Phase 3 mein `SELECT ... FOR UPDATE` add karna, multiple captures ke liye capture table (capture_id based keys), aur webhook vs API finalize source ko metrics mein tag karna."
+  }
+ },
+ {
+  "id": "PAYS-028",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does the recovery worker decide what to do with a stuck payment?",
+  "answer_hinglish": "`run_recovery(sm, provider, stuck_after_seconds)` do loops chalata hai: payments aur refunds.\n\nPayments selection: `status IN ('authorizing','capturing','voiding','requires_reconciliation') AND updated_at < now() - stuck_after` (merchant fee settings join ke saath). Index `ix_payments_status_updated (status, updated_at)` isi query ke liye hai.\n\nPhase detection: `requires_reconciliation` khud nahi batata ki kis step pe ambiguity thi. Isliye `_last_intent()` `payment_events` se last event padhta hai jiska `to_status IN ('authorizing','capturing','voiding')` -- woh \"phase\" hai, aur uska `data` (jaise capture amount).\n\nPhase `authorizing`: `provider.find_by_reference(str(payment_id))` (GET, safe retry) -> `_adopt_authorization`. Kuch nahi mila -> `failed` (\"request never arrived\"). declined -> declined. voided -> voided. Warna -> `authorized` with provider id aur amount; aur agar provider pe `captured` hai toh `authorized -> capturing -> captured` + ledger, sab ek transaction mein.\n\nPhase `capturing`: same key `capture-{id}` se capture retry. Provider ya toh ab capture karega ya stored response replay karega -- \"never twice\". Phir `finalize_capture`. `ProviderRejected` -> wapas `authorized`.\n\nPhase `voiding`: same key `void-{id}` se retry -> voided, ya reject -> authorized.\n\nRefunds: `refunds.status IN ('pending','requires_reconciliation')` aur purane -> `refund-{id}` key se retry -> `finalize_refund`; reject -> refund `failed`.\n\nError handling per item: AMBIGUOUS -> `still_unknown += 1` (next run). Koi aur exception -> `log.exception(\"recovery_failed\")` aur continue -- ek kharab payment poora batch nahi rokta. Return `{\"resolved\", \"still_unknown\", \"refunds_resolved\"}`.",
+  "why_needed": "Crash/timeout ke baad in-flight payments ko automatically sahi final state pe laana -- bina human ke.",
+  "real_world_analogy": "Hospital ka night nurse: har bed ka chart dekhta hai, last instruction kya thi ('injection dena hai'), aur use complete karta hai -- jo pehle ho chuka uska record dekh ke dobara nahi deta.",
+  "how_it_works": "Select stuck -> last intent from events -> authorizing: lookup by reference; capturing/voiding/refund: retry same key -> finalize via CAS.",
+  "in_this_project": "`recovery.py::run_recovery`, `_adopt_authorization`, `_last_intent`; `worker.py` har 15s; admin `POST /admin/recovery/run?stuck_after_seconds=`. Tests: `test_payment_unknown_to_provider_is_failed_by_recovery`, `test_crash_mid_capture_is_completed_by_recovery_exactly_once`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/payments/services/recovery.py::_adopt_authorization",
+   "projects/09-payments/payments/worker.py",
+   "projects/09-payments/tests/test_failures.py::test_payment_unknown_to_provider_is_failed_by_recovery",
+   "projects/09-payments/tests/test_failures.py::test_crash_mid_capture_is_completed_by_recovery_exactly_once"
+  ],
+  "code_example": "# real, payments/services/recovery.py (trimmed)\nphase = intent[\"to_status\"] if intent else \"authorizing\"\nif phase == \"authorizing\":\n    found = await provider.find_by_reference(str(p[\"id\"]))\n    await _adopt_authorization(sm, p, found, merchant)\nelif phase == \"capturing\":\n    amount = (intent[\"data\"] or {}).get(\"amount\") or p[\"amount_authorized\"]\n    await provider.capture(p[\"provider_payment_id\"], amount, idem=f\"capture-{p['id']}\")\n    ...",
+  "code_language": "python",
+  "advantages": [
+   "Phase-aware, idempotent resolution",
+   "Ek item ki failure isolated"
+  ],
+  "disadvantages": [
+   "No SKIP LOCKED -- multiple workers same rows uthayenge",
+   "Sequential processing, ek-ek provider call"
+  ],
+  "common_mistakes": [
+   "Authorizing phase mein retry authorize karna nayi key se",
+   "Not-found ko turant failed maanna jab request abhi in-flight ho sakti hai (isliye stuck_after threshold)"
+  ],
+  "follow_up_questions": [
+   "stuck_after_seconds bahut chhota ho toh kya risk?",
+   "Do workers parallel chalein toh?",
+   "Refund reject hone pe customer ko kaise batayenge?"
+  ],
+  "concepts": [
+   "recovery worker",
+   "phase detection",
+   "lookup by reference",
+   "retry same key"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lookup-by-reference (authorize) vs retry-same-key (capture/void/refund): authorize ke liye lookup isliye ki 'nahi mila -> failed' safe conclusion deta hai; retry karna bhi kaam karta par provider pe late-arriving original request ke saath race ho sakti hai.",
+   "failure_scenarios": "Agar stuck_after bahut chhota hai toh recovery ek abhi-chal-rahi request ko 'not found -> failed' kar sakti hai, aur phir original authorize provider pe succeed ho -- charged but failed. Threshold > max request duration (3 attempts x timeout) hona chahiye. Provider key retention window ke baad retry double effect de sakta hai.",
+   "alternatives": "Event-driven recovery (delayed message per intent), ya provider status polling via GET /authorizations/{id} for capture phase bhi (mock mein endpoint hai).",
+   "scale_10x_100x": "10x: `FOR UPDATE SKIP LOCKED LIMIT N` batches, multiple workers, concurrency limit on provider calls, aur backoff per payment (attempt count column) taaki permanently broken items har 15s hit na hon.",
+   "production_improvements": "Attempt counter + max attempts -> manual review queue, metrics (resolved/still_unknown gauges), alert on age, aur recovery actions ko events mein tag karna (already done via reason strings)."
+  }
+ },
+ {
+  "id": "PAYS-029",
+  "project_slug": "p09-payments",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does webhooks.handle() deduplicate and apply provider events safely?",
+  "answer_hinglish": "`handle(sm, evt)` do kaam karta hai: dedupe, phir idempotent apply.\n\nDedupe: pehle transaction mein `INSERT INTO provider_events (id, type, payload, outcome) VALUES (..., 'received') ON CONFLICT (id) DO NOTHING RETURNING id` -- `id` provider ka event id (`pevt_...`) aur table ka PRIMARY KEY. Insert nahi hua toh pichhli delivery ka `outcome` padho: agar woh 'received' ke alawa kuch hai (applied/ignored/noop...) toh pichhli delivery poori ho chuki -> `\"duplicate\"`. Agar abhi bhi 'received' hai, matlab pichhli delivery record hui par apply se pehle crash/fail ho gayi -> dobara apply karo.\n\nApply:\n- `authorization.captured`: `SELECT p.*, m.fee_bps, m.fee_fixed ... WHERE p.provider_payment_id = :i FOR UPDATE OF p` -- payment row lock (merchants row nahi). Payment nahi mila -> outcome `unknown_payment` (\"reconciliation will surface it\"). Status `capturing` ya `requires_reconciliation` -> `finalize_capture(...)` with webhook ka `captured` amount -> `applied`. Warna (already captured, ya kuch aur) -> `noop_status_{status}`.\n- `refund.succeeded` with `reference` (humara refund id, provider echo karta hai): `finalize_refund(sm, reference, provider_refund_id)` -> `applied`. `finalize_refund` khud idempotent hai (already succeeded -> return).\n- Baaki types -> `ignored`.\n\nEnd mein `provider_events.outcome` update -- ops ke liye visibility.\n\nOut-of-order/early arrival: webhook API response se pehle aaye toh finalize karta hai; baad mein aaye toh no-op. Do baar aaye toh duplicate. Kisi bhi order mein final state same.\n\nReview story: pehle koi bhi doosri delivery seedha `duplicate` thi. Dedupe row apply se pehle commit hoti thi, toh agar apply crash/fail hua, provider ka retry `duplicate` ban jaata aur event lost (sirf recovery/reconciliation bachate). Fix: outcome ko 'done' marker ki tarah use kiya -- 'received' wala event redelivery pe re-apply hota hai; yeh safe hai kyunki har handler idempotent CAS hai. Regression test: `test_webhook_whose_first_apply_failed_is_applied_on_redelivery` ('received' row pehle se, delivery -> applied, phir -> duplicate, ek hi capture posting). Bacha hua limit: agar provider kabhi redeliver hi na kare toh 'received' event ko koi background inbox processor nahi uthata.",
+  "why_needed": "Webhooks at-least-once deliver hote hain, kisi bhi order mein; bina dedupe + idempotent apply ke double booking ya stale overwrite hoga.",
+  "real_world_analogy": "Post office ka registered letter: har letter ka number register mein. Same number dobara aaye toh 'already received'. Letter ka content (capture ho gaya) apply karne se pehle check: kya yeh pehle se file mein hai?",
+  "how_it_works": "PK-based dedupe via savepoint insert; per-type handler using FOR UPDATE + CAS finalize; outcome recorded.",
+  "in_this_project": "`webhooks.py::handle`; test `test_webhooks_are_verified_deduplicated_and_can_finalize_capture` -- capture webhook finalize karta hai, same event dobara bhejne pe `outcome == duplicate`, aur sirf 1 capture ledger transaction; `test_webhook_whose_first_apply_failed_is_applied_on_redelivery` -- failed apply ke baad redelivery apply hoti hai.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/webhooks.py::handle",
+   "projects/09-payments/payments/services/payments.py::finalize_refund",
+   "projects/09-payments/tests/test_failures.py::test_webhooks_are_verified_deduplicated_and_can_finalize_capture",
+   "projects/09-payments/tests/test_review_fixes.py::test_webhook_whose_first_apply_failed_is_applied_on_redelivery"
+  ],
+  "code_example": "# real, payments/services/webhooks.py (trimmed)\nasync with sm() as s, s.begin():\n    inserted = await s.scalar(text(\n        \"INSERT INTO provider_events (id, type, payload, outcome) VALUES (:i, :t, CAST(:p AS jsonb), 'received') \"\n        \"ON CONFLICT (id) DO NOTHING RETURNING id\"), {...})\n    if inserted is None:\n        prev = await s.scalar(text(\"SELECT outcome FROM provider_events WHERE id = :i\"), {\"i\": evt[\"id\"]})\n        if prev != \"received\":\n            return \"duplicate\"      # 'received' = earlier apply never finished -> apply again (handlers are CAS)",
+  "code_language": "python",
+  "advantages": [
+   "Order-independent, duplicate-safe",
+   "Outcome column se ops visibility"
+  ],
+  "disadvantages": [
+   "'received' event sirf provider redelivery pe re-apply hota hai -- koi internal inbox processor nahi",
+   "Sirf do event types handled"
+  ],
+  "common_mistakes": [
+   "Webhook ko blindly status set karne dena (captured -> capturing overwrite)",
+   "Dedupe na karna kyunki 'handler idempotent hai' -- outcome tracking bhi chahiye"
+  ],
+  "follow_up_questions": [
+   "'received' outcome ko 'done' marker banana kyun safe hai (handlers CAS kyun hone chahiye)?",
+   "unknown_payment events ka kya karoge?",
+   "Webhook amount pe bharosa karna chahiye?"
+  ],
+  "concepts": [
+   "webhook dedupe",
+   "at-least-once delivery",
+   "idempotent consumer",
+   "savepoint"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Separate dedupe tx simple hai aur concurrent duplicate deliveries ko jaldi rokta hai; 'received' -> re-apply rule usse 'recorded but not applied' window ko recoverable banata hai, bas handlers ka idempotent hona zaroori hai. Single tx (insert event + apply + outcome) atomic hai par lambi transaction aur FOR UPDATE ke saath.",
+   "failure_scenarios": "Handler exception (jaise finalize_refund NotFound) -> 500 provider ko; event 'received' rehta hai aur provider ka retry use dobara apply karta hai (pehle yeh 'duplicate' ban ke lost hota tha -- review fix). Do concurrent deliveries dono 'received' dekh ke apply kar sakti hain -- CAS + unique ledger ref ek hi effect dete hain. Webhook secret leak -> forged events (HMAC protects only if secret safe).",
+   "alternatives": "Inbox pattern: event insert with status 'received', background processor jo received events ko apply kare aur 'processed' mark kare -- retries built-in. Ya dedupe ko apply transaction mein move karna.",
+   "scale_10x_100x": "High webhook volume pe provider_events table bada hoga -- TTL/partition; handler ko queue ke peeche rakhna taaki HTTP response fast (2xx) jaaye aur processing async ho.",
+   "production_improvements": "Inbox processor, unknown_payment events ka alert, per-type metrics, aur `processed_at` ko actually apply time pe set karna (abhi insert default)."
+  }
+ },
+ {
+  "id": "PAYS-030",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Give an overview of the database schema. What does each table hold?",
+  "answer_hinglish": "Ek migration `0001_initial.py` poora schema banata hai. Groups mein:\n\nCore payments: `merchants` (name, `api_key_hash` UNIQUE, fee_bps, fee_fixed). `payments` (merchant_reference, amount, currency, amount_authorized/captured/refunded, fee, status, provider_payment_id, decline_code, last_error, version, timestamps). `payment_events` (append-only audit trail). `refunds` (payment_id, amount, status pending/succeeded/failed/requires_reconciliation, provider_refund_id).\n\nIdempotency: `idempotency_keys` (PK merchant_id + key, request hash, state, stored response, locked_until).\n\nLedger: `ledger_accounts` (code, merchant_id, currency; UNIQUE triple), `ledger_transactions` (payment_id, kind capture/refund/adjustment, `idempotency_ref` UNIQUE), `ledger_entries` (transaction_id, account_id, signed amount, CHECK amount <> 0). Plus triggers: deferred balance check aur immutability.\n\nWebhooks: `provider_events` (provider event id PK, type, payload, outcome).\n\nReconciliation: `reconciliation_runs` (settlement_date, summary jsonb) aur `reconciliation_items` (kind, ours/theirs jsonb, resolution).\n\nSaga: `inventory`, `reservations` (UNIQUE order_id+sku), `sagas` (order_id UNIQUE), `saga_steps` (PK saga_id+step).\n\nMock provider ka apna schema `provider`: `authorizations`, `operations` (idempotency for capture/void/refund), `flaky`. Comment: \"stands in for a third party; the app never reads it directly\" -- sirf tests verification ke liye directly query karte hain.\n\nEk simplification: dono same Postgres database mein hain (alag schema) taaki local setup simple rahe; conceptually woh alag systems hain aur sirf HTTP se baat karte hain.",
+  "why_needed": "Schema hi invariants ka ghar hai -- interview mein table design se pata chalta hai ki aapne kaunsi guarantees DB ko di hain.",
+  "real_world_analogy": "Ek dukaan ki alag-alag registers: sales register, cash book (ledger), complaint register (events), aur mahine ka audit file (reconciliation).",
+  "how_it_works": "Alembic migration STATEMENTS list ko sequentially execute karta hai; downgrade sab drop karta hai.",
+  "in_this_project": "`migrations/versions/0001_initial.py`; `DATABASE_DESIGN.md` ER diagram aur invariants table.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/DATABASE_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Saare invariants ek jagah dikhte hain",
+   "Provider schema alag -- boundary clear"
+  ],
+  "disadvantages": [
+   "Ek hi migration -- evolution history nahi",
+   "Mock provider same DB mein (production mein alag hoga)"
+  ],
+  "common_mistakes": [
+   "Balance column add karna ledger ke saath",
+   "Provider tables ko app se directly join karna"
+  ],
+  "follow_up_questions": [
+   "Kaunse invariants DB mein hain aur kaunse code mein?",
+   "provider schema same DB mein kyun?",
+   "Kaun si tables sabse fast grow karengi?"
+  ],
+  "concepts": [
+   "schema design",
+   "invariants",
+   "ledger tables"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-031",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "Explain the partial unique index uq_payment_reference_live. Why partial, and what does it prevent?",
+  "answer_hinglish": "`CREATE UNIQUE INDEX uq_payment_reference_live ON payments (merchant_id, merchant_reference) WHERE status NOT IN ('declined', 'failed', 'voided')`.\n\nMatlab: ek merchant ke ek order reference (jaise order id) ke liye ek hi \"live\" payment ho sakta hai. Live = koi bhi status jo charge ban sakta hai ya ban chuka hai: created, authorizing, authorized, capturing, captured, partially_refunded, refunded, voiding, requires_reconciliation.\n\nKya prevent karta hai: idempotency key client-chosen hai. Agar merchant ka backend bug ki wajah se same order ke liye NAYI key ke saath dobara POST kare (jaise app restart, key regenerate), toh idempotency layer ise naya operation samjhegi. Index yahan backstop hai -- insert IntegrityError -> `DuplicatePayment` 409 with existing payment id. Test `test_duplicate_order_payment_blocked`: key k1 -> 201, key k2 same order -> 409 `duplicate_payment`.\n\nPartial kyun: agar full unique index hota toh decline ke baad customer doosra card try hi nahi kar paata -- same order reference pe second row allowed nahi hoti. Declined/failed/voided wale payments mein paisa nahi gaya, toh unhe \"dead\" maan ke index se exclude kiya. `test_declines_and_retry_after_decline`: insufficient_funds decline, phir nayi key se tok_visa -> captured.\n\nEk subtle point: `refunded` live mein count hota hai, toh fully refunded order ko dobara pay nahi kar sakte same reference se -- conservative choice. Aur status change hone pe Postgres index membership automatically update karta hai (row WHERE condition se in/out).\n\nRace-safe hai: do concurrent inserts mein se ek unique violation pe fail hoga -- application-level \"check then insert\" ki tarah race nahi.",
+  "why_needed": "Idempotency keys client discipline pe depend karti hain; business-level uniqueness DB enforce kare toh client bugs bhi double charge nahi bana paate.",
+  "real_world_analogy": "Railway reservation: ek seat pe ek hi confirmed ticket; cancelled/waitlist-failed tickets ki ginti nahi, toh cancel ke baad naya ticket ban sakta hai.",
+  "how_it_works": "Postgres partial index sirf un rows ko index karta hai jo predicate satisfy karein; unique constraint sirf unhi rows pe lagta hai.",
+  "in_this_project": "Migration mein comment: 'One live payment per order: a retry after declined/failed/voided is allowed, a double charge is not.' `create_payment` IntegrityError handler wahi predicate use karke existing id dhoondta hai. `TRADEOFFS.md` #9.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/payments/services/payments.py::create_payment",
+   "projects/09-payments/tests/test_payments.py::test_duplicate_order_payment_blocked",
+   "projects/09-payments/TRADEOFFS.md"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE UNIQUE INDEX uq_payment_reference_live ON payments (merchant_id, merchant_reference)\n  WHERE status NOT IN ('declined', 'failed', 'voided');",
+  "code_language": "sql",
+  "advantages": [
+   "Client bugs se bhi double charge blocked",
+   "Decline ke baad retry possible"
+  ],
+  "disadvantages": [
+   "Merchants ko stable references bhejne padte hain",
+   "Refunded order dobara pay nahi ho sakta same reference se"
+  ],
+  "common_mistakes": [
+   "Full unique index lagana -- decline ke baad retry block",
+   "Sirf application-level check -- race"
+  ],
+  "follow_up_questions": [
+   "Agar merchant reference hi na bheje toh?",
+   "requires_reconciliation live kyun hai?",
+   "Index predicate aur code ka predicate drift ho jaaye toh?"
+  ],
+  "concepts": [
+   "partial unique index",
+   "double payment prevention",
+   "business idempotency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Business-key uniqueness strong guarantee hai par merchant API contract mein constraint daalta hai (stable merchant_reference zaroori). Partial predicate statuses ki list duplicate karta hai (index + code) -- drift risk.",
+   "failure_scenarios": "Agar merchant har attempt pe naya reference bheje (jaise 'order-1-attempt-2') toh index bypass ho jaata hai. requires_reconciliation payment jo baad mein 'failed' resolve ho -- tab tak customer retry blocked rahega (correct par UX friction).",
+   "alternatives": "Unique on (merchant_id, merchant_reference, attempt_no) with explicit attempts; ya ek 'orders' table jiska ek payment_intent ho (Stripe PaymentIntent model) jismein multiple attempts child rows hon.",
+   "scale_10x_100x": "Index size payments ke saath grow karta hai par partial hone se thoda chhota; sharding ke baad uniqueness ke liye shard key mein merchant_id hona chahiye taaki constraint local rahe.",
+   "production_improvements": "Statuses list ko ek SQL function/enum category se drive karna, dashboard pe 'blocked duplicate attempts' metric, aur API docs mein reference semantics clearly likhna."
+  }
+ },
+ {
+  "id": "PAYS-032",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How does the deferred constraint trigger ledger_balanced enforce that every ledger transaction sums to zero?",
+  "answer_hinglish": "Migration 0001 mein plpgsql function `ledger_check_balanced()` bana tha: `SELECT coalesce(sum(amount),0) FROM ledger_entries WHERE transaction_id = NEW.transaction_id`; `<> 0` toh RAISE. Review mein bug mila: yeh currencies ke across sum karta tha, toh +1000 INR aur -1000 USD 'balanced' pass ho jaata (value out of thin air). Migration 0002 ne function replace kiya: entries ko `ledger_accounts` se join karke `GROUP BY a.currency HAVING sum(e.amount) <> 0` -- har currency apne aap mein zero honi chahiye, warna `RAISE EXCEPTION 'ledger transaction % is unbalanced in % (sum = %)'`. Regression test `test_ledger_rejects_transaction_that_balances_only_across_currencies`. Use `CREATE CONSTRAINT TRIGGER ledger_balanced AFTER INSERT ON ledger_entries DEFERRABLE INITIALLY DEFERRED FOR EACH ROW` se lagaya hai.\n\nDeferred kyun zaroori: entries ek-ek karke insert hoti hain. Capture ke teen inserts -- pehla +1000 insert hote hi sum 1000 hai. Agar trigger immediate hota toh pehli row pe hi exception. `INITIALLY DEFERRED` ka matlab trigger COMMIT ke time chalta hai, jab saari entries aa chuki hain -- tab transaction \"as a whole\" validate hota hai. Fail hua toh poora transaction rollback, including payment status change (kyunki woh same tx mein hai).\n\nConstraint trigger normal trigger se alag hai: sirf constraint triggers DEFERRABLE ho sakte hain.\n\nDefense in depth: `ledger.post()` Python mein bhi `sum(lines) != 0` pe `ValueError` deta hai (comment: \"the DB would reject it too, at COMMIT\"). Code check fast feedback deta hai, DB check guarantee deta hai -- chahe koi raw SQL likhe, koi naya service aaye, ya bug ho.\n\nTest `test_ledger_invariants_enforced_by_database`: ek transaction mein sirf +500 ki entry insert -> commit pe `DBAPIError` match \"unbalanced\".\n\nCost: FOR EACH ROW hai, toh 3 entries wale transaction mein trigger 3 baar chalta hai aur har baar sum query (index `ix_ledger_entries_tx` se fast). TRADEOFFS #4: \"costs DB-specific logic and a per-entry trigger at commit\".",
+  "why_needed": "Ledger ka sabse basic invariant code bugs pe nahi chhoda ja sakta -- 'bugs can't create money' tabhi true hai jab DB enforce kare.",
+  "real_world_analogy": "Exam hall mein answer sheet submit karte waqt hi check hota hai ki saare pages hain -- har page likhte waqt nahi.",
+  "how_it_works": "AFTER INSERT row trigger queued till COMMIT; at commit each queued invocation sums entries of that transaction; any non-zero raises and aborts the whole tx.",
+  "in_this_project": "Migration 0001 mein `ledger_balanced` constraint trigger; migration 0002 mein per-currency `ledger_check_balanced` function. `DATABASE_DESIGN.md` invariants table. Test conftest cleanup mein sirf `ledger_no_update` disable hota hai, balance trigger nahi.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/payments/services/ledger.py::post",
+   "projects/09-payments/tests/test_payments.py::test_ledger_invariants_enforced_by_database",
+   "projects/09-payments/DATABASE_DESIGN.md",
+   "projects/09-payments/migrations/versions/0002_ledger_currency_and_audit.py",
+   "projects/09-payments/tests/test_review_fixes.py::test_ledger_rejects_transaction_that_balances_only_across_currencies"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE CONSTRAINT TRIGGER ledger_balanced AFTER INSERT ON ledger_entries\n   DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION ledger_check_balanced();",
+  "code_language": "sql",
+  "advantages": [
+   "Bugs ya manual SQL se bhi unbalanced entry impossible",
+   "Transaction-level check, row-level nahi"
+  ],
+  "disadvantages": [
+   "Per-row trigger -- N entries pe N sum queries",
+   "Postgres-specific logic"
+  ],
+  "common_mistakes": [
+   "Immediate trigger banana -- multi-row inserts fail",
+   "Sirf application check pe bharosa"
+  ],
+  "follow_up_questions": [
+   "SET CONSTRAINTS ALL IMMEDIATE se kya hoga?",
+   "FOR EACH STATEMENT kyun nahi?",
+   "Bulk import mein performance kaise?"
+  ],
+  "concepts": [
+   "deferred constraint",
+   "constraint trigger",
+   "ledger invariant",
+   "defense in depth"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "DB-enforced invariants correctness ki strongest guarantee hain par logic DB mein chhupta hai, testing/portability mushkil, aur write path pe cost. App-only check sasta par bypassable.",
+   "failure_scenarios": "Koi session `SET CONSTRAINTS ledger_balanced IMMEDIATE` kare toh multi-row posting fail hogi. Trigger disable (jaise test cleanup immutability trigger ke saath karta hai) production mein privilege abuse ka raasta -- trigger disable rights restrict karne chahiye.",
+   "alternatives": "Entries ko ek hi INSERT ... VALUES (..),(..) statement mein daal ke statement-level trigger with transition tables; ya transaction row pe `total` aur CHECK; ya ledger ko append-only service (TigerBeetle jaisa) mein le jaana jo invariant natively enforce kare.",
+   "scale_10x_100x": "Per-entry sum queries volume ke saath linear; 100x pe statement-level trigger ya batched posting, aur hot accounts ke liye sub-accounts.",
+   "production_improvements": "Statement-level trigger with REFERENCING NEW TABLE (per-currency check ab join + GROUP BY karta hai, toh per-row cost thoda badha), alert on any rollback due to unbalanced posting, aur trigger disable rights sirf migration role ko."
+  }
+ },
+ {
+  "id": "PAYS-033",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How is ledger immutability enforced, and how do you correct a mistake in an append-only ledger?",
+  "answer_hinglish": "`ledger_immutable()` function bas `RAISE EXCEPTION 'ledger entries are append-only'` karta hai, aur `CREATE TRIGGER ledger_no_update BEFORE UPDATE OR DELETE ON ledger_entries FOR EACH ROW` se laga hai. Matlab koi bhi UPDATE ya DELETE -- application bug, galat migration, ya manual SQL -- DB reject karega. Test `test_ledger_invariants_enforced_by_database`: `UPDATE ledger_entries SET amount = amount * 2` -> `DBAPIError` match \"append-only\".\n\nGalti kaise sudharein: accounting ka standard rule -- kabhi history edit mat karo, ek naya reversing transaction post karo. Agar capture galat amount pe book hua, toh ek `adjustment` kind ka transaction jo exact opposite entries daale (sum phir bhi 0), phir sahi entries ka naya transaction. History mein teeno dikhte hain: original, reversal, correction -- auditor ko pata hai kya hua aur kab. `ledger_transactions.kind` ke comment mein `capture | refund | adjustment` hai, though code abhi adjustment posting helper nahi deta.\n\nKyun important: ledger financial truth hai. Agar entries editable hon toh koi bhi balance silently change ho sakta hai aur derived balances ka \"always explainable\" property khatam.\n\nNote: `ledger_transactions` table pe immutability trigger nahi hai, sirf `ledger_entries` pe. Aur test cleanup fixture `ALTER TABLE ledger_entries DISABLE TRIGGER ledger_no_update` karke TRUNCATE karta hai, phir enable -- comment \"test cleanup only\". (TRUNCATE row-level DELETE trigger fire nahi karta waise bhi, par yeh explicit hai.)",
+  "why_needed": "Financial records ki trustworthiness tab hai jab history badli na ja sake; regulators aur auditors yahi expect karte hain.",
+  "real_world_analogy": "Bank passbook mein galat entry ko whitener se nahi mitate; neeche 'reversal' entry aati hai aur phir sahi entry.",
+  "how_it_works": "BEFORE UPDATE OR DELETE row trigger always raises -> statement aborted.",
+  "in_this_project": "Migration mein `ledger_immutable` aur `ledger_no_update`; `DATABASE_DESIGN.md`: 'append-only; corrections are reversing transactions'; `tests/conftest.py::clean` fixture.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/tests/conftest.py::clean",
+   "projects/09-payments/tests/test_payments.py::test_ledger_invariants_enforced_by_database",
+   "projects/09-payments/DATABASE_DESIGN.md"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE FUNCTION ledger_immutable() RETURNS trigger LANGUAGE plpgsql AS $$\nBEGIN RAISE EXCEPTION 'ledger entries are append-only'; END $$;\nCREATE TRIGGER ledger_no_update BEFORE UPDATE OR DELETE ON ledger_entries\n  FOR EACH ROW EXECUTE FUNCTION ledger_immutable();",
+  "code_language": "sql",
+  "advantages": [
+   "Tamper-evident history",
+   "Corrections bhi audited"
+  ],
+  "disadvantages": [
+   "Galti sudharna zyada rows banata hai",
+   "Table owner trigger disable kar sakta hai -- privilege control chahiye"
+  ],
+  "common_mistakes": [
+   "UPDATE se 'fix' karna",
+   "Reversal ko delete samajhna"
+  ],
+  "follow_up_questions": [
+   "Reversing transaction ka idempotency_ref kya hoga?",
+   "ledger_transactions bhi immutable honi chahiye?",
+   "GDPR delete request ledger pe kaise?"
+  ],
+  "concepts": [
+   "append-only",
+   "immutability",
+   "reversing entry",
+   "audit"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-034",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "What does ledger_transactions.idempotency_ref UNIQUE protect against?",
+  "answer_hinglish": "`idempotency_ref text NOT NULL UNIQUE` -- comment: \"the same business event can't be booked twice\". Har business event ka ek deterministic reference: capture ke liye `capture:{payment_id}`, refund ke liye `refund:{refund_id}`.\n\n`ledger.post()` insert karta hai `INSERT INTO ledger_transactions ... ON CONFLICT (idempotency_ref) DO NOTHING RETURNING id`. Agar `tid is None` (conflict) -> return `False` -- entries insert hi nahi hoti. Event already booked.\n\nKyun zaroori jab CAS already hai? Kyunki capture ko finalize karne ke teen raste hain: API response path, webhook, aur recovery worker. Normally status CAS (`capturing -> captured`) sirf ek ko jeetne deta hai aur baaki `InvalidTransition` paate hain -- tab tak ledger tak pahunchte hi nahi. Lekin defense in depth: agar koi future code path status check bhool jaaye, ya koi bug same event ko do baar post kare, DB phir bhi double booking rok dega. Test `test_crash_mid_capture_is_completed_by_recovery_exactly_once` recovery do baar chala ke `count(*) WHERE kind='capture' == 1` assert karta hai; webhook test bhi yahi assert karta hai.\n\nDesign point: business-meaningful idempotency key (event identity) hai, technical (request id) nahi. Multiple captures support karne ho toh ref `capture:{capture_id}` banana padega -- abhi `capture:{payment_id}` single-capture assumption encode karta hai.\n\nNote: `post()` ka False return callers ignore karte hain (`finalize_capture` result check nahi karta) -- kyunki CAS pehle hi guard karta hai.",
+  "why_needed": "Multiple async paths same event finalize kar sakte hain; ledger ko khud event-level idempotent hona chahiye.",
+  "real_world_analogy": "Invoice number: same invoice number se do baar payment entry daalne ki koshish karo toh accountant bolega 'yeh invoice already posted hai'.",
+  "how_it_works": "Unique index on idempotency_ref; ON CONFLICT DO NOTHING RETURNING -> None means duplicate.",
+  "in_this_project": "`ledger.py::post`, `book_capture` (`capture:{id}`), `book_refund` (`refund:{refund_id}`); migration column definition.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::post",
+   "projects/09-payments/payments/services/ledger.py::book_capture",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/tests/test_failures.py::test_crash_mid_capture_is_completed_by_recovery_exactly_once"
+  ],
+  "code_example": "# real, payments/services/ledger.py\ntid = await s.scalar(text(\"INSERT INTO ledger_transactions (payment_id, kind, idempotency_ref) VALUES (:p, :k, :r) \"\n                          \"ON CONFLICT (idempotency_ref) DO NOTHING RETURNING id\"), {...})\nif tid is None:\n    return False",
+  "code_language": "python",
+  "advantages": [
+   "Double booking DB-level impossible",
+   "Deterministic, readable refs"
+  ],
+  "disadvantages": [
+   "Ref format single-capture assumption encode karta hai",
+   "False return silently ignore hota hai"
+  ],
+  "common_mistakes": [
+   "Random UUID ko idempotency_ref banana",
+   "ON CONFLICT DO UPDATE karna (history overwrite)"
+  ],
+  "follow_up_questions": [
+   "Multiple captures ke liye ref kaise banaoge?",
+   "Reversal ka ref kya hoga?",
+   "Return False pe log/metric chahiye?"
+  ],
+  "concepts": [
+   "ledger idempotency",
+   "unique constraint",
+   "business event identity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-035",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Which CHECK constraints protect the payments table and why put them in the database?",
+  "answer_hinglish": "Payments table pe ye CHECKs hain: `amount > 0`; `status IN (...12 statuses...)`; `captured_le_authorized CHECK (amount_captured <= amount_authorized)`; `refunded_le_captured CHECK (amount_refunded <= amount_captured)`; `authorized_le_amount CHECK (amount_authorized <= amount)`. Merchants pe `fee_bps BETWEEN 0 AND 10000` aur `fee_fixed >= 0`. Refunds pe `amount > 0` aur status list. Ledger entries pe `amount <> 0`. Inventory pe `available >= 0`.\n\nDB mein kyun, jab code already check karta hai? Teen reasons:\n1. Defense in depth: code checks bugs ke saath galat ho sakte hain (jaise over-refund race). DB constraint last line hai -- violation pe transaction fail, paisa galat state mein nahi jaata.\n2. Multiple writers: API, webhooks, recovery worker, admin SQL -- sab ko same rules milte hain bina code duplicate kiye.\n3. Documentation: schema padh ke invariants turant samajh aate hain. `DATABASE_DESIGN.md` ka \"Invariants and where they live\" table yahi map karta hai.\n\nCode checks phir bhi rakhe kyunki woh achha error dete hain -- 422 \"refund exceeds the refundable amount\" with details, jabki CHECK violation generic IntegrityError hota.\n\nInventory ka `available >= 0` saga mein interesting hai: `UPDATE inventory SET available = available - :q WHERE sku = :s AND available >= :q` -- WHERE clause conditional decrement karta hai, aur CHECK backstop hai.\n\nValid transitions DB mein nahi hain, sirf valid status values -- yeh conscious split hai: transitions code (`state.py`) mein.",
+  "why_needed": "Money invariants kabhi violate nahi hone chahiye, chahe code mein bug ho. DB woh jagah hai jahan rule sabke liye enforce hota hai.",
+  "real_world_analogy": "Lift ka max weight sensor: operator ka dhyan chooke toh bhi lift overload pe chalegi hi nahi.",
+  "how_it_works": "Postgres har INSERT/UPDATE pe row ke against CHECK expression evaluate karta hai; false -> error, statement abort.",
+  "in_this_project": "Migration 0001 payments table definition; `SECURITY.md` 'Amount manipulation: integer validation, CHECK constraints, capture <= authorized'.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/DATABASE_DESIGN.md",
+   "projects/09-payments/SECURITY.md"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py (trimmed)\nCONSTRAINT captured_le_authorized CHECK (amount_captured <= amount_authorized),\nCONSTRAINT refunded_le_captured CHECK (amount_refunded <= amount_captured),\nCONSTRAINT authorized_le_amount CHECK (amount_authorized <= amount)",
+  "code_language": "sql",
+  "advantages": [
+   "Bugs se bhi invariant safe",
+   "Self-documenting schema"
+  ],
+  "disadvantages": [
+   "Generic error messages",
+   "Constraint change ke liye migration"
+  ],
+  "common_mistakes": [
+   "Sirf code mein validation",
+   "CHECK mein dusri tables refer karne ki koshish (allowed nahi -- trigger chahiye)"
+  ],
+  "follow_up_questions": [
+   "Transitions ko DB mein enforce karna chahiye?",
+   "Cross-table invariant kaise enforce karoge?",
+   "CHECK violation ko API error mein kaise map karoge?"
+  ],
+  "concepts": [
+   "CHECK constraint",
+   "invariants",
+   "defense in depth"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-036",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How is the idempotency_keys table designed, and what would you add for production?",
+  "answer_hinglish": "Columns: `merchant_id` (FK), `key`, `request_method`, `request_path`, `request_hash`, `state` (CHECK in_progress/completed), `response_status`, `response_body jsonb`, `locked_until timestamptz`, `created_at`. PRIMARY KEY `(merchant_id, key)`.\n\nDesign choices:\n- Composite PK merchant-scoped: do merchants ki keys collide nahi karti, aur ek merchant doosre ki key se uska response replay nahi kar sakta (tenant isolation).\n- PK hi atomic claim ka basis hai -- `INSERT ... ON CONFLICT DO NOTHING`.\n- `request_hash` binding: key + exact request. Method aur path alag columns mein bhi hain (debugging), hash mein bhi.\n- `response_body jsonb` + `response_status`: exact replay including errors.\n- `locked_until`: lease. Completed pe NULL.\n\nProduction gaps (DEPLOYMENT.md #4 aur TRADEOFFS #6): retention -- keys hamesha rehti hain, table unbounded grow. Fix: `created_at` pe index aur cleanup job (`DELETE WHERE created_at < now() - interval '7 days'` in batches) ya time-based partitioning aur purana partition drop. Stripe 24h rakhta hai; DEPLOYMENT.md \"e.g. 7 days\" suggest karta hai.\n\nAur: `recovery_point` column (Stripe ka atomic phases design) jo batata ki request kis step tak pahunchi -- takeover pe beech se resume. Abhi takeover poora handler dobara chalata hai; review fix ke baad payment/refund ka id `id_for(merchant, key, kind)` (uuid5) se derive hota hai, toh dobara chala handler wahi row dhoond ke resume karta hai -- par 'kis step tak pahunche' ka explicit record nahi hai.\n\nResponse body mein payment ka poora data hai -- PII/large payloads; production mein size limit aur encryption consider karna.",
+  "why_needed": "Idempotency table har mutating request pe hit hoti hai; uska design correctness aur growth dono decide karta hai.",
+  "real_world_analogy": "Courier ka receipt register: tracking number + sender (merchant), parcel description (hash), status, aur delivery slip ki copy.",
+  "how_it_works": "PK claim -> state machine in_progress -> completed with stored response; lease for crash takeover.",
+  "in_this_project": "Migration `idempotency_keys` CREATE TABLE; `idempotency.py` saare queries `merchant_id = :m AND key = :k` pe.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/payments/services/idempotency.py",
+   "projects/09-payments/DEPLOYMENT.md",
+   "projects/09-payments/TRADEOFFS.md"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE TABLE idempotency_keys (\n  merchant_id uuid NOT NULL REFERENCES merchants(id),\n  key text NOT NULL, request_method text NOT NULL, request_path text NOT NULL, request_hash text NOT NULL,\n  state text NOT NULL CHECK (state IN ('in_progress', 'completed')),\n  response_status int, response_body jsonb, locked_until timestamptz,\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (merchant_id, key))",
+  "code_language": "sql",
+  "advantages": [
+   "Tenant-scoped, race-free claim",
+   "Exact replay including errors"
+  ],
+  "disadvantages": [
+   "No TTL -- unbounded growth",
+   "Stored bodies duplicate payment data"
+  ],
+  "common_mistakes": [
+   "Global key namespace",
+   "Key ko bina request hash ke store karna"
+  ],
+  "follow_up_questions": [
+   "Retention kitni rakhoge aur kyun?",
+   "Partitioning vs DELETE cleanup?",
+   "recovery_point kaise kaam karega?"
+  ],
+  "concepts": [
+   "idempotency table",
+   "composite key",
+   "retention",
+   "lease"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-037",
+  "project_slug": "p09-payments",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why are ledger accounts per merchant and currency, and how would you query a merchant's balances?",
+  "answer_hinglish": "`ledger_accounts (id, code, merchant_id, currency, UNIQUE(code, merchant_id, currency))`. Har merchant ke liye har currency mein teen accounts: `provider_receivable`, `merchant_payable`, `platform_fee_revenue`. Lazily create hote hain -- `ledger._account()` pehli posting pe.\n\nPer merchant kyun: humein har merchant ko kitna dena hai (`merchant_payable`) alag-alag pata hona chahiye -- payouts per merchant hote hain. Ek global payable account mein sab mix ho jaata.\n\nPer currency kyun: INR aur USD ko jodna meaningless hai. Ek account ek currency -- toh `sum(amount)` hamesha same unit mein. Agar ek account mixed currency hota toh 100 INR + 100 USD = 200 \"kuch\". Multi-currency conversion project mein nahi hai (README limitation), toh har posting payment ki currency ke accounts pe jaati hai.\n\nBalances query (`ledger.balances`): `SELECT a.code, a.currency, coalesce(sum(e.amount),0) FROM ledger_accounts a LEFT JOIN ledger_entries e ON e.account_id = a.id WHERE a.merchant_id = :m GROUP BY a.code, a.currency`. LEFT JOIN taaki zero-activity accounts bhi dikhein. Index `ix_ledger_entries_account (account_id)` join ko support karta hai.\n\n`platform_fee_revenue` bhi per-merchant hai -- interesting choice: platform ki total revenue = sab merchants ke fee accounts ka sum. Iska side benefit: koi single global \"hot account\" nahi jispe har capture likhe -- hot-account contention naturally kam. Trade-off: platform-level reports ke liye aggregation.\n\nNote `merchant_id` column nullable hai -- future platform-level accounts ke liye jagah, abhi use nahi.",
+  "why_needed": "Accounts ki granularity decide karti hai ki kaunse sawaal sasta answer hoga (merchant payout) aur kahan contention hoga.",
+  "real_world_analogy": "Ek CA har client ki alag file aur har currency ka alag page rakhta hai -- dollar aur rupee ek column mein nahi jodta.",
+  "how_it_works": "Get-or-create account by (code, merchant, currency); entries reference account id; balances = GROUP BY sum.",
+  "in_this_project": "`ledger.py::_account` aur `balances`; route `GET /ledger/balances` merchant-scoped.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::_account",
+   "projects/09-payments/payments/services/ledger.py::balances",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/payments/api/routes.py::balances"
+  ],
+  "code_example": "-- real, payments/services/ledger.py\nSELECT a.code, a.currency, coalesce(sum(e.amount), 0) AS balance FROM ledger_accounts a\nLEFT JOIN ledger_entries e ON e.account_id = a.id WHERE a.merchant_id = :m\nGROUP BY a.code, a.currency ORDER BY a.currency, a.code",
+  "code_language": "sql",
+  "advantages": [
+   "Merchant payouts ke liye seedha balance",
+   "Currency mixing impossible by design"
+  ],
+  "disadvantages": [
+   "Accounts count = merchants x currencies x 3",
+   "Platform-wide reports ke liye aggregation"
+  ],
+  "common_mistakes": [
+   "Ek global payable account",
+   "Currency column bhoolna"
+  ],
+  "follow_up_questions": [
+   "Platform ki total fee revenue kaise nikaloge?",
+   "Multi-currency FX kaise model karoge?",
+   "Accounts ka chart of accounts kaise extend karoge?"
+  ],
+  "concepts": [
+   "chart of accounts",
+   "per-tenant accounts",
+   "currency isolation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-038",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Walk through ledger.post() line by line. Why skip zero amounts and why check the sum in Python too?",
+  "answer_hinglish": "`post(s, *, kind, payment_id, idempotency_ref, merchant_id, currency, lines)` -- `lines` list of `(account_code, signed_amount)`.\n\nLine 1: `if sum(a for _, a in lines) != 0: raise ValueError(f\"unbalanced posting {lines}\")`. Python check -- fast fail, clear error with lines, aur DB round trip se pehle. Comment honestly kehta hai \"the DB would reject it too, at COMMIT\". Do jagah isliye: app check developer ko turant batata hai; DB check guarantee hai.\n\nLine 2: `INSERT INTO ledger_transactions ... ON CONFLICT (idempotency_ref) DO NOTHING RETURNING id`. Conflict -> `tid is None` -> `return False` (already booked). Yeh event-level idempotency hai.\n\nLine 3: `for code, amount in lines: if amount: ...insert entry`. Zero skip kyun? `ledger_entries.amount` pe `CHECK (amount <> 0)` hai. Kab zero aata hai? Fee zero ho sakti hai (merchant `fee_bps=0, fee_fixed=0`) -> `(\"platform_fee_revenue\", -0)`. Ya fee == amount (chhote amounts pe `min` cap) -> `merchant_payable` 0. Zero entry ka koi accounting meaning nahi, aur CHECK use reject karta. Toh skip.\n\nHar entry ke liye `await _account(s, code, merchant_id, currency)` -- get-or-create. Yeh har line pe ek SELECT (aur pehli baar INSERT) hai -- benchmark ke 26 statements mein inka bhi hissa hai.\n\nReturn `True`. Callers (`book_capture`, `book_refund`) caller ke transaction mein chalte hain -- `post` khud commit nahi karta, isliye status change ke saath atomic hai.",
+  "why_needed": "Ledger posting ek chhota function hai par ismein teen invariants (balance, idempotency, non-zero) meet karte hain.",
+  "real_world_analogy": "Accountant voucher likhne se pehle khud total check karta hai, phir voucher number register mein dekhta hai (duplicate?), phir entries likhta hai -- khaali (zero) lines nahi.",
+  "how_it_works": "Validate sum -> claim transaction by ref -> insert non-zero entries with resolved account ids -> deferred trigger at commit.",
+  "in_this_project": "`ledger.py::post`; migration `CHECK (amount <> 0)`; `money.fee_for` ka `min(..., amount)` cap jo zero payable bana sakta hai.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::post",
+   "projects/09-payments/payments/services/money.py::fee_for",
+   "projects/09-payments/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# real, payments/services/ledger.py\nfor code, amount in lines:\n    if amount:\n        await s.execute(text(\"INSERT INTO ledger_entries (transaction_id, account_id, amount) VALUES (:t, :a, :x)\"),\n                        {\"t\": tid, \"a\": await _account(s, code, merchant_id, currency), \"x\": amount})",
+  "code_language": "python",
+  "advantages": [
+   "Teen invariants ek jagah",
+   "Caller ke tx mein -- atomic with status"
+  ],
+  "disadvantages": [
+   "Per-line account lookup (extra queries)",
+   "Balance rule do jagah (Python + DB trigger) -- duplicated logic"
+  ],
+  "common_mistakes": [
+   "post() ke andar commit karna",
+   "Zero entries insert karke CHECK error lana"
+  ],
+  "follow_up_questions": [
+   "Account ids cache kaise karoge?",
+   "Entries ek multi-row INSERT mein kyun nahi?",
+   "False return ka kya use?"
+  ],
+  "concepts": [
+   "ledger posting",
+   "zero amount",
+   "idempotent insert"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-039",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Why does 'RETURNING *, (SELECT status FROM payments WHERE id = :id) AS _old' return the OLD status?",
+  "answer_hinglish": "Yeh `state.transition` ka ek neat SQL trick hai. Humein UPDATE ke baad naya row bhi chahiye (caller ko return karne ke liye) aur purana status bhi (audit event ke `from_status` ke liye), aur ek hi round trip mein.\n\nPostgres mein ek statement ke andar ki saari subqueries statement ke start ka snapshot dekhti hain. UPDATE apne hi changes ko us statement ki subqueries ko visible nahi karta. Toh `RETURNING` mein `(SELECT status FROM payments WHERE id = :id)` pre-update status deta hai, jabki `RETURNING *` (target table ke columns) post-update values deta hai. Result: `row[\"status\"]` = naya, `row[\"_old\"]` = purana.\n\nAlternative kya hote? (1) Pehle `SELECT status` alag statement -- extra round trip aur race (SELECT aur UPDATE ke beech koi aur change kar de toh from_status galat). (2) `UPDATE ... FROM (SELECT ... FOR UPDATE) old` CTE pattern -- kaam karta hai par verbose. (3) Expected set se guess -- par expected set mein multiple statuses ho sakte hain (`{\"capturing\", \"requires_reconciliation\"}`), toh actual from pata nahi.\n\nConcurrency subtlety: READ COMMITTED mein agar UPDATE ko concurrent commit ka wait karna pada aur woh row re-check karta hai (EvalPlanQual), subquery ka snapshot phir bhi statement start ka hai. Theoretically aise edge case mein `_old` concurrent change se pehle ka status dikha sakta hai. Practically CAS ke saath: agar concurrent tx ne status badla toh humara WHERE fail ho jaata hai aur koi row return hi nahi hoti -- toh galat `_old` record hone ka window bahut chhota hai.\n\nFunction `_old` ko final dict se hata deta hai: `{k: v for k, v in row.items() if k != \"_old\"}`.",
+  "why_needed": "Audit trail ka from_status accurate aur cheap hona chahiye; yeh ek round-trip mein dono deta hai.",
+  "real_world_analogy": "Photocopy machine se nikla page (new state) aur machine ke andar ka original (old state) -- dono ek saath haath mein.",
+  "how_it_works": "Statement-level snapshot: subqueries in RETURNING see pre-statement data; RETURNING target columns show post-update values.",
+  "in_this_project": "`state.py::transition` ka UPDATE statement; `_old` event insert mein `\"f\": row[\"_old\"]` ke roop mein.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/state.py::transition"
+  ],
+  "code_example": "-- real SQL inside payments/services/state.py\nUPDATE payments SET status = :to, version = version + 1, updated_at = now()\nWHERE id = :id AND status = ANY(:exp)\nRETURNING *, (SELECT status FROM payments WHERE id = :id) AS _old",
+  "code_language": "sql",
+  "advantages": [
+   "Ek round trip",
+   "Exact from_status jab multiple expected states hon"
+  ],
+  "disadvantages": [
+   "Non-obvious SQL -- comments/explanation chahiye",
+   "Rare concurrent edge case mein snapshot nuance"
+  ],
+  "common_mistakes": [
+   "Socha ki RETURNING subquery naya status dikhayegi",
+   "from_status ko expected set ke first element se fill karna"
+  ],
+  "follow_up_questions": [
+   "READ COMMITTED mein EvalPlanQual kya hai?",
+   "CTE se same kaise likhoge?",
+   "Kya yeh MySQL mein kaam karega?"
+  ],
+  "concepts": [
+   "MVCC snapshot",
+   "RETURNING",
+   "single round trip",
+   "audit"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Clever SQL performance aur accuracy deta hai par readability ki keemat pe; team ke liye comment/test se document karna zaroori.",
+   "failure_scenarios": "Concurrent update ke baad re-check case mein _old stale ho sakta hai; agar kabhi transition() ko non-CAS use kiya (broad expected) toh audit misleading ho sakta hai.",
+   "alternatives": "`WITH old AS (SELECT status FROM payments WHERE id=:id FOR UPDATE) UPDATE ... FROM old RETURNING payments.*, old.status` -- explicit lock, clear semantics. Ya trigger jo OLD.status se event row khud likhe (audit via trigger).",
+   "scale_10x_100x": "Statement cost negligible; scale pe koi issue nahi. Bada scale pe audit-by-trigger centralize karna attractive ho sakta hai.",
+   "production_improvements": "payment_events insert ko DB trigger (AFTER UPDATE OF status) mein move karna taaki koi bhi writer audit skip na kar sake; tab OLD/NEW natively milte hain."
+  }
+ },
+ {
+  "id": "PAYS-040",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Explain webhooks.verify(): header parsing, HMAC, constant-time compare and timestamp tolerance.",
+  "answer_hinglish": "`verify(secret, body, header, tolerance=300)` -- header format `t=<unix_ts>,v1=<hex_sig>` (Stripe jaisa).\n\nParsing: `dict(p.split(\"=\", 1) for p in (header or \"\").split(\",\"))` aur `int(parts[\"t\"])`. Header missing, '=' missing, ya t non-integer -> `ValueError`/`KeyError` -> `Unauthorized(\"malformed signature header\")` 401.\n\nSignature: `hmac.new(secret.encode(), f\"{ts}.\".encode() + body, hashlib.sha256).hexdigest()`. Signed payload = timestamp + \".\" + raw body bytes. Timestamp ko sign mein include karna zaroori hai -- warna attacker purana valid body naye timestamp ke saath replay kar deta.\n\nCompare: `hmac.compare_digest(expected, parts.get(\"v1\", \"\"))` -- constant-time, taaki response time se signature byte-by-byte guess na ho (timing attack).\n\nTolerance: `abs(time.time() - ts) > 300` -> reject. 5 minute window replay attacks limit karta hai; abs isliye ki future timestamps bhi reject (clock skew allowance ke saath).\n\nDono failure ek hi message `\"invalid provider signature\"` dete hain -- attacker ko nahi batate kaunsa check fail hua.\n\nPhir `json.loads(body)` -- parse SIGNATURE CHECK KE BAAD, aur raw bytes pe sign check -- parsed-and-reserialized JSON pe nahi (whitespace/key order badal jaata).\n\nTest: valid sig ke saath duplicate -> `duplicate`, `v1=deadbeef` -> 401. Route `provider_webhook` raw `await request.body()` pass karta hai.\n\nGap (SECURITY.md): webhook secret rotation nahi -- production mein multiple `v1` signatures (old + new secret) accept karne chahiye rotation window ke dauraan.",
+  "why_needed": "Webhook endpoint public hai; bina verification koi bhi 'captured' event bhej ke free goods le sakta hai.",
+  "real_world_analogy": "Sealed envelope with date stamp: seal (HMAC) batata hai kisne bheja aur khola nahi gaya; date stamp batata hai purana letter dobara toh nahi bheja.",
+  "how_it_works": "Parse header -> recompute HMAC over ts.body -> constant-time compare -> check |now - ts| <= tolerance -> parse JSON.",
+  "in_this_project": "`webhooks.py::verify`; mock provider `emit()` same scheme se sign karta hai; route `/webhooks/provider` header `x-provider-signature`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/webhooks.py::verify",
+   "projects/09-payments/mockprovider/app.py",
+   "projects/09-payments/payments/api/routes.py::provider_webhook",
+   "projects/09-payments/SECURITY.md"
+  ],
+  "code_example": "# real, payments/services/webhooks.py\nexpected = hmac.new(secret.encode(), f\"{ts}.\".encode() + body, hashlib.sha256).hexdigest()\nif not hmac.compare_digest(expected, parts.get(\"v1\", \"\")) or abs(time.time() - ts) > tolerance:\n    raise Unauthorized(\"invalid provider signature\")\nreturn json.loads(body)",
+  "code_language": "python",
+  "advantages": [
+   "Authenticity + integrity + replay window",
+   "Timing-safe"
+  ],
+  "disadvantages": [
+   "Single secret, no rotation",
+   "Tolerance window ke andar replay possible (event-id dedupe cover karta hai)"
+  ],
+  "common_mistakes": [
+   "`==` se compare",
+   "Parsed JSON ko re-serialize karke sign verify karna",
+   "Timestamp sign na karna"
+  ],
+  "follow_up_questions": [
+   "Secret rotation kaise karoge?",
+   "Tolerance window ke andar replay kaise rukta hai?",
+   "IP allowlisting kaafi hai kya?"
+  ],
+  "concepts": [
+   "HMAC",
+   "constant-time compare",
+   "replay protection",
+   "webhook security"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-041",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "What validation does the PaymentIn model perform and why does it matter for a payments API?",
+  "answer_hinglish": "`PaymentIn` pydantic model:\n- `amount: int = Field(gt=0, le=10**12, description=\"minor units (e.g. paise)\")` -- positive integer, upper bound 10^12 (overflow/absurd amounts rokne ke liye; bigint ki range se kaafi neeche).\n- `currency: str = Field(pattern=r\"^[A-Za-z]{3}$\")` -- 3 letters; service layer phir upper-case karke `SUPPORTED_CURRENCIES` se check karta hai (422 \"unsupported currency\").\n- `payment_method: str = Field(pattern=r\"^tok_[a-z_]+$\")` -- sirf tokens. Card number (digits) pass hi nahi ho sakta -- PCI scope protection API level pe.\n- `merchant_reference: str = Field(min_length=1, max_length=200)` -- duplicate-order index ka key.\n- `capture: bool = True`, `description` max 500.\n\nSimilar: `CaptureIn.amount: int | None = Field(default=None, gt=0)`, `RefundIn.amount: int = Field(gt=0)`, `MerchantIn.fee_bps` 0..10000. Path params `payment_id: uuid.UUID` -- invalid UUID 422, SQL tak pahunchta hi nahi.\n\nKyun matter karta hai: input validation boundary pe karna sabse sasta defense hai. Negative amount refund mein \"ulta paisa\" bana sakta tha; float amount rounding issues; arbitrary payment_method mein card number aa sakta tha (PCI). DB CHECKs backstop hain, par 422 with field-level error client ke liye zyada useful hai.\n\nEk nuance: pydantic v2 lax mode mein `\"100\"` string ya `100.0` float int mein coerce ho sakte hain, par `100.5` reject hoga. Strict money APIs `StrictInt` use karte hain taaki float bhejna hi error ho.",
+  "why_needed": "Payments API mein galat input = galat paisa. Boundary validation pehli line of defense hai.",
+  "real_world_analogy": "Bank ka cheque counter: amount figures aur words match, date valid, signature -- tabhi andar jaata hai.",
+  "how_it_works": "FastAPI request body ko model se validate karta hai; failure pe 422 with error details before handler runs.",
+  "in_this_project": "`api/routes.py::PaymentIn`, `CaptureIn`, `RefundIn`, `MerchantIn`; `test_api_requires_merchant_key_and_admin_token` 422 for missing Idempotency-Key.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::PaymentIn",
+   "projects/09-payments/payments/api/routes.py::RefundIn",
+   "projects/09-payments/payments/api/routes.py::CaptureIn",
+   "projects/09-payments/payments/services/money.py::SUPPORTED_CURRENCIES"
+  ],
+  "code_example": "# real, payments/api/routes.py\nclass PaymentIn(BaseModel):\n    amount: int = Field(gt=0, le=10**12, description=\"minor units (e.g. paise)\")\n    currency: str = Field(pattern=r\"^[A-Za-z]{3}$\")\n    payment_method: str = Field(pattern=r\"^tok_[a-z_]+$\")\n    merchant_reference: str = Field(min_length=1, max_length=200)\n    capture: bool = True",
+  "code_language": "python",
+  "advantages": [
+   "Early, cheap rejection",
+   "Card numbers structurally blocked"
+  ],
+  "disadvantages": [
+   "Lax coercion float -> int allow kar sakta hai",
+   "Validation rules do jagah (model + service)"
+  ],
+  "common_mistakes": [
+   "Amount ko float type dena",
+   "payment_method free-text rakhna"
+  ],
+  "follow_up_questions": [
+   "StrictInt kab use karoge?",
+   "Currency validation model mein kyun nahi?",
+   "Upper bound 10^12 kyun?"
+  ],
+  "concepts": [
+   "input validation",
+   "pydantic",
+   "PCI scope"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-042",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Why does ledger._account use ON CONFLICT DO UPDATE ... RETURNING instead of ON CONFLICT DO NOTHING?",
+  "answer_hinglish": "`_account(s, code, merchant_id, currency)` get-or-create hai: pehle `SELECT id ... WHERE code AND merchant_id AND currency`. Mila toh return. Nahi mila toh `INSERT ... ON CONFLICT (code, merchant_id, currency) DO UPDATE SET code = EXCLUDED.code RETURNING id`.\n\nDO NOTHING kyun nahi: Postgres mein `ON CONFLICT DO NOTHING RETURNING id` conflict hone par KOI row return nahi karta -- RETURNING sirf inserted ya updated rows deta hai. Race scenario: do concurrent transactions ek naye merchant ka pehla capture book kar rahe hain. Dono SELECT mein \"nahi mila\" dekhte hain. Dono INSERT karte hain. Ek insert karta hai; doosra unique conflict pe pehle ka commit wait karta hai, phir DO NOTHING -> `None`. Ab entry `account_id = NULL` ke saath insert hoti -> NOT NULL violation.\n\n`DO UPDATE SET code = EXCLUDED.code` ek no-op update hai (same value) jo conflict wale existing row ko \"touch\" karta hai, aur isliye RETURNING uska id deta hai. Ek statement, race-safe, hamesha id.\n\nCost: no-op update bhi ek naya row version (MVCC dead tuple) aur row lock banata hai -- isliye pehle plain SELECT hai, taaki common case (account exists) mein write hi na ho. Upsert sirf pehli baar ya race mein.\n\nAlternative: DO NOTHING ke baad ek aur SELECT -- do statements, aur READ COMMITTED mein doosra SELECT naya committed row dekh lega. Kaam karta hai, par DO UPDATE trick ek round trip bachata hai.",
+  "why_needed": "Get-or-create races classic concurrency bug hain; payments mein woh NULL account id ya duplicate accounts bana sakte hain.",
+  "real_world_analogy": "Register mein naam likhne gaye; kisi ne abhi abhi likh diya. 'Kuch mat karo' se aapko uska roll number nahi milta; 'apna naam dobara tick karo' se mil jaata hai.",
+  "how_it_works": "SELECT fast path; upsert slow path with no-op DO UPDATE so RETURNING always yields the id.",
+  "in_this_project": "`ledger.py::_account`; unique constraint `UNIQUE (code, merchant_id, currency)` migration mein.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::_account",
+   "projects/09-payments/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# real, payments/services/ledger.py\naid = await s.scalar(text(\"SELECT id FROM ledger_accounts WHERE code = :c AND merchant_id = :m AND currency = :cur\"), ...)\nif aid is None:\n    aid = await s.scalar(text(\"INSERT INTO ledger_accounts (code, merchant_id, currency) VALUES (:c, :m, :cur) \"\n                              \"ON CONFLICT (code, merchant_id, currency) DO UPDATE SET code = EXCLUDED.code RETURNING id\"), ...)",
+  "code_language": "python",
+  "advantages": [
+   "Race-safe single statement",
+   "Common path read-only"
+  ],
+  "disadvantages": [
+   "No-op update dead tuple banata hai",
+   "Per-entry lookup -- cache nahi"
+  ],
+  "common_mistakes": [
+   "DO NOTHING RETURNING pe id expect karna",
+   "SELECT-then-INSERT bina conflict handling"
+  ],
+  "follow_up_questions": [
+   "merchant_id NULL ho toh unique constraint kaise behave karega?",
+   "Accounts merchant creation pe hi kyun nahi bana dete?",
+   "Account ids cache karoge toh invalidation?"
+  ],
+  "concepts": [
+   "upsert",
+   "get-or-create race",
+   "RETURNING",
+   "MVCC"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lazy account creation flexible hai (naye currency pe auto) par write path pe extra queries aur race handling laata hai. Eager creation (merchant onboarding pe) write path simple karta hai par currencies pehle se pata honi chahiye.",
+   "failure_scenarios": "NULL merchant_id wale accounts (platform-level) ke liye UNIQUE constraint NULLs ko distinct maanta hai -- duplicates ban sakte hain; Postgres 15+ `NULLS NOT DISTINCT` chahiye. Abhi code NULL use nahi karta.",
+   "alternatives": "Eager creation, in-process cache of (code, merchant, currency) -> id, ya `INSERT ... ON CONFLICT DO NOTHING` + fallback SELECT.",
+   "scale_10x_100x": "Har capture pe 3 account SELECTs -- benchmark ke 26 statements mein contribute karte hain; cache se 3 statements per posting bachenge.",
+   "production_improvements": "Merchant creation pe accounts pre-create, LRU cache, aur `NULLS NOT DISTINCT` platform accounts ke liye."
+  }
+ },
+ {
+  "id": "PAYS-043",
+  "project_slug": "p09-payments",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does the merchant() dependency authenticate requests, and how is merchant scoping applied in queries?",
+  "answer_hinglish": "`merchant(request, authorization=Header())` FastAPI dependency hai jo har merchant endpoint pe `Depends(merchant)` se lagti hai.\n\nSteps: header `Bearer sk_test_` se start nahi karta toh 401 \"merchant API key required (sk_test_...)\". Phir `authorization[7:]` (Bearer ke baad ka raw key) ka `sha256(...).hexdigest()`. `SELECT id, name, fee_bps, fee_fixed FROM merchants WHERE api_key_hash = :h`. Na mile toh 401 \"invalid API key\". Mila toh merchant dict return -- yahi `m` handler mein aata hai.\n\nKey creation (`POST /admin/merchants`): `\"sk_test_\" + secrets.token_urlsafe(24)` (192 bits entropy), DB mein sirf hash store, plaintext key response mein ek baar (\"shown once\").\n\nScoping: merchant id har query mein filter hai. `get_payment(s, payment_id, merchant[\"id\"])` `AND merchant_id = :m` lagata hai -- dusre merchant ke payment id pe 404 (403 nahi, taaki existence leak na ho). `create_refund` ka `SELECT ... WHERE id = :i AND merchant_id = :m FOR UPDATE`. `list_payments`, `balances` sab `merchant_id` filter. Idempotency keys `(merchant_id, key)` scoped.\n\nExceptions: internal paths jaise `finalize_refund`, webhook handler, recovery `get_payment(s, id)` bina merchant ke chalte hain -- yeh trusted internal callers hain, user input nahi.\n\n`sk_test_` prefix: Stripe convention -- test vs live keys visually alag, aur prefix-check se accidental galat key early reject. Yahan sirf test keys exist karti hain.",
+  "why_needed": "Multi-tenant payments API mein ek merchant ka doosre merchant ka data dekhna ya refund karna catastrophic hai.",
+  "real_world_analogy": "Locker room: aapki chaabi ka number register mein (hash), aur aap sirf apne locker khol sakte ho -- doosre ka number daaloge toh 'aisa locker nahi' jawab.",
+  "how_it_works": "Header -> sha256 -> lookup by unique hash -> merchant context injected into handler -> all queries filter by merchant id.",
+  "in_this_project": "`api/routes.py::merchant`, `create_merchant`; `payments.py::get_payment` optional merchant filter. `test_api_requires_merchant_key_and_admin_token`: 'Bearer nope' -> 401.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::merchant",
+   "projects/09-payments/payments/api/routes.py::create_merchant",
+   "projects/09-payments/payments/services/payments.py::get_payment",
+   "projects/09-payments/tests/test_payments.py::test_api_requires_merchant_key_and_admin_token"
+  ],
+  "code_example": "# real, payments/api/routes.py\nif not authorization or not authorization.startswith(\"Bearer sk_test_\"):\n    raise Unauthorized(\"merchant API key required (sk_test_...)\")\nh = hashlib.sha256(authorization[7:].encode()).hexdigest()",
+  "code_language": "python",
+  "advantages": [
+   "Plaintext key DB mein kabhi nahi",
+   "Har query tenant-scoped"
+  ],
+  "disadvantages": [
+   "Har request pe DB lookup (no cache)",
+   "Ek merchant ek key -- rotation/multiple keys nahi"
+  ],
+  "common_mistakes": [
+   "Key plaintext store karna",
+   "Cross-tenant access pe 403 dena (existence leak)",
+   "Kisi ek query mein merchant filter bhoolna"
+  ],
+  "follow_up_questions": [
+   "SHA-256 bina salt kyun theek hai yahan?",
+   "Key rotation kaise support karoge?",
+   "Row Level Security use karoge?"
+  ],
+  "concepts": [
+   "API key auth",
+   "tenant isolation",
+   "hashing secrets"
+  ],
+  "advanced": null
+ }
+]

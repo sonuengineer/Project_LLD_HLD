@@ -1,0 +1,994 @@
+[
+ {
+  "id": "PAYS-088",
+  "project_slug": "p09-payments",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Trade-off: retrying with the same key inside the request vs failing fast and leaving it to recovery.",
+  "answer_hinglish": "`HttpProvider` default `retries=2` (3 attempts), backoff 50ms/100ms, per-attempt deadline 1s. TRADEOFFS #3: \"Retry with the same idempotency key. Resolves most ambiguity immediately; relies on the provider honouring keys (all serious providers do, for a retention window).\"\n\nIn-request retry ke fayde: zyada tar transient issues (ek dropped connection, ek 500, ek slow response) request ke andar hi resolve -- client ko final status milta hai, `requires_reconciliation` kam. `test_timeout_retried_with_same_key_resolves_immediately` dikhata hai: tok_slow ke pehle attempt pe timeout, retry pe provider existing authorization turant lauta deta hai -> `authorized`, 1 authorization.\n\nCost: worst-case latency ~3.15s per provider call, aur ek payment mein do provider calls (auth + capture) -> ~6s worst case. Provider outage mein har request provider ko 3x hit karti hai (retry amplification). Worker/connection time bhi zyada.\n\nFail fast (retries=0): fast response, provider pe kam load, par har blip `requires_reconciliation` ban jaata hai -- client UX worse aur recovery pe zyada load. Tests yahi mode use karte hain recovery path verify karne ke liye.\n\nRetention dependency: same-key retry tabhi safe hai jab provider key yaad rakhe. In-request retries milliseconds mein hain -- safe. Recovery retries 30s+ baad -- still safe for real providers (~24h), par agar recovery days baad chale (worker down) toh retry naya effect bana sakta hai. Isliye recovery SLO << provider key retention.\n\nMera choice: small bounded retries (2) + async recovery -- common blips synchronous, long outages async. Production mein add karunga: jitter, retry budget, circuit breaker taaki outage mein retries band.",
+  "why_needed": "Retry policy directly latency, provider load aur unknown-rate ko control karta hai; isko consciously tune karna padta hai.",
+  "real_world_analogy": "Phone nahi laga toh do baar aur try karte ho; phir bhi nahi laga toh message chhod dete ho aur baad mein callback ka wait (recovery).",
+  "how_it_works": "Bounded in-request retries with backoff; leftover ambiguity handed to recovery via requires_reconciliation.",
+  "in_this_project": "`provider.py::HttpProvider` retries/backoff; `tests/conftest.py::system` (retries param); dono tok_slow tests; `TRADEOFFS.md` #3.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/provider.py::HttpProvider",
+   "projects/09-payments/tests/conftest.py::system",
+   "projects/09-payments/TRADEOFFS.md",
+   "projects/09-payments/tests/test_failures.py::test_timeout_retried_with_same_key_resolves_immediately"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Most blips resolved synchronously",
+   "Recovery handles the rest"
+  ],
+  "disadvantages": [
+   "Higher tail latency and retry amplification",
+   "Depends on provider key retention"
+  ],
+  "common_mistakes": [
+   "Unbounded retries",
+   "Retrying non-idempotent calls",
+   "No jitter under load"
+  ],
+  "follow_up_questions": [
+   "Retry budget kaise implement karoge?",
+   "Circuit breaker aur retries ka interaction?",
+   "Capture ke liye alag retry policy?"
+  ],
+  "concepts": [
+   "retry policy",
+   "tail latency",
+   "retry amplification",
+   "idempotency retention"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Sync retries improve UX and reduce async work but cost latency and provider load; async-only is cheaper per request but pushes complexity to clients.",
+   "failure_scenarios": "Provider brownout: every request waits ~3s and retries triple load, deepening the outage. Recovery delayed beyond retention -> possible duplicate effects.",
+   "alternatives": "Hedged requests (dangerous for payments), retry only in recovery, adaptive retries based on recent error rate.",
+   "scale_10x_100x": "At 10x, retry amplification during incidents can overload both provider and our pools -> retry budget (e.g., max 10% extra) and breakers become mandatory.",
+   "production_improvements": "Full jitter, retry budget, per-endpoint breaker, honour Retry-After, metrics on attempts per call."
+  }
+ },
+ {
+  "id": "PAYS-089",
+  "project_slug": "p09-payments",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "The idempotency request hash is computed over the raw body bytes. What are the consequences of that choice?",
+  "answer_hinglish": "`request_hash(method, path, body)` = sha256 of method + path + raw bytes. Parsed JSON pe nahi.\n\nFayde:\n- Simple aur exact: koi normalization logic nahi jismein bugs ho sakein.\n- Byte-level strict: koi bhi field change (amount 10000 -> 999) detect -- `test_idempotency_key_semantics` mein `amount=999` same key -> 422 `idempotency_key_reused`.\n- Path included: same key ko `/capture` aur `/void` pe use karna -> 422 (keys per operation).\n- Hash parse se pehle compute hota hai -- validation se independent.\n\nConsequences / downsides:\n- Semantically same, byte-wise different body -> 422. Example: client library ne retry pe JSON key order badal diya, whitespace alag, ya `1.0` vs `1`. Real retry ko client bug samjha jaayega. Practically most HTTP clients same object ko same bytes mein serialize karte hain, par cross-language retries (mobile app vs backend proxy) mein risk hai.\n- Headers hash mein nahi -- agar koi semantic header hota (jaise currency header) toh change detect nahi hota. Yahan saare semantics body/path mein hain, toh theek.\n- Empty body endpoints (void) pe sirf method + path hash.\n\nAlternative: canonical JSON (sorted keys, no whitespace) ka hash after parsing -- tolerant, par normalization ko exactly define karna padta hai (numbers, unicode). Ya sirf specific fields (amount, currency, reference) ka fingerprint -- flexible, par kuch fields miss hone ka risk.\n\nStripe bhi parameters compare karta hai aur mismatch pe error deta hai -- strictness payments mein safe default hai: false 422 annoying hai, par false replay (alag request ko purana response) dangerous.",
+  "why_needed": "Hash ka definition decide karta hai ki 'same request' kya hai -- yeh idempotency ka core contract hai.",
+  "real_world_analogy": "Bank cheque: amount mein ek comma ka farak bhi ho toh bank reject karta hai -- strict, par galat paisa kabhi nahi jaata.",
+  "how_it_works": "sha256(method + ' ' + path + newline + raw body) stored on first request; compared on every reuse.",
+  "in_this_project": "`idempotency.py::request_hash`; `routes.py::idempotent` passes `await request.body()` and `request.url.path`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/idempotency.py::request_hash",
+   "projects/09-payments/payments/api/routes.py::idempotent",
+   "projects/09-payments/tests/test_payments.py::test_idempotency_key_semantics"
+  ],
+  "code_example": "# real, payments/services/idempotency.py\ndef request_hash(method: str, path: str, body: bytes) -> str:\n    return hashlib.sha256(method.encode() + b\" \" + path.encode() + b\"\\n\" + body).hexdigest()",
+  "code_language": "python",
+  "advantages": [
+   "Exact and simple",
+   "Fails safe (false 422 rather than false replay)"
+  ],
+  "disadvantages": [
+   "Serialization differences cause spurious 422",
+   "Query string not included in path"
+  ],
+  "common_mistakes": [
+   "Hashing only the key without the request",
+   "Normalizing loosely and replaying a different request"
+  ],
+  "follow_up_questions": [
+   "Canonical JSON kaise define karoge?",
+   "Query params hash mein kyun nahi?",
+   "Client SDK yeh problem kaise avoid kare?"
+  ],
+  "concepts": [
+   "request fingerprint",
+   "idempotency contract",
+   "strictness"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-090",
+  "project_slug": "p09-payments",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Trade-off: a synchronous payments API that can return ambiguous statuses vs a fully asynchronous API (202 + webhooks).",
+  "answer_hinglish": "Mera API synchronous hai: `POST /payments` provider ko call karta hai aur final-ish status (`captured`, `declined`, `authorized`) ke saath 201 lautata hai -- par kabhi kabhi `requires_reconciliation` bhi, jab outcome unknown ho. TRADEOFFS #2: \"requires a recovery worker and a requires_reconciliation state that clients must handle (poll / webhook)\".\n\nSync ke fayde: 95%+ cases mein client ko turant answer -- checkout UX simple (\"payment successful\" page). Debugging simple (ek request, ek response). Merchant integration easy.\n\nSync ke nuksaan: request latency provider latency + retries se bound (worst ~3s per call). Client ko phir bhi async case handle karna padta hai (`requires_reconciliation`) -- toh client mein do code paths. Server resources (connections, workers) provider ke saath tied.\n\nFully async (202 Accepted + `payment_id`, phir merchant webhook / polling): har payment ka flow uniform hai -- client hamesha \"pending\" se start karta hai aur final status event se paata hai. Server provider calls ko queue/worker mein decouple kar sakta hai, retries aur rate limiting centrally. Provider outages absorb ho jaate hain. Cost: merchant ko webhook endpoint banana padta hai (signature, dedupe -- exactly jo humne provider ke liye kiya), UX mein spinner/polling, aur end-to-end latency thoda zyada.\n\nReal world: Stripe PaymentIntents hybrid hai -- sync confirm response with `status` (succeeded / processing / requires_action) + webhooks as source of truth. Mera design isi ke kareeb hai, bas merchant-facing webhooks implement nahi hain.\n\nMera recommendation production ke liye: hybrid rakho, par merchant webhooks add karo aur docs mein clearly bolo \"webhook is the source of truth; sync response is a fast path\".",
+  "why_needed": "API shape decide karta hai ki ambiguity kaun handle karega -- server, client, ya dono.",
+  "real_world_analogy": "Restaurant: counter pe order karo aur wahin khaana milta hai (sync) vs token lo aur buzzer bajne pe aao (async). Kabhi kabhi counter wala bhi bolta hai 'thoda ruko, buzzer dunga' -- hybrid.",
+  "how_it_works": "Sync path returns current state after provider call; async truth via webhooks/polling; recovery converges unknowns.",
+  "in_this_project": "`routes.py::create_payment` returns 201 with status; `requires_reconciliation` handling; no merchant webhook table/dispatcher in code; `TRADEOFFS.md` #2.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::create_payment",
+   "projects/09-payments/payments/services/payments.py::create_payment",
+   "projects/09-payments/TRADEOFFS.md",
+   "projects/09-payments/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Sync: simple UX for the common case",
+   "Async: uniform flow, decoupled from provider latency"
+  ],
+  "disadvantages": [
+   "Sync: clients still need async handling for unknowns",
+   "Async: merchants must run webhook receivers"
+  ],
+  "common_mistakes": [
+   "Sync API that turns unknowns into failures to avoid async handling",
+   "Async API without dedupe/ordering guidance for merchants"
+  ],
+  "follow_up_questions": [
+   "Merchant webhooks kaise deliver karoge (Project 4)?",
+   "Polling ke liye rate limits?",
+   "3DS jaise 'requires_action' flows kaise fit honge?"
+  ],
+  "concepts": [
+   "sync vs async API",
+   "202 Accepted",
+   "webhooks",
+   "API design"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hybrid gives best UX but two consistency channels (response + webhook) that can disagree temporarily; pure async is consistent but heavier for integrators.",
+   "failure_scenarios": "Sync: provider brownout ties up API workers -> cascading latency. Async: queue backlog delays all payments; webhook delivery failures leave merchants blind without polling.",
+   "alternatives": "Long-polling endpoint for status, server-sent events for checkout pages, or client SDK that abstracts both.",
+   "scale_10x_100x": "At scale async decoupling lets you shape provider traffic (rate limits per provider) and absorb spikes; sync needs larger worker pools.",
+   "production_improvements": "Merchant webhooks via outbox + delivery service with retries/HMAC, status polling endpoint with ETag, SDK handling requires_reconciliation automatically."
+  }
+ },
+ {
+  "id": "PAYS-091",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "What would you monitor and alert on for this payment system in production?",
+  "answer_hinglish": "Abhi project mein metrics/alerts implement nahi hain (logging `bpcommon` se JSON logs hai, aur worker `recovery_run` log karta hai). Production ke liye main yeh rakhunga, priority order mein:\n\nMoney-safety signals:\n1. Unknown/stuck payments: count aur oldest age of `requires_reconciliation`, `authorizing`, `capturing`, `voiding` (DEPLOYMENT.md #2: \"alert on payments in requires_reconciliation older than N minutes\"). Same for refunds `pending/requires_reconciliation`.\n2. Trial balance != 0 -> page immediately (lagbhag impossible, isliye ho toh serious).\n3. Reconciliation exceptions per day by kind (`missing_internally`, `amount_mismatch`, `ledger_mismatch` ...) -- non-zero pe ticket, `ledger_mismatch` pe page.\n\nProvider health:\n4. Provider latency p50/p95, error class counts (timeout, 5xx, transport, 4xx), retry attempts per call.\n5. Decline rate by decline_code -- sudden spike = provider/issuer issue ya fraud.\n\nWebhooks:\n6. Webhook 401 rate (secret mismatch/forgery), outcome distribution (`applied`, `duplicate`, `noop_*`, `unknown_payment`).\n\nApp health:\n7. API latency/error rates per endpoint, 409 rates (idempotency in-progress, InvalidTransition), DB pool saturation, recovery worker heartbeat (last successful run time) -- worker down silent failure hai.\n\nBusiness:\n8. Payments/min, capture rate, refund rate.\n\nAlert design: symptom-based (customer impact) pe page, cause-based pe dashboard. Har alert ke saath runbook.",
+  "why_needed": "Payments mein silent failures (stuck payments, missed reconciliation) sabse costly hain; monitoring hi unhe visible banata hai.",
+  "real_world_analogy": "Car dashboard: fuel (balance), engine temperature (provider latency), check-engine light (trial balance) -- sab gauges nahi, par jo matter karte hain.",
+  "how_it_works": "Export counters/gauges from DB queries and code paths; alert rules on thresholds and age.",
+  "in_this_project": "Existing signals: `payments.status/updated_at/last_error`, `provider_events.outcome`, `reconciliation_runs.summary`, `/admin/ledger/trial-balance`, worker logs. `DEPLOYMENT.md` checklist.",
+  "implementation_files": [
+   "projects/09-payments/DEPLOYMENT.md",
+   "projects/09-payments/payments/worker.py",
+   "projects/09-payments/payments/services/reconcile.py::run",
+   "projects/09-payments/payments/services/ledger.py::trial_balance"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Most signals derivable from existing tables",
+   "Focus on money-safety first"
+  ],
+  "disadvantages": [
+   "Nothing wired yet",
+   "DB-query-based metrics add load if polled too often"
+  ],
+  "common_mistakes": [
+   "Alerting only on HTTP 5xx",
+   "No heartbeat for background workers"
+  ],
+  "follow_up_questions": [
+   "Worker heartbeat kaise implement karoge?",
+   "Alert fatigue kaise avoid karoge?",
+   "SLOs kya define karoge?"
+  ],
+  "concepts": [
+   "monitoring",
+   "alerting",
+   "observability",
+   "SLO"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-092",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Which tables grow without bound, and what retention or cleanup would you add?",
+  "answer_hinglish": "Abhi koi cleanup job nahi hai. Growth analysis:\n\n1. `idempotency_keys`: har mutating request ek row, response body ke saath. Sirf replay window ke liye chahiye. Retention: DEPLOYMENT.md \"e.g. 7 days\" (Stripe 24h). Cleanup: `DELETE FROM idempotency_keys WHERE created_at < now() - interval '7 days' AND state = 'completed'` batches mein (LIMIT via ctid/subquery), `created_at` pe index. Better: daily partitions aur `DROP PARTITION` -- no vacuum bloat. Caution: retention client retry window aur provider key retention se align ho.\n\n2. `payment_events`: har transition ek row (~4-6 per payment). Audit data -- delete nahi, archive. Monthly partitions (SYSTEM_DESIGN 10x row), purane cold storage mein.\n\n3. `ledger_entries` / `ledger_transactions`: financial records -- regulatory retention (years). Never delete; partition by month, snapshots for balances.\n\n4. `provider_events`: webhook dedupe. Provider retry window (days) ke baad dedupe ki zaroorat nahi; 30-90 din rakh ke archive/delete.\n\n5. `reconciliation_items`: mostly `matched` rows (har transaction per run). Matched rows ko store karna optional -- sirf exceptions + summary rakh sakte; ya 90 din baad matched delete.\n\n6. `provider.*` mock tables -- irrelevant in prod.\n\nPartitioning caveat: Postgres partitioned tables pe unique constraints mein partition key include karna padta hai. `ledger_transactions.idempotency_ref UNIQUE` monthly partition pe global unique nahi rahega -- ref mein date nahi hai. Options: ref uniqueness ek separate non-partitioned table mein, ya ledger_transactions ko partition hi na karna (sirf entries).",
+  "why_needed": "Unbounded growth eventually latency, storage cost aur vacuum problems laata hai; retention policy design ka hissa hai.",
+  "real_world_analogy": "Ghar ke documents: bijli ke bill 1 saal rakho, property papers hamesha, aur shopping receipts return window ke baad phenk do.",
+  "how_it_works": "Classify data by purpose (dedupe window vs audit vs financial record) -> choose delete, archive, or partition-and-keep.",
+  "in_this_project": "Migration tables; `DEPLOYMENT.md` #4 'Idempotency key retention (e.g. 7 days) with a cleanup job; partition events/ledger tables by month'; `TRADEOFFS.md` #6.",
+  "implementation_files": [
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/DEPLOYMENT.md",
+   "projects/09-payments/TRADEOFFS.md",
+   "projects/09-payments/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- illustrative batched cleanup\nDELETE FROM idempotency_keys\nWHERE (merchant_id, key) IN (\n  SELECT merchant_id, key FROM idempotency_keys\n  WHERE state = 'completed' AND created_at < now() - interval '7 days'\n  LIMIT 5000);",
+  "code_language": "sql",
+  "advantages": [
+   "Bounded storage and faster indexes",
+   "Partition drops are instant and bloat-free"
+  ],
+  "disadvantages": [
+   "Global unique constraints conflict with partitioning",
+   "Retention must align across layers"
+  ],
+  "common_mistakes": [
+   "Deleting ledger data for space",
+   "One giant DELETE that locks and bloats the table"
+  ],
+  "follow_up_questions": [
+   "idempotency_ref uniqueness partitioning ke saath kaise rakhoge?",
+   "Retention windows ko kaise align karoge?",
+   "Archive se audit query kaise?"
+  ],
+  "concepts": [
+   "data retention",
+   "partitioning",
+   "cleanup jobs",
+   "archiving"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-093",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What would have to change to move from the mock provider to a real provider in production?",
+  "answer_hinglish": "Pehle rule: is project mein kabhi real credentials nahi daalne -- yeh mock-only portfolio project hai. Question hypothetical production migration ka hai. DEPLOYMENT.md \"Checklist for a real deployment\" base hai:\n\n1. Adapter: `PaymentProvider` implement karne wali real adapter class. Vendor ke idempotency header use karo, error mapping bahut carefully (vendor ke \"processing\"/\"unknown\" errors ko AMBIGUOUS mein). `find_by_reference` ke liye vendor metadata/search, `settlements` ke liye vendor settlement/balance-transaction reports.\n\n2. Secrets: API keys aur webhook secrets secret manager se (env files mein nahi), per-endpoint webhook secret, rotation support (do secrets accept during rotation).\n\n3. Webhooks: vendor-specific signature verification (abhi `verify` mock format pe hai), more event types (`payment_failed`, `refund.failed`, `charge.dispute.created`), inbox-style processing.\n\n4. Flows jo mock mein nahi: 3-D Secure / SCA (`requires_action` status + redirect), authorization expiry (~7 days) -> auto-void ya expire handling, multiple partial captures, disputes/chargebacks lifecycle, payouts to merchants (README limitations).\n\n5. Recovery & reconciliation ops: worker always running with alerts; daily reconciliation per provider and currency with human review queue (`reconciliation_items.resolution` column use karna); recovery SLO < vendor key retention.\n\n6. Security/compliance: frontend tokenization (PCI SAQ-A scope), rate limiting per merchant (Project 1), RBAC for admin (Project 6), encryption at rest, Postgres PITR backups (\"the ledger is the system of record\").\n\n7. Testing: vendor sandbox contract tests running the same scenarios as `test_failures.py`; mock provider remain for CI.\n\n8. Remove test-only hooks (mock `/test/drift` exists only in mock service -- ensure it never ships).",
+  "why_needed": "Mock se real tak ka gap honestly batana dikhata hai ki aap production complexity samajhte ho, sirf demo nahi.",
+  "real_world_analogy": "Flight simulator se real cockpit: controls same (adapter protocol), par weather, ATC, aur passengers (real money, compliance) naye hain.",
+  "how_it_works": "Swap adapter behind protocol; add missing flows, secrets management, ops processes and compliance controls.",
+  "in_this_project": "`DEPLOYMENT.md` checklist; `provider.py::PaymentProvider`; `README.md` known limitations; `SECURITY.md` gaps; compose comment 'MOCK PROVIDER ONLY'.",
+  "implementation_files": [
+   "projects/09-payments/DEPLOYMENT.md",
+   "projects/09-payments/payments/services/provider.py::PaymentProvider",
+   "projects/09-payments/README.md",
+   "projects/09-payments/SECURITY.md",
+   "projects/09-payments/docker-compose.yml"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Protocol boundary makes the swap localized",
+   "Failure model already designed for real-world ambiguity"
+  ],
+  "disadvantages": [
+   "Many real-world flows absent (3DS, disputes, payouts)",
+   "Webhook verification not abstracted yet"
+  ],
+  "common_mistakes": [
+   "Copying sandbox keys into repo/env files",
+   "Mapping vendor ambiguous errors as declines"
+  ],
+  "follow_up_questions": [
+   "3DS flow state machine mein kaise fit hoga?",
+   "Disputes ko ledger mein kaise book karoge?",
+   "Contract tests kaise design karoge?"
+  ],
+  "concepts": [
+   "production readiness",
+   "provider integration",
+   "secrets management",
+   "compliance"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Thin adapter keeps core stable but vendor-specific features push for richer protocol; balance by optional capability interfaces.",
+   "failure_scenarios": "Wrong error mapping (timeout treated as decline) = charged-but-failed at scale; webhook secret misconfig = all webhooks 401 silently; authorization expiry unhandled = uncapturable orders.",
+   "alternatives": "Payment orchestration platform instead of direct integration; start with one vendor's hosted checkout to minimize scope.",
+   "scale_10x_100x": "Production volume needs worker scaling, reconciliation automation, and per-provider dashboards from day one.",
+   "production_improvements": "Staged rollout (shadow/limited merchants), contract test suite against sandbox, runbooks for each failure scenario, dispute and payout modules."
+  }
+ },
+ {
+  "id": "PAYS-094",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "Reconciliation reports an amount_mismatch: the provider shows 9,000 captured, we show 10,000. What is the operational workflow?",
+  "answer_hinglish": "Yeh exactly test scenario hai: `test_reconciliation_finds_drift_and_unrecorded_charges` mock provider ke `/test/drift/{pid}` se captured 9,000 kar deta hai (\"e.g. partial chargeback\") -> summary mein `amount_mismatch: 1`. Real world mein causes: chargeback/dispute, provider-side manual adjustment, partial capture humne kuch aur record kiya, ya humara bug.\n\nWorkflow (code mein abhi detection hai, resolution workflow nahi -- `reconciliation_items.resolution` column exist karta hai par code use nahi karta):\n\n1. Triage: `GET /admin/reconciliation/runs/{id}` -> exception item with `ours` (status, amount_captured, amount_refunded) aur `theirs` (provider view). Provider dashboard/API se event history dekho -- dispute? adjustment?\n\n2. Classify cause:\n   - Provider-initiated (chargeback): truth provider hai. Humare books mein naya business event post karo -- e.g., `dispute` ledger transaction: `merchant_payable +1000`, `provider_receivable -1000` (merchant se paisa wapas lena). Kabhi existing entries edit nahi.\n   - Humara bug (galat amount record): reversing + correcting postings, aur bug fix.\n   - Timing (provider ne baad mein update kiya): next day's run mein match ho jaayega.\n\n3. Record resolution: `UPDATE reconciliation_items SET resolution = '<who/what/why>'` -- audit trail. Ideally ek proper `resolved_by`, `resolved_at`, linked ledger transaction id.\n\n4. Prevent: agar chargebacks common hain, `charge.dispute.*` webhooks handle karo taaki daily recon ka wait na ho.\n\nAuto-fix kyun nahi: reconciliation findings ambiguous ho sakti hain (provider bhi galat ho sakta hai), aur money movement ka decision human/finance approval maangta hai. Rule: detection automated, resolution reviewed. Low-risk categories (timing mismatches that self-heal) ko auto-close kar sakte hain.",
+  "why_needed": "Detection sirf aadha kaam hai; production mein exceptions ka owner, SLA aur audit trail chahiye.",
+  "real_world_analogy": "Bank statement mein ek entry match nahi kar rahi: CA pehle reason dhoondta hai, phir adjustment entry daalta hai aur note likhta hai -- purani entry kaat-ta nahi.",
+  "how_it_works": "Exceptions -> triage -> classify -> corrective postings (append-only) -> record resolution -> prevent recurrence.",
+  "in_this_project": "`reconcile.py::run` amount_mismatch; `routes.py::reconciliation_run` exceptions endpoint; migration `reconciliation_items.resolution`; mock `/test/drift`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/reconcile.py::run",
+   "projects/09-payments/payments/api/routes.py::reconciliation_run",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/tests/test_failures.py::test_reconciliation_finds_drift_and_unrecorded_charges"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Exceptions persisted with both views for investigation",
+   "Append-only ledger keeps corrections auditable"
+  ],
+  "disadvantages": [
+   "No resolution workflow or tooling",
+   "Chargebacks only detected daily"
+  ],
+  "common_mistakes": [
+   "Overwriting our amounts to match the provider",
+   "Auto-posting adjustments without review"
+  ],
+  "follow_up_questions": [
+   "Dispute ledger posting exactly kya hogi?",
+   "Resolution ka data model kya hoga?",
+   "Exceptions ka SLA kya rakhoge?"
+  ],
+  "concepts": [
+   "reconciliation exceptions",
+   "chargebacks",
+   "adjusting entries",
+   "ops workflow"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Human review = slow but safe; auto-resolution = fast but risks compounding errors. Tier by category and amount.",
+   "failure_scenarios": "Provider report itself wrong/late; mismatch caused by our partial-capture semantics; duplicate resolution postings (needs idempotency_ref per resolution).",
+   "alternatives": "Dispute webhooks + dispute state machine; third-party reconciliation tools; matching on provider balance transactions instead of authorizations.",
+   "scale_10x_100x": "Exceptions volume scales with transactions; need queues, assignment, aging dashboards, and auto-close for known benign classes.",
+   "production_improvements": "Resolution table (item, action, ledger_tx_id, actor, timestamp), admin endpoint for adjustment postings with idempotency, dispute webhooks."
+  }
+ },
+ {
+  "id": "PAYS-095",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "How is the system deployed and configured with Docker Compose?",
+  "answer_hinglish": "`docker-compose.yml` (project name `p09-payments`) paanch services define karta hai:\n\n1. `postgres`: `postgres:17-alpine`, named volume `pgdata` (data restart pe safe), healthcheck `pg_isready`.\n2. `migrate`: same app image, `alembic upgrade head` chalata hai; `postgres` healthy hone tak wait.\n3. `provider`: mock provider -- `uvicorn mockprovider.app:app_from_env --factory` port 8000, env `PROVIDER_DATABASE_URL`, `PROVIDER_API_KEY`, `PROVIDER_WEBHOOK_URL=http://api:8000/webhooks/provider`, `PROVIDER_WEBHOOK_SECRET`. Migrate complete hone ke baad start.\n4. `api`: payments app, port `127.0.0.1:58009:8000` -- sirf localhost pe exposed.\n5. `worker`: `python -m payments.worker` -- recovery loop.\n\nShared env YAML anchor `x-env: &env`: `PAY_DATABASE_URL`, `PAY_PROVIDER_URL=http://provider:8000`, `PAY_PROVIDER_API_KEY`, `PAY_PROVIDER_WEBHOOK_SECRET`, `PAY_ADMIN_TOKEN` (default `change-me-pay-admin`, override via env). App config `config.py` pydantic-settings `env_prefix=\"PAY_\"` -- toh `PAY_STUCK_AFTER_SECONDS`, `PAY_PROVIDER_TIMEOUT_SECONDS`, `PAY_IDEMPOTENCY_LOCK_SECONDS` bhi override ho sakte hain.\n\nRun: `docker compose up -d --build`, phir `python demo.py http://127.0.0.1:58009` jo merchant banata hai, visa payment, decline, partial refund, slow provider, ledger balances aur trial balance print karta hai, aur dashboard URL.\n\nComment top pe: \"MOCK PROVIDER ONLY. Never configure real payment credentials here.\" Mock keys (`mock_provider_key`, `whsec_mock_provider`) placeholders hain.\n\nProduction differences (DEPLOYMENT.md): secrets manager, worker always on with alerts, PITR backups, rate limiting, RBAC.",
+  "why_needed": "Interview mein 'isse kaise chalaoge' practical sawaal hai; deployment topology se dependencies aur startup order dikhte hain.",
+  "real_world_analogy": "Shaadi ka setup: pehle tent (postgres), phir decoration (migrate), phir caterer (provider), phir mehmaan entry (api), aur safai wala jo raat bhar ghoomta hai (worker).",
+  "how_it_works": "Compose orders startup via depends_on conditions; app reads PAY_* env vars via pydantic-settings.",
+  "in_this_project": "`docker-compose.yml`, `Dockerfile`, `payments/config.py::Settings`, `demo.py`, `DEPLOYMENT.md`, `.env.example`.",
+  "implementation_files": [
+   "projects/09-payments/docker-compose.yml",
+   "projects/09-payments/payments/config.py::Settings",
+   "projects/09-payments/demo.py",
+   "projects/09-payments/DEPLOYMENT.md",
+   "projects/09-payments/.env.example"
+  ],
+  "code_example": "# real, payments/config.py (trimmed)\nclass Settings(BaseSettings):\n    model_config = SettingsConfigDict(env_prefix=\"PAY_\", env_file=\".env\", extra=\"ignore\")\n    provider_timeout_seconds: float = 1.0\n    stuck_after_seconds: float = 30.0\n    idempotency_lock_seconds: float = 60.0",
+  "code_language": "python",
+  "advantages": [
+   "One command brings up the full topology",
+   "Migrations gate app startup"
+  ],
+  "disadvantages": [
+   "Single worker, no scaling",
+   "Secrets via env vars"
+  ],
+  "common_mistakes": [
+   "Exposing API on 0.0.0.0 with default admin token",
+   "Starting API before migrations complete"
+  ],
+  "follow_up_questions": [
+   "Zero-downtime migrations kaise?",
+   "Worker ko scale karoge toh kya badlega?",
+   "Healthchecks API ke liye kyun nahi?"
+  ],
+  "concepts": [
+   "docker compose",
+   "configuration",
+   "startup ordering"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-096",
+  "project_slug": "p09-payments",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "A customer says 'I was charged but my order failed'. How does the system help support answer that?",
+  "answer_hinglish": "Yeh exactly woh failure hai jise project rokna chahta hai -- par support ko investigate karne ka tareeka bhi chahiye.\n\nStep 1: payment dhoondo -- merchant ke `merchant_reference` (order id) se `GET /payments?status=` list ya DB query. `GET /payments/{id}` poora picture deta hai: status, amounts (authorized/captured/refunded), `provider_payment_id`, `decline_code`, `last_error`, events timeline (har transition reason ke saath), aur refunds list.\n\nStep 2: status ke hisaab se:\n- `requires_reconciliation` / `authorizing` / `capturing`: outcome abhi resolve ho raha hai. Customer ke statement pe pending hold dikh sakta hai. Recovery worker resolve karega; urgent ho toh admin `POST /admin/recovery/run`. Customer ko bolo \"payment processing hai, confirm ho jaayega\" -- dobara pay mat karwao (partial unique index waise bhi block karega).\n- `authorized` (capture failed ya merchant ne capture nahi kiya): paisa hold hai, charge nahi hua -- void se release karo agar order cancel hai.\n- `captured` par order fail: merchant side issue; refund karo (`POST /payments/{id}/refunds`). Saga flow mein compensation automatically refund karta hai.\n- `failed`/`declined` par customer kehta hai charge hua: shayad pending authorization hold jo bank release karega, ya provider pe actually authorized (late request) -- reconciliation `status_mismatch` pakdega; provider pe void karna chahiye.\n\nStep 3: reconciliation report check karo us din ka -- `missing_internally` item matlab provider pe charge hai jiska humare paas record nahi (jaise tok_slow case before recovery).\n\nEvents timeline yahan sabse useful hai: \"authorization outcome unknown\" -> \"authorized (found by recovery)\" jaisa trail support ko exact story deta hai.",
+  "why_needed": "Support ke paas exact answer hona trust aur chargeback rate dono ke liye important hai.",
+  "real_world_analogy": "Courier complaint: tracking id se poori journey dekho -- kahan atka, kab scan hua -- phir decide karo re-deliver ya refund.",
+  "how_it_works": "Lookup by reference -> inspect status, amounts, events -> act (wait, void, refund) -> cross-check reconciliation.",
+  "in_this_project": "`routes.py::get_payment` (events + refunds), `list_payments`; `payments.last_error`, `decline_code`; recovery and refunds endpoints; reconciliation exceptions.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::get_payment",
+   "projects/09-payments/payments/api/routes.py::list_payments",
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/payments/services/reconcile.py::run"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Full audit timeline per payment",
+   "Clear action per status"
+  ],
+  "disadvantages": [
+   "No support UI/search by reference endpoint",
+   "Merchant-facing notifications absent"
+  ],
+  "common_mistakes": [
+   "Asking the customer to pay again while status is unknown",
+   "Refunding before checking whether capture actually happened"
+  ],
+  "follow_up_questions": [
+   "Search by merchant_reference endpoint kaise add karoge?",
+   "Support ko kaunse admin actions dene chahiye?",
+   "Customer communication templates?"
+  ],
+  "concepts": [
+   "customer support",
+   "audit trail",
+   "operational runbook"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-097",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Exactly-once processing over a network is impossible. How does this system still avoid double effects?",
+  "answer_hinglish": "Two Generals problem ki wajah se: sender kabhi pakka nahi jaan sakta ki uska message process hua ya nahi agar acknowledgment lost ho sakta hai. Toh choice hai: at-most-once (kabhi retry mat karo -- message kho sakta hai, payments mein \"charged without order\" ya \"never captured\") ya at-least-once (retry karo jab tak ack na mile -- duplicates possible). Exactly-once delivery impossible; par exactly-once EFFECT possible hai: at-least-once delivery + idempotent processing = effectively once.\n\nMera system har hop pe yahi karta hai:\n- Client -> API: client at-least-once retry karta hai; `Idempotency-Key` + stored response = effect once.\n- API -> provider: in-request retries aur recovery retries (at-least-once); provider-side idempotency keys (`auth-{pid}`, `capture-{pid}`, ...) = effect once. `test_crash_mid_capture_is_completed_by_recovery_exactly_once`.\n- Provider -> API webhooks: provider at-least-once; `provider_events` PK dedupe + CAS handlers = effect once.\n- Multiple internal finalizers (API, webhook, recovery): CAS on status + `ledger_transactions.idempotency_ref` UNIQUE = ledger posting once.\n\nDo cheezein jo isko kaam karwati hain: (1) har operation ki stable identity durable state se derive hoti hai (memory se nahi), (2) dedupe record aur effect ek hi atomic boundary mein ya effect khud idempotent (CAS).\n\nLimits: dedupe stores ki retention (provider key ~24h, humari keys no TTL abhi) ke baad duplicate possible. Aur jahan dedupe record aur effect alag transactions mein hain, wahan crash pe \"at-most-once\" ban jaata hai. Webhooks mein yahi bug tha (dedupe insert apply se pehle commit, crash ke baad redelivery 'duplicate') -- review fix: dedupe row ka outcome 'received' rehta hai jab tak apply poora na ho, aur redelivery 'received' event ko dobara apply karti hai (CAS ki wajah se safe). Isi tarah takeover pe payment/refund ids ab Idempotency-Key se derive hote hain, taaki retry naya object na banaye.",
+  "why_needed": "Distributed systems interviews mein 'exactly-once' claim ko defend ya debunk karna classic hai; correct framing seniority dikhata hai.",
+  "real_world_analogy": "Registered post: postman tab tak try karta hai jab tak signature na mile (at-least-once); aap har letter ka number register mein likhte ho taaki duplicate letter pe dobara action na lo (idempotent receiver).",
+  "how_it_works": "At-least-once transport + stable operation ids + durable dedupe/CAS at each receiver.",
+  "in_this_project": "Idempotency at every hop: `idempotency.py`, provider keys in `payments.py`/`recovery.py`, `webhooks.py` dedupe, `ledger.py` refs, `state.py` CAS.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/idempotency.py",
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/payments/services/webhooks.py::handle",
+   "projects/09-payments/payments/services/ledger.py::post",
+   "projects/09-payments/SYSTEM_DESIGN.md",
+   "projects/09-payments/tests/test_review_fixes.py::test_webhook_whose_first_apply_failed_is_applied_on_redelivery"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Correct framing: guarantees about effects, not delivery",
+   "Each hop independently safe"
+  ],
+  "disadvantages": [
+   "Depends on dedupe retention windows",
+   "Effect + dedupe atomic nahi hain; correctness 'done' marker + idempotent effects pe tiki hai"
+  ],
+  "common_mistakes": [
+   "Claiming exactly-once delivery",
+   "Dedupe in memory (lost on restart)"
+  ],
+  "follow_up_questions": [
+   "Kafka ka 'exactly-once semantics' kya actually deta hai?",
+   "Dedupe aur effect atomic kaise banaoge webhooks mein?",
+   "Retention windows kaise choose karoge?"
+  ],
+  "concepts": [
+   "exactly-once",
+   "at-least-once",
+   "idempotent receiver",
+   "Two Generals"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Idempotent receivers push cost into storage (dedupe tables) and design discipline; transactional messaging (Kafka EOS) only works within one system's boundary.",
+   "failure_scenarios": "Dedupe record committed before effect + crash = lost effect; effect committed before dedupe record + crash = duplicate effect unless effect itself idempotent (CAS). Retention expiry = duplicates.",
+   "alternatives": "Transactional outbox/inbox, Kafka transactions within a cluster, deterministic ids + upserts everywhere.",
+   "scale_10x_100x": "Dedupe stores become large hot tables at scale -> TTL partitions, compact keys, maybe bloom-filter pre-checks.",
+   "production_improvements": "Webhook 'received' events ke liye inbox processor (abhi sirf redelivery pe re-apply), har dedupe store ki retention set + document, aur tests jo steps ke beech process kill karein (jaise `test_review_fixes.py` crash rows simulate karta hai)."
+  }
+ },
+ {
+  "id": "PAYS-098",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Where would the transactional outbox pattern fit in this system, and why is the ledger NOT posted via an outbox?",
+  "answer_hinglish": "Outbox pattern: jab ek DB change aur ek external message dono chahiye, toh message ko pehle ek `outbox` table mein SAME transaction mein likho; ek alag relay process outbox padh ke message publish karta hai (at-least-once) aur sent mark karta hai. Dual-write problem (DB commit hua, message fail -- ya ulta) solve hota hai.\n\nIs project mein outbox implement nahi hai. Kahan fit hota:\n1. Merchant webhooks/notifications: payment `captured` ya `refunded` hone pe merchant ko event bhejna. `transition()` ke saath same tx mein outbox row -> relay (Project 4 jaisa delivery service) HMAC-signed webhooks retries ke saath. Abhi merchant notifications hai hi nahi.\n2. Analytics/streaming: SYSTEM_DESIGN 100x row \"outbox -> Kafka for events; read models for dashboards\".\n3. Provider calls as outbox (\"intent\" row + worker jo provider call kare): conceptually humara intermediate state + recovery worker already ek outbox-jaisa mechanism hai -- `authorizing` row intent hai aur recovery relay hai. Difference: sync path pehle khud try karta hai (fast path), worker sirf fallback.\n\nLedger outbox se kyun nahi: ledger posting aur status change ka atomic hona design ka core invariant hai (\"status and books can't disagree\"). Agar capture status commit ho aur ledger posting outbox se baad mein async ho, toh ek window hai jahan payment captured hai par ledger mein nahi -- balances galat, reconciliation `ledger_mismatch` false positives, aur relay bug = missing money. Ledger aur payments same DB mein hain, toh local transaction free mein atomicity deta hai -- outbox sirf cross-system boundaries ke liye hai.\n\nRule: same DB -> same transaction; different system -> outbox (ya intent + recovery).",
+  "why_needed": "Outbox microservices ka standard reliability pattern hai; kab use karna aur kab nahi -- dono samajhna zaroori.",
+  "real_world_analogy": "Office ka outgoing letters tray: letter likh ke file mein copy aur tray mein original ek saath rakhte ho; peon baad mein tray se post karta hai. Par apne hi register mein entry ke liye tray nahi -- seedha register mein likhte ho.",
+  "how_it_works": "Write business change + outbox row atomically; relay publishes with retries and marks sent; consumers dedupe by event id.",
+  "in_this_project": "No outbox table in migration; `SYSTEM_DESIGN.md` scaling row mentions it; `payments.py::finalize_capture` keeps ledger in the same tx; intermediate state + `recovery.py` act like an intent log.",
+  "implementation_files": [
+   "projects/09-payments/SYSTEM_DESIGN.md",
+   "projects/09-payments/payments/services/payments.py::finalize_capture",
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/payments/services/state.py::transition"
+  ],
+  "code_example": "-- illustrative outbox table and write in the same transaction as transition()\nCREATE TABLE outbox (\n  id bigserial PRIMARY KEY,\n  topic text NOT NULL,\n  payload jsonb NOT NULL,\n  created_at timestamptz NOT NULL DEFAULT now(),\n  sent_at timestamptz);\n-- inside transition(): INSERT INTO outbox (topic, payload) VALUES ('payment.' || :to, :payload);",
+  "code_language": "sql",
+  "advantages": [
+   "Solves dual-write for notifications",
+   "Keeps ledger atomic by not using it there"
+  ],
+  "disadvantages": [
+   "Relay is another process to run and monitor",
+   "At-least-once -> consumers must dedupe"
+  ],
+  "common_mistakes": [
+   "Publishing to Kafka inside the request after commit (dual write)",
+   "Moving ledger postings to async events"
+  ],
+  "follow_up_questions": [
+   "Relay ordering per payment kaise guarantee karoge?",
+   "Outbox table cleanup?",
+   "CDC (Debezium) vs polling relay?"
+  ],
+  "concepts": [
+   "transactional outbox",
+   "dual write",
+   "atomicity boundary"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Outbox gives reliable messaging with local transactions at the cost of a relay and latency; CDC avoids the extra table writes but adds infra.",
+   "failure_scenarios": "Relay crash after publish before marking sent -> duplicate messages; relay lag -> stale merchant notifications; unbounded outbox growth.",
+   "alternatives": "CDC on payments/payment_events (payment_events is already an event log that could be streamed), listen/notify for low-latency wakeups.",
+   "scale_10x_100x": "At 100x, outbox becomes a hot insert table -> partition by time, multiple relays sharded by id range, Kafka partition key = payment_id for ordering.",
+   "production_improvements": "Use payment_events itself as the outbox (it is already append-only and written in the same tx) with a sent cursor, plus consumer dedupe by event id."
+  }
+ },
+ {
+  "id": "PAYS-099",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "With lease-based idempotency takeover, can two executions overlap? How would fencing help?",
+  "answer_hinglish": "Haan, theoretically overlap possible hai. Lease = `locked_until = now + 60s`. Scenario: request 1 slow hai -- provider timeouts (3 attempts x 1s) plus DB stalls, ya process GC/CPU starved, aur 60s se zyada chal gaya (unlikely par possible: event loop blocked, DB lock wait). Lease expire. Client retry (same key) aata hai -> `begin()` dekhta hai expired -> takeover -> handler 2 shuru. Ab handler 1 aur 2 dono chal rahe hain.\n\nKya bigad sakta hai, aur kya bachata hai:\n- Create payment: handler 2 ka pid bhi `id_for(merchant, key)` se derive hota hai -> same row; `authorizing` ho toh same `auth-{pid}` resend (provider dedupe), CAS transitions mein ek hi jeetega. Safe.\n- Capture: CAS `authorized -> capturing` sirf ek jeetega; dono `capture-{pid}` key use karte hain. Safe.\n- Refund: yeh real bug tha (review mein mila): handler 2 naya refund row + naya `refund-{rid2}` key banata tha -> pending-sum check ke andar ho toh do refunds (captured 10,000, refund 3,000: R1 + R2 = 6,000 pass). Fix: `rid = id_for(merchant, key, \"refund\")`, toh handler 2 R1 hi dhoondta hai aur pending ho toh same `refund-{rid}` se resend karta hai -- test `test_refund_takeover_after_crash_does_not_refund_twice`.\n- `complete()` race: dono end mein `complete()` karte hain -- last writer wins, stored response handler 2 ka ya 1 ka.\n\nFencing token concept: har lease grant pe ek monotonically increasing number (e.g., `lease_version` column, takeover pe +1). Handler apne writes ke saath token bhejta hai, aur write tabhi accept hota hai jab token current ho. Yahan: idempotency row mein `version`; `complete()` `WHERE version = :mine` -- stale handler ka complete reject. Side effects ke liye project ne \"resource id deterministic from key\" approach li (refund/payment id = uuid5 of merchant + key) -- handler 2 wahi row resume karta hai; yeh fencing se bhi zyada robust hai kyunki provider tak same key jaati hai. `complete()` pe fencing (version) abhi bhi nahi hai.\n\nLease length tuning: lease > max possible handler duration (timeout x attempts x provider calls + DB) with margin. 60s current max (~6-7s) se kaafi upar hai, toh practically rare.",
+  "why_needed": "Leases distributed systems ka common tool hai, aur unka classic failure (paused holder) samajhna senior-level expectation hai.",
+  "real_world_analogy": "Parking ticket 1 ghante ka: aap late ho gaye, attendant ne spot kisi aur ko de diya; aap wapas aaye aur dono gaadiyan ek spot pe. Fencing = har naye ticket pe naya number; purana number wala gate se nikal hi nahi sakta.",
+  "how_it_works": "Lease expiry assumes holder is dead; a paused holder violates that; fencing tokens or deterministic resource ids make stale writers harmless.",
+  "in_this_project": "`idempotency.py::begin` takeover branch, `complete` (no version check); `payments.py::id_for` + `create_refund(refund_id=...)` (same refund id on every run); `config.idempotency_lock_seconds`; test `test_refund_takeover_after_crash_does_not_refund_twice`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/idempotency.py::begin",
+   "projects/09-payments/payments/services/idempotency.py::complete",
+   "projects/09-payments/payments/services/payments.py::create_refund",
+   "projects/09-payments/payments/config.py",
+   "projects/09-payments/payments/services/payments.py::id_for",
+   "projects/09-payments/tests/test_review_fixes.py::test_refund_takeover_after_crash_does_not_refund_twice"
+  ],
+  "code_example": "# real, payments/services/payments.py (trimmed) -- refund takeover resumes instead of inserting again\nif refund_id is not None:\n    prev = ...  # SELECT r.* FROM refunds r JOIN payments p ... WHERE r.id = :r AND p.merchant_id = :m\n    if prev is not None:\n        if prev[\"status\"] != \"pending\":\n            return {\"id\": prev[\"id\"], \"status\": prev[\"status\"], \"amount\": prev[\"amount\"]}\n        return await _send_refund(sm, provider, p, refund_id, prev[\"amount\"])   # same refund-{id} key",
+  "code_language": "python",
+  "advantages": [
+   "Leases make crash recovery automatic",
+   "Deterministic resource ids remove most overlap risk"
+  ],
+  "disadvantages": [
+   "Paused-holder overlap is possible",
+   "`complete()` has no fencing: a stale handler can overwrite the stored response"
+  ],
+  "common_mistakes": [
+   "Assuming lease expiry means the holder is dead",
+   "Lease shorter than worst-case handler time"
+  ],
+  "follow_up_questions": [
+   "Fencing token ko provider calls tak kaise extend karoge?",
+   "Lease ko heartbeat se extend karoge?",
+   "Kleppmann vs Redlock debate kya tha?"
+  ],
+  "concepts": [
+   "lease",
+   "fencing token",
+   "paused process",
+   "idempotency takeover"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Longer leases reduce overlap risk but delay recovery after real crashes; heartbeated leases fix both at the cost of complexity.",
+   "failure_scenarios": "GC pause / event-loop stall beyond lease; clock skew between app servers (locked_until uses app clock, comparison uses app clock too -- different servers could disagree).",
+   "alternatives": "Heartbeat-extended leases, deterministic resource ids per key, Stripe recovery points, DB-side now() for lease timestamps.",
+   "scale_10x_100x": "More replicas = more chance of skew and pauses; use DB time (now()) consistently and fencing on all writes.",
+   "production_improvements": "Use DB now() for locked_until, add version/fencing to idempotency rows (complete() WHERE version = :mine), heartbeat-extend leases for long handlers, test with an artificially paused handler. (Linking refunds/payments to the key is done via `id_for`.)"
+  }
+ },
+ {
+  "id": "PAYS-100",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "payment_events is an append-only log of every transition. Could you make it the source of truth (event sourcing)? Should you?",
+  "answer_hinglish": "Abhi model \"state + audit log\" hai: `payments` row current state hai (source of truth), `payment_events` same transaction mein likha history hai. Event sourcing mein ulta: events hi truth hain, aur `payments` row ek projection (derived view) hoti jo events replay karke banti.\n\nKya possible hai: haan, kaafi kareeb hai. Har transition ka `from_status`, `to_status`, `data` (amount, fee, provider_id, decline_code) already record hota hai. `_last_intent()` already events se intent padhta hai -- yeh event-sourcing-ish read hai. Ledger bhi effectively event-sourced hai: balances sirf entries se derive hote hain.\n\nFayde agar karein: (1) temporal queries (\"kal 3 baje is payment ka state kya tha\") natural; (2) naye projections (analytics, merchant dashboards) events replay karke bina migration; (3) outbox ki zaroorat kam -- events khud stream ho sakte.\n\nKyun main abhi nahi karunga:\n1. Concurrency control: abhi CAS `UPDATE ... WHERE status = ANY(...)` ek row pe hai -- simple aur fast. Event sourcing mein optimistic concurrency on stream version chahiye (`expected_version`), aur current state har command pe rebuild/snapshot se.\n2. Constraints: CHECK constraints (captured <= authorized), partial unique index (one live payment per order) projection pe hain -- event store pe enforce karna mushkil; uniqueness ke liye alag reservation table.\n3. Event schema evolution: `data` jsonb abhi informal hai; event sourcing mein versioned schemas, upcasters.\n4. Complexity vs benefit: payments ka state chhota hai; audit trail already mil raha hai.\n\nMiddle ground (recommended): current design rakho, `payment_events` ko formal schema do, aur CDC/outbox se stream karo -- event sourcing ke reporting benefits bina write-path complexity ke. Ledger already append-only truth hai -- wahan event-sourced thinking sahi jagah applied hai.",
+  "why_needed": "Event sourcing ek popular senior topic hai; existing design ko uske against evaluate karna depth dikhata hai.",
+  "real_world_analogy": "Passbook (events) vs account balance screen (state): bank dono rakhta hai -- passbook kabhi delete nahi hoti, par har baar passbook jodke balance nahi dikhata.",
+  "how_it_works": "Today: state row is truth, events are atomic audit. Event sourcing: events are truth, state is projection rebuilt with snapshots.",
+  "in_this_project": "`state.py::transition` writes both; `recovery.py::_last_intent` reads events; `ledger.py` derived balances; migration payment_events.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/state.py::transition",
+   "projects/09-payments/payments/services/recovery.py::_last_intent",
+   "projects/09-payments/payments/services/ledger.py::balances",
+   "projects/09-payments/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Current design already gets audit + intent benefits",
+   "Ledger already derives state from immutable entries"
+  ],
+  "disadvantages": [
+   "Full event sourcing complicates constraints and concurrency",
+   "Event schema discipline required"
+  ],
+  "common_mistakes": [
+   "Treating an audit log as event sourcing",
+   "Event sourcing everything because it is fashionable"
+  ],
+  "follow_up_questions": [
+   "Uniqueness constraints event-sourced system mein kaise?",
+   "Snapshots kab lete ho?",
+   "CDC se events stream karna vs outbox?"
+  ],
+  "concepts": [
+   "event sourcing",
+   "audit log",
+   "projections",
+   "CQRS"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Event sourcing: perfect history and flexible projections vs harder invariants and operational complexity. State+audit: simple invariants, history good enough.",
+   "failure_scenarios": "Projection bugs produce wrong current state; replay of buggy historical events; schema drift in jsonb data breaking replays.",
+   "alternatives": "State + CDC stream (Debezium), state + outbox events, or event sourcing only for the ledger (already the case in spirit).",
+   "scale_10x_100x": "Events table is already the fastest-growing payment table; partitioning and archival needed either way; replay times grow without snapshots.",
+   "production_improvements": "Formalize event types and versions in payment_events (append-only trigger already added in migration 0002), stream via CDC for analytics/read models."
+  }
+ },
+ {
+  "id": "PAYS-101",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you extend the ledger to support multi-currency payments and FX conversion?",
+  "answer_hinglish": "Abhi: accounts per (code, merchant, currency); har payment ek currency mein (INR/USD/EUR/GBP), saari postings us currency ke accounts pe. README: \"no multi-currency conversion\". Ek ledger transaction ki saari entries same currency ki hain -- implicitly, kyunki `book_capture` payment currency ke accounts use karta hai. Pehle DB isko enforce nahi karta tha (balanced trigger sirf amounts ka sum dekhta tha, currency nahi) -- review mein yeh bug mila: INR +1000 aur USD -1000 'balanced' pass ho jaata.\n\nPehla fix (FX se pehle hi zaroori, aur ab DONE): invariant \"har transaction har currency mein balanced hai\". Migration `0002_ledger_currency_and_audit.py` ne `ledger_check_balanced()` ko `GROUP BY a.currency HAVING sum(e.amount) <> 0` wala bana diya; regression test `test_ledger_rejects_transaction_that_balances_only_across_currencies`. Yahi invariant FX ka foundation hai.\n\nFX ke saath (customer USD mein pay kare, merchant INR mein settle ho):\n1. FX ek do-currency transaction hai jo har currency mein alag se balance hota hai, ek FX clearing account ke through:\n   - USD: provider_receivable +10,000 (cents) | fx_clearing_USD -10,000\n   - INR: fx_clearing_INR +830,000 (paise) | merchant_payable -X | fee_revenue -fee\n   Har currency ka sum 0. FX rate aur source `ledger_transactions` metadata mein store (rate snapshot, timestamp) -- immutable.\n2. Rounding: conversion Decimal mein, explicit rounding rule, aur rounding difference ek `fx_rounding` account mein -- warna sum 0 nahi hoga.\n3. FX gain/loss: rate capture time vs settlement time alag -> `fx_gain_loss` revenue/expense account postings at settlement.\n4. Minor unit exponent per currency (JPY 0, KWD 3) -- `money.py` mein currency exponent table, aur fee calc us exponent ke hisaab se.\n5. Trial balance per currency: `SELECT currency, SUM(amount) ... GROUP BY currency` -- har currency 0; overall cross-currency sum meaningless.\n6. Reconciliation per currency (DEPLOYMENT.md #3 \"per provider and currency\").",
+  "why_needed": "Global payments ka real requirement; aur yeh dikhata hai ki aap ledger invariants ko currency dimension mein soch sakte ho.",
+  "real_world_analogy": "Exchange counter: aap dollar dete ho (dollar drawer mein +), counter rupee deta hai (rupee drawer se -). Har drawer apne aap mein hisaab rakhta hai; dono ko jod-ke 'balance' nahi karte.",
+  "how_it_works": "Per-currency balanced transactions linked via FX clearing accounts; rates stored immutably; rounding to a dedicated account.",
+  "in_this_project": "`ledger.py::book_capture` (single currency), `_account` per currency; migration 0002 trigger ab per-currency balance check karta hai; `money.py::SUPPORTED_CURRENCIES` (all 2-decimal).",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::book_capture",
+   "projects/09-payments/migrations/versions/0002_ledger_currency_and_audit.py",
+   "projects/09-payments/tests/test_review_fixes.py::test_ledger_rejects_transaction_that_balances_only_across_currencies",
+   "projects/09-payments/payments/services/money.py::SUPPORTED_CURRENCIES",
+   "projects/09-payments/README.md"
+  ],
+  "code_example": "-- real, migrations/versions/0002_ledger_currency_and_audit.py (inside ledger_check_balanced)\nSELECT a.currency, sum(e.amount) AS total INTO bad\n  FROM ledger_entries e JOIN ledger_accounts a ON a.id = e.account_id\n WHERE e.transaction_id = NEW.transaction_id\n GROUP BY a.currency HAVING sum(e.amount) <> 0 LIMIT 1;\nIF FOUND THEN\n  RAISE EXCEPTION 'ledger transaction % is unbalanced in % (sum = %)', NEW.transaction_id, bad.currency, bad.total;\nEND IF;",
+  "code_language": "sql",
+  "advantages": [
+   "Each currency independently auditable",
+   "FX effects explicit and traceable"
+  ],
+  "disadvantages": [
+   "More accounts and postings per payment",
+   "Rate sourcing and rounding policy become critical"
+  ],
+  "common_mistakes": [
+   "Summing amounts across currencies",
+   "Converting at read time with today's rate"
+  ],
+  "follow_up_questions": [
+   "Rate kahan se aur kab lock karoge?",
+   "Refund mein kaunsa rate?",
+   "Rounding account ka balance kaun clear karta hai?"
+  ],
+  "concepts": [
+   "multi-currency",
+   "FX",
+   "clearing account",
+   "currency exponent"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-currency balancing via clearing accounts is accounting-correct but adds postings; storing converted amounts only is simpler but loses original-currency truth.",
+   "failure_scenarios": "Mixed-currency transaction (ab trigger rok deta hai, pehle slip ho jaata tha); rate snapshot missing -> unexplainable conversions; refunds at a different rate creating unexpected gains/losses; FX clearing account ka balance kabhi zero na ho (unsettled FX).",
+   "alternatives": "Store dual amounts (original + settlement) per entry, or delegate FX to provider and book only settlement currency.",
+   "scale_10x_100x": "Accounts multiply by currencies; hot FX clearing accounts -> sub-accounts.",
+   "production_improvements": "Currency exponent table, FX rate service with immutable snapshots, FX clearing + rounding accounts, per-currency trial balance endpoint (per-currency trigger already done in 0002)."
+  }
+ },
+ {
+  "id": "PAYS-102",
+  "project_slug": "p09-payments",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Critique the reconciliation engine's correctness and scalability, and propose a production-grade design.",
+  "answer_hinglish": "Current `reconcile.run(sm, provider, day)`: provider `settlements(day)` (saare authorizations created that day) vs humare payments `created_at::date = :d AND provider_payment_id IS NOT NULL`, plus ledger receivable per payment. Kinds: matched, missing_internally, missing_at_provider, amount_mismatch, status_mismatch, ledger_mismatch. Items aur summary persisted.\n\nCorrectness issues jo main observe karta hoon:\n1. Day boundary: hum payment row provider call se PEHLE banate hain. 23:59:59.9 UTC pe humara created_at day D, provider ka D+1. Result: provider-side `missing_internally` on D+1 aur humara `missing_at_provider` on D -- false positives.\n2. `created_at::date` session TimeZone pe depend (UTC bug story); explicit `AT TIME ZONE 'UTC'` safer.\n3. Humari side `provider_payment_id IS NOT NULL` filter: requires_reconciliation payments jinka provider id nahi, woh humari list mein hi nahi -- provider pe charge `missing_internally` dikhega (test exactly yahi assert karta hai) -- correct detection, par auto-link possible hai via reference (provider ka `reference` = humara payment id!). Recon engine reference se match karke \"unrecorded but known\" classify kar sakta.\n4. Ledger query `booked` poore ledger pe hai (no day filter) -- O(total ledger) per run.\n5. `missing_at_provider` voided/declined bhi include -- provider report sab authorizations deta hai toh theek, par real settlement reports sirf money movements dete hain.\n6. Re-run creates new run; no idempotency or diff between runs; resolution workflow missing.\n7. Real settlement reports authorization date nahi, settlement batch/payout date pe hote hain, fees provider-side deduct hote hain, aur refunds alag line items hote hain.\n\nProduction design: provider report ingest -> raw table (immutable, per file) -> normalize to \"provider balance transactions\" -> match by provider id (fallback reference) with a tolerance window (D-1..D+1) -> classify -> exceptions queue with owner/SLA -> auto-close known benign patterns (timing) -> ledger-level recon: provider payout amount vs `provider_receivable` movement. Scale: partition by date, set-based SQL matching (JOIN on provider id) instead of Python dicts, per provider/currency jobs.",
+  "why_needed": "Reconciliation finance ka safety net hai; uska khud galat hona (false positives/negatives) trust tod deta hai.",
+  "real_world_analogy": "Bank statement milana sirf 'same date' pe karoge toh raat 12 baje ki entries hamesha mismatch dikhengi; smart accountant ek din ka margin rakhta hai aur reference number se match karta hai.",
+  "how_it_works": "Ingest -> normalize -> match on stable ids with time tolerance -> classify -> persist exceptions with workflow.",
+  "in_this_project": "`reconcile.py::run`, `PROVIDER_TO_OURS`; mock `settlements` endpoint; test asserts `missing_internally` for tok_slow; `README.md` 'Reconciliation days are UTC days'.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/reconcile.py::run",
+   "projects/09-payments/mockprovider/app.py",
+   "projects/09-payments/tests/test_failures.py::test_reconciliation_finds_drift_and_unrecorded_charges",
+   "projects/09-payments/README.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "All mismatch kinds covered with both views persisted",
+   "Ledger-level check included, not just status"
+  ],
+  "disadvantages": [
+   "Day-boundary false positives",
+   "Whole-ledger scan and in-memory matching"
+  ],
+  "common_mistakes": [
+   "Matching only on our created_at day",
+   "Auto-overwriting our data from the report"
+  ],
+  "follow_up_questions": [
+   "Tolerance window ke saath duplicates kaise avoid karoge?",
+   "Provider fees ko reconcile kaise karoge?",
+   "Reconciliation ko idempotent kaise banaoge?"
+  ],
+  "concepts": [
+   "reconciliation design",
+   "settlement reports",
+   "matching",
+   "false positives"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict day matching is simple but noisy; tolerance windows reduce noise but need dedupe across days. In-memory matching is easy to read but doesn't scale vs SQL joins.",
+   "failure_scenarios": "Report arrives late/partial -> mass missing_internally; provider id format changes; our bug writing wrong provider id -> mismatches cascade.",
+   "alternatives": "Third-party recon platforms, ledger-centric recon (match money movements, not payment statuses), streaming recon on webhooks with daily batch as backstop.",
+   "scale_10x_100x": "Millions of rows/day: load report into staging table, JOIN on indexed provider id, partition by date, parallelize per provider/currency.",
+   "production_improvements": "Reference-based matching for missing provider ids, +/- 1 day window, ledger query filtered to the day's payment ids, resolution workflow, run idempotency per (provider, day, report_version)."
+  }
+ },
+ {
+  "id": "PAYS-103",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Beginner",
+  "question": "Coding exercise: write a test proving that retrying a capture with the same Idempotency-Key replays the response and captures only once.",
+  "answer_hinglish": "Goal: capture endpoint ke liye idempotency semantics prove karna -- same key + same body -> same response with `Idempotent-Replayed: true`; same key + different amount -> 422; provider aur ledger pe sirf ek capture.\n\nApproach: `tests/conftest.py` ke `system()` aur `pay()` helpers reuse karo. `capture=False` se authorized payment banao. Same key `cap-1` aur body `{\"amount\": 4000}` se do baar capture. Phir same key, amount 5000 -> 422 `idempotency_key_reused`. Assertions DB pe: `ledger_transactions` capture count 1, aur `provider.authorizations.captured == 4000` (provider ne ek hi baar capture kiya).\n\nKyun yeh test value add karta hai: existing `test_idempotency_key_semantics` sirf `POST /payments` cover karta hai. Capture ka path alag hai (status 200, path mein payment id) -- aur request hash path include karta hai, toh yeh bhi implicitly verify hota hai ki path-based hashing kaam kar raha hai.\n\nNote: httpx same dict ko same bytes mein serialize karta hai, isliye hash match hoga. Response dicts compare karte waqt key order matter nahi karta (jsonb stored response keys reorder kar sakta hai, par dict equality order-insensitive hai).\n\nRun: `../../.venv/Scripts/python -m pytest -q tests/test_payments.py -k capture_replay` (test DB migrated hona chahiye, TESTING.md command).",
+  "why_needed": "Tests hi prove karte hain ki idempotency har endpoint pe hai, sirf ek pe nahi.",
+  "real_world_analogy": "Same courier receipt dobara dikhane pe wahi parcel status milta hai; alag parcel ke liye same receipt -- counter mana karta hai.",
+  "how_it_works": "Two identical requests -> second served from idempotency_keys; mismatched body -> hash differs -> 422; DB counts confirm single effect.",
+  "in_this_project": "Uses `tests/conftest.py::system`, `pay`, `clean` fixture; asserts on `ledger_transactions` and `provider.authorizations` like existing tests.",
+  "implementation_files": [
+   "projects/09-payments/tests/conftest.py::system",
+   "projects/09-payments/tests/conftest.py::pay",
+   "projects/09-payments/tests/test_payments.py::test_idempotency_key_semantics",
+   "projects/09-payments/payments/api/routes.py::capture"
+  ],
+  "code_example": "# solution: add to tests/test_payments.py\nasync def test_capture_replay_is_idempotent(clean):\n    async with system() as c:\n        p = (await pay(c, \"k1\", capture=False)).json()\n        h = {\"Idempotency-Key\": \"cap-1\"}\n        a = await c.post(f\"/payments/{p['id']}/capture\", json={\"amount\": 4_000}, headers=h)\n        b = await c.post(f\"/payments/{p['id']}/capture\", json={\"amount\": 4_000}, headers=h)\n        assert a.status_code == b.status_code == 200\n        assert a.json() == b.json() and b.headers.get(\"idempotent-replayed\") == \"true\"\n        diff = await c.post(f\"/payments/{p['id']}/capture\", json={\"amount\": 5_000}, headers=h)\n        assert diff.status_code == 422 and diff.json()[\"error\"][\"code\"] == \"idempotency_key_reused\"\n        async with c.app.state.sm() as s:\n            assert await s.scalar(text(\"SELECT count(*) FROM ledger_transactions WHERE kind = 'capture'\")) == 1\n            assert await s.scalar(text(\"SELECT captured FROM provider.authorizations\")) == 4_000",
+  "code_language": "python",
+  "advantages": [
+   "Covers a second endpoint's idempotency",
+   "Asserts effects, not just HTTP codes"
+  ],
+  "disadvantages": [
+   "Integration test needs Postgres",
+   "Doesn't cover concurrent same-key capture"
+  ],
+  "common_mistakes": [
+   "Asserting only status codes",
+   "Using a different body object that serializes differently"
+  ],
+  "follow_up_questions": [
+   "Concurrent same-key capture ka test kaise likhoge?",
+   "Refund ke liye same test?",
+   "Replay ka latency assert karoge?"
+  ],
+  "concepts": [
+   "idempotency test",
+   "integration test",
+   "effect assertions"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-104",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Coding exercise: add a ledger reversal function that books an exact reversing transaction for an existing ledger transaction.",
+  "answer_hinglish": "Requirement: append-only ledger mein galti sudharne ka sahi tareeka reversing transaction hai. Function: `book_reversal(s, original_tx_id)` jo original transaction ki har entry ka opposite amount ek naye `adjustment` transaction mein daale.\n\nDesign decisions:\n1. Idempotent: `idempotency_ref = f\"reversal:{original_ref}\"` -- same transaction do baar reverse nahi ho sakta (UNIQUE + ON CONFLICT DO NOTHING), same pattern as `ledger.post`.\n2. Balanced automatically: original sum 0 tha, toh negation ka sum bhi 0 -- deferred trigger commit pe pass karega.\n3. Same accounts: original entries ke `account_id` reuse (code lookup ki zaroorat nahi).\n4. Caller ke transaction mein chale (commit nahi karta), taaki reversal ke saath correction posting aur koi status change atomic ho.\n5. Original kabhi touch nahi -- immutability trigger waise bhi rokta.\n\nReversing ke baad correct posting chahiye ho toh caller `ledger.post(...)` naye ref (jaise `capture:{pid}:corrected`) ke saath kare. Note: `book_capture` ka ref `capture:{pid}` hai -- reversal ke baad dobara `book_capture` call karoge toh ON CONFLICT ki wajah se kuch nahi hoga; isliye correction ka ref alag chahiye.\n\nTest: capture ke baad reversal -> merchant balances sab 0, trial balance 0, `ledger_entries` count double, aur dobara reversal -> False.",
+  "why_needed": "Ledger corrections production ka routine kaam hai; bina edit kiye correct karna accounting ka core rule hai.",
+  "real_world_analogy": "Galat cheque entry ko kaatne ke bajaye 'reversal' entry likhna jo exact ulti ho -- page pe dono dikhte hain, hisaab zero.",
+  "how_it_works": "Read original entries -> claim reversal ref -> insert negated entries -> deferred trigger validates at commit.",
+  "in_this_project": "Extends `payments/services/ledger.py` next to `post`; uses `ledger_transactions.kind` 'adjustment' (already documented in migration comment); test pattern from `test_authorize_and_capture_books_balanced_ledger`.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/ledger.py::post",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/tests/test_payments.py::test_authorize_and_capture_books_balanced_ledger"
+  ],
+  "code_example": "# solution: add to payments/services/ledger.py\nasync def book_reversal(s, original_tx_id) -> bool:\n    \"\"\"Book an exact reversing 'adjustment' for a ledger transaction. Returns False if already reversed.\"\"\"\n    orig = (await s.execute(text(\"SELECT payment_id, idempotency_ref FROM ledger_transactions WHERE id = :t\"),\n                            {\"t\": original_tx_id})).mappings().one()\n    entries = (await s.execute(text(\"SELECT account_id, amount FROM ledger_entries WHERE transaction_id = :t\"),\n                               {\"t\": original_tx_id})).all()\n    tid = await s.scalar(text(\"INSERT INTO ledger_transactions (payment_id, kind, idempotency_ref) \"\n                              \"VALUES (:p, 'adjustment', :r) ON CONFLICT (idempotency_ref) DO NOTHING RETURNING id\"),\n                         {\"p\": orig[\"payment_id\"], \"r\": f\"reversal:{orig['idempotency_ref']}\"})\n    if tid is None:\n        return False\n    for account_id, amount in entries:\n        await s.execute(text(\"INSERT INTO ledger_entries (transaction_id, account_id, amount) VALUES (:t, :a, :x)\"),\n                        {\"t\": tid, \"a\": account_id, \"x\": -amount})\n    return True\n\n\n# test: tests/test_payments.py\nasync def test_reversal_zeroes_balances_and_is_idempotent(clean):\n    async with system() as c:\n        await pay(c, \"k1\")\n        sm = c.app.state.sm\n        async with sm() as s, s.begin():\n            tx = await s.scalar(text(\"SELECT id FROM ledger_transactions WHERE kind = 'capture'\"))\n            assert await ledger.book_reversal(s, tx) is True\n        async with sm() as s, s.begin():\n            assert await ledger.book_reversal(s, tx) is False\n        assert set((await balances(c)).values()) == {0}\n        assert (await c.get(\"/admin/ledger/trial-balance\", headers=ADMIN)).json()[\"sum_of_all_entries\"] == 0",
+  "code_language": "python",
+  "advantages": [
+   "Corrections stay auditable",
+   "Idempotent and automatically balanced"
+  ],
+  "disadvantages": [
+   "Payment row amounts not adjusted (separate business decision)",
+   "Reversal ref scheme must be documented"
+  ],
+  "common_mistakes": [
+   "UPDATE-ing original entries",
+   "Reusing the original ref for the corrected posting (silently skipped)"
+  ],
+  "follow_up_questions": [
+   "Payment status/amounts bhi adjust karne chahiye?",
+   "Partial reversal kaise?",
+   "Reversal ka admin API aur approval flow?"
+  ],
+  "concepts": [
+   "reversing entry",
+   "append-only ledger",
+   "idempotent posting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Full-transaction reversal is simple and exact; partial adjustments need explicit lines and stronger review. Reversal decoupled from payment row means books and payment status may intentionally differ -- must be documented.",
+   "failure_scenarios": "Reversing a refund transaction without reversing the refund status creates reconciliation ledger_mismatch; reversing twice prevented by ref, but reversing the reversal needs its own ref scheme.",
+   "alternatives": "Generic `post_adjustment(lines, reason, approved_by)` API; corrections only via finance tooling with maker-checker approval.",
+   "scale_10x_100x": "Adjustment volume small; main concern is governance and audit, not performance.",
+   "production_improvements": "Maker-checker approval, reason and actor columns on ledger_transactions, admin endpoint with idempotency key, recon awareness of adjustments."
+  }
+ },
+ {
+  "id": "PAYS-105",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Beginner",
+  "question": "Coding exercise: write a test for the void flow, including that a voided payment cannot be captured and frees the order reference.",
+  "answer_hinglish": "Void flow ka direct test suite mein nahi hai, toh yeh gap fill karte hain.\n\nTest steps:\n1. `pay(c, \"k1\", capture=False)` -> authorized.\n2. `POST /payments/{id}/void` with `Idempotency-Key: v1` -> 200, status `voided`. (Void endpoint body nahi leta; hash method+path+empty body.)\n3. Capture after void -> `capture_payment` CAS `{\"authorized\"} -> capturing` fail -> `InvalidTransition` 409, error code `invalid_state_transition`.\n4. Provider side: authorization status `voided` (mock provider ka void endpoint `WHERE status = 'authorized'` update karta hai).\n5. Same order reference (`order-1`, default in `pay_body`) pe nayi key se payment -> allowed, kyunki `voided` partial unique index ke predicate se bahar hai -> `captured`.\n6. Ledger: void pe koi posting nahi; final ledger mein sirf naye payment ka capture.\n\nEdge to think: void endpoint pe same key se dobara call -> replay 200 voided (stored). Alag key se dobara void -> 409 (state voided, CAS fail).\n\nKyun valuable: void path mein ek bhi test nahi hai abhi, aur partial index ka \"voided frees the reference\" behaviour sirf decline ke liye test hai.",
+  "why_needed": "Har state transition path ka kam se kam ek test hona chahiye; void abhi untested hai.",
+  "real_world_analogy": "Hotel booking cancel ki (void) -- room phir se available; cancelled booking pe checkout nahi ho sakta.",
+  "how_it_works": "authorized -> voiding -> voided via CAS; voided is terminal; partial index excludes voided so the reference can be reused.",
+  "in_this_project": "`payments.py::void_payment`; route `void`; mock provider `/void`; `tests/conftest.py::pay_body` default ref 'order-1'.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/payments.py::void_payment",
+   "projects/09-payments/payments/api/routes.py::void",
+   "projects/09-payments/tests/conftest.py::pay_body",
+   "projects/09-payments/mockprovider/app.py"
+  ],
+  "code_example": "# solution: add to tests/test_payments.py\nasync def test_void_releases_authorization_and_frees_reference(clean):\n    async with system() as c:\n        p = (await pay(c, \"k1\", capture=False)).json()\n        v = await c.post(f\"/payments/{p['id']}/void\", headers={\"Idempotency-Key\": \"v1\"})\n        assert v.status_code == 200 and v.json()[\"status\"] == \"voided\"\n        cap = await c.post(f\"/payments/{p['id']}/capture\", json={}, headers={\"Idempotency-Key\": \"c1\"})\n        assert cap.status_code == 409 and cap.json()[\"error\"][\"code\"] == \"invalid_state_transition\"\n        async with c.app.state.sm() as s:\n            assert await s.scalar(text(\"SELECT status FROM provider.authorizations\")) == \"voided\"\n        again = (await pay(c, \"k2\")).json()          # same order-1, new attempt: voided is not 'live'\n        assert again[\"status\"] == \"captured\"\n        async with c.app.state.sm() as s:\n            assert await s.scalar(text(\"SELECT count(*) FROM ledger_transactions\")) == 1",
+  "code_language": "python",
+  "advantages": [
+   "Covers an untested transition path",
+   "Verifies index semantics for voided"
+  ],
+  "disadvantages": [
+   "Doesn't cover ambiguous void",
+   "Relies on mock provider schema for assertion"
+  ],
+  "common_mistakes": [
+   "Expecting a ledger posting on void",
+   "Forgetting the Idempotency-Key on void"
+  ],
+  "follow_up_questions": [
+   "Ambiguous void (timeout) ka test kaise?",
+   "Void ke baad recovery kya karega?",
+   "Partial capture ke baad remainder void?"
+  ],
+  "concepts": [
+   "void",
+   "state machine test",
+   "partial unique index"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-106",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Coding exercise: make the recovery worker safe to run as multiple replicas using SKIP LOCKED, without holding locks across provider calls.",
+  "answer_hinglish": "Problem: `run_recovery` ek plain SELECT se stuck payments uthata hai. Do workers same rows uthayenge -- correctness safe (CAS, keys), par duplicate provider calls aur noise.\n\nNaive fix galat hai: `SELECT ... FOR UPDATE SKIP LOCKED` aur phir provider call usi transaction mein -- yeh \"never hold a DB transaction across a network call\" tod deta hai.\n\nSahi approach: claim-by-lease. Ek short transaction mein rows claim karo by bumping `updated_at` (jo stuck detection ka clock hai), `SKIP LOCKED` se taaki concurrent workers alag rows paayein, phir commit (lock release). Claimed rows ka `updated_at = now()` ho gaya, toh doosre workers unhe agle `stuck_after_seconds` tak stuck nahi maanenge -- yeh effectively lease hai. Phir bina transaction ke provider calls.\n\nAgar worker claim ke baad crash ho? Lease expire (stuck_after ke baad) -> doosra worker uthayega. Agar processing ne state badal di, `transition()` khud `updated_at` set karta hai.\n\nCaveat: `updated_at` bump bina event ke -- audit mein dikhega nahi; acceptable, ya dedicated `recovery_claimed_until` column better (stuck detection ka clock pollute nahi hota). Batch size `LIMIT` se bounded.",
+  "why_needed": "Background workers ko horizontally scale karna common requirement hai; SKIP LOCKED Postgres ka idiomatic queue-claim tool hai.",
+  "real_world_analogy": "Kaam ki pile se har worker apni mutthi bhar files uthata hai aur unpe 'in progress -- 30 min' sticky note lagata hai; doosra worker sticky note wali files chhod deta hai.",
+  "how_it_works": "UPDATE ... WHERE id IN (SELECT ... FOR UPDATE SKIP LOCKED LIMIT n) RETURNING -> short tx -> process outside tx.",
+  "in_this_project": "Modifies the selection in `recovery.py::run_recovery`; index `ix_payments_status_updated` supports the inner SELECT; `SYSTEM_DESIGN.md` 10x row.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/migrations/versions/0001_initial.py",
+   "projects/09-payments/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# solution: replace the stuck-payments SELECT in run_recovery\nasync with sm() as s, s.begin():\n    stuck = (await s.execute(text(\n        \"UPDATE payments p SET updated_at = now() \"\n        \"FROM merchants m \"\n        \"WHERE m.id = p.merchant_id AND p.id IN (\"\n        \"  SELECT id FROM payments \"\n        \"  WHERE status IN ('authorizing', 'capturing', 'voiding', 'requires_reconciliation') \"\n        \"    AND updated_at < now() - make_interval(secs => :s) \"\n        \"  ORDER BY updated_at LIMIT :n FOR UPDATE SKIP LOCKED) \"\n        \"RETURNING p.id, p.status, m.fee_bps, m.fee_fixed\"),\n        {\"s\": stuck_after_seconds, \"n\": batch_size})).mappings().all()\n# transaction committed: row locks released, the bumped updated_at acts as a lease\nfor row in stuck:\n    ...  # unchanged: provider calls happen here, outside any transaction\n\n# test idea: run two run_recovery() calls concurrently with asyncio.gather on 1 stuck payment\n# and assert resolved counts sum to 1 and the ledger has one capture transaction.",
+  "code_language": "python",
+  "advantages": [
+   "Workers partition work without coordination",
+   "No locks held during network calls"
+  ],
+  "disadvantages": [
+   "updated_at bump pollutes stuck clock and audit",
+   "Lease length tied to stuck_after_seconds"
+  ],
+  "common_mistakes": [
+   "Holding FOR UPDATE SKIP LOCKED during provider calls",
+   "Claiming unbounded batches"
+  ],
+  "follow_up_questions": [
+   "Dedicated claim column kyun better?",
+   "Batch size kaise choose karoge?",
+   "Refund loop ke liye same pattern?"
+  ],
+  "concepts": [
+   "SKIP LOCKED",
+   "lease",
+   "work claiming",
+   "horizontal workers"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lease-by-timestamp is simple; dedicated claim column cleaner; advisory locks per payment alternative but session-bound (dangerous with pools).",
+   "failure_scenarios": "Worker paused longer than lease -> another worker re-claims and both call provider (still safe via keys/CAS). Clock: uses DB now(), good.",
+   "alternatives": "Advisory locks (`pg_try_advisory_lock`), external queue (one message per stuck payment), leader election.",
+   "scale_10x_100x": "Many workers + large backlog: tune batch size and provider concurrency; ORDER BY updated_at gives oldest-first fairness.",
+   "production_improvements": "`recovery_claimed_until` + `recovery_attempts` columns, backoff per payment, metrics on claimed/resolved per worker."
+  }
+ },
+ {
+  "id": "PAYS-107",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: write a randomized test that runs a mix of payments, captures and refunds and asserts ledger invariants hold.",
+  "answer_hinglish": "Idea: property-style test -- specific scenarios ke bajaye random sequence chalao aur invariants check karo jo hamesha true hone chahiye:\n1. Trial balance == 0.\n2. Har payment ke liye ledger `provider_receivable` sum == `amount_captured - amount_refunded`.\n3. `amount_refunded <= amount_captured <= amount_authorized`.\n4. Merchant balances: `merchant_payable + platform_fee_revenue + provider_receivable == 0` (closed system).\n\nRandom ops: payment with random amount (1..50,000) aur random capture flag; agar authorized hai toh random partial capture; captured payments pe random refunds (kabhi over-refund bhi try -- 422 expected, invariant phir bhi hold). Fixed seed (`random.Random(7)`) taaki failure reproducible ho -- flaky random tests worst hote hain.\n\nKyun useful: fee rounding (half-up, min cap) aur partial refund combinations hand-written tests se miss ho sakte hain. Edge amounts jaise 10 (fee == amount -> merchant_payable entry skip) automatically aa jaate hain.\n\nHypothesis library use kar sakte the, par project mein dependency nahi -- simple seeded loop kaafi hai (no unnecessary libraries).",
+  "why_needed": "Ledger invariants ko scenario-by-scenario nahi, broad input space pe verify karna chahiye.",
+  "real_world_analogy": "Bank ka surprise audit: koi fixed checklist nahi, random transactions uthao aur check karo hisaab milta hai.",
+  "how_it_works": "Seeded random operations via the real API, then SQL assertions on invariants.",
+  "in_this_project": "Uses `system`, `pay`, `balances` helper pattern from `tests/test_payments.py`; ledger tables and `money.fee_for`.",
+  "implementation_files": [
+   "projects/09-payments/tests/conftest.py::system",
+   "projects/09-payments/tests/test_payments.py::test_partial_capture_and_refunds",
+   "projects/09-payments/payments/services/ledger.py::trial_balance",
+   "projects/09-payments/payments/services/money.py::fee_for"
+  ],
+  "code_example": "# solution: add to tests/test_payments.py\nimport random\n\nasync def test_random_operations_keep_ledger_invariants(clean):\n    rnd = random.Random(7)\n    async with system() as c:\n        for i in range(25):\n            amt = rnd.randint(1, 50_000)\n            p = (await pay(c, f\"rk{i}\", ref=f\"ro{i}\", amount=amt, capture=rnd.random() < 0.5)).json()\n            if p[\"status\"] == \"authorized\":\n                cap = rnd.randint(1, amt)\n                p = (await c.post(f\"/payments/{p['id']}/capture\", json={\"amount\": cap},\n                                  headers={\"Idempotency-Key\": f\"rc{i}\"})).json()\n            for j in range(rnd.randint(0, 3)):\n                await c.post(f\"/payments/{p['id']}/refunds\", json={\"amount\": rnd.randint(1, amt)},\n                             headers={\"Idempotency-Key\": f\"rr{i}-{j}\"})   # may be 422: fine\n        assert (await c.get(\"/admin/ledger/trial-balance\", headers=ADMIN)).json()[\"sum_of_all_entries\"] == 0\n        async with c.app.state.sm() as s:\n            bad = (await s.execute(text(\n                \"SELECT p.id FROM payments p LEFT JOIN (\"\n                \"  SELECT t.payment_id, sum(e.amount) AS r FROM ledger_transactions t \"\n                \"  JOIN ledger_entries e ON e.transaction_id = t.id \"\n                \"  JOIN ledger_accounts a ON a.id = e.account_id AND a.code = 'provider_receivable' \"\n                \"  GROUP BY t.payment_id) b ON b.payment_id = p.id \"\n                \"WHERE coalesce(b.r, 0) <> p.amount_captured - p.amount_refunded\"))).all()\n            assert bad == []",
+  "code_language": "python",
+  "advantages": [
+   "Explores combinations humans miss",
+   "Reproducible via fixed seed"
+  ],
+  "disadvantages": [
+   "Slower than unit tests (real DB)",
+   "Random failures need seed logging to debug"
+  ],
+  "common_mistakes": [
+   "Unseeded randomness (flaky)",
+   "Asserting on exact random outcomes instead of invariants"
+  ],
+  "follow_up_questions": [
+   "Concurrency bhi randomize karoge?",
+   "Hypothesis stateful testing kaise apply hoga?",
+   "Failure pe minimal reproduction kaise nikaloge?"
+  ],
+  "concepts": [
+   "property-based testing",
+   "invariants",
+   "randomized testing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "PAYS-108",
+  "project_slug": "p09-payments",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: add an admin endpoint that reports stuck or ambiguous payments by status and age, suitable for alerting.",
+  "answer_hinglish": "Monitoring ka sabse important signal \"kitne payments unknown/stuck hain aur sabse purana kitna purana\" hai. Abhi yeh sirf DB query se milta hai. Ek admin endpoint banao jo alerting system (ya cron) poll kar sake.\n\nDesign:\n- Route `GET /admin/payments/stuck?older_than_seconds=300`, `dependencies=[Depends(admin)]` -- existing admin pattern.\n- Query: statuses `authorizing, capturing, voiding, requires_reconciliation`, `updated_at < now() - make_interval(secs => :s)` -- same expression jo `recovery.py` use karta hai, aur index `ix_payments_status_updated` use hoga.\n- Group by status: count aur `min(updated_at)` (oldest). Saath mein refunds ke liye same (`pending`, `requires_reconciliation`).\n- Response JSON: alert rule likh sakte ho \"requires_reconciliation count > 0 with oldest > 15 min\".\n\nTest: ek payment ko manually `authorizing` mein daalo (jaise `test_payment_unknown_to_provider_is_failed_by_recovery` karta hai), `older_than_seconds=0` se call -> `authorizing: 1`. Bina admin token 403.\n\nProduction mein yeh Prometheus gauge ke roop mein better hai (scraped), par endpoint first step hai aur dashboard (`payments/dashboard.html`) bhi use kar sakta hai.",
+  "why_needed": "Stuck payments silent failures hain; unhe measurable banana pehla ops requirement hai.",
+  "real_world_analogy": "Hospital ka 'pending reports' board: kitni reports pending aur sabse purani kab se -- nurse ko pata hai kahan dhyan dena hai.",
+  "how_it_works": "Grouped aggregate over the status/updated_at index exposed via an admin-protected route.",
+  "in_this_project": "Follows `routes.py` admin route pattern (`run_recovery`, `trial_balance`); reuses the stuck predicate from `recovery.py::run_recovery`; test style from `tests/test_failures.py`.",
+  "implementation_files": [
+   "projects/09-payments/payments/api/routes.py::admin",
+   "projects/09-payments/payments/api/routes.py::trial_balance",
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/09-payments/tests/test_failures.py::test_payment_unknown_to_provider_is_failed_by_recovery"
+  ],
+  "code_example": "# solution: add to payments/api/routes.py\n@router.get(\"/admin/payments/stuck\", tags=[\"admin\"], dependencies=[Depends(admin)])\nasync def stuck_payments(request: Request, older_than_seconds: float = Query(300, ge=0)):\n    async with request.app.state.sm() as s:\n        pays = (await s.execute(text(\n            \"SELECT status, count(*) AS n, min(updated_at) AS oldest FROM payments \"\n            \"WHERE status IN ('authorizing', 'capturing', 'voiding', 'requires_reconciliation') \"\n            \"AND updated_at < now() - make_interval(secs => :s) GROUP BY status\"), {\"s\": older_than_seconds})).mappings().all()\n        refs = (await s.execute(text(\n            \"SELECT status, count(*) AS n, min(updated_at) AS oldest FROM refunds \"\n            \"WHERE status IN ('pending', 'requires_reconciliation') \"\n            \"AND updated_at < now() - make_interval(secs => :s) GROUP BY status\"), {\"s\": older_than_seconds})).mappings().all()\n    return {\"payments\": {r[\"status\"]: {\"count\": r[\"n\"], \"oldest\": r[\"oldest\"]} for r in pays},\n            \"refunds\": {r[\"status\"]: {\"count\": r[\"n\"], \"oldest\": r[\"oldest\"]} for r in refs}}\n\n\n# test: tests/test_failures.py\nasync def test_stuck_report(clean):\n    async with system() as c:\n        async with c.app.state.sm() as s, s.begin():\n            pid = await s.scalar(text(\"INSERT INTO payments (merchant_id, merchant_reference, amount, currency, status, \"\n                                      \"payment_method, provider) VALUES (:m, 'x', 100, 'INR', 'created', 'tok_visa', 'mockpay') RETURNING id\"),\n                                 {\"m\": c.merchant_id})\n            await transition(s, pid, {\"created\"}, \"authorizing\", \"test\")\n        r = (await c.get(\"/admin/payments/stuck?older_than_seconds=0\", headers=ADMIN)).json()\n        assert r[\"payments\"][\"authorizing\"][\"count\"] == 1\n        assert (await c.get(\"/admin/payments/stuck\")).status_code == 403",
+  "code_language": "python",
+  "advantages": [
+   "Direct, indexed signal for alerting",
+   "Reuses existing admin and query patterns"
+  ],
+  "disadvantages": [
+   "Polling endpoint, not a metrics exporter",
+   "Sirf counts aur oldest timestamp -- kaunse payments, yeh drill-down alag query chahiye"
+  ],
+  "common_mistakes": [
+   "Unauthenticated ops endpoints",
+   "Full table scans without the status/updated_at index"
+  ],
+  "follow_up_questions": [
+   "Prometheus exporter mein kaise convert karoge?",
+   "Alert thresholds kya rakhoge?",
+   "Dashboard pe kaise dikhayenge?"
+  ],
+  "concepts": [
+   "observability",
+   "admin endpoint",
+   "alerting"
+  ],
+  "advanced": null
+ }
+]

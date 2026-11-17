@@ -1,0 +1,183 @@
+{
+ "project_slug": "p02-mini-redis",
+ "project": "minidis -- Redis-like In-Memory Database",
+ "source_dir": "projects/02-mini-redis",
+ "summary": "minidis is a from-scratch Redis-like in-memory database written in Python asyncio. It speaks the real Redis wire protocol (RESP2 and RESP3 via HELLO), so redis-py, redis-cli and redis-benchmark work against it unchanged. It implements strings, lists, sets and hashes with atomic single-threaded execution, lazy + sampled active expiration, maxmemory eviction (exact LRU, sampled LRU, volatile-ttl), binary snapshots with CRC32 and atomic rename, an append-only file with always/everysec/no fsync, group commit, truncated-tail recovery and background rewrite, plus asynchronous master -> replica replication with ACK offsets, read-only replicas and manual promotion. 52 tests use the official redis-py client, and benchmarks against real Redis 7 drove a measured replication-batching fix; a code review then fixed the lag_bytes baseline for late-attached replicas (repl_base), DEL being refused under noeviction (may_grow flag) and lenient integer parsing (strict to_int), each with a regression test.",
+ "pitch": {
+  "intro_30s": "Maine Python asyncio mein ek Redis-like in-memory database banaya hai, naam minidis. Yeh real Redis wire protocol bolta hai -- RESP2 aur RESP3 dono -- isliye official redis-py, redis-cli aur redis-benchmark bina change ke chalte hain. Isme atomic single-threaded execution, lazy + active expiry, LRU eviction, snapshot aur AOF persistence, aur master-replica replication hai. Real Redis ke against benchmark karke maine ek replication bottleneck pakda aur fix kiya.",
+  "explain_2min": "Maine minidis isliye banaya taaki Redis ko black box ki tarah use karne ke bajaye andar se samajh sakun -- SET bhejne se disk tak kya hota hai.\n\nServer asyncio pe chalta hai, har client connection ek task hai. TCP byte stream hai, isliye mera RESP parser incremental hai: bytes buffer mein jodta hai aur command tabhi nikalta hai jab poora aa jaye. Pipelining, binary-safe values aur telnet-style inline commands sab support hote hain. redis-py 8 by default HELLO 3 bhejta hai, toh RESP3 bhi implement kiya -- maps, sets, null types.\n\nCommand handlers deliberately synchronous hain. Event loop ek time pe ek hi handler chalata hai aur handler await nahi karta, isliye har command atomic hai bina kisi lock ke -- 50 clients x 200 INCR exactly 10000 deta hai. Downside bhi test se dikhaya: ek slow command sab clients ko rok deta hai.\n\nKeyspace ek OrderedDict hai (order = LRU recency) plus alag expires dict. Expiry do tarah ki hai: lazy (access pe check) aur active (har 100ms 20 random volatile keys sample karo, 25% se zyada expired toh dobara). maxmemory pe noeviction, exact allkeys-lru, sampled volatile-lru aur volatile-ttl policies hain.\n\nPersistence mein binary snapshot hai CRC32 ke saath, temp file + fsync + atomic rename. AOF mein always, everysec aur no fsync modes hain, always mein group commit, relative TTL ko absolute PEXPIREAT mein rewrite, aur crash se aadha likha tail recover hota hai. BGREWRITEAOF rewrite buffer ke saath.\n\nReplication async hai: replica SYNC bhejta hai, snapshot leta hai, phir command stream apply karta hai aur har second ACK offset bhejta hai. Benchmark mein writes slow the; replica band karne pe 2x fast hue, toh maine replication stream ko per loop tick batch kiya -- pipelined SET 11k se ~35k req/s ho gaya.",
+  "deep_5min": "Main ek request ka poora safar batata hoon, phir hardest decisions.\n\nClient `SET k v EX 60` bhejta hai. Wire pe yeh RESP array hai: `*5\\r\\n$3\\r\\nSET\\r\\n...`. `Server._handle_client` mein `reader.read(65536)` se jo bhi bytes aaye -- aadha command, ya 16 pipelined commands -- woh `Parser.feed()` mein jaate hain. `_parse_multibulk` length-prefixed format padhta hai; agar payload abhi poora nahi aaya toh `None` return karta hai aur buffer ko touch nahi karta. Buffer tabhi consume hota hai jab poora command available ho. Isliye partial frames safe hain aur values mein `\\r\\n` ho tab bhi binary safe.\n\nHar complete command `Server.execute` mein jaata hai: registry lookup, arity check, agar replica hai toh READONLY error, agar maxmemory set hai toh `evict_until_fits` pehle memory free karta hai, warna OOM error. Phir handler chalta hai -- plain sync function. Yahi atomicity ka raaz hai: asyncio cooperative hai, handler ke andar koi await nahi, toh beech mein doosra client interleave nahi kar sakta.\n\nSET handler key store karta hai aur `ctx.rewrite` se batata hai ki AOF/replicas ko kya bhejna hai: `SET k v` plus `PEXPIREAT k <absolute ms>`. Relative TTL ko absolute isliye kiya kyunki AOF kal replay hua toh `EX 60` key ko fresh 60 second de deta. `_propagate` AOF buffer mein likhta hai aur replication buffer mein queue karta hai; `call_soon(_flush_replication)` poore batch ko ek socket write mein replicas ko bhejta hai.\n\nBatch ke saare replies ban jaane ke baad durability: `appendfsync always` mein ek fsync poore batch ke liye (group commit) aur tabhi reply jaata hai, `everysec` mein sirf flush aur cron thread mein har second fsync karta hai. Phir saare replies ek write mein, `drain()` se backpressure.\n\nBackground mein cron 10Hz chalta hai: active expiry, AOF flush/fsync, save rules, aur slow replica check.\n\nHardest decisions: pehla, BGSAVE bina fork ke. Redis fork + copy-on-write use karta hai; Windows pe fork nahi hai, toh maine serialize event loop mein kiya (consistent point-in-time, lekin bade data pe pause) aur disk write thread mein. Isi se ek bug nikla -- BGSAVE ke baad dirty counter -1 ho gaya, kyunki beech ke writes ka hisaab galat tha; fix: `dirty_at_start` subtract karo.\n\nDoosra, replicas khud keys expire nahi karte -- sirf hide karte hain aur master ke DEL ka wait karte hain, taaki dono identical rahein. Test ne yahan ek memory leak pakda: replica already-expired key ka DEL ignore kar raha tha. Fix `Keyspace.delete` mein.\n\nTeesra, performance investigation. redis-benchmark se real Redis 7 ke against measure kiya: writes reads se 2-6x slow. Hypothesis: har propagated command ka alag socket write. Experiment: replica band kiya, pipelined SET 11.2k se 23.2k. Fix: per loop tick batching. Re-measure: pipelined SET 34.7k. Real Redis phir bhi ~4-6x fast hai, jo C vs CPython ke liye expected hai.\n\nStorage side pe ek aur decision interesting tha. Keyspace ek `OrderedDict` hai jiska order hi recency hai -- har access pe `move_to_end`, toh `allkeys-lru` ke liye victim seedha pehli key hai, exact LRU O(1) mein. Lekin Redis exact LRU nahi karta, kyunki har key pe linked-list pointers memory khaate hain; woh 5 random keys sample karke sabse purani hatata hai. Maine `volatile-lru` isi tarah sampling se banaya, `_atime` logical clock ke saath, taaki dono approaches code mein compare kar sakun. Random sampling O(1) chahiye thi, Python set yeh nahi deta, isliye `RandomSet` likha -- list plus index map, delete pe last element ko khali jagah swap karo. Wahi structure active expiry ke 20-key sampling mein bhi kaam aata hai.\n\nRestart pe recovery order bhi socha hua hai: agar AOF on hai aur file exist karti hai toh AOF replay hota hai (usually zyada complete), warna snapshot load hota hai aur CRC check fail ho toh server start hi nahi hota -- silently partial data se better hai ki operator decide kare. AOF ke end mein aadha command mile toh woh crash ka nishaan hai, usko kaat ke aage badhte hain; beech mein garbage ho toh refuse.\n\nReplication mein master `SYNC` aate hi pending stream flush karta hai, phir synchronously snapshot banata hai aur usi tick mein replica ko register karta hai -- isliye snapshot aur stream ke beech koi write miss ya duplicate nahi hota. Replica har second `REPLCONF ACK offset` bhejta hai aur `INFO` mein `lag_bytes` dikhta hai. Slow replica ka buffer 64MB cross kare toh disconnect.\n\nCode review mein teen gaps mile aur fix kiye, har ek ka regression test ke saath: late-attach replica ka lag_bytes galat baseline (per-replica `repl_base`), noeviction pe DEL bhi OOM se refuse hota tha (`may_grow` flag, Redis ka denyoom), aur `int()` `\" 5\"`/`+5`/`1_000` accept karta tha (strict `to_int`).  Honest limitations: no auth/TLS, no PSYNC (har reconnect full sync), async replication mein failover pe acknowledged writes lose ho sakte hain, used_memory sirf estimate hai.",
+  "architecture_walkthrough": "`protocol.py`: incremental RESP parser (`Parser`) aur `encode(value, proto)` jo Python types ko RESP2 ya RESP3 wire format mein badalta hai; `encode_command` AOF aur replication stream ke liye.\n\n`server.py`: `Server` class -- `_handle_client` (ek asyncio task per connection), `execute` (dispatch + READONLY/OOM checks + propagation), `_propagate` aur `_flush_replication` (AOF + batched replica stream), `_serve_replica` (master side SYNC), `_cron` (10Hz housekeeping), `start_bgsave`, `_load_from_disk`, `info`.\n\n`keyspace.py`: storage engine -- `OrderedDict` data, `expires` dict, `sizes`, `_atime`, `RandomSet` of volatile keys; lazy expiry, `active_expire_cycle`, `evict_until_fits`, memory estimate, `on_implicit_delete` callback.\n\n`randomset.py`: list + index map, O(1) add/discard/random sample.\n\n`commands/`: ek module per data type; `@command(name, arity, write)` decorator `REGISTRY` bharta hai; `Context` mein `rewrite()` se handler decide karta hai ki kya propagate ho.\n\n`persistence/snapshot.py`: binary format, CRC32, `write_atomic` (temp + fsync + os.replace). `persistence/aof.py`: append/flush/fsync, `replay` with truncated tail, `minimal_commands` + `rewrite`.\n\n`replication.py`: `ReplicaLink` -- SYNC, snapshot load, stream apply, ACK loop, reconnect backoff.\n\n`config.py`: `ServerConfig` + argparse/env. Deployment: Dockerfile (non-root) aur docker compose (master, replica, real Redis for benchmarks).",
+  "difficult_decisions": [
+   "Command handlers ko sync rakhna: lock-free atomicity milti hai (50x200 INCR = 10000), lekin koi bhi slow command poore server ko block karta hai -- yeh Redis wala hi trade-off hai.",
+   "BGSAVE bina fork: serialize event loop mein (consistent snapshot, bade data pe pause), disk write + fsync thread mein. fork + copy-on-write Windows pe available nahi aur worst case memory double karta.",
+   "AOF mein relative TTL ko absolute PEXPIREAT mein rewrite karna aur lazy/active expiry ko DEL ke roop mein log karna -- taaki replay kab bhi ho, deterministic rahe.",
+   "Replicas khud keys expire nahi karte; sirf reads se hide karte hain aur master ke DEL ka wait karte hain, taaki master aur replica kabhi diverge na hon.",
+   "Exact LRU (OrderedDict move_to_end) aur sampled LRU (5 random volatile keys) dono implement kiye, taaki Redis kyun sampling karta hai yeh code se dikha sakun.",
+   "appendfsync always mein per-command fsync ke bajaye per-batch fsync (group commit): guarantee wahi -- reply se pehle disk pe -- lekin pipelining mein bahut sasta."
+  ],
+  "biggest_challenges": [
+   "redis-py 8 connect hote hi HELLO 3 bhejta hai; minidis sirf RESP2 bolta tha toh har connection fail hua. RESP3 encoder (map %, set ~, null _, boolean #) aur per-connection proto add kiya.",
+   "Replica memory leak: master ka DEL agar already logically-expired key ke liye aata tha toh replica 'already gone' maan ke ignore kar deta tha, key kabhi free nahi hoti thi. Regression test test_replica_physically_deletes_on_master_del.",
+   "BGSAVE ke baad dirty counter -1 ho gaya (pehle 0 reset, phir subtract). Fix: snapshot start pe dirty_at_start capture karo aur sirf utna subtract karo; test_writes_during_bgsave_stay_dirty.",
+   "Benchmark mein writes reads se 2-6x slow the. Replica band karke dekha toh pipelined SET 11.2k se 23.2k -- per-command socket write bottleneck tha. Replication stream ko per loop tick batch kiya: pipelined SET 34.7k req/s.",
+   "Windows pe tests 94s le rahe the: localhost pehle IPv6 ::1 try karta tha aur IPv4 listener pe ~2s per connection waste hota tha. 127.0.0.1 use karke suite 11s pe aa gaya."
+  ],
+  "failure_scenarios": [
+   "Process crash: AOF always mein koi acknowledged write nahi jaata (fsync before reply); everysec mein ~1s tak; snapshot-only mein last snapshot ke baad ka sab.",
+   "Crash ke beech AOF ka last command aadha likha: replay pehle ke saare commands apply karta hai, aof_truncated_tail log karta hai aur file ko last good byte tak truncate karta hai. Beech mein garbage ho toh start hi refuse.",
+   "Snapshot corrupt/truncated: CRC32 mismatch -> CorruptSnapshot, load refuse. Snapshot likhte waqt crash/disk full: temp file + os.replace ki wajah se purani file intact.",
+   "Memory limit: noeviction pe writes ko OOM error, reads chalte rehte hain; volatile policies ko agar TTL wali key na mile toh bhi OOM.",
+   "Slow replica: output buffer 64MB se upar gaya toh master disconnect karta hai, replica reconnect karke full sync karta hai. Master down: replica exponential backoff 0.1s -> 2s se retry karta hai.",
+   "Async replication + failover: old master ne jo writes acknowledge kiye lekin stream nahi kiye, woh REPLICAOF NO ONE ke baad naye master pe nahi honge."
+  ],
+  "improvements": [
+   "PSYNC: replication id + backlog ring buffer, taaki chhote network blips pe full sync na karna pade.",
+   "AUTH/ACL aur TLS (asyncio start_server ssl=...), plus dangerous commands (FLUSHDB, DEBUG, REPLICAOF) ko ACL categories ke peeche.",
+   "Per-client query buffer aur output buffer limits; abhi sirf per-argument limits (512MB bulk, 1M multibulk) aur replica buffer limit hai.",
+   "Replica ko master offset bhejna (FULLRESYNC <replid> <offset> jaisa) taaki PSYNC possible ho. lag_bytes ka late-attach baseline bug already fix hai (per-replica repl_base, test_lag_bytes_is_zero_for_caught_up_replica_attached_late), lekin replica khud abhi bhi 0 se ginta hai.",
+   "Sentinel-like automatic failover aur WAIT command for synchronous-ish replication; Linux pe fork-based BGSAVE.",
+   "MULTI/EXEC, Pub/Sub, sorted sets, blocking pops -- abhi implement nahi hain."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "TCP framing and the incremental RESP parser",
+   "steps": [
+    "1. Concept: TCP ek byte stream hai, message boundaries nahi deta; protocol ko khud framing karni padti hai.",
+    "2. Is project ko kyun chahiye: ek read() mein aadha command ya 16 pipelined commands aa sakte hain.",
+    "3. API: Parser.feed(bytes) aur Parser.get_command() jo poora command ya None deta hai.",
+    "4. Implementation: _parse_multibulk length-prefix padhta hai, payload adhoora ho toh None, buffer sirf end mein `del buf[:pos]`.",
+    "5. Demo: pytest -q tests/test_protocol.py -k partial (byte-by-byte feed) aur -k pipelined.",
+    "6. Interviewer next: malformed input pe connection kyun close karte ho? Limits (MAX_BULK_LEN) kyun?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/protocol.py::Parser",
+    "projects/02-mini-redis/tests/test_protocol.py"
+   ]
+  },
+  {
+   "concept": "RESP2 vs RESP3 and HELLO",
+   "steps": [
+    "1. Concept: RESP2 mein 5 types; RESP3 mein typed replies (map %, set ~, null _, boolean #, double ,).",
+    "2. Kyun: redis-py 8 by default HELLO 3 bhejta hai; pehle har connection fail hota tha.",
+    "3. API: HELLO [2|3] [SETNAME n] -> ClientState.proto set hota hai.",
+    "4. Implementation: handlers Python types return karte hain; encode(value, proto) wire form chunta hai.",
+    "5. Demo: pytest -k resp3_client aur test_encode_resp2_and_resp3.",
+    "6. Next: HGETALL RESP2 mein flat array kyun hai? bool ko int se pehle check kyun?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/commands/server_cmds.py::hello",
+    "projects/02-mini-redis/minidis/protocol.py::encode"
+   ]
+  },
+  {
+   "concept": "Single-threaded atomic execution",
+   "steps": [
+    "1. Concept: asyncio cooperative hai; task sirf await pe switch hota hai.",
+    "2. Kyun: INCR jaise read-modify-write ko lock ke bina atomic banana.",
+    "3. API: @command decorator, handlers plain def (async nahi).",
+    "4. Implementation: Server.execute handler ko seedha call karta hai, koi await nahi.",
+    "5. Demo: pytest -k concurrent_incr (10000 exact) aur -k slow_command (DEBUG SLEEP sabko rokta hai).",
+    "6. Next: handler mein await daal diya toh kya toot jayega? MULTI/EXEC kaise banaoge?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/commands/__init__.py::command",
+    "projects/02-mini-redis/minidis/server.py::execute",
+    "projects/02-mini-redis/tests/test_concurrency.py"
+   ]
+  },
+  {
+   "concept": "Lazy and active expiry",
+   "steps": [
+    "1. Concept: TTL wali keys ko time pe hatana -- lazy (access pe) aur active (background sampling).",
+    "2. Kyun: sirf lazy se unread keys hamesha memory mein rahengi.",
+    "3. API: EXPIRE/PEXPIREAT/TTL; Keyspace.set_expire_at, _expire_if_needed.",
+    "4. Implementation: active_expire_cycle 20 sample, >25% expired toh repeat, max 16 rounds; RandomSet O(1) sampling.",
+    "5. Demo: pytest -k active_expiry_removes_keys_nobody_reads (fake Clock).",
+    "6. Next: replica pe expiry kaise hoti hai? 25% threshold kyun?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/keyspace.py::active_expire_cycle",
+    "projects/02-mini-redis/minidis/randomset.py::RandomSet",
+    "projects/02-mini-redis/tests/test_expiry_eviction.py"
+   ]
+  },
+  {
+   "concept": "maxmemory and eviction",
+   "steps": [
+    "1. Concept: memory limit pe write se pehle jagah banao ya OOM do.",
+    "2. Kyun: cache use-case mein purana data hatana theek hai; primary store mein nahi.",
+    "3. API: --maxmemory, --maxmemory-policy, CONFIG SET maxmemory-policy.",
+    "4. Implementation: evict_until_fits + _pick_victim: OrderedDict head (exact LRU), sampled _atime (volatile-lru), soonest expiry (volatile-ttl).",
+    "5. Demo: pytest -k allkeys_lru aur -k noeviction_returns_oom_error.",
+    "6. Next: Redis sampled LRU kyun use karta hai? used_memory vs RSS?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/keyspace.py::evict_until_fits",
+    "projects/02-mini-redis/minidis/config.py::ServerConfig"
+   ]
+  },
+  {
+   "concept": "Snapshots: format, CRC, atomic rename, BGSAVE",
+   "steps": [
+    "1. Concept: point-in-time dataset ki binary photo.",
+    "2. Kyun: fast restart aur backups.",
+    "3. API: SAVE, BGSAVE, save rules '3600 1 300 100 60 10000'.",
+    "4. Implementation: dump() -> MAGIC + records + 0xFF + CRC32; write_atomic temp + fsync + os.replace; start_bgsave serialize in loop, write in thread.",
+    "5. Demo: pytest -k corrupted_snapshot, -k atomic_write, -k writes_during_bgsave.",
+    "6. Next: fork + copy-on-write kya hai? directory fsync kyun chahiye?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/persistence/snapshot.py::write_atomic",
+    "projects/02-mini-redis/minidis/server.py::start_bgsave"
+   ]
+  },
+  {
+   "concept": "AOF: fsync policies, replay, rewrite",
+   "steps": [
+    "1. Concept: har write command log karo; durability = fsync frequency.",
+    "2. Kyun: snapshot ke beech ka data bhi bachana.",
+    "3. API: --appendonly yes --appendfsync always|everysec|no, BGREWRITEAOF.",
+    "4. Implementation: group commit in _handle_client, everysec fsync_in_thread in _cron, replay truncated tail, rewrite buffer + os.replace.",
+    "5. Demo: pytest -k aof (restart x3 modes, absolute expiry, truncated tail, rewrite with concurrent writes).",
+    "6. Next: everysec mein kitna loss? relative TTL ko absolute kyun?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/persistence/aof.py::AppendOnlyFile",
+    "projects/02-mini-redis/tests/test_persistence.py"
+   ]
+  },
+  {
+   "concept": "Async master-replica replication",
+   "steps": [
+    "1. Concept: master write stream replicas ko bhejta hai, client ko wait nahi karvata.",
+    "2. Kyun: read scaling aur failover ke liye copy.",
+    "3. API: --replicaof host:port, REPLICAOF NO ONE, INFO replication.",
+    "4. Implementation: SYNC -> snapshot -> stream; REPLCONF ACK har second; lag_bytes; replica READONLY; 64MB buffer limit; backoff 0.1s -> 2s.",
+    "5. Demo: pytest -q tests/test_replication.py.",
+    "6. Next: failover pe data loss kab? PSYNC kaise banaoge? replica expiry kyun nahi karta?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/replication.py::ReplicaLink",
+    "projects/02-mini-redis/minidis/server.py::_serve_replica"
+   ]
+  },
+  {
+   "concept": "Benchmark-driven performance fix",
+   "steps": [
+    "1. Concept: measure -> hypothesis -> experiment -> fix -> re-measure.",
+    "2. Kyun: writes reads se 2-6x slow the.",
+    "3. Tool: redis-benchmark -n 50000 -c 50 -P 1/16 via bench/compare.sh.",
+    "4. Implementation: _propagate queue + call_soon(_flush_replication) = ek socket write per tick.",
+    "5. Demo: bash bench/compare.sh; TESTING.md tables (SET P=16 11,249 -> 34,698).",
+    "6. Next: is batching ka latency cost kya hai? aur kahan time ja raha hai?"
+   ],
+   "files": [
+    "projects/02-mini-redis/minidis/server.py::_flush_replication",
+    "projects/02-mini-redis/TESTING.md",
+    "projects/02-mini-redis/bench/compare.sh"
+   ]
+  }
+ ]
+}

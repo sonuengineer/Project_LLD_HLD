@@ -1,0 +1,1037 @@
+[
+ {
+  "id": "JOBQ-065",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Tell me about the throughput investigation: how did you go from 158 to 577 jobs/s?",
+  "answer_hinglish": "Yeh meri favourite performance story hai kyunki numbers real hain (`TESTING.md`, 2026-11-16 run).\n\n**Setup**: `bench/throughput.py` -- 5000 no-op jobs (`report.generate` with 0s), real worker subprocesses (`python -m jobqueue.worker`), 16 slots each, Redis 7 Docker Desktop pe Windows 11 (shared machine, ~25 doosre containers). Time mein worker process startup bhi included hai.\n\n**Symptom**: 1 worker process sirf 158 jobs/s, 4 processes 440 jobs/s. 16 slots hone ke bawajood, aur handler no-op hai -- toh CPU handler mein nahi ja raha.\n\n**Diagnosis**: claim loop serial tha. Har iteration ek job claim karta tha (`claim.lua` sirf id return karta) aur phir alag `HGETALL` se job data -- ek job ke liye 2 round trips, aur loop ek-ek karke chalta. Slots free the lekin claims ka wait kar rahe the. Bottleneck round-trip latency thi, Redis CPU nahi.\n\n**Fix**: `claim.lua` ko `max_jobs` argument diya -- ek call mein jitne slots free utni jobs pop + lease, aur har job ka `HGETALL` inline return. Worker `claim_many(queue, id, self._free)` call karta hai.\n\n**Result**: 1 process 577 jobs/s (3.6x), 4 processes 1,227 jobs/s. Enqueue side ~750-1,190 jobs/s ek Python producer se (SADD + EVALSHA per job).\n\nLesson jo main bolta hoon: pehle measure karo, phir round trips count karo. Chhote operations mein latency throughput ko dominate karti hai. Caveat: yeh no-op jobs hain; real workloads handlers (I/O) se bound honge.",
+  "why_needed": "Real numbers ke saath diagnosis-fix-result story interview mein bahut strong signal hai.",
+  "real_world_analogy": "Godown se ek-ek box uthake truck tak le jaana, aur har box ke liye alag se challan office jaana -- vs trolley bhar ke ek trip aur challan saath mein.",
+  "how_it_works": "Throughput ~ concurrency / latency (Little's law); amortize round trips via batching.",
+  "in_this_project": "`bench/throughput.py`, `claim.lua` ARGV[6] max_jobs, `JobQueue.claim_many`, `Worker.run` `self._claim_next(self._free)`. `ARCHITECTURE.md` decision #5 'measured 3.6x throughput'.",
+  "implementation_files": [
+   "projects/03-job-queue/bench/throughput.py::main",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/core/queue.py::claim_many",
+   "projects/03-job-queue/TESTING.md"
+  ],
+  "code_example": "# real: bench/throughput.py usage\npython bench/throughput.py --jobs 5000 --workers 4 --concurrency 16\n# TESTING.md results:\n# Before (claim 1 + HGETALL): 158 jobs/s (1 proc), 440 jobs/s (4 procs)\n# After  (batch + inline):    577 jobs/s (1 proc), 1,227 jobs/s (4 procs)",
+  "code_language": "bash",
+  "advantages": [
+   "Measured, reproducible",
+   "Simple change, big win"
+  ],
+  "disadvantages": [
+   "Batch claim increases crash blast radius",
+   "Numbers from a shared dev laptop, not prod hardware"
+  ],
+  "common_mistakes": [
+   "Optimizing Redis CPU when bottleneck is round trips",
+   "Benchmarking without including realistic handler work"
+  ],
+  "follow_up_questions": [
+   "Why didn't 4 processes give 4x?",
+   "What would you measure next?",
+   "How does Little's law apply here?"
+  ],
+  "concepts": [
+   "throughput",
+   "round trips",
+   "batching",
+   "benchmarking"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Batching trades latency-per-job and crash blast radius for throughput; cap batch at free slots so claimed jobs start immediately.",
+   "failure_scenarios": "Crash after a 16-job claim delays 16 jobs by a lease; noisy shared machine skews numbers.",
+   "alternatives": "Pipelining multiple claim calls, Redis Streams XREADGROUP COUNT, more processes instead of bigger batches.",
+   "scale_10x_100x": "Next limits: Python per-job overhead (pydantic, JSON, logging), single Redis thread, stats/completed writes per ack. Batch ack would be next.",
+   "production_improvements": "Profile worker (py-spy), batch acks, reduce per-job logging, run bench on dedicated hardware and record p99 enqueue-to-start latency."
+  }
+ },
+ {
+  "id": "JOBQ-066",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What is the time complexity of the main queue operations?",
+  "answer_hinglish": "Saare core operations sorted set pe O(log n) hain, jahan n us zset ka size hai:\n- **Enqueue**: `HSET` (O(fields)), `INCR` O(1), `ZADD ready` O(log n). Idempotency `GET`/`SET` O(1).\n- **Claim**: promotion `ZRANGEBYSCORE ... LIMIT 0 100` O(log n + m) jahan m promoted count (max 100); har promoted job pe `ZREM` + `ZADD` O(log n). Pop `ZPOPMIN` O(log n) per job, `HINCRBY`, `HSET`, `ZADD active` O(log n), `HGETALL` O(fields). Batch of k: O(k log n).\n- **Ack**: `ZREM active` O(log n), `EXPIRE` O(1), `ZADD completed` + `ZREMRANGEBYRANK` O(log n + removed).\n- **Fail**: `ZREM`, `RPUSH`, `LTRIM` (small list), `ZADD delayed/dead` -- O(log n).\n- **Extend**: `ZADD active` (score update) O(log n).\n- **Reap**: `ZRANGEBYSCORE active -inf now LIMIT 0 100` O(log n + m).\n- **Stats**: `ZCARD` O(1) x 4 + `HGETALL` stats -- pipelined.\n\nPractical matlab: 1 million ready jobs pe bhi log2(1M) ~ 20 steps -- har op microseconds. Yahi reason hai ki bottleneck Redis CPU nahi balki network round trips aur Python overhead nikla (throughput story).\n\nEk non-log cheez: `GET /dlq/requeue-all` `list_ids` 10,000 tak + har job ke liye `get` + `requeue_dead` -- O(k) round trips. Aur `tick_schedules` har tick pe saare schedules iterate karta hai -- O(#schedules) EVALSHA per worker per second.",
+  "why_needed": "Scaling discussion ke liye per-operation cost pata hona chahiye.",
+  "real_world_analogy": "Dictionary mein word dhoondhna: har page nahi palatte, beech se khol ke aadha-aadha karte ho -- 1000 pages mein ~10 steps.",
+  "how_it_works": "Skiplist-based zset: O(log n) insert/delete/rank; range O(log n + m).",
+  "in_this_project": "Scripts in `core/lua/`; `queue_stats` pipeline; `SYSTEM_DESIGN.md` 'Capacity model': 'Redis CPU per job is a handful of small O(log n) zset ops'.",
+  "implementation_files": [
+   "projects/03-job-queue/SYSTEM_DESIGN.md",
+   "projects/03-job-queue/jobqueue/core/queue.py::queue_stats",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Scales to millions of queued jobs",
+   "Bounded range ops"
+  ],
+  "disadvantages": [
+   "Admin endpoints (requeue-all, list with get per job) are O(k) round trips"
+  ],
+  "common_mistakes": [
+   "Thinking ZRANGEBYSCORE without LIMIT is cheap on huge zsets",
+   "Ignoring network round trips in cost analysis"
+  ],
+  "follow_up_questions": [
+   "Which operation would hurt first at 10M queued jobs?",
+   "How much memory does one job take?"
+  ],
+  "concepts": [
+   "complexity",
+   "Big-O",
+   "sorted set"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-067",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why are max_promote and the reaper limit bounded at 100? What happens without bounds?",
+  "answer_hinglish": "Redis single-threaded hai: jab ek Lua script chal rahi hai, koi doosra client serve nahi hota -- na API ka enqueue, na doosre workers ke ack. Toh script ka runtime sabka tail latency hai.\n\nSocho 1 lakh jobs ka `run_at` ek hi time pe hai (marketing campaign \"sabko 9 baje email\"). Unbounded promotion mein ek claim script 1 lakh ZREM + HGET + INCR + HSET + ZADD karega -- yeh sau milliseconds se seconds tak Redis ko freeze kar sakta hai. Us dauraan saare clients ruke; lease extensions late, heartbeat late; agar `lua-time-limit` (default 5s) cross hua toh Redis BUSY errors dene lagta hai.\n\n`max_promote = 100` (claim_many default) ka matlab: har claim call max 100 jobs promote karegi. Backlog multiple claims mein drain hoga -- har worker har cycle mein 100, toh N workers milke tezi se drain kar lete hain, aur beech mein doosre commands interleave ho jaate hain. Priority correctness pe asar: promoted batch ke andar order run_at ke hisaab se hai (ZRANGEBYSCORE ascending), toh oldest pehle.\n\nSame reasoning reaper ka `limit=100`: ZRANGEBYSCORE active with LIMIT, phir per job fail. Mass crash (100 workers ek saath) pe reaping multiple rounds mein hoga (har 2s per worker).\n\n`max_jobs` bhi bounded hai -- free slots (max concurrency). Aur `completed_cap` 1000, error list 20. Principle: har Redis operation ka worst case bounded rakho.",
+  "why_needed": "Single-threaded server pe ek unbounded script poore system ki latency spike karti hai.",
+  "real_world_analogy": "Ek counter pe ek customer 500 items ka bill banwaye toh poori line ruki; isliye 'max 10 items per turn, phir line mein wapas lago'.",
+  "how_it_works": "Bounded work per atomic call keeps tail latency predictable; backlog drains across calls.",
+  "in_this_project": "`claim.lua` `LIMIT 0, tonumber(ARGV[4])`, `JobQueue.claim_many(max_promote=100)`, `reap_expired(limit=100)`, comment 'bounded so one call never blocks Redis for long'.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/core/queue.py::claim_many",
+   "projects/03-job-queue/jobqueue/core/queue.py::reap_expired"
+  ],
+  "code_example": "-- real: jobqueue/core/lua/claim.lua\n-- 1) delayed -> ready (bounded so one call never blocks Redis for long)\nlocal due = redis.call('ZRANGEBYSCORE', KEYS[2], '-inf', now, 'LIMIT', 0, tonumber(ARGV[4]))",
+  "code_language": "lua",
+  "advantages": [
+   "Predictable Redis latency",
+   "Fair interleaving with other clients"
+  ],
+  "disadvantages": [
+   "Large due backlog takes several cycles to promote",
+   "Only workers polling that queue promote"
+  ],
+  "common_mistakes": [
+   "Unbounded loops in Lua",
+   "Promoting everything due 'because it's atomic'"
+  ],
+  "follow_up_questions": [
+   "What is lua-time-limit / busy-reply-threshold?",
+   "How would you size max_promote?"
+  ],
+  "concepts": [
+   "bounded work",
+   "tail latency",
+   "Lua",
+   "backpressure"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Small bounds = smooth latency but slower bulk drains; large bounds = faster drain but latency spikes.",
+   "failure_scenarios": "Huge due-at-once backlog: promotion lags; claims still pop already-ready jobs first, so promoted jobs wait behind them in priority bands.",
+   "alternatives": "Separate promoter loop with its own bound; time-sliced scripts; Redis Functions with bounded loops.",
+   "scale_10x_100x": "At 100x, a single queue's delayed zset may need sharding by time bucket.",
+   "production_improvements": "Metric: delayed-zset 'due but not promoted' count (ZCOUNT -inf now) as a lag signal; adaptive max_promote."
+  }
+ },
+ {
+  "id": "JOBQ-068",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would you scale this to 100x? Explain the Redis Cluster hash-tag caveat in your Lua scripts.",
+  "answer_hinglish": "**10x** (SYSTEM_DESIGN scaling table): zyada worker replicas (`--scale worker=N`), workload classes ke liye alag queues aur dedicated worker pools, Redis AOF + replica. Redis single instance abhi bhi theek -- ops chhote hain.\n\n**100x**: single Redis thread bottleneck ban sakta hai. Option: shard queues across Redis instances ya Redis Cluster. Yahan bada caveat:\n\nRedis Cluster mein ek script ki saari keys **same hash slot** mein honi chahiye, aur script ko jo keys touch karni hain woh `KEYS` mein declared honi chahiye taaki client sahi node pe route kare. Is project ke scripts dono rules todte hain:\n1. Job hash key Lua ke andar dynamically banti hai: `ARGV[1] .. 'job:' .. ARGV[2]` -- KEYS mein nahi. Cluster mein yeh key kisi aur slot/node pe ho sakti hai -> `CROSSSLOT` ya galat node error.\n2. Global keys `jq:seq` aur `jq:idem:{key}` queue keys ke slot mein nahi hain.\n3. Queue keys `jq:q:default:ready` mein `{}` hash tag nahi hai, toh ready/delayed/active alag slots mein ho sakte hain.\n\nREADME known limitation exactly yahi kehta hai: \"Lua scripts build job keys dynamically (not declared in KEYS) -> fine on one Redis, needs hash tags per queue for Redis Cluster.\"\n\nFix: har queue ki saari keys ek hash tag mein -- `jq:{default}:ready`, `jq:{default}:job:{id}`, `jq:{default}:seq`, `jq:{default}:idem:{key}`. Job id lookup ke liye job id mein queue encode karo ya `GET /jobs/{id}` ko queue chahiye. Isse ek queue = ek slot = ek node; scaling = queues ko nodes pe distribute karna. Ek bahut hot queue ko N sub-queues (`{default-0}`...`{default-7}`) mein split karke workers round-robin karein.\n\nSaath mein: push wakeups (idle polling traffic kam), completed history Postgres/ClickHouse mein.",
+  "why_needed": "Scale-out interviews mein data partitioning aur multi-key atomicity ka conflict samajhna key hai.",
+  "real_world_analogy": "Bade school ko kai buildings mein baanto -- lekin ek class ke bachche, unke registers aur unka teacher ek hi building mein hone chahiye, warna roll call mein teacher ko building badalni padegi.",
+  "how_it_works": "Cluster routes by CRC16(hash tag) mod 16384; multi-key ops/scripts require single slot; hash tags force co-location.",
+  "in_this_project": "Not implemented. `README.md` known limitations, `SYSTEM_DESIGN.md` scaling path, key construction in `JobQueue.k` and `job_key`, Lua `ARGV[1] .. 'job:'`.",
+  "implementation_files": [
+   "projects/03-job-queue/README.md",
+   "projects/03-job-queue/SYSTEM_DESIGN.md",
+   "projects/03-job-queue/jobqueue/core/queue.py::job_key",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua"
+  ],
+  "code_example": "# illustrative (not in repo): cluster-safe key builders\ndef k(self, queue: str, kind: str) -> str:\n    return f\"{self.p}{{{queue}}}:{kind}\"            # jq:{default}:ready\ndef job_key(self, queue: str, job_id: str) -> str:\n    return f\"{self.p}{{{queue}}}:job:{job_id}\"       # same slot as the queue",
+  "code_language": "python",
+  "advantages": [
+   "Hash tags keep per-queue atomicity",
+   "Queues become the unit of sharding"
+  ],
+  "disadvantages": [
+   "One hot queue = one hot node",
+   "Job lookup needs queue name",
+   "Cross-queue ops (strict priority) become multi-node calls"
+  ],
+  "common_mistakes": [
+   "Assuming Lua 'just works' on Cluster",
+   "Putting everything in one hash tag (defeats sharding)"
+  ],
+  "follow_up_questions": [
+   "How would GET /jobs/{id} work if the job key needs the queue?",
+   "How do you rebalance hot queues?"
+  ],
+  "concepts": [
+   "Redis Cluster",
+   "hash tags",
+   "sharding",
+   "scalability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-queue slotting keeps scripts atomic but limits a single queue to one node's throughput; sub-queue splitting trades strict FIFO for parallelism.",
+   "failure_scenarios": "Node failure in cluster takes its queues offline until failover; resharding moves slots (and queues) with brief MOVED/ASK redirects.",
+   "alternatives": "Client-side sharding by queue name across independent Redis instances (simpler than Cluster), Kafka with partitions, managed SQS.",
+   "scale_10x_100x": "10x: replicas + pools. 100x: shard by queue, sub-queues for hot queues, push wakeups, history offload. 1000x: probably a purpose-built broker.",
+   "production_improvements": "Refactor key builders with hash tags, declare all keys in KEYS, per-queue seq and idem keys, cluster-mode integration test."
+  }
+ },
+ {
+  "id": "JOBQ-069",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "How would you size worker concurrency and the number of worker processes?",
+  "answer_hinglish": "Pehle workload type dekho.\n\n**I/O-bound** (emails, HTTP APIs, DB writes) -- zyada time await mein. Ek asyncio process mein high concurrency (16, 32, 64) theek hai. Little's law: throughput ~ concurrency / avg job latency. Agar job 200ms ki hai aur 100 jobs/s chahiye toh ~20 concurrent slots. Lekin dependent resources ka dhyan: Postgres pool `pool_size=10, max_overflow=10` (`db/session.py`) = 20 connections per process -- concurrency 64 rakhoge toh handlers pool ka wait karenge. Redis pool `concurrency + 8`. Downstream rate limits (email provider) bhi cap hain.\n\n**CPU-bound** -- event loop block hota hai. DEPLOYMENT #2: concurrency ~1 per core per process, aur CPU work ko process pool mein bhejo, ya dedicated queue + worker pool.\n\n**Processes**: parallelism (multiple cores) aur fault isolation ke liye multiple processes. Compose default 3 replicas x 16. Scale: `docker compose up -d --scale worker=6`.\n\nSignal kya dekho: `/queues` ka `ready` backlog badh raha hai aur workers ka `running` count concurrency ke barabar -> capacity kam, scale out. Ready backlog badh raha hai lekin `running` kam -> claim bottleneck ya polling. `stale_acks` > 0 -> event loop block ho raha (concurrency ya CPU work zyada).\n\nPractical: start chhota, load test (`bench/throughput.py` jaisa, real handler ke saath), aur queue age p99 pe autoscale.",
+  "why_needed": "Galat sizing = ya resources waste, ya downstream overload, ya blocked loops.",
+  "real_world_analogy": "Ek waiter kitni tables sambhale: sirf order lena ho (I/O) toh 15; agar waiter ko khana bhi pakaana hai (CPU) toh 1.",
+  "how_it_works": "Little's law L = lambda * W; bound by downstream pools and rate limits.",
+  "in_this_project": "`worker/__main__.py` `--concurrency` + pool, `db/session.py`, `DEPLOYMENT.md` #2-#3, compose `--concurrency 16` replicas 3.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/__main__.py",
+   "projects/03-job-queue/jobqueue/db/session.py::make_engine",
+   "projects/03-job-queue/DEPLOYMENT.md",
+   "projects/03-job-queue/docker-compose.yml"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Asyncio makes high I/O concurrency cheap",
+   "Processes add cores and isolation"
+  ],
+  "disadvantages": [
+   "Pools and downstream limits must be co-tuned"
+  ],
+  "common_mistakes": [
+   "Concurrency > DB pool",
+   "One process per job (fork overhead)",
+   "Scaling workers into a rate-limited provider"
+  ],
+  "follow_up_questions": [
+   "How would you autoscale on queue backlog?",
+   "What's Little's law?"
+  ],
+  "concepts": [
+   "sizing",
+   "Little's law",
+   "concurrency",
+   "capacity planning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-070",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Enqueue runs at ~750-1,190 jobs/s from one producer. Why, and how would you speed it up?",
+  "answer_hinglish": "`TESTING.md`: \"Enqueue rate from one Python producer: ~750-1,190 jobs/s (each enqueue = SADD + EVALSHA).\" Bench `asyncio.gather` se 200-200 ke batches mein enqueue karta hai.\n\nKyun limited:\n1. **Do round trips per job**: `JobQueue.enqueue` pehle `await self.r.sadd(jq:queues, queue)` phir `await self._s[\"enqueue\"](...)`. Har job ke liye do network trips.\n2. **Python overhead**: pydantic `EnqueueRequest` construction, `uuid4`, `json.dumps` do baar (payload aur flat fields), redis-py command encoding.\n3. **Delay case**: `delay_seconds` ke saath `_redis_now()` ek teesra round trip (agar now_ms nahi diya).\n4. **API path** (bench direct JobQueue use karta hai): HTTP pe aur zyada -- FastAPI, validation, aur enqueue ke baad `get(job_id)` (HGETALL + LRANGE) taaki response mein job JSON ho -- 2 aur round trips.\n\nSpeedups:\n- `SADD` ko `enqueue.lua` ke andar le aao (KEYS mein `jq:queues` declare karke) -> 1 round trip.\n- Bulk enqueue API: `POST /jobs/batch` jo ek pipeline/script mein N jobs daale.\n- Pipelining: multiple EVALSHA ek pipeline mein (non-transactional) -- latency amortize.\n- API response mein `get` skip karke sirf id/status (ya script se hash return).\n- Delay: run_at ko Lua ke andar compute karo (`now + delay_ms` ARGV) -> TIME round trip khatam.\n\nKyun yeh abhi priority nahi tha: real producers usually ek request = ek job, toh per-request latency (single-digit ms) matter karta hai, bulk throughput nahi.",
+  "why_needed": "Producer throughput bulk imports aur fan-out jobs ke liye matter karta hai.",
+  "real_world_analogy": "Post office pe har letter ke liye do counters pe line lagana (register + stamp) -- ek hi counter pe dono kaam karwa do, ya ek bundle mein 100 letters do.",
+  "how_it_works": "Round trips dominate small ops; fold extra calls into the script, pipeline or batch.",
+  "in_this_project": "`JobQueue.enqueue` (SADD then script), `bench/throughput.py` enqueue loop, `api/routes.py::enqueue` (get after enqueue).",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/queue.py::enqueue",
+   "projects/03-job-queue/bench/throughput.py",
+   "projects/03-job-queue/jobqueue/api/routes.py::enqueue",
+   "projects/03-job-queue/TESTING.md"
+  ],
+  "code_example": "# illustrative (not in repo): pipelined bulk enqueue\npipe = q.r.pipeline(transaction=False)\nfor req in reqs:\n    q._s[\"enqueue\"](keys=[...], args=[...], client=pipe)   # redis-py scripts accept client=pipeline\nresults = await pipe.execute()",
+  "code_language": "python",
+  "advantages": [
+   "Clear, measured baseline",
+   "Known cheap fixes"
+  ],
+  "disadvantages": [
+   "Two round trips per job today",
+   "API adds two more for the response"
+  ],
+  "common_mistakes": [
+   "Optimizing enqueue when workers are the bottleneck",
+   "Sequential awaits in a loop instead of gather/pipeline"
+  ],
+  "follow_up_questions": [
+   "Why does the API call get() after enqueue?",
+   "Would a batch endpoint change idempotency semantics?"
+  ],
+  "concepts": [
+   "enqueue throughput",
+   "pipelining",
+   "round trips"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Single-job API keeps semantics simple (per-job idempotency, per-job status); batch APIs add partial-failure semantics.",
+   "failure_scenarios": "Pipelined batch with Redis down mid-way: some jobs enqueued, some not -> producer must retry with idempotency keys.",
+   "alternatives": "Lua bulk enqueue script, Redis Functions, producer-side buffering with periodic flush.",
+   "scale_10x_100x": "100x producers: Redis CPU becomes the limit before network; shard queues.",
+   "production_improvements": "Fold SADD into script, add batch endpoint, drop extra get() in API response or make it optional."
+  }
+ },
+ {
+  "id": "JOBQ-071",
+  "project_slug": "p03-job-queue",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "Why did 4 worker processes not give 4x the throughput of 1 in your benchmark?",
+  "answer_hinglish": "Numbers: 1 process 577 jobs/s, 4 processes 1,227 jobs/s -- ~2.1x, 4x nahi. (Pehle wale version mein 158 -> 440, ~2.8x.)\n\nReasons (honest, aur kuch hypotheses jo main aise label karta hoon):\n1. **Shared machine**: bench Docker Desktop pe Windows 11 pe chala, ~25 doosre containers ke saath (TESTING.md). 4 Python processes + Redis + producer sab same CPU cores share karte hain. Worker processes CPU ke liye compete karte hain.\n2. **Startup time included**: TESTING.md explicitly kehta hai time mein worker process start-up included hai. 5000 jobs ke chhote run mein 4 processes ka import/connect overhead relatively bada hai.\n3. **Single Redis thread**: saare workers ek Redis pe -- claims, acks, stats, completed zset writes serialize hote hain. No-op jobs pe har job ka cost almost pura Redis + Python overhead hai.\n4. **Shared hot keys**: sab workers same `ready` aur `active` zset aur `stats` hash ko hit karte hain.\n5. **Polling/idle**: queue khaali hone ke paas workers idle backoff mein jaate hain -- tail pe kuch time waste.\n\nTakeaway: no-op benchmarks system overhead measure karte hain, scaling nahi. Real handlers (I/O wait 100ms+) mein workers zyada linearly scale karte hain kyunki bottleneck handler latency hai, Redis nahi. Proper scaling test dedicated hardware pe, longer run, steady-state throughput (startup excluded) ke saath karunga.",
+  "why_needed": "Benchmark results ko critically interpret karna maturity dikhata hai.",
+  "real_world_analogy": "4 chef ek chhote kitchen mein ek hi stove share karein toh 4x khana nahi banta -- stove (Redis) aur jagah (CPU) shared hai.",
+  "how_it_works": "Amdahl-style: shared serial resources (Redis thread, CPU) limit parallel speedup.",
+  "in_this_project": "`TESTING.md` throughput table aur conditions; `bench/throughput.py` print line '(includes worker process start-up)'.",
+  "implementation_files": [
+   "projects/03-job-queue/TESTING.md",
+   "projects/03-job-queue/bench/throughput.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Honest interpretation",
+   "Identifies next bottlenecks"
+  ],
+  "disadvantages": [
+   "Benchmark conditions noisy"
+  ],
+  "common_mistakes": [
+   "Claiming linear scaling from a laptop benchmark",
+   "Excluding setup costs silently"
+  ],
+  "follow_up_questions": [
+   "How would you design a fair scaling benchmark?",
+   "What is Amdahl's law?"
+  ],
+  "concepts": [
+   "benchmarking",
+   "scaling",
+   "Amdahl's law"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-072",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "How does the system prevent a producer from executing arbitrary code on workers?",
+  "answer_hinglish": "Teen design choices:\n\n1. **Job type ek naam hai, code nahi**: job mein sirf `type` string hai (`email.send`). Worker `self.registry.get(job.type)` se sirf pre-registered handlers chalata hai. Naam registry mein nahi -> `PermanentError` -> DLQ. Producer koi function path, module name, ya code nahi bhej sakta. Type format bhi validated: `^[a-z0-9_.]{1,64}$`.\n\n2. **Payload JSON hai, pickle nahi**: `JobQueue.enqueue` payload ko `json.dumps` karta hai aur Job model `json.loads`. Python `pickle` deserialization arbitrary code execute kar sakta hai (`__reduce__` trick) -- kuch purane job libraries default pickle use karti thi aur yeh real RCE vector tha. JSON sirf data hai.\n\n3. **Handlers payload ko data ki tarah treat karte hain**: SQLAlchemy Core bound parameters (`insert(...).values(...)`), toh SQL injection nahi. `eval`/`exec`/shell nahi.\n\n`SECURITY.md` table: \"Malicious job types / arbitrary code execution -> Only registered handler names run; payload is JSON data, never code (no pickle).\"\n\nRemaining risks: handler khud payload ko trust kare (jaise URL fetch karna -> SSRF, file path -> path traversal) -- yeh handler-level validation hai. Aur API token leak hua toh attacker koi bhi registered job type chala sakta hai (jaise mass emails) -- scopes chahiye.",
+  "why_needed": "Job queues historically RCE ka source rahe hain (pickle); worker ko producer pe blindly trust nahi karna chahiye.",
+  "real_world_analogy": "Restaurant mein customer menu se dish ka naam bolta hai; kitchen mein ghus ke apni recipe nahi pakwa sakta.",
+  "how_it_works": "Allow-list dispatch + data-only serialization.",
+  "in_this_project": "`handlers/__init__.py::Registry`, `Worker._execute` unknown type branch, `JobQueue.enqueue` json.dumps, `SECURITY.md`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/__init__.py::Registry",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/SECURITY.md",
+   "projects/03-job-queue/jobqueue/core/models.py::EnqueueRequest"
+  ],
+  "code_example": "# real: jobqueue/worker/worker.py\nif handler is None:\n    raise PermanentError(f\"no handler registered for job type {job.type!r}\")",
+  "code_language": "python",
+  "advantages": [
+   "No RCE via job data",
+   "Unknown types fail fast"
+  ],
+  "disadvantages": [
+   "Handlers must still validate payload semantics"
+  ],
+  "common_mistakes": [
+   "pickle for payloads",
+   "Dynamic import of a function path from the job"
+  ],
+  "follow_up_questions": [
+   "What is SSRF and how could a handler be vulnerable?",
+   "How would you restrict which producer can enqueue which job type?"
+  ],
+  "concepts": [
+   "RCE",
+   "pickle",
+   "allow-list",
+   "deserialization"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-073",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "Why shouldn't secrets go into job payloads, and what should you do instead?",
+  "answer_hinglish": "Job payload bahut jagah dikhta aur store hota hai:\n1. Redis job hash mein plain text (`payload` field) -- retention tak (24h success, dead jobs indefinitely).\n2. `GET /jobs/{id}`, `GET /jobs?status=`, `GET /dlq` responses mein poora payload.\n3. Dashboard (DLQ table) mein.\n4. Logs mein agar koi handler payload log kare.\n5. Redis AOF file aur backups/replicas mein.\nKoi encryption at rest nahi (SECURITY.md gaps: \"no payload encryption at rest\").\n\nToh agar payload mein password reset token, API key, card number daala -- woh in sab jagah leak ho sakta hai, aur jisko bhi API token mila woh padh sakta hai.\n\nInstead: **reference pass karo, secret nahi**. Payload mein `user_id` ya `reset_request_id` daalo; handler Postgres/secrets manager se actual sensitive data load kare. Service credentials (email provider key, DB password) worker ke env se aate hain (`JQ_DATABASE_URL`, DEPLOYMENT #6 \"Secrets via env... never in job payloads\").\n\nBonus: references se payload chhota rehta hai aur job hamesha latest data use karti hai (stale snapshot nahi). Trade-off: agar data job chalne se pehle delete ho gaya toh handler ko handle karna padega (PermanentError).",
+  "why_needed": "Queues data ko kai jagah copy karte hain; secrets ka blast radius badh jata hai.",
+  "real_world_analogy": "Courier se ghar ki chaabi bhejne ki jagah sirf 'locker number' bhejo; chaabi locker wale ke paas safe rehti hai.",
+  "how_it_works": "Indirection: payload holds identifiers; sensitive data fetched at execution time from secure store.",
+  "in_this_project": "`SECURITY.md` rows 'Payload secrets visible in dashboard / Redis' aur gaps; `DEPLOYMENT.md` #6; `config.py` env-based settings.",
+  "implementation_files": [
+   "projects/03-job-queue/SECURITY.md",
+   "projects/03-job-queue/DEPLOYMENT.md",
+   "projects/03-job-queue/jobqueue/config.py::Settings",
+   "projects/03-job-queue/jobqueue/api/routes.py::get_job"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Smaller payloads",
+   "Secrets stay in one controlled place",
+   "Fresh data at execution"
+  ],
+  "disadvantages": [
+   "Extra lookup in handler",
+   "Referenced data may be gone"
+  ],
+  "common_mistakes": [
+   "Putting OAuth tokens in payloads",
+   "Logging full payloads at INFO"
+  ],
+  "follow_up_questions": [
+   "How would you add payload encryption?",
+   "Who can read job payloads today?"
+  ],
+  "concepts": [
+   "secrets management",
+   "data minimization",
+   "security"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-074",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How is the dashboard protected against XSS from job data?",
+  "answer_hinglish": "Job data attacker-controlled ho sakta hai: `type` (validated regex), lekin `last_error` mein exception message hota hai jo payload se aa sakta hai (jaise `invalid recipient '<script>...'`), queue names, worker ids (CLI `--worker-id` se). Dashboard `innerHTML` se table rows banata hai -- agar raw string daali toh `<img src=x onerror=...>` execute ho jayega operator ke browser mein, aur woh operator ka API token (jo dashboard use karta hai) chura sakta hai.\n\nFix: `dashboard.html` mein `esc` function -- `&`, `<`, `>`, `\"` ko HTML entities mein convert karta hai -- aur queue name, worker id, queues list, job type, last_error sab `esc(...)` se render hote hain. SECURITY.md row: \"Dashboard XSS via job data -> All values HTML-escaped before rendering -> dashboard.html::esc\".\n\nReview mein ek gap mila tha: DLQ row mein `j.id` bina esc ke render hota tha aur `onclick=\"requeue('${j.id}')\"` mein bhi. Job id server-side `uuid4().hex` hai (hex chars only), toh practically safe tha -- phir bhi defence in depth ke liye fix kiya: ab dono jagah `esc(j.id)`. Jo abhi bhi baaki hai: `esc` single quote escape nahi karta (onclick ke single-quoted JS string context mein matter karta hai), aur inline onclick ki jagah event listener + data attribute better hoga.\n\nAur strong layer: Content-Security-Policy header (`script-src 'self'`, no inline) -- abhi set nahi hai.",
+  "why_needed": "Admin dashboards high-privilege browsers mein chalte hain; stored XSS wahan sabse khatarnak hai.",
+  "real_world_analogy": "Notice board pe koi bhi parchi chipka sakta hai; board manager har parchi ko plastic cover mein daalta hai taaki koi parchi 'board ka hissa' na ban jaye.",
+  "how_it_works": "Output encoding per context (HTML body vs attribute vs JS string).",
+  "in_this_project": "`jobqueue/dashboard.html` `esc` helper; served by `main.py` `/dashboard` route.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/dashboard.html::esc",
+   "projects/03-job-queue/jobqueue/main.py::create_app",
+   "projects/03-job-queue/SECURITY.md"
+  ],
+  "code_example": "// real: jobqueue/dashboard.html\nconst esc=s=>String(s??'').replace(/[&<>\"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','\"':'&quot;'}[c]));",
+  "code_language": "javascript",
+  "advantages": [
+   "Stored XSS blocked for text fields"
+  ],
+  "disadvantages": [
+   "Single quote not escaped",
+   "Inline onclick still relies on the id format (escaped now, but not JS-string-safe)",
+   "No CSP"
+  ],
+  "common_mistakes": [
+   "Escaping only some fields",
+   "Using innerHTML with raw API data"
+  ],
+  "follow_up_questions": [
+   "Why does attribute context need different escaping?",
+   "What would a CSP for this page look like?"
+  ],
+  "concepts": [
+   "XSS",
+   "output encoding",
+   "CSP"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-075",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "How could someone abuse the queue as a denial-of-service vector, and what mitigations exist or are missing?",
+  "answer_hinglish": "Abuse vectors:\n1. **Flood enqueue**: valid token ke saath lakhs jobs -> Redis memory full -> (noeviction pe) saare writes fail, ya (eviction policy pe) jobs evict = data loss.\n2. **Huge payloads**: `payload: dict` ka size limit nahi. 10MB payloads x thousands = memory gone. Saath mein claim inline hash return karta hai -> worker memory aur network.\n3. **Poison/expensive jobs**: max_attempts 50 aur timeout 3600s (allowed max) ke saath CPU-heavy job -> workers 50 ghante tak busy.\n4. **Many queue names**: har naam `jq:queues` mein permanent -- unbounded.\n5. **Idempotency keys**: 200 chars x millions, 24h TTL.\n6. **Schedules**: interval >= 1s, unlimited count -> har worker har second sab iterate karta hai.\n\nExisting mitigations: bearer auth (sirf token holders), validation (type/queue regex, priority, attempts <= 50, timeout <= 3600), DLQ + PermanentError (poison bounded), bounded Lua work, Redis not exposed outside compose network. SECURITY.md: \"add a request body size limit at the proxy (documented)\".\n\nMissing (honest): per-producer rate limiting (Project 1 ka rate limiter yahan lagana), per-tenant quotas, payload size limit in API, max queue length / backpressure (429 jab ready > N), per-producer allowed job types, queue name allow-list.\n\nMain production mein: proxy body limit (e.g. 64KB), API pe `len(json.dumps(payload))` check, per-token rate limit, ready-depth based 429, aur Redis memory alert at 70%.",
+  "why_needed": "Shared infrastructure ko ek client poora gira na de.",
+  "real_world_analogy": "Ek customer restaurant ki saari tables 'reserved' karwa de bina aaye -- reservation limit per customer aur deposit chahiye.",
+  "how_it_works": "Resource exhaustion via unbounded inputs; mitigate with quotas, limits, backpressure.",
+  "in_this_project": "`core/models.py::EnqueueRequest` bounds, `SECURITY.md` rows, `README.md` 'No per-tenant fairness or rate limiting inside the queue'.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/models.py::EnqueueRequest",
+   "projects/03-job-queue/SECURITY.md",
+   "projects/03-job-queue/README.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Basic bounds exist",
+   "Auth limits who can abuse"
+  ],
+  "disadvantages": [
+   "No payload size, rate limit, queue depth limit"
+  ],
+  "common_mistakes": [
+   "Relying on auth alone for DoS protection",
+   "Using an eviction policy on the queue Redis"
+  ],
+  "follow_up_questions": [
+   "How would you implement backpressure on enqueue?",
+   "Where would you integrate the rate limiter from Project 1?"
+  ],
+  "concepts": [
+   "DoS",
+   "quotas",
+   "backpressure",
+   "rate limiting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict limits protect the system but may reject legit bursts; queues exist to absorb bursts, so limits should be generous but finite.",
+   "failure_scenarios": "Redis OOM with noeviction -> all enqueues and even acks (writes) fail -> processing stalls; with LRU -> silent job loss.",
+   "alternatives": "Per-tenant queues with quotas, admission control at gateway, payload offload to object storage with size caps.",
+   "scale_10x_100x": "At 100x tenants, need per-tenant fairness + quotas, not just global limits.",
+   "production_improvements": "Body size limit, per-token rate limit, max ready depth -> 429 with Retry-After, memory alerts."
+  }
+ },
+ {
+  "id": "JOBQ-076",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "What are the documented security gaps and how would you harden this for production?",
+  "answer_hinglish": "SECURITY.md honestly teen gaps list karta hai: \"single shared API token (no per-producer identity or scopes), no TLS between services in compose, no payload encryption at rest.\" Code padh ke main kuch aur add karta hoon.\n\nHardening plan, priority order:\n1. **Identity & authorization**: shared token ki jagah per-producer credentials (API keys stored hashed, ya JWT/OIDC service accounts). Scopes: `jobs:enqueue` (specific job types), `jobs:read`, `dlq:replay`, `workers:admin`, `schedules:write`. Abhi koi bhi token holder `DELETE /workers`, `/dlq/requeue-all`, schedules sab kar sakta hai. Default token `change-me-jq-token` hai -- startup pe refuse karo agar default ho.\n2. **Transport**: Redis TLS + ACL users (API user ko sirf needed commands; worker user alag), Postgres TLS + least-privilege role (handler role sirf apni tables pe INSERT/SELECT). Compose Redis/Postgres ko internal network pe rakhta hai -- achha baseline.\n3. **Data protection**: payload encryption for sensitive job types (envelope encryption, key in KMS), ya references only. Retention for dead jobs.\n4. **Input limits**: body size, rate limits, queue name allow-list.\n5. **Dashboard**: currently `/dashboard` HTML unauthenticated (data APIs protected); token user paste karta hai browser mein. Better: SSO session, CSP header, escape all fields.\n6. **Audit**: DLQ replay, schedule changes, worker forget -- audit log with who/when.\n7. **Error hygiene**: already `traceback.format_exception_only` (no stack locals) aur 2000 char truncation -- good.\n\nContainer side already: non-root user uid 10001, slim image.",
+  "why_needed": "Senior engineers se expected hai ki woh gaps khud identify karke prioritized plan dein.",
+  "real_world_analogy": "Office building: abhi sab employees ke paas ek hi master key hai. Chahiye: har employee ka apna access card, sirf apne floors ke liye, aur entry log.",
+  "how_it_works": "Defence in depth: authn/z, transport security, data protection, limits, audit.",
+  "in_this_project": "`SECURITY.md` gaps, `api/routes.py::require_token` single token, `config.py` default `api_token`, `Dockerfile` `USER app`.",
+  "implementation_files": [
+   "projects/03-job-queue/SECURITY.md",
+   "projects/03-job-queue/jobqueue/api/routes.py::require_token",
+   "projects/03-job-queue/jobqueue/config.py::Settings",
+   "projects/03-job-queue/Dockerfile"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear prioritized roadmap",
+   "Some good baselines already (non-root, internal network, escaping)"
+  ],
+  "disadvantages": [
+   "Current single token = all-or-nothing access"
+  ],
+  "common_mistakes": [
+   "Treating internal network as trusted forever",
+   "Shipping default secrets"
+  ],
+  "follow_up_questions": [
+   "How would you rotate API keys without downtime?",
+   "What Redis ACL rules would a worker need?"
+  ],
+  "concepts": [
+   "security hardening",
+   "authorization",
+   "TLS",
+   "least privilege"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-producer auth adds key management overhead; scopes add policy complexity but limit blast radius of a leaked key.",
+   "failure_scenarios": "Leaked shared token today = full control: enqueue any type, replay DLQ, delete schedules, forget workers.",
+   "alternatives": "mTLS between services (service mesh), OAuth client credentials, API gateway handling auth.",
+   "scale_10x_100x": "Many producers/tenants -> key management service, per-tenant quotas, tenant id in job for isolation.",
+   "production_improvements": "Scoped keys, default-secret startup check, Redis ACL + TLS, audit log, CSP on dashboard."
+  }
+ },
+ {
+  "id": "JOBQ-077",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How are error messages stored for failed jobs, and why is that a security concern?",
+  "answer_hinglish": "Worker generic exception pe `\"\".join(traceback.format_exception_only(exc)).strip()` store karta hai -- sirf exception type aur message, jaise `ValueError: cannot process this payload`. Poora traceback (file paths, line numbers) ya local variables nahi. Timeout pe `timed out after Xms`, PermanentError pe `PermanentError: <msg>`.\n\n`JobQueue.fail` error ko `error[:2000]` truncate karta hai. `fail.lua` isse `last_error` field mein aur `:errors` list mein (last 20) store karta hai. Worker log mein `error[:300]`.\n\nSecurity concern kyun:\n1. **Information leakage**: exception messages mein kabhi DB connection strings, internal hostnames, SQL query text, ya payload values (PII) aa jaate hain. Yeh `GET /jobs/{id}`, `/dlq` aur dashboard pe kisi bhi token holder ko dikhte hain.\n2. **Storage abuse**: unbounded error text x 20 attempts x dead jobs jo kabhi expire nahi hote = memory. Truncation isse bound karta hai: max ~40KB per job (20 x 2000).\n3. **XSS**: error text dashboard mein render hota hai -- `esc()` se protected.\n\nSECURITY.md row: \"Errors truncated to 2000 chars; only exception type + message stored, no locals.\"\n\nResidual risk: exception message khud sensitive ho sakta hai (asyncpg errors mein kabhi values hote hain). Production mein: known exception types ke liye sanitized messages, aur full traceback sirf logs mein (access-controlled), job record mein error code + short message.",
+  "why_needed": "Debugging info aur data leakage ke beech balance.",
+  "real_world_analogy": "Complaint register mein 'machine kharab hai, code E42' likho -- poora internal wiring diagram nahi jo koi bhi customer padh le.",
+  "how_it_works": "Minimal error capture + truncation + bounded history + output escaping.",
+  "in_this_project": "`Worker._execute` `traceback.format_exception_only`, `JobQueue.fail` `error[:2000]`, `fail.lua` LTRIM.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/jobqueue/core/queue.py::fail",
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+   "projects/03-job-queue/SECURITY.md"
+  ],
+  "code_example": "# real: jobqueue/worker/worker.py\nexcept Exception as exc:\n    await self._fail(job, token, \"\".join(traceback.format_exception_only(exc)).strip(), \"error\")",
+  "code_language": "python",
+  "advantages": [
+   "No stack traces/locals exposed",
+   "Bounded size"
+  ],
+  "disadvantages": [
+   "Message itself may contain sensitive values",
+   "Debugging needs logs for full trace"
+  ],
+  "common_mistakes": [
+   "Storing traceback.format_exc() with locals in job records",
+   "Unbounded error lists"
+  ],
+  "follow_up_questions": [
+   "Where should full tracebacks go?",
+   "How would you correlate a job error with logs?"
+  ],
+  "concepts": [
+   "error handling",
+   "information leakage",
+   "security"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-078",
+  "project_slug": "p03-job-queue",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "How does the deployment limit network exposure of Redis and Postgres?",
+  "answer_hinglish": "`docker-compose.yml` mein sirf `api` service ka port publish hota hai, aur woh bhi `127.0.0.1:58003:8000` -- sirf localhost pe, public interface pe nahi. `redis` aur `postgres` services ka koi `ports:` mapping nahi -- woh sirf compose ke internal network pe reachable hain (service name `redis:6379`, `postgres:5432`). Workers aur API unhe internal DNS se access karte hain.\n\nYeh kyun important hai? Redis by default bina password ke chalta hai, aur exposed Redis internet pe attackers ka favourite target hai -- `CONFIG SET dir` + `SAVE` trick se server pe files likh dete hain, ya bas saara data padh/mita dete hain. Queue ke liye: koi bhi `FLUSHDB` kar de toh saari jobs gone, ya jobs inject kar de jo workers chalayenge.\n\nSECURITY.md row: \"Redis exposed -> Compose keeps Redis/Postgres on the internal network; only API port published on 127.0.0.1\".\n\nAur layers: Postgres password env se (`JQ_DB_PASSWORD`, default dev value -- production mein change), container non-root (`USER app`). Gaps: no TLS between services, Redis pe password/ACL nahi (internal network pe trust). Production mein managed Redis with AUTH + TLS + private subnet, security groups jo sirf worker/API subnets allow karein.",
+  "why_needed": "Data stores ko public network pe kabhi expose nahi karna chahiye.",
+  "real_world_analogy": "Ghar ka main gate (API) hi bahar khulta hai; tijori (Redis/Postgres) andar ke kamre mein hai jahan sirf ghar wale ja sakte hain.",
+  "how_it_works": "Network segmentation: only the entry point is published; internal services on private network.",
+  "in_this_project": "`docker-compose.yml` ports section, `SECURITY.md`, `Dockerfile` `USER app`.",
+  "implementation_files": [
+   "projects/03-job-queue/docker-compose.yml",
+   "projects/03-job-queue/SECURITY.md",
+   "projects/03-job-queue/Dockerfile"
+  ],
+  "code_example": "# real, trimmed: docker-compose.yml\n  api:\n    ports: [\"127.0.0.1:58003:8000\"]\n  redis:\n    image: redis:7-alpine          # no ports: internal network only",
+  "code_language": "yaml",
+  "advantages": [
+   "Minimal attack surface",
+   "Simple default"
+  ],
+  "disadvantages": [
+   "No auth/TLS inside the network"
+  ],
+  "common_mistakes": [
+   "Publishing 6379 for 'debugging' and forgetting",
+   "Binding API to 0.0.0.0 on a public host without TLS"
+  ],
+  "follow_up_questions": [
+   "How would you access Redis for debugging safely?",
+   "What Redis ACLs would you configure?"
+  ],
+  "concepts": [
+   "network security",
+   "segmentation",
+   "Redis security"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-079",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "Describe the real kill -9 test. What exactly does it prove?",
+  "answer_hinglish": "`tests/test_crash_process.py::test_kill_minus_nine_worker_process` -- project ka sabse strong proof.\n\nSteps:\n1. Ek `email.send` job enqueue: `timeout_seconds=60`, `backoff_base_seconds=0.05`, payload `{\"to\": \"c@x.io\", \"crash_after_commit\": True}`.\n2. `spawn(\"proc-A\")`: real OS process `python -m jobqueue.worker --queues default --worker-id proc-A`, env mein chhoti leases: `JQ_MAX_LEASE_MS=500`, `JQ_LEASE_GRACE_MS=500`, `JQ_REAP_INTERVAL_SECONDS=0.3`.\n3. Test Postgres poll karta hai jab tak `email_outbox` mein row na aa jaye -- matlab A ne commit kar diya. Handler ab `crash_after_commit` ki wajah se `asyncio.sleep(3600)` mein hai (attempt 1). Assert job status `ACTIVE`.\n4. `a.kill()` -- Windows pe TerminateProcess, Linux pe SIGKILL. Koi cleanup, finally, ya shutdown code nahi chalta. Ack kabhi nahi gaya.\n5. `spawn(\"proc-B\")`. B ka reaper lease expiry (~1s) ke baad job retry mein daalta hai, B claim karta hai (attempt 2), handler ledger conflict dekhta hai.\n6. Asserts: `job.attempts == 2`, `job.worker == \"proc-B\"`, `job.result[\"duplicate\"] is True`, aur `email_outbox` count exactly 1.\n\nKya prove hota hai: (a) at-least-once -- hard-killed worker ki job lost nahi hui, (b) lease + reaper real separate processes ke beech kaam karte hain, (c) idempotent consumer -- side effect exactly once. In-process version (`test_redelivery_after_crash_is_idempotent`) task cancel karta hai; yeh version real process death hai -- koi Python cleanup chance nahi.",
+  "why_needed": "Crash-recovery claims ko real process kill se verify karna -- mocks se nahi.",
+  "real_world_analogy": "Fire drill: sach mein bijli kaat ke dekho ki generator chalta hai ya nahi -- sirf 'switch off' ka natak nahi.",
+  "how_it_works": "Real subprocess, hard kill, observe recovery via shared Redis/Postgres state.",
+  "in_this_project": "`tests/test_crash_process.py` (`spawn`, env overrides), handler hook in `builtin.py`, `FAILURE_SCENARIOS.md` row 1.",
+  "implementation_files": [
+   "projects/03-job-queue/tests/test_crash_process.py::test_kill_minus_nine_worker_process",
+   "projects/03-job-queue/tests/test_crash_process.py::spawn",
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/03-job-queue/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: tests/test_crash_process.py (trimmed)\n    finally:\n        a.kill()      # hard kill: no cleanup code runs\n        a.wait()\n    b = spawn(\"proc-B\")\n    ...\n    assert job.attempts == 2 and job.worker == \"proc-B\" and job.result[\"duplicate\"] is True\n    async with sessionmaker() as s:\n        assert await s.scalar(select(func.count()).select_from(EmailOutbox)) == 1",
+  "code_language": "python",
+  "advantages": [
+   "Real OS-level failure",
+   "End-to-end with Redis + Postgres"
+  ],
+  "disadvantages": [
+   "Timing-based (polling loops)",
+   "Needs infra running"
+  ],
+  "common_mistakes": [
+   "Simulating crash with exceptions (cleanup still runs)",
+   "Using huge lease values in tests -> slow"
+  ],
+  "follow_up_questions": [
+   "Why shrink lease to 500ms in the test?",
+   "What would a crash BEFORE commit look like?"
+  ],
+  "concepts": [
+   "chaos testing",
+   "crash recovery",
+   "kill -9"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-080",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens when Redis becomes unavailable?",
+  "answer_hinglish": "FAILURE_SCENARIOS row 14: \"Enqueue fails (API 500 -> producer must retry with an idempotency key); workers log claim_failed and back off.\"\n\n**API side**: `enqueue` -> redis-py connection error -> bpcommon ka unhandled handler shared error shape ke saath 500. `BlockingConnectionPool(max_connections=50, timeout=2)` -- pool exhausted ho toh 2s wait. Producer ko retry karna chahiye **same idempotency key** ke saath, kyunki ho sakta hai Redis ne script apply kar diya ho aur reply lost hua -- key ke bina duplicate job.\n\n**Worker side**:\n- `_claim_next`: exception -> `log.exception(\"claim_failed\")`, `asyncio.sleep(0.5)`, return -> main loop idle backoff. Hot loop nahi.\n- Running handlers chal te rehte hain (Postgres effects ho jaate hain), lekin `ack` fail -> `_execute` ke `else` mein exception -> task error; job Redis mein active rehti hai.\n- `_keep_lease`: extend exception -> `lease_extension_failed` warning log aur agle tick (lease/3) pe phir try. Review fix: pehle koi try nahi tha -> ek blip pe task mar jaata, extensions band, lease expire -> duplicate execution (`test_lease_keeper_survives_transient_redis_errors`). Redis lamba down ho toh lease phir bhi expire hogi (expected).\n- Heartbeat/reaper/scheduler loops: try/except + log, continue.\n\n**Recovery**: Redis wapas aaya (data AOF se) -- jo jobs active the unki leases expire ho chuki hongi -> reaper retry -> handlers ledger se duplicate detect karte hain. Ack-failed jobs ka effect do baar nahi hota.\n\n**Data**: Redis restart AOF `everysec` ke saath max ~1s ke writes lose kar sakta hai -- recently enqueued jobs ya recent acks (ack lost = job dobara chalegi, idempotent safe; enqueue lost = producer ko 2xx mil chuka tha -> job silently lost). Yeh honest risk hai.",
+  "why_needed": "Broker outage sabse impactful failure hai; behaviour predictable hona chahiye.",
+  "real_world_analogy": "Railway signal system down: stations tickets nahi bech sakte (API 500), trains platform pe ruk jaati hain (workers back off), aur system wapas aane pe chalti trains ka status reconcile hota hai.",
+  "how_it_works": "Fail-fast at API, back-off at workers, lease-based reconciliation after recovery.",
+  "in_this_project": "`Worker._claim_next` except branch, `_heartbeat_loop` try/except, `api/routes.py::enqueue`, `main.py` pool config.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_claim_next",
+   "projects/03-job-queue/jobqueue/main.py::create_app",
+   "projects/03-job-queue/FAILURE_SCENARIOS.md",
+   "projects/03-job-queue/docker-compose.yml",
+   "projects/03-job-queue/tests/test_worker.py::test_lease_keeper_survives_transient_redis_errors"
+  ],
+  "code_example": "# real: jobqueue/worker/worker.py\nexcept Exception:\n    log.exception(\"claim_failed\", extra={\"queue\": qname})\n    await asyncio.sleep(0.5)\n    return out",
+  "code_language": "python",
+  "advantages": [
+   "No hot loops",
+   "Recovery via leases is automatic"
+  ],
+  "disadvantages": [
+   "Enqueue unavailable during outage",
+   "AOF everysec window can lose ~1s of writes",
+   "Long Redis outage still expires leases (keeper only survives short blips)"
+  ],
+  "common_mistakes": [
+   "Producers retrying without idempotency key",
+   "Assuming 2xx enqueue = durable on disk"
+  ],
+  "follow_up_questions": [
+   "Should the API buffer jobs locally when Redis is down?",
+   "What does appendfsync always cost?"
+  ],
+  "concepts": [
+   "Redis outage",
+   "graceful degradation",
+   "durability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fail-fast (500) keeps semantics clear; local buffering improves availability but risks loss on API crash.",
+   "failure_scenarios": "Partial outage: API can reach Redis, workers can't -> backlog grows; workers can reach Redis but Postgres down -> retries/DLQ.",
+   "alternatives": "Outbox in producer DB (survives Redis outage), Redis Sentinel/managed failover, multi-AZ replicas.",
+   "scale_10x_100x": "Bigger deployments: Redis HA mandatory; failover time (seconds) defines outage; client retry policy with jitter.",
+   "production_improvements": "(_keep_lease retry already done)  readiness probe on Redis ping, alert on claim_failed rate, appendfsync tuning per durability need."
+  }
+ },
+ {
+  "id": "JOBQ-081",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "Redis is the queue's source of truth. What happens on Redis data loss or failover, and how do you mitigate it?",
+  "answer_hinglish": "README limitation: \"Redis is the queue's source of truth: running Redis without AOF/replication risks losing queued jobs.\"\n\n**Without persistence**: Redis restart = saari ready/delayed/active/dead jobs gone. Producers ko 201 mil chuka tha. Silent loss.\n\n**AOF `everysec`** (compose: `--appendonly yes --appendfsync everysec`): har second fsync. Crash pe last ~1s ke writes lose ho sakte hain. `always` har write pe fsync -- safest lekin throughput/latency cost.\n\n**Replication + failover** (Sentinel/managed): Redis replication async hai. Primary ne claim apply kiya, replica tak nahi pahuncha, primary mara, replica promote. Effects:\n- Lost enqueue: producer ko success mila tha, job gayab. (Sabse bura)\n- Lost claim: job wapas ready mein dikhegi -> doosra worker chalayega -> pehla worker bhi chal raha hai -> duplicate (ledger absorbs). Pehle worker ka ack -> token mismatch? Naye primary pe attempts purana hai, toh ho sakta hai A ka token aur B ka token same number ho jaye (dono attempt 1)! Fencing yahan toot sakta hai -- B ka claim attempts=1 dega jo A ke paas bhi hai. Idempotent ledger hi bachata hai.\n- Lost ack: job dobara chalegi -> duplicate effect blocked by ledger.\n\nMitigations:\n1. AOF + replica + managed failover (DEPLOYMENT #1).\n2. `WAIT 1 timeout` after enqueue for critical jobs -- replica ack ka wait (synchronous-ish replication; still not a guarantee).\n3. Producer-side outbox: job intent producer ke DB mein durable; relay re-enqueue kar sakta hai idempotency key se.\n4. Idempotent handlers everywhere -- duplicates ko harmless banana.\n5. Reconciliation job: Postgres/outbox vs Redis compare.",
+  "why_needed": "In-memory brokers ke durability guarantees ko precisely samajhna senior expectation hai.",
+  "real_world_analogy": "Whiteboard pe orders likhe hain aur har second photo leti ho (AOF). Whiteboard gir gaya toh last second ke orders gaye; doosra whiteboard (replica) thoda peeche chal raha tha.",
+  "how_it_works": "Async replication + periodic fsync = bounded but non-zero loss window; idempotency + outbox close the gaps.",
+  "in_this_project": "`docker-compose.yml` redis command, `DEPLOYMENT.md` #1, `FAILURE_SCENARIOS.md` row 15, `README.md` limitations.",
+  "implementation_files": [
+   "projects/03-job-queue/docker-compose.yml",
+   "projects/03-job-queue/DEPLOYMENT.md",
+   "projects/03-job-queue/FAILURE_SCENARIOS.md",
+   "projects/03-job-queue/README.md"
+  ],
+  "code_example": "# real: docker-compose.yml\n  redis:\n    image: redis:7-alpine\n    command: [\"redis-server\", \"--appendonly\", \"yes\", \"--appendfsync\", \"everysec\"]",
+  "code_language": "yaml",
+  "advantages": [
+   "AOF everysec: good durability/performance balance",
+   "Idempotency absorbs duplicate side of failures"
+  ],
+  "disadvantages": [
+   "Lost-enqueue is not absorbed by anything today",
+   "Fencing can be weakened by failover rollback of attempts"
+  ],
+  "common_mistakes": [
+   "Running queue Redis as a cache (no persistence, LRU eviction)",
+   "Believing replication is synchronous"
+  ],
+  "follow_up_questions": [
+   "What does the WAIT command guarantee?",
+   "How would you detect jobs lost in a failover?"
+  ],
+  "concepts": [
+   "durability",
+   "replication",
+   "failover",
+   "AOF"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Durability vs latency: appendfsync always / WAIT add latency per op; everysec is the common compromise. Outbox moves durability to Postgres.",
+   "failure_scenarios": "Failover rollback: lost enqueues (silent), re-claimable jobs (duplicates), attempts counter rollback (fencing collision).",
+   "alternatives": "Durable brokers (Kafka with acks=all, RabbitMQ quorum queues, SQS), Postgres-backed queue, Redis with WAIT/WAITAOF (Redis 7.2).",
+   "scale_10x_100x": "Bigger scale makes failovers routine; design must assume them -- idempotency + reconciliation become mandatory.",
+   "production_improvements": "Managed Redis multi-AZ, WAITAOF for critical enqueues, producer outbox, monotonic lease epoch stored durably, failover chaos tests."
+  }
+ },
+ {
+  "id": "JOBQ-082",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens if Postgres is down while handlers are running?",
+  "answer_hinglish": "Yeh FAILURE_SCENARIOS table mein explicit row nahi hai, toh main code se reason karta hoon.\n\n`email.send` handler `async with ctx.sessionmaker() as session, session.begin()` pe connection maangega. Postgres down -> asyncpg connection error (ya `pool_pre_ping` fail) -> exception handler se bahar -> `Worker._execute` ka generic `except Exception` -> `_fail(reason=\"error\")` -> `fail.lua` -> attempts < max toh delayed with jittered backoff, warna DLQ.\n\nKya safe hai: transaction commit nahi hua, toh na ledger row na email row -- retry fresh start karega. Koi partial effect nahi (dono ek transaction mein hain).\n\nKya risky hai: default retry budget chhota hai -- 5 attempts, backoff 2, 4, 8, 16s (jittered) -> worst case ~30s mein job DLQ mein. Agar Postgres 5 minute down hai, toh saari email jobs DLQ mein chali jayengi. Recovery: Postgres wapas aane pe `POST /dlq/requeue-all?queue=default&type=email.send`. Data lost nahi, lekin manual step aur alert noise.\n\nPlus `pool_pre_ping=True` (`db/session.py`) stale connections detect karta hai, toh Postgres restart ke baad pool khud recover.\n\nImprovements: dependency outage ke liye (a) higher max_attempts + larger backoff_max for DB-dependent job types, (b) circuit breaker -- DB down detect ho toh worker claiming pause kare instead of burning attempts, (c) connection errors ko \"infrastructure error\" classify karke attempts count na karna.",
+  "why_needed": "Downstream outages pe retry budget aur DLQ behaviour samajhna operational maturity hai.",
+  "real_world_analogy": "Bank ka server down hai: cashier customer ko 'baad mein aana' bolta hai (retry). Paanch baar bhi down mila toh file 'pending' tray mein (DLQ) -- server wapas aaye toh tray se dobara.",
+  "how_it_works": "Exception -> fail.lua retry/dead; transaction atomicity prevents partial effects.",
+  "in_this_project": "`handlers/builtin.py::send_email`, `Worker._execute` generic except, `db/session.py` `pool_pre_ping=True`, `api/routes.py::requeue_all`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/jobqueue/db/session.py::make_engine",
+   "projects/03-job-queue/jobqueue/api/routes.py::requeue_all"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No partial effects",
+   "Jobs preserved in DLQ"
+  ],
+  "disadvantages": [
+   "Short retry budget for long outages",
+   "Workers keep claiming and failing (wasted attempts)"
+  ],
+  "common_mistakes": [
+   "Infinite retries to 'wait out' outages without circuit breaking",
+   "Forgetting to replay DLQ after the outage"
+  ],
+  "follow_up_questions": [
+   "How would you add a circuit breaker to the worker?",
+   "Should connection errors count as attempts?"
+  ],
+  "concepts": [
+   "dependency failure",
+   "retries",
+   "circuit breaker"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-083",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What goes wrong if a handler blocks the event loop (demo.cpu_block)?",
+  "answer_hinglish": "`demo.cpu_block` jaanbujh ke bad handler hai: `async def` hai lekin andar `time.sleep(seconds)` -- blocking call. Docstring: \"While blocked, the worker can't extend leases or heartbeat -> lease expires -> job is redelivered (duplicate execution).\"\n\nChain of failures:\n1. Asyncio single thread. `time.sleep` thread ko block karta hai, event loop koi aur task nahi chala sakta.\n2. **Same worker ki baaki saari jobs** freeze -- doosre 15 slots ke handlers bhi ruk gaye.\n3. **`_keep_lease` tasks** nahi chalte -> is worker ki saari active jobs ki leases extend nahi hoti.\n4. **`asyncio.wait_for` timeout** bhi fire nahi hota -- timer callback bhi event loop pe hai. Timeout tabhi detect hoga jab block khatam.\n5. **Heartbeat** ruk jata -> 3x interval baad `/workers` pe `alive: false`.\n6. Doosre worker ka reaper expired leases dekhta hai -> sirf blocking job nahi, is worker ki SAARI in-flight jobs retry mein -> doosre workers unhe chalate hain -> duplicate execution, jabki original worker bhi baad mein unhe complete karega.\n7. Original worker jaagta hai -> acks stale -> `stale_acks` counter badhta hai.\n\nDetection: `stale_acks > 0` (DEPLOYMENT #5 alert), `reaped` counter, worker alive flapping, asyncio debug mode (`PYTHONASYNCIODEBUG=1` slow callback warnings).\n\nFix: `await asyncio.to_thread(blocking_fn)` (I/O-ish blocking ya GIL-releasing libs), `loop.run_in_executor(ProcessPoolExecutor, cpu_fn)` CPU work ke liye, ya CPU jobs ke liye alag queue + concurrency 1 workers. FAILURE_SCENARIOS row 7.",
+  "why_needed": "Async workers ka sabse common production bug; symptoms confusing hote hain (duplicates, flapping health).",
+  "real_world_analogy": "Ek waiter ek table pe 10 minute ke liye phone pe atak gaya -- baaki tables ke order ruk gaye, manager ne samjha waiter gayab hai aur tables doosre waiter ko de di; ab dono serve kar rahe hain.",
+  "how_it_works": "Blocking call starves the event loop: timers, I/O callbacks, and other tasks all delayed.",
+  "in_this_project": "`handlers/builtin.py::cpu_block`, `Worker._keep_lease`, `WorkerStats.stale_acks`, `TRADEOFFS.md` #4.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::cpu_block",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_keep_lease",
+   "projects/03-job-queue/jobqueue/worker/worker.py::WorkerStats",
+   "projects/03-job-queue/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real (bad on purpose): jobqueue/handlers/builtin.py\n@registry.task(\"demo.cpu_block\")\nasync def cpu_block(ctx: JobContext):\n    import time\n    time.sleep(float(ctx.payload.get(\"seconds\", 1)))\n\n# fix (illustrative)\n    await asyncio.to_thread(time.sleep, float(ctx.payload.get(\"seconds\", 1)))",
+  "code_language": "python",
+  "advantages": [
+   "Documented anti-pattern with a demo",
+   "Failure is detectable via stale_acks"
+  ],
+  "disadvantages": [
+   "One bad handler affects all jobs on the worker",
+   "Timeouts don't fire during the block"
+  ],
+  "common_mistakes": [
+   "Using requests/psycopg2 (sync) inside async handlers",
+   "Thinking `async def` makes code non-blocking"
+  ],
+  "follow_up_questions": [
+   "How would you detect blocking in production?",
+   "When is to_thread enough vs a process pool?"
+  ],
+  "concepts": [
+   "event loop blocking",
+   "asyncio",
+   "CPU-bound",
+   "duplicate execution"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Asyncio gives cheap concurrency but zero isolation; process-per-job gives isolation at higher cost. Hybrid: async worker + executor for CPU.",
+   "failure_scenarios": "Block longer than lease -> all in-flight jobs on that worker duplicated; block longer than heartbeat TTL -> worker shown dead.",
+   "alternatives": "Thread-based workers (RQ forks per job), process pools, separate CPU worker pool, watchdog thread that cancels.",
+   "scale_10x_100x": "More concurrency per process = bigger blast radius per blocking event; at scale, prefer more processes with lower concurrency for mixed workloads.",
+   "production_improvements": "Loop-lag metric (measure sleep(0.1) drift), asyncio debug slow-callback logging, lint rule banning time.sleep/requests in handlers."
+  }
+ },
+ {
+  "id": "JOBQ-084",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A worker crashes right after batch-claiming 16 jobs. What happens and how long until they run?",
+  "answer_hinglish": "TRADEOFFS #9: \"Batch claim. Big throughput win; a worker that crashes right after claiming N jobs delays all N until their leases expire.\"\n\nTimeline default config ke saath:\n1. T=0: `claim.lua` 16 jobs ko active mein daalta hai, har ek attempts+1, lease = `min(timeout_ms, 30000) + 5000` -> default 30s timeout pe 35s.\n2. Worker crash -- koi extension nahi.\n3. T~35s: leases expire. Har zinda worker ka reaper har 2s chalta hai (`reap_interval_seconds`), toh T 35-37s ke beech koi reaper unhe dekhta hai.\n4. `fail.lua` reason `lease_expired`: attempts (1) < max (5) -> delayed with backoff `retry_delay_ms(1, 2000, ...)` = random 0-2s.\n5. T~37-39s: delayed se promote (claim pe) aur doosre workers claim karte hain.\n\nToh roughly 35-40s ki delay, aur har job ka ek attempt \"burn\" ho gaya bina kuch kiye. Agar crash loop hai (worker baar baar claim karke crash), toh 5 crashes mein job DLQ mein -- poison worker case. Stats mein `reaped` counter batata hai.\n\nChhoti timeout wali jobs (5s timeout) ka lease 10s hota hai -> faster recovery.\n\nMitigations: `max_lease_ms` kam karo (faster detection, zyada extension traffic); batch ko free slots tak limit (already); crash-loop detection (worker restarts count); lease-expired attempts ko alag count karna taaki infra crashes retry budget na khayein.",
+  "why_needed": "Batching ka hidden cost failure ke time dikhta hai.",
+  "real_world_analogy": "Delivery boy ne 16 parcels utha liye aur bike kharab -- 16 customers tab tak wait karenge jab tak office ko pata na chale (lease) aur parcels doosre boy ko na mil jayein.",
+  "how_it_works": "Recovery time ~= lease + reap interval + backoff.",
+  "in_this_project": "`claim.lua` lease formula, `config.py` `max_lease_ms=30000`, `lease_grace_ms=5000`, `reap_interval_seconds=2.0`, `fail.lua` `reaped` counter.",
+  "implementation_files": [
+   "projects/03-job-queue/TRADEOFFS.md",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/config.py::Settings",
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Bounded, predictable recovery",
+   "Crash-loop eventually stops at DLQ"
+  ],
+  "disadvantages": [
+   "~35-40s delay for up to 16 jobs",
+   "Each crash burns an attempt"
+  ],
+  "common_mistakes": [
+   "Huge max_lease_ms 'for safety' (slow recovery)",
+   "Batch larger than free slots"
+  ],
+  "follow_up_questions": [
+   "How would you shorten recovery without more Redis traffic?",
+   "Should lease_expired count against max_attempts?"
+  ],
+  "concepts": [
+   "batch claim",
+   "crash recovery",
+   "blast radius"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lease length: short = fast recovery + more extensions; long = less traffic + slow recovery. Batch size: throughput vs blast radius.",
+   "failure_scenarios": "Crash-looping worker repeatedly claims and dies -> jobs pushed toward DLQ; heartbeat shows the worker flapping.",
+   "alternatives": "Graceful release on known shutdown (return jobs to ready immediately), shorter leases for small jobs, per-job claim (no batch) for critical queue.",
+   "scale_10x_100x": "More workers = more frequent crashes in absolute terms; recovery capacity scales with reapers.",
+   "production_improvements": "Release-on-shutdown script for cancelled jobs, crash-loop backoff in process supervisor, metric of lease-expired per worker id."
+  }
+ },
+ {
+  "id": "JOBQ-085",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens to in-flight jobs during a deploy (SIGTERM)?",
+  "answer_hinglish": "`worker/__main__.py` SIGINT aur SIGTERM pe `loop.add_signal_handler(sig, w.stop)` register karta hai (Windows pe NotImplementedError suppress -- wahan Ctrl+C KeyboardInterrupt se). `stop()` sirf `_stop` event set karta hai.\n\nShutdown flow:\n1. Main loop `while not self._stop.is_set()` se bahar -- **naye claims band**. Idle wait bhi `_stop.wait()` pe hai toh turant jaagta hai.\n2. `_shutdown(bg)`: log `worker_draining` with in-flight count. `asyncio.wait(running tasks, timeout=shutdown_grace)` (default 10s) -- running jobs ko finish hone do. Finish hone wali jobs normally ack hoti hain.\n3. Grace ke baad bhi pending tasks -> `t.cancel()`. `_execute` mein `CancelledError` re-raise hota hai -- no ack, no fail. Lease extension bhi cancel. Job active zset mein rehti hai, lease expire hogi (~35s), doosre worker ka reaper retry karega. Comment: \"leases will expire and the reaper elsewhere will re-queue them\".\n4. Background loops cancel; `HDEL jq:workers id` aur alive key delete -- dashboard se worker clean hata.\n\nCompose: `stop_grace_period: 30s` -- Docker SIGTERM ke 30s baad SIGKILL. Shutdown_grace (10s) usse kam hona chahiye taaki cleanup ho sake. DEPLOYMENT #4: grace >= longest normal job.\n\nTest `test_heartbeat_and_graceful_shutdown`: 0.5s job running, `stop()`, job SUCCEEDED (abandon nahi), aur worker hash entry removed.\n\nImprovement: cancelled jobs ko lease expiry ka wait karwane ki jagah turant ready mein wapas daalna (ek `release` script) -- deploys pe 35s delay bachega.",
+  "why_needed": "Har deploy ek controlled failure hai; drain logic se jobs lost ya delayed nahi honi chahiye.",
+  "real_world_analogy": "Shift change: naya order lena band, haath ke orders poore karo; time khatam toh adhure orders next shift ke liye counter pe chhod do.",
+  "how_it_works": "Stop accepting -> drain with deadline -> cancel leftovers -> rely on leases for recovery.",
+  "in_this_project": "`worker/__main__.py` signal handlers, `Worker.stop`, `Worker._shutdown`, compose `stop_grace_period`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/__main__.py::main",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_shutdown",
+   "projects/03-job-queue/tests/test_worker.py::test_heartbeat_and_graceful_shutdown",
+   "projects/03-job-queue/docker-compose.yml"
+  ],
+  "code_example": "# real: jobqueue/worker/worker.py\nasync def _shutdown(self, bg: list[asyncio.Task]) -> None:\n    log.info(\"worker_draining\", extra={\"in_flight\": len(self.running)})\n    if self.running:\n        done, pending = await asyncio.wait(list(self.running.values()), timeout=self.shutdown_grace)\n        for t in pending:\n            t.cancel()  # leases will expire and the reaper elsewhere will re-queue them",
+  "code_language": "python",
+  "advantages": [
+   "No new work during shutdown",
+   "Short jobs complete",
+   "Leftovers recovered automatically"
+  ],
+  "disadvantages": [
+   "Long jobs cancelled mid-way wait ~lease to retry",
+   "Cancelled jobs may have partial effects"
+  ],
+  "common_mistakes": [
+   "SIGKILL-only deploys",
+   "stop_grace_period shorter than shutdown_grace"
+  ],
+  "follow_up_questions": [
+   "How would you hand cancelled jobs back immediately?",
+   "How does Kubernetes terminationGracePeriodSeconds relate?"
+  ],
+  "concepts": [
+   "graceful shutdown",
+   "drain",
+   "SIGTERM",
+   "deploys"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-086",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A downstream email provider is down for an hour. Walk through what your system does and what you'd change.",
+  "answer_hinglish": "Assume real `email.send` provider call karta (is repo mein stand-in `email_outbox` insert hai, toh yeh hypothetical extension hai).\n\n**Current behaviour**: har email job provider call pe exception -> `fail.lua` retry. Defaults: max_attempts 5, base 2s, max 600s -> backoff caps 2, 4, 8, 16s -> ~30s worst case mein DLQ. Ek ghante ki outage mein: pehle 30s ke andar saari existing jobs DLQ, aur naye enqueues bhi har ~30s mein DLQ. Workers busy rehte hain fail karne mein. Jitter thundering herd rokta hai, lekin outage itni lambi hai ki retry budget khatam.\n\nRecovery: provider wapas -> `POST /dlq/requeue-all?queue=default&type=email.send` -> lakhs jobs ek saath ready -> workers full speed provider ko hit karte hain -> provider ke rate limits / dobara overload. Plus duplicates? Ledger protect karta hai agar provider call ledger ke saath atomic ho -- external call ke liye job id ko provider idempotency key banana padega.\n\n**Changes I'd make**:\n1. **Per-type retry policy**: email ke liye max_attempts 15+ aur backoff_max 30 min -- outage absorb ho jaye bina DLQ.\n2. **Circuit breaker**: N consecutive provider failures -> breaker open -> worker email jobs claim karna pause kare (ya claim karke turant `fail` with delay without burning attempt). Half-open probe.\n3. **Separate queue + pool for email**: outage doosre job types ko starve na kare.\n4. **Rate-limited replay**: requeue-all ko throttle (batches, spread run_at).\n5. **Alerting**: DLQ growth rate, retried counter spike, provider error rate.",
+  "why_needed": "Long dependency outages retry design ki asli pariksha hain.",
+  "real_world_analogy": "Bank holiday: cheques jama karte raho, har 5 minute counter pe jaake mat poocho; 'bank band hai' board dekh ke ruk jao (circuit breaker), khulne pe line mein dheere dheere.",
+  "how_it_works": "Retry budget vs outage duration; circuit breaker to stop burning attempts; throttled replay.",
+  "in_this_project": "`core/models.py` defaults, `core/backoff.py`, `fail.lua`, `api/routes.py::requeue_all`, `FAILURE_SCENARIOS.md` (external effects note).",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/models.py::EnqueueRequest",
+   "projects/03-job-queue/jobqueue/core/backoff.py",
+   "projects/03-job-queue/jobqueue/api/routes.py::requeue_all",
+   "projects/03-job-queue/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No data loss (DLQ keeps jobs)",
+   "Jitter avoids synchronized retries"
+  ],
+  "disadvantages": [
+   "Default budget too short for long outages",
+   "Unthrottled bulk replay",
+   "No circuit breaker"
+  ],
+  "common_mistakes": [
+   "Infinite retries with no breaker",
+   "Replaying DLQ all at once into a recovering provider"
+  ],
+  "follow_up_questions": [
+   "How would you implement a circuit breaker shared across workers?",
+   "Should a breaker-open state count as an attempt?"
+  ],
+  "concepts": [
+   "circuit breaker",
+   "retry budget",
+   "outage",
+   "replay"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Long retries keep jobs out of DLQ but delay visibility of real failures; breaker reduces wasted work but needs shared state.",
+   "failure_scenarios": "Replay storm after recovery, provider rate limiting (429) -> more retries; duplicates if provider call not idempotent.",
+   "alternatives": "Pause queue API (operator toggles), separate retry queues with fixed delays (Kafka retry topics), managed services with built-in redrive (SQS DLQ redrive).",
+   "scale_10x_100x": "At large volume, backlog after an hour could be millions; need rate-limited drain and capacity headroom.",
+   "production_improvements": "Per-type policies in registry, shared circuit breaker key in Redis, paused-queue flag checked in claim, throttled requeue with spread run_at."
+  }
+ },
+ {
+  "id": "JOBQ-087",
+  "project_slug": "p03-job-queue",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens to a job whose type has no registered handler, e.g. during a rolling deploy?",
+  "answer_hinglish": "Worker `_execute` mein `handler = self.registry.get(job.type)`; None aaya toh `raise PermanentError(f\"no handler registered for job type {job.type!r}\")`. PermanentError -> `force_dead` -> job pehli hi attempt pe DLQ, `last_failure_reason = \"permanent\"`. Test: `nope.missing` type, max_attempts 5 ke saath bhi `attempts == 1` aur reason permanent.\n\nNormal case mein yeh sahi hai: typo wala type (`emial.send`) kabhi succeed nahi hoga, retry waste hai.\n\nRolling deploy pe problem: maan lo naya code ek naya job type `invoice.send` add karta hai. API pehle deploy hui aur jobs enqueue hone lagi, lekin kuch workers abhi purane version pe hain. Purana worker job claim karta hai -> handler nahi -> PermanentError -> DLQ. Job valid thi, sirf galat worker ko mili.\n\nSolutions:\n1. **Deploy order**: workers pehle, API/producers baad mein (handler pehle exist kare, phir jobs aayen). Compose mein ek hi image hai, lekin rollout order control karna padega.\n2. **Unknown type ko retryable banana** with longer delay -- naya worker pick kar lega. Trade-off: genuine typos DLQ tak late pahunchenge.\n3. **Capability-based claiming**: worker sirf woh types claim kare jo uske registry mein hain -- queue per type ya claim script mein filter.\n4. DLQ replay as recovery: deploy complete hone ke baad `requeue-all?type=invoice.send`.\n\nInterview mein main option 1 + 4 bolta hoon, aur option 2 as conscious trade-off.",
+  "why_needed": "Deploys ke dauraan mixed versions normal hain; queue ko unke saath sahi behave karna chahiye.",
+  "real_world_analogy": "Naya dish menu mein add hua lekin purane chef ko recipe nahi pata -- woh order 'cancel' kar deta hai jabki naya chef 5 minute mein aane wala tha.",
+  "how_it_works": "Registry lookup miss -> PermanentError -> immediate DLQ.",
+  "in_this_project": "`Worker._execute`, `tests/test_worker.py::test_end_to_end_success_retry_poison_timeout` (unknown type assertions).",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/tests/test_worker.py::test_end_to_end_success_retry_poison_timeout",
+   "projects/03-job-queue/jobqueue/handlers/__init__.py::Registry"
+  ],
+  "code_example": "# real: tests/test_worker.py\nunknown, _ = await q.enqueue(EnqueueRequest(type=\"nope.missing\", max_attempts=5))\n...\nu = await wait_status(q, unknown, JobStatus.DEAD)\nassert u.attempts == 1 and u.last_failure_reason == \"permanent\"",
+  "code_language": "python",
+  "advantages": [
+   "Typos fail fast",
+   "No wasted retries"
+  ],
+  "disadvantages": [
+   "Rolling deploys can DLQ valid jobs"
+  ],
+  "common_mistakes": [
+   "Deploying producers before consumers for new job types",
+   "Not validating type at enqueue"
+  ],
+  "follow_up_questions": [
+   "Should the API reject unknown types at enqueue?",
+   "How would capability-based claiming work?"
+  ],
+  "concepts": [
+   "rolling deploy",
+   "versioning",
+   "PermanentError"
+  ],
+  "advanced": null
+ }
+]

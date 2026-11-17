@@ -1,0 +1,193 @@
+{
+ "project_slug": "p08-collab",
+ "project": "Real-Time Collaborative Editing Backend",
+ "source_dir": "projects/08-collab",
+ "summary": "Google-Docs-style collaborative plain-text editing in FastAPI + Postgres + Redis: an Operational Transformation library (retain/insert/delete TextOp with apply, compose, transform, transform_index, diff_op; TP1 property-tested over 2000 random cases plus a shrunk counterexample proving transform does not distribute over compose), a central sequencer built on a Postgres row lock (SELECT ... FOR UPDATE) that transforms each incoming op against history one revision at a time, stores the transformed op and dedupes resends by (client_id, client_seq), WebSocket rooms with one-time tickets, an ot.js-style client state machine extended with an offline buffer, reconnection with last_rev catch-up, presence and cursors in Redis, version history via snapshots every N revisions with restore-as-a-new-op, and horizontal scaling with no sticky sessions: any server sequences any document, Redis pub/sub fans out, and a per-room ordered forwarder buffers reordered messages and gap-fills lost ones from Postgres, plus a periodic tail check (one batched head query per server) for a lost LAST message. A review pass then fixed client_id hijacking (ids namespaced per user), live revocation (DELETE share endpoint + perm event + role re-check inside the sequencer), client resync after a rejected op and immediate close of slow clients, each with a regression test. 34 tests including a 6-client, 2-server fuzz test with offline/reconnect; measured ~20 ms p50 propagation on both same-server and cross-server paths and 45-66 committed ops/s per document.",
+ "pitch": {
+  "intro_30s": "Maine ek real-time collaborative editing backend banaya hai -- Google Docs jaisa, plain text ke liye. Users WebSocket se connect hote hain, sab ek hi document ek saath edit karte hain, aur Operational Transformation se sabke documents same pe converge karte hain. Postgres ka row lock har document ke ops ko total order deta hai, Redis pub/sub multiple servers tak fan-out karta hai, aur ek ordered forwarder pub/sub ki loss aur reordering ko Postgres se repair karta hai. Offline editing, reconnect, version history, aur access control bhi hai.",
+  "explain_2min": "Problem yeh hai: kai log ek document ko ek saath edit kar rahe hain, har koi apna change turant dekhna chahta hai, toh har client ke paas local copy hai aur concurrent edits alag order mein alag copies pe lagte hain. Agar kuch na karo toh documents diverge ho jaate hain.\n\nMaine Operational Transformation use kiya. Op ek list hai -- retain, insert, delete -- jo poore document ko cover karti hai. `transform(a, b)` do concurrent ops ko adjust karta hai taaki 'a phir b'' aur 'b phir a'' same text dein (TP1). Yeh property 2000 random cases pe test hoti hai.\n\nOT ka simple version tabhi kaam karta hai jab sab ek hi order follow karein. Isliye ek central sequencer hai -- aur woh koi alag service nahi, Postgres hai. `submit` document row pe SELECT FOR UPDATE leta hai, (client_id, client_seq) se duplicate check karta hai, base_rev ke baad ke saare ops ke against incoming op ko EK-EK karke transform karta hai, apply karke rev+1 pe store karta hai. Ek-ek kyun? Kyunki maine property test se ek counterexample nikala: transform compose pe distribute nahi karta.\n\nClient ek waqt pe ek op bhejta hai aur baaki edits buffer mein compose karta hai. Server ke ops aane pe pending ops ke against transform karta hai.\n\nScaling: koi bhi server koi bhi document serve kar sakta hai -- nginx plain round-robin, no sticky sessions. Commit ke baad op Redis pub/sub pe publish hota hai. Pub/sub at-most-once aur unordered hai, toh har server pe har room ka ordered forwarder rev order mein deliver karta hai, aur gap 300ms rahe toh Postgres se fill karta hai. Ack bhi isi stream se aata hai.\n\nNumbers (Docker Desktop on Windows): propagation p50 ~20ms dono same-server aur cross-server; ek document pe 45-66 committed ops/s.",
+  "deep_5min": "Main ek edit ki poori journey se samjhata hoon.\n\nAlice browser mein type karti hai. Editor textarea ka purana aur naya value `diffOp` se ek TextOp banata hai, local doc pe turant apply hota hai -- Alice ko zero latency. Agar Alice ka koi op pehle se in-flight hai (outstanding), naya op `compose` se buffer mein jud jaata hai. Warna op `client_seq` aur `base_rev` (last server revision jo Alice ne dekha) ke saath WebSocket pe jaata hai.\n\nWebSocket connect karne ke liye page pehle `POST /ws-tickets` se 30-second ka one-time ticket leta hai, kyunki browser WebSocket pe Authorization header nahi laga sakta aur token URL mein daalna logs mein leak karta hai. Server GETDEL se ticket consume karta hai. Join pe role check hota hai, aur har op message pe viewer ko 'forbidden' milta hai.\n\nServer pe `service.submit`: pehle op parse aur size check (max 10k components) lock ke bahar. Phir transaction: `SELECT content, rev FROM documents WHERE id = :d FOR UPDATE`. Ab koi aur server is document pe op commit nahi kar sakta -- yahi total order hai. Dedupe: `(client_id, client_seq)` pehle se hai toh duplicate, kuch nahi likhte -- yeh lost ack ke baad resend ko safe banata hai. Phir `rev > base_rev` wale ops padh ke incoming op ko EK-EK karke transform karte hain. Yeh decision hardest tha: maine socha tha history compose karke ek baar transform kar doon, property test fail hua, shrink karke minimal counterexample mila -- compose ka insert-before-delete normalisation tie-break flip kar deta hai. Toh rule bana: server wahi sequence follow kare jo client dekhta hai. Phir apply (length mismatch = invalid op), size check, op ko rev+1 pe store (TRANSFORMED op, taaki history replay plain fold ho), content update, aur har 50 revs pe snapshot. Commit.\n\nCommit ke BAAD publish Redis channel `collab:doc:{id}` pe. Order important hai: crash beech mein ho toh op durable hai, worst case late delivery, kabhi phantom op nahi.\n\nHar server `psubscribe collab:doc:*` karta hai. Message aata hai toh room ka ordered forwarder: rev < next_rev toh duplicate; warna buffer mein; `next_rev` se consecutive flush. Redis pub/sub do problems deta hai: alag publishers ke messages reorder ho sakte hain, aur subscriber blip pe messages lost. Buffer reorder handle karta hai; gap 300ms rahe toh Postgres se `ops_between` padh ke fill.\n\nFlush mein har local connection ke liye `_for()`: Alice ke connection ko yeh 'ack' banke jaata hai, Bob ko 'op'. Ack ko ordered stream se bhejna doosra important decision tha -- agar ack direct bhejte toh Alice ko ack rev 10 pehle aur Bob ka op rev 9 baad mein mil sakta tha, aur uska state machine corrupt hota. Har connection ka bounded queue (1000) aur alag writer task hai, toh slow client room ko block nahi karta -- queue full pe 1013 close, client reconnect karke catch up karta hai.\n\nBob ka client op receive karta hai: apne outstanding aur buffer ke against transform, phir apply. Same sequence, TP1 -- Bob aur server same text.\n\nReconnect: client `last_rev` bhejta hai, server sirf missed ops bhejta hai (apne ops ack ban ke), phir 'joined', phir client unacked op SAME client_seq se resend -- dedupe exactly-once effect deta hai. Offline mein edits buffer mein jama hote hain. Yahin fuzz test ne real bug pakda: ot.js model mein buffer sirf outstanding ke saath exist karta hai, isliye code buffer ko tabhi transform karta tha; offline client ke paas buffer tha par outstanding nahi -> length mismatch. Fix: buffer independently transform.\n\nEk aur race bhi mili: ek server pe last connection leave aur naya join ek saath -- join purane, dict se hataye gaye room mein register ho jaata tha aur orphan ho jaata. Fix: dono same room lock ke andar aur identity check.\n\nLimits jo main openly bolta hoon: per-document throughput ek sequencer se bounded (45-66 ops/s yahan) -- humans ke liye kaafi kyunki clients keystrokes compose karte hain; plain text only; undo nahi; server mandatory (CRDT/P2P nahi).",
+  "architecture_walkthrough": "Clients: `editor.html` (JS port of OT + state machine) aur `client.py` (Python reference client) -- dono optimistic local apply, ek outstanding op + composed buffer, offline buffer, reconnect with last_rev.\n\nnginx (`deploy/nginx.conf`): plain round-robin over collab1/collab2, WebSocket upgrade headers, proxy_read_timeout 3600s. No sticky sessions.\n\nCollab servers (FastAPI): `api.py` -- HTTP (users, ws-tickets, docs, share, history, revisions, restore, presence, stats) aur `/ws` (ticket GETDEL, join, op/cursor/ping, close codes 4401/4403/4400/1013). `service.py` -- permissions (`require_role`, 404 for non-members), sequencer `submit`, `content_at`, `history`. `realtime.py` -- `Hub`: per-server rooms, Redis subscriber with reconnect loop, ordered forwarder (`_deliver_ordered`, `_flush`, `_fill_gap_later`), presence hash with staleness. `ot.py` -- pure OT library.\n\nPostgres (source of truth): `documents` (content + rev; the row is the lock), `operations` (PK (document_id, rev) = total order; UNIQUE (document_id, client_id, client_seq) = idempotency; transformed op jsonb), `snapshots` (rev 0 + every 50), `document_permissions` (owner/editor/viewer).\n\nRedis (disposable): pub/sub channel per doc, presence hashes, one-time tickets. Restart = temporary degradation, never data loss.",
+  "difficult_decisions": [
+   "Postgres row lock as the sequencer instead of an in-memory sequencer: any server can sequence any document, failover is trivial and every acked op is durable -- at the cost of ~45-66 committed ops/s per document (measured).",
+   "Transform the incoming op against history ONE revision at a time, not against a composed history op: a shrunk property-test counterexample showed transform does not distribute over compose, so server and clients must follow the same sequence.",
+   "Acks travel through the same ordered pub/sub stream as everyone else's ops (no direct ack after commit), so a client never sees its ack before an earlier concurrent op; costs one pub/sub hop on the author's ack.",
+   "Redis pub/sub for fan-out plus a per-room ordered forwarder with 300ms gap fill from Postgres, instead of a durable bus (Streams/Kafka): Postgres is already the durable log, so Redis only needs to be fast.",
+   "Store the TRANSFORMED op (history replay is a plain left fold) and snapshot every 50 revisions; original intent and base_rev are not kept.",
+   "Drop slow consumers (bounded 1000-message queue, close 1013) and let them catch up from last_rev, instead of blocking the room or buffering unboundedly."
+  ],
+  "biggest_challenges": [
+   "Fuzz test (6 clients, 2 servers, offline/reconnect) found the offline-buffer bug: the client transformed incoming ops against its buffer only when an op was outstanding (the ot.js model), but an offline client has a buffer with nothing outstanding -> catch-up ops hit text that already contained offline edits -> length mismatch. Fixed by transforming the buffer independently.",
+   "While debugging that, found a room join/leave race: leave() could drop a room while a concurrent join() (suspended on a DB read) registered into it, orphaning the connection so it never received updates. Fixed by doing both under the room lock with an identity re-check.",
+   "A property test I expected to pass failed: transform does not distribute over compose. Shrinking gave a minimal case ('heoo', s1=[3,-1], s2=[3,'2']) where compose's insert-before-delete normalisation flips a tie-break. Kept as a test; it is the reason for the one-by-one server transform.",
+   "Making Redis pub/sub safe for ordered delivery across servers: messages from different publishers reorder and a subscriber blip loses messages; solved with the ordered forwarder, duplicate suppression and gap fill from Postgres."
+  ],
+  "failure_scenarios": [
+   "Redis restart: subscribers reconnect after 0.5s; messages published meanwhile are lost and recovered by gap fill from Postgres when the next revision arrives; presence and tickets are rebuilt by clients. No edit is lost.",
+   "Server crash: clients reconnect to any server via round-robin, rejoin with last_rev and catch up; an op committed but not published is delivered as an ack in catch-up; presence entries age out after 30s.",
+   "Lost ack: the op was applied but the socket dropped; on reconnect the catch-up delivers it as the client's own ack, and any resend with the same client_seq is deduplicated (test_lost_ack_resend_is_deduplicated).",
+   "Slow client: its 1000-message queue fills, `Conn.kick` closes it immediately with 1013 (not only when it next sends something) and it catches up from last_rev; the room is never blocked.",
+   "Malformed or wrong-length op, or a viewer editing: rejected with invalid_operation / forbidden, nothing stored (test_invalid_operation_rejected, test_viewer_cannot_edit_and_strangers_cannot_join).",
+   "Lost LAST message (tail loss): no later revision reveals the gap, so the review found the room would stay stale and the author would never get its ack. Fixed: every tail_check_ms (1s) each server compares its active rooms with the DB heads in one query (Hub.check_tails) and delivers what is missing (test_lost_last_message_is_recovered_by_tail_check).",
+   "Rejected in-flight op (e.g. document too large): the client can never get an ack and its buffer depends on that op, so it drops pending edits and reloads (CollabClient.resync, same in editor.html) instead of stalling (test_rejected_op_makes_client_resync_instead_of_stalling).",
+   "Access revoked or downgraded while connected: DELETE /docs/{id}/share/{user_id} or a share change publishes a perm event; every server closes (4403) or re-roles that user's sockets, and service.submit re-checks the role inside the transaction in case the event is lost (test_revoking_access_closes_sockets_and_sequencer_rejects)."
+  ],
+  "improvements": [
+   "Done in review: tail check (Hub.check_tails every tail_check_ms). Still open: trigger an immediate check right after a subscriber reconnect and expose per-room lag (head - next_rev + 1) as a metric.",
+   "Done in review: client_id is namespaced as <user_id>:<client_id> in ws_endpoint, so dedupe and ack routing are per user. Still open: stop broadcasting client_id to everyone and compare the payload on a duplicate instead of silently ignoring it.",
+   "Done in review: revoke endpoint, perm pub/sub event (Hub._apply_permission) and an authoritative role re-check inside service.submit; the owner row cannot be changed via share (409). Still open: a permission audit log.",
+   "Client resilience: (resync on a rejected outstanding op is done) rev-continuity check, ack timeout, reconnect with exponential backoff and jitter, persisted offline buffer.",
+   "Hot documents: collapse submit into one round trip or batch ops per lock; for very hot docs an in-memory sequencer with sticky doc routing, leases and fencing tokens.",
+   "Undo (invert + rebase stack against remote ops), op rate limiting per user, Origin allow-list, and op-log retention/compaction."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Convergence and Operational Transformation (TP1)",
+   "steps": [
+    "1. Concept: concurrent edits on local copies diverge unless ops are adjusted; OT transforms concurrent ops so 'a then b'' equals 'b then a'' (TP1).",
+    "2. Why here: every user edits optimistically on a local copy; without transform the 'ac' + X/Y example ends as aXYc vs aYXc.",
+    "3. API: TextOp components (int>0 retain, str insert, int<0 delete), apply, transform in collab/ot.py.",
+    "4. Implementation: transform walks both ops with the _iter sentinel, emits inserts first (a's insert wins ties), consumes min() of retain/delete pairs, skips overlapping deletes.",
+    "5. Demonstrate: pytest tests/test_ot.py -k 'tie_break or overlap or property_transform' (2000 random TP1 cases).",
+    "6. Interviewer next: what is TP2, why don't you need it, and how do CRDTs differ?"
+   ],
+   "files": [
+    "projects/08-collab/collab/ot.py",
+    "projects/08-collab/tests/test_ot.py",
+    "projects/08-collab/LEARNING_GUIDE.md"
+   ]
+  },
+  {
+   "concept": "Compose, normalisation and the non-distributivity finding",
+   "steps": [
+    "1. Concept: compose(a, b) merges sequential ops; builders normalise (merge adjacent, insert before delete).",
+    "2. Why here: the client composes keystrokes into a buffer while an op is in flight; the server must not compose history before transforming.",
+    "3. API: compose, TextOp.insert canonical form.",
+    "4. Implementation: compose cancels a-insert/b-delete, passes a-deletes and b-inserts straight through.",
+    "5. Demonstrate: pytest tests/test_ot.py -k 'compose or distribute' -- see [3, '2', -1] and 'aYYbZ2212' vs 'aYYbZ2221'.",
+    "6. Interviewer next: so how does the server transform against history, and why is the client's buffer compose still safe?"
+   ],
+   "files": [
+    "projects/08-collab/collab/ot.py",
+    "projects/08-collab/tests/test_ot.py",
+    "projects/08-collab/collab/service.py"
+   ]
+  },
+  {
+   "concept": "Central sequencer on a Postgres row lock",
+   "steps": [
+    "1. Concept: a sequencer assigns each op a unique revision -- one total order per document.",
+    "2. Why here: TP1-only OT needs everyone to follow the same order, across many servers.",
+    "3. API: service.submit(sm, settings, doc_id, user_id, client_id, client_seq, base_rev, raw_op).",
+    "4. Implementation: SELECT content, rev ... FOR UPDATE; dedupe; history rev > base_rev transformed one by one; apply; INSERT op at rev+1; UPDATE content; snapshot every N; commit; publish after commit.",
+    "5. Demonstrate: python bench/latency.py (45 vs 66 committed ops/s on one document with 1 vs 8 writers).",
+    "6. Interviewer next: why is per-document throughput bounded and how would you scale a hot document?"
+   ],
+   "files": [
+    "projects/08-collab/collab/service.py",
+    "projects/08-collab/migrations/versions/0001_initial.py",
+    "projects/08-collab/bench/latency.py",
+    "projects/08-collab/TESTING.md"
+   ]
+  },
+  {
+   "concept": "Client state machine, offline buffer and the fuzz-found bug",
+   "steps": [
+    "1. Concept: one outstanding op + composed buffer (Synchronized / AwaitingConfirm / AwaitingWithBuffer), plus an offline buffer state.",
+    "2. Why here: keeps base_rev simple, batches keystrokes, and lets users edit offline.",
+    "3. API: CollabClient.edit, _server_op, _ack, _flush_buffer, settled.",
+    "4. Implementation: incoming op transformed against outstanding then buffer (independently!), then applied; ack clears outstanding and flushes buffer.",
+    "5. Demonstrate: pytest tests/test_realtime.py -k 'fuzz or offline' (6 clients, 2 servers, 2 seeds).",
+    "6. Interviewer next: what bug did the fuzz test find and why did the ot.js model hide it?"
+   ],
+   "files": [
+    "projects/08-collab/collab/client.py",
+    "projects/08-collab/collab/editor.html",
+    "projects/08-collab/ARCHITECTURE.md",
+    "projects/08-collab/tests/test_realtime.py"
+   ]
+  },
+  {
+   "concept": "Reconnection, lost acks and exactly-once effect",
+   "steps": [
+    "1. Concept: at-least-once resend + idempotent receiver = exactly-once effect.",
+    "2. Why here: connections drop after the server applied an op but before the ack arrived.",
+    "3. API: join message with last_rev; UNIQUE (document_id, client_id, client_seq).",
+    "4. Implementation: Hub.join replays ops_between(last_rev, head) via _for (own ops become acks), sends joined{catchup}, client resends outstanding with the SAME seq, submit dedupes under the lock.",
+    "5. Demonstrate: pytest tests/test_realtime.py -k lost_ack (content 'abcXYZ', rev 1).",
+    "6. Interviewer next: what if last_rev is very old, and what happens during a reconnect storm?"
+   ],
+   "files": [
+    "projects/08-collab/collab/realtime.py",
+    "projects/08-collab/collab/client.py",
+    "projects/08-collab/collab/service.py"
+   ]
+  },
+  {
+   "concept": "Horizontal scaling: Redis fan-out and the ordered forwarder",
+   "steps": [
+    "1. Concept: Redis pub/sub is at-most-once and unordered across publishers; a reorder buffer plus repair from a durable store gives ordered delivery.",
+    "2. Why here: users on different servers edit the same doc; no sticky sessions.",
+    "3. API: Hub.publish, _subscriber (psubscribe collab:doc:*), _deliver_ordered, _flush, _fill_gap_later, _for.",
+    "4. Implementation: buffer by rev, flush consecutive from next_rev, after gap_fill_delay_ms read missing revs from Postgres; acks are the author's projection of the same message.",
+    "5. Demonstrate: pytest tests/test_realtime.py -k horizontal; docker compose up and python demo.py http://127.0.0.1:58008; check /stats gap_fills.",
+    "6. Interviewer next: how the tail check bounds tail loss, Redis Streams/Kafka alternatives, and the cost of psubscribe * at many servers."
+   ],
+   "files": [
+    "projects/08-collab/collab/realtime.py",
+    "projects/08-collab/deploy/nginx.conf",
+    "projects/08-collab/SYSTEM_DESIGN.md",
+    "projects/08-collab/demo.py"
+   ]
+  },
+  {
+   "concept": "Rooms, concurrency inside asyncio, and slow consumers",
+   "steps": [
+    "1. Concept: asyncio has no threads but every await is an interleaving point; bounded queues give backpressure.",
+    "2. Why here: join/leave race orphaned connections; one slow client must not block a room.",
+    "3. API: Room (conns, next_rev, buffer, lock), Hub.join/leave, Conn.send, write_loop.",
+    "4. Implementation: join acquires room.lock and re-checks identity; leave drops the room under the same lock; Conn.send put_nowait, QueueFull -> closed -> 1013.",
+    "5. Demonstrate: read FAILURE_SCENARIOS.md bug #2 and #9; GET /stats slow_disconnects.",
+    "6. Interviewer next: how would you test the race deterministically and why Conn.kick closes a slow client immediately instead of on its next message?"
+   ],
+   "files": [
+    "projects/08-collab/collab/realtime.py",
+    "projects/08-collab/collab/api.py",
+    "projects/08-collab/FAILURE_SCENARIOS.md"
+   ]
+  },
+  {
+   "concept": "Version history, snapshots and restore",
+   "steps": [
+    "1. Concept: event log + periodic snapshots; any revision = nearest snapshot + replay.",
+    "2. Why here: users need history and restore without rewriting what live editors depend on.",
+    "3. API: GET /docs/{id}/history, /revisions/{rev}, POST /restore/{rev}; service.content_at, history, restore_op.",
+    "4. Implementation: snapshot at rev 0 and every snapshot_every revs inside submit; restore = diff_op(current, old) submitted as a normal op.",
+    "5. Demonstrate: pytest tests/test_realtime.py -k history (snapshot_every=3, rev 4 via snapshot@3, restore creates rev 6 seen live).",
+    "6. Interviewer next: retention/compaction of the op log and exactness of restore under concurrent edits."
+   ],
+   "files": [
+    "projects/08-collab/collab/service.py",
+    "projects/08-collab/collab/api.py",
+    "projects/08-collab/DATABASE_DESIGN.md"
+   ]
+  },
+  {
+   "concept": "Security of real-time endpoints",
+   "steps": [
+    "1. Concept: WebSocket auth without headers, CSWSH, per-message authorization, untrusted op validation.",
+    "2. Why here: tokens in URLs leak to logs; viewers can still send op frames; malicious ops could corrupt documents.",
+    "3. API: POST /ws-tickets, /ws?ticket=, require_role, TextOp.from_json, max_op_components, max_document_chars.",
+    "4. Implementation: 30s ticket in Redis consumed with GETDEL; 404 for non-members; viewer ops rejected per message; ops must apply exactly at their revision.",
+    "5. Demonstrate: pytest tests/test_realtime.py -k 'ticket or viewer or invalid'.",
+    "6. Interviewer next: how revocation reaches live sockets (perm event + sequencer re-check), why client_id is namespaced per user, and the still-open gaps: Origin checks and rate limiting."
+   ],
+   "files": [
+    "projects/08-collab/collab/api.py",
+    "projects/08-collab/collab/service.py",
+    "projects/08-collab/SECURITY.md"
+   ]
+  }
+ ]
+}

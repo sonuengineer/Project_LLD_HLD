@@ -1,0 +1,1034 @@
+[
+ {
+  "id": "SAAS-085",
+  "project_slug": "p06-saas",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Walk through tenant suspension end to end: who triggers it, what changes, and how fast it takes effect.",
+  "answer_hinglish": "Do raste hain jisse tenant ka access badalta hai. (1) Platform admin: `POST /admin/tenants/{id}/status` with `{status: 'suspended', reason: 'unpaid'}`. `set_status` `global_tx` mein `UPDATE tenants SET status` karta hai (rowcount 0 -> 404), phir `tenant_tx(tenant_id, admin_id)` mein tenant ke audit log mein `platform.tenant_suspended` + reason, phir `_invalidate_tenant_cache` slug cache key delete karta hai. Agli request `_tenant_by_slug` DB se fresh status padhegi aur `tenant_principal` 'tenant is suspended' 403 dega -- har tenant route pe, JWT aur API key dono ke liye, kyunki check dono branches ke baad hai. Effect: turant (cache invalidation), worst case 60s TTL agar invalidation fail ho. (2) Billing: `subscription.updated` event with status != 'active' -> `apply_event` `tenants.plan = 'free'` (downgrade, suspension nahi). Toh payment fail = free plan limits, data intact; hard suspension admin decision hai.\n\nSuspension mein kya NAHI rukta: user-level routes (`/me`, `/tenants`, login) -- user ki identity tenant se alag hai. Background jobs: review se pehle worker status check nahi karta tha (suspended tenant ka report process ho jaata); ab `process_one` tenant status padhta hai aur non-active pe `job_skipped_suspended_tenant` log karke skip. Data delete nahi hota. Order detail: suspension check membership ke BAAD hai, toh non-member ko 404 hi milta hai -- suspended status leak nahi hota. Aur suspended requests meter nahi hoti (rate limit/meter suspension check ke baad). `test_platform_admin_suspension`: suspend -> 403 with 'suspended' message; reactivate -> 200; usage endpoint api_calls >= 1.\n\nProduction additions: dunning flow (grace period, reminder emails, phir suspend), read-only mode (suspended tenants data export kar sakein), reactivation pe audit, aur webhooks bhi status check karein (jobs already karte hain).",
+  "why_needed": "Billing failure ka operational flow har SaaS ka real-world scenario hai.",
+  "real_world_analogy": "Society maintenance na bharne pe pehle reminder, phir gym access band (downgrade), aur last mein flat ka common area access block (suspension) -- lekin flat ka saamaan wahi rehta hai.",
+  "how_it_works": "Admin -> UPDATE status -> audit in tenant -> DEL slug cache -> next request 403. Billing non-active -> plan free.",
+  "in_this_project": "`saas/api/routes.py::set_status`, `_invalidate_tenant_cache`; `saas/api/deps.py::tenant_principal` (suspension check); `saas/services/billing.py::apply_event` (non-active -> free); test `test_platform_admin_suspension`; FAILURE_SCENARIOS #13.",
+  "implementation_files": [
+   "projects/06-saas/saas/api/routes.py::set_status",
+   "projects/06-saas/saas/api/deps.py::tenant_principal",
+   "projects/06-saas/saas/services/billing.py::apply_event",
+   "projects/06-saas/tests/test_api.py::test_platform_admin_suspension"
+  ],
+  "code_example": "# real api/deps.py\nif tenant[\"status\"] == \"suspended\":\n    raise Forbidden(\"tenant is suspended\", details={\"tenant\": slug})",
+  "code_language": "python",
+  "advantages": [
+   "Immediate effect via invalidation",
+   "Audited in tenant",
+   "Applies to keys and users alike"
+  ],
+  "disadvantages": [
+   "Queued jobs still run",
+   "No grace/read-only mode",
+   "Status update and audit not atomic"
+  ],
+  "common_mistakes": [
+   "Suspension pe data delete",
+   "Suspension check membership se pehle (status leak)",
+   "Cache invalidate bhoolna"
+  ],
+  "follow_up_questions": [
+   "Read-only suspension kaise implement karoge?",
+   "Dunning flow design?",
+   "Suspended tenant ke webhooks/jobs ka kya?"
+  ],
+  "concepts": [
+   "tenant lifecycle",
+   "suspension",
+   "billing operations"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-086",
+  "project_slug": "p06-saas",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What would you monitor and alert on for this multi-tenant SaaS in production?",
+  "answer_hinglish": "DEPLOYMENT.md item 6 base deta hai: '401/403 spikes, plan_limit_reached/quota_exceeded rates per tenant (upsell signal), cache hit ratio.' Main isko layers mein expand karta hoon.\n\nSecurity signals: 401 spike (credential stuffing, broken client), 403 spike per tenant (misconfigured key ya escalation attempts), 404 on `/t/{slug}` from authenticated users (enumeration attempts), refresh token reuse events (theft), webhook signature failures (forgery attempts ya secret mismatch), platform admin actions (har ek alert-worthy). Abhi bpcommon `http_requests_total{service, method, route, status}` deta hai -- route template label hai (cardinality safe), lekin tenant label nahi -- per-tenant ke liye logs ya separate low-cardinality metrics (top-N).\n\nBusiness/limits: `plan_limit_reached`, `feature_not_in_plan`, `quota_exceeded`, `rate_limited` counts per plan aur top tenants -- sales ke liye upsell signal aur support ke liye 'customer stuck' signal. Usage near quota (80%).\n\nReliability: Redis errors aur fail-open count (abhi code metric emit nahi karta -- gap), DB pool wait time, transaction latency (tenant_tx), job queue depth `LLEN saas:jobs`, stuck 'queued' reports, usage flush lag (last successful flush), webhook processing latency aur duplicates rate.\n\nIsolation canaries: periodic synthetic test -- canary tenant B se canary tenant A ka resource access try karo, 404 expect; aur DB check ki har tenant table pe `relrowsecurity` aur `relforcerowsecurity` true hai, app role `rolbypassrls` false. Cache: `TenantCache.hits/misses` counters exist hain in-process -- Prometheus mein expose karne chahiye. Logs: JSON with request_id; audit rows bhi request_id rakhti hain -- correlation.",
+  "why_needed": "Observability production readiness ka core hai; multi-tenant specific signals (isolation canaries) senior touch hai.",
+  "real_world_analogy": "Hospital ICU monitor: sirf heartbeat nahi, oxygen, BP, aur 'galat dawai to nahi di' ka double-check bhi -- har signal ka alarm threshold.",
+  "how_it_works": "Metrics (Prometheus) + structured logs (request_id) + audit + synthetic canaries + DB config assertions.",
+  "in_this_project": "`shared/bpcommon/http.py::setup_app` (HTTP_REQUESTS, HTTP_LATENCY, `/metrics`, request id), `saas/services/cache.py::TenantCache` (hits/misses), DEPLOYMENT.md item 6, `saas/services/audit.py::record` (request_id).",
+  "implementation_files": [
+   "shared/bpcommon/http.py::setup_app",
+   "projects/06-saas/saas/services/cache.py::TenantCache",
+   "projects/06-saas/DEPLOYMENT.md",
+   "projects/06-saas/saas/services/audit.py::record"
+  ],
+  "code_example": "-- illustrative isolation config check (run periodically as owner)\nSELECT c.relname FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'tenant_id'\n WHERE c.relkind = 'r' AND (NOT c.relrowsecurity OR NOT c.relforcerowsecurity);\nSELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = 'saas_app';",
+  "code_language": "sql",
+  "advantages": [
+   "Route-templated metrics already",
+   "Request ids end to end",
+   "Distinct error codes = easy dashboards"
+  ],
+  "disadvantages": [
+   "No per-tenant metrics",
+   "Fail-open not instrumented",
+   "Cache counters not exported"
+  ],
+  "common_mistakes": [
+   "Tenant id as Prometheus label for all tenants (cardinality explosion)",
+   "Sirf infra metrics, business signals nahi",
+   "Isolation ko one-time test maan lena"
+  ],
+  "follow_up_questions": [
+   "Per-tenant metrics bina cardinality explosion ke?",
+   "Isolation canary kaise design karoge?",
+   "SLOs kya define karoge?"
+  ],
+  "concepts": [
+   "observability",
+   "monitoring",
+   "alerting",
+   "isolation canaries"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-087",
+  "project_slug": "p06-saas",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A large customer onboards 5,000 users and heavy API traffic. What breaks first, and what do you do?",
+  "answer_hinglish": "Pehle kya toot-ta hai, order mein socho. (1) Plan limits: enterprise plan `max_members=None`, `max_projects=None`, 200 rps burst 400, quota None -- limits nahi tootenge, lekin agar woh pro pe hain (25 members) toh invites 403. Sales ko custom plan chahiye -- abhi overrides table nahi (TRADEOFFS #7). (2) Invitations: 5,000 invites manually -- token inviter ko return hota hai (no email) -- operationally impossible; SSO/SCIM chahiye ('sso' feature flag hai, implementation nahi). (3) Tenant-wide rate limit: 5,000 users + integrations ek hi bucket `saas:rl:{tenant}` share karte hain -- 200 rps poore org ke liye kam pad sakta hai, aur ek batch integration interactive users ko 429 dila degi. Fix: per-user/per-key sub-buckets + higher tenant cap. (4) `list_members` -- no pagination, 5,000 rows + users join har call pe; `list_projects` LIMIT 100 hard-coded bina cursor. (5) Memberships PK `(tenant_id, user_id)` aur role cache theek scale karte hain. (6) Noisy neighbour: unke reports single `saas:jobs` queue mein doosron ko delay karenge; unki queries shared DB CPU. (7) `audit_logs` fast badhega -- `ix_audit_tenant_created` read ke liye theek, lekin retention/partitioning chahiye. (8) Cache: `projects:list` invalidation har write pe -- bahut writes = low hit ratio.\n\nAction plan: custom entitlements (overrides), SSO + SCIM provisioning, pagination (keyset on `(tenant_id, created_at)` -- index already hai), per-key limits, per-tenant job queues, aur agar load doosron ko hurt kare -- silo (hybrid). Pehle load test with realistic shape.",
+  "why_needed": "Real scaling usually ek 'whale' customer se aata hai; interviewer bottleneck-first thinking dekhta hai.",
+  "real_world_analogy": "Chhote restaurant mein achanak 500 logon ki shaadi ki booking: menu (plan) custom, guest list (invites) bulk, ek counter (rate limit) kam, aur baaki customers ka khana late (noisy neighbour) -- shayad alag hall (silo) chahiye.",
+  "how_it_works": "Identify per-component limits: entitlements, onboarding flow, shared buckets, unpaginated endpoints, shared queues, table growth.",
+  "in_this_project": "`saas/core/plans.py::PLANS`, `saas/services/tenancy.py::list_members` (no pagination), `list_projects` (LIMIT 100), `saas/services/limits.py::TenantLimits` (tenant bucket), `saas/services/jobs.py::QUEUE`, `saas/services/tenancy.py::invite` (token returned, no email).",
+  "implementation_files": [
+   "projects/06-saas/saas/core/plans.py::PLANS",
+   "projects/06-saas/saas/services/tenancy.py::list_members",
+   "projects/06-saas/saas/services/limits.py::TenantLimits",
+   "projects/06-saas/saas/services/jobs.py::enqueue"
+  ],
+  "code_example": "-- illustrative keyset pagination using the existing index\nSELECT id, name, created_at FROM projects\n WHERE (created_at, id) < (:last_created_at, :last_id)\n ORDER BY created_at DESC, id DESC LIMIT 50;   -- RLS adds tenant_id = ... -> index (tenant_id, created_at DESC)",
+  "code_language": "sql",
+  "advantages": [
+   "Core data model scales (tenant-first keys)",
+   "Enterprise plan has no hard caps"
+  ],
+  "disadvantages": [
+   "No bulk onboarding/SSO",
+   "No pagination",
+   "Shared tenant bucket and job queue"
+  ],
+  "common_mistakes": [
+   "Whale tenant ko bina load test onboard karna",
+   "Limits ko globally badhana (sabke liye)",
+   "Offset pagination on big tables"
+  ],
+  "follow_up_questions": [
+   "Per-user rate limits kaise layer karoge?",
+   "SCIM kya hai aur kyun?",
+   "Kis metric pe silo decision?"
+  ],
+  "concepts": [
+   "whale tenant",
+   "capacity planning",
+   "pagination",
+   "enterprise onboarding"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Custom entitlements aur per-tenant infra flexibility dete hain par plans ki simplicity khote hain.",
+   "failure_scenarios": "Rate-limit starvation within tenant; giant unpaginated responses; queue delays for others; audit table bloat.",
+   "alternatives": "Dedicated silo from day one for whales; per-tenant worker pools; GraphQL/cursor APIs; bulk import endpoints.",
+   "scale_10x_100x": "Multiple whales -> hybrid model mandatory; per-tier infra.",
+   "production_improvements": "Overrides table, SSO/SCIM, keyset pagination, per-key limits, per-tenant queues, load tests with whale profile."
+  }
+ },
+ {
+  "id": "SAAS-088",
+  "project_slug": "p06-saas",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A customer reports they saw another company's data. How do you respond, and how does this design help?",
+  "answer_hinglish": "Pehle incident response, phir root cause. Immediate: severity-1 incident, security team aur leadership loop mein, customer se exact details (URL, time, screenshot, request id agar UI dikhata hai -- response header `x-request-id` bpcommon middleware set karta hai). Agar active leak ka shak hai toh suspect feature disable (feature flag ya route block) -- containment pehle.\n\nInvestigation, layer by layer (design ki defence-in-depth yahan map hoti hai): (1) Kis path se data aaya? Access logs (JSON, request_id, path, status, duration) se request dhoondo. (2) Cache: kya response cache se tha? Key naming check -- koi key bina tenant id ke (`_global` namespace mein tenant data) ya galat tenant id ke saath? Cache leak RLS bypass karta hai. (3) DB: query kaunse transaction context mein chali -- tenant_tx sahi tenant? Koi SECURITY DEFINER function involved? (resolve_api_key, accept_invitation_lookup, user_tenants -- inke filters review). (4) Role/config: app abhi bhi saas_app se connected hai? `SELECT rolsuper, rolbypassrls` -- agar kisi ne owner URL deploy kar diya toh RLS silently off. (5) Policies: `pg_policies` mein koi OR wapas aaya? (6) Jobs: report job galat tenant_id ke saath enqueue hua? (7) Exports/emails/logs: CSV export (`audit_export`) RLS-scoped hai, lekin kahin aur generated files?\n\nScope: kitne tenants, kitne records, kis time window -- audit logs aur access logs se. Phir fix + regression test (jaise escalation bug ke time `test_unfiltered_membership_query_cannot_return_other_tenant_roles`), customer notification (legal/GDPR breach timelines -- typically 72 hours to regulator under GDPR), aur postmortem. Design help: RLS fail-closed, audit with request_id, append-only audit (attacker trail nahi mita sakta).",
+  "why_needed": "Security incident handling senior engineers se expected hai -- technical aur process dono.",
+  "real_world_analogy": "Bank mein customer kahe 'mujhe kisi aur ka statement mila': pehle us printer ko band karo (containment), CCTV aur logs dekho (investigation), kitne logon ko galat statement gaye (scope), phir sabko batao aur printer theek karo.",
+  "how_it_works": "Contain -> collect evidence (request_id) -> check each isolation layer -> scope -> fix + regression test -> notify -> postmortem.",
+  "in_this_project": "`shared/bpcommon/http.py` (x-request-id, access logs), `saas/services/audit.py::record` (request_id, ip), `saas/services/cache.py::TenantCache.key`, SECURITY DEFINER functions in migrations, ARCHITECTURE.md isolation layers.",
+  "implementation_files": [
+   "shared/bpcommon/http.py::setup_app",
+   "projects/06-saas/saas/services/audit.py::record",
+   "projects/06-saas/saas/services/cache.py::TenantCache",
+   "projects/06-saas/ARCHITECTURE.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Request ids correlate logs and audit",
+   "Layered design gives a checklist",
+   "Append-only audit preserves evidence"
+  ],
+  "disadvantages": [
+   "No per-request tenant tag in metrics",
+   "Cache contents ephemeral -- evidence lost after TTL"
+  ],
+  "common_mistakes": [
+   "Customer report ko dismiss karna bina evidence",
+   "Fix karke regression test na likhna",
+   "Legal/notification timelines ignore"
+  ],
+  "follow_up_questions": [
+   "Breach notification ke legal requirements?",
+   "Evidence preserve kaise karoge (cache, logs)?",
+   "Postmortem mein kya actions?"
+  ],
+  "concepts": [
+   "incident response",
+   "data leak",
+   "forensics"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Detailed logging forensics mein help karta hai par khud PII risk hai; balance with redaction and retention.",
+   "failure_scenarios": "Leak via cache/job/definer function/misconfigured role; incomplete logs -> scope unknown -> notify all.",
+   "alternatives": "Bug bounty, periodic pen tests, automated cross-tenant canaries to catch before customers do.",
+   "scale_10x_100x": "More services = more leak paths; tenant id propagation in traces (OpenTelemetry baggage) helps scope.",
+   "production_improvements": "Runbook, isolation canaries, role/policy config checks in CI and runtime, tenant id in structured logs, response-level assertion that rows belong to Principal.tenant_id."
+  }
+ },
+ {
+  "id": "SAAS-089",
+  "project_slug": "p06-saas",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "The app was accidentally deployed with the owner or superuser database URL. How would you detect and prevent that?",
+  "answer_hinglish": "Yeh sabse dangerous misconfiguration hai kyunki kuch bhi 'toot-ta' nahi -- saare tests ke HTTP flows chal jaate hain, app normal lagta hai, bas RLS silently off. Owner role pe FORCE RLS policies lagengi (FORCE ki wajah se), lekin docker-compose aur tests mein owner superuser hai (`postgres` image ka POSTGRES_USER superuser hota hai) -- superuser pe FORCE bhi kaam nahi karta. `test_superuser_would_bypass_rls` exactly dikhata hai: random tenant context ke saath bhi 3 rows. Upar se audit append-only bhi gaya (superuser UPDATE/DELETE kar sakta hai), aur app DDL chala sakta hai.\n\nDetection: (1) Startup assertion -- lifespan mein `SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user` aur owner check `SELECT count(*) FROM pg_tables WHERE tableowner = current_user AND schemaname = 'public'`; agar superuser/bypassrls/owner -> refuse to start (fail fast). Yeh repo mein nahi hai -- recommended addition. (2) Runtime canary: global_tx mein `SELECT count(*) FROM projects` -- agar > 0 toh RLS bypass ho raha hai (fail-closed design ka nice side effect: correct setup mein yeh hamesha 0). (3) Postgres side: `log_connections` + alert on non-app roles from app hosts; `pg_stat_activity` mein usename by application_name.\n\nPrevention: owner credentials sirf migration job ke secret mein, app pods ke secret mein kabhi nahi (Kubernetes secrets scoped per workload); owner role ko LOGIN sirf CI network se (pg_hba.conf); managed DB pe master user ko app ke liye kabhi use na karna; config validation (URL username == 'saas_app'). DEPLOYMENT.md: 'Never point the app at the owner/superuser URL: RLS would silently stop protecting anything.'",
+  "why_needed": "Silent security failure modes ka detection senior operational thinking hai.",
+  "real_world_analogy": "Bank cashier ko galti se manager ki master key de di -- sab normal chalega, koi alarm nahi; isliye shift shuru hote hi check karo 'yeh kaunsi chaabi hai'.",
+  "how_it_works": "Misconfig -> RLS bypass silently. Detect: startup role assertion, fail-closed canary query, DB connection auditing. Prevent: secret scoping, pg_hba, config validation.",
+  "in_this_project": "`tests/test_rls.py::test_superuser_would_bypass_rls`, `saas/main.py::create_app` (lifespan -- where a check would go), `saas/config.py::Settings` (comment), DEPLOYMENT.md warning, `docker-compose.yml` (owner = POSTGRES_USER).",
+  "implementation_files": [
+   "projects/06-saas/tests/test_rls.py::test_superuser_would_bypass_rls",
+   "projects/06-saas/saas/main.py::create_app",
+   "projects/06-saas/saas/config.py::Settings",
+   "projects/06-saas/DEPLOYMENT.md"
+  ],
+  "code_example": "# illustrative startup guard (not in repo) -- call in lifespan before yield\nasync def assert_safe_db_role(engine):\n    async with engine.connect() as c:\n        r = (await c.execute(text(\"SELECT rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user\"))).one()\n        owns = await c.scalar(text(\"SELECT count(*) FROM pg_tables WHERE schemaname = 'public' AND tableowner = current_user\"))\n    if r.rolsuper or r.rolbypassrls or owns:\n        raise RuntimeError(\"refusing to start: DB role bypasses RLS\")",
+  "code_language": "python",
+  "advantages": [
+   "Fail-fast guard is cheap",
+   "Canary query exploits fail-closed design"
+  ],
+  "disadvantages": [
+   "Without guard, failure is invisible",
+   "Guard itself must not be skippable by config"
+  ],
+  "common_mistakes": [
+   "Dev convenience: superuser everywhere",
+   "Same secret for migrate and app",
+   "Relying only on docs"
+  ],
+  "follow_up_questions": [
+   "Guard ko tests mein kaise verify karoge?",
+   "Managed Postgres (RDS) pe master user ke saath kya dhyan?",
+   "Read replicas pe bhi same guard?"
+  ],
+  "concepts": [
+   "misconfiguration",
+   "fail fast",
+   "RLS bypass",
+   "secret scoping"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Startup guard ek extra query aur deploy-time strictness hai; benefit -- ek poori vulnerability class eliminate.",
+   "failure_scenarios": "Owner URL in app -> RLS off, audit mutable, DDL possible; guard false-negative if role granted BYPASSRLS later (runtime canary covers).",
+   "alternatives": "Separate DB users per service enforced by platform (IAM DB auth); policy-as-code for secrets.",
+   "scale_10x_100x": "Many services -> centralised config validation and DB role inventory.",
+   "production_improvements": "Startup guard, periodic canary, pg_hba restrictions, secret scoping, CI test that app URL role is saas_app."
+  }
+ },
+ {
+  "id": "SAAS-090",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "How do errors flow from service code to the HTTP response? Explain the AppError hierarchy and the SaaS-specific errors.",
+  "answer_hinglish": "`shared/bpcommon/errors.py` mein `AppError(Exception)` base class hai with class attributes `status_code` aur `code`, aur instance pe `message`, `details`, `headers`. Subclasses: `NotFound` (404 not_found), `Conflict` (409), `Unauthorized` (401), `Forbidden` (403), `TooManyRequests` (429 rate_limited), `Unprocessable` (422), `ServiceUnavailable` (503). `install_error_handlers` FastAPI pe teen handlers lagata hai: AppError -> JSON `{error: {code, message, details, request_id}}` with status aur headers (Retry-After yahin se jaata hai); `RequestValidationError` -> 422 `validation_error` with field errors; aur unhandled `Exception` -> 500 `internal_error` without stack trace (server-side log with request id).\n\nSaaS project apne domain errors `saas/services/errors.py` mein add karta hai: `PlanLimitReached` (403 plan_limit_reached), `FeatureNotInPlan` (403 feature_not_in_plan), `QuotaExceeded` (429 quota_exceeded). Bas subclass + do class attributes -- handler automatically sahi response banata hai.\n\nService code bas raise karta hai: `raise PlanLimitReached(f\"plan '{p.plan.name}' allows {p.plan.max_projects} projects\", details={'limit': ..., 'current': count})`. Fayda: business code HTTP ke baare mein nahi jaanta, aur client stable `code` pe switch kar sakta hai (message human ke liye). Distinct codes for same status (403 forbidden vs plan_limit_reached vs feature_not_in_plan; 429 rate_limited vs quota_exceeded) client ko batate hain 'upgrade karo' vs 'permission maango' vs 'retry later'. API_DOCUMENTATION.md mein error codes table hai.",
+  "why_needed": "Consistent error contracts API design ka basic hai; interviewer code-level clarity dekhta hai.",
+  "real_world_analogy": "Hospital ke standard colour codes: code red, code blue -- har staff ko pata hai kya karna hai, chahe message alag ho.",
+  "how_it_works": "raise SubclassOfAppError -> exception handler -> JSON envelope + status + headers + request_id.",
+  "in_this_project": "`shared/bpcommon/errors.py::AppError`, `install_error_handlers`; `saas/services/errors.py::PlanLimitReached`, `FeatureNotInPlan`, `QuotaExceeded`; API_DOCUMENTATION.md 'Error codes'.",
+  "implementation_files": [
+   "shared/bpcommon/errors.py::AppError",
+   "shared/bpcommon/errors.py::install_error_handlers",
+   "projects/06-saas/saas/services/errors.py::PlanLimitReached",
+   "projects/06-saas/API_DOCUMENTATION.md"
+  ],
+  "code_example": "# real saas/services/errors.py\nclass PlanLimitReached(AppError):\n    status_code, code = 403, \"plan_limit_reached\"\n\nclass FeatureNotInPlan(AppError):\n    status_code, code = 403, \"feature_not_in_plan\"\n\nclass QuotaExceeded(AppError):\n    status_code, code = 429, \"quota_exceeded\"",
+  "code_language": "python",
+  "advantages": [
+   "Stable machine-readable codes",
+   "Business code HTTP-agnostic",
+   "request_id in every error"
+  ],
+  "disadvantages": [
+   "Exceptions as control flow",
+   "Codes must be versioned carefully (clients depend)"
+  ],
+  "common_mistakes": [
+   "Stack traces to clients",
+   "Same code for different failures",
+   "Raising HTTPException deep in services"
+  ],
+  "follow_up_questions": [
+   "Error codes ko API versioning mein kaise manage karoge?",
+   "details mein sensitive info leak ka risk?",
+   "Retry-After header kaise attach hota hai?"
+  ],
+  "concepts": [
+   "error handling",
+   "API contracts",
+   "exception hierarchy"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-091",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Walk through change_role line by line. Which escalation cases does each check prevent, and what edge cases remain?",
+  "answer_hinglish": "`change_role(s, p, user_id, body)` ke checks order mein: (1) `p.require(P.MEMBER_MANAGE)`; phir `p.role is None` (API key) -> 403 'membership changes require a user session'; phir `_lock_tenant` (tenant row FOR UPDATE). (2) Target ka current role `WHERE tenant_id = :t AND user_id = :u` -- explicit tenant filter (escalation bug ke baad ka pattern); None -> 404 'member not found'. (3) `body.role == 'owner' and p.role != 'owner'` -> 403 'only owners can grant owner' -- admin kisi ko (khud ko bhi) owner nahi bana sakta. (4) `body.role != 'owner' and not can_assign_role(p.role, body.role) and p.role != 'owner'` -> 403 -- non-owner sirf apne se neeche ka role assign kar sakta hai: admin -> member/viewer ok, admin -> admin nahi. Owner exempt hai (owner admin assign kar sakta hai; can_assign_role(owner, admin) waise bhi true hai). (5) `current == 'owner' and p.role != 'owner'` -> 403 -- owner ka role sirf owner badal sakta hai. (5b) `p.role != 'owner' and ROLE_RANK[current] >= ROLE_RANK[p.role]` -> 403 -- non-owner sirf apne se neeche wale members badal sakta hai (review fix). (6) `current == 'owner' and body.role != 'owner' and _owner_count(s) == 1` -> 409 'cannot demote the last owner'. Phir UPDATE (explicit tenant filter) aur audit `member.role_changed` with old/new.\n\nTest coverage: admin self-promote -> 403 (check 3), last owner demote -> 409 (check 6), owner demotes admin to viewer -> takes effect.\n\nReview mein mile edge cases aur unka status: (a) Peer demotion (admin -> doosra admin) -- FIXED by check 5b. (b) Same rule ki wajah se admin ab khud ko bhi demote nahi kar sakta. (c) API key principal (`role` None) -> `ROLE_RANK[None]` KeyError -> 500 -- FIXED (session required, 403). (d) Check 6 write skew -- FIXED by tenant lock (`test_two_owners_cannot_demote_each_other_to_zero_owners`). (e) Abhi bhi open: same role pe set karna bhi audit row banata hai (no-op change).",
+  "why_needed": "Code-level walkthrough of authorization logic -- interviewer har condition ka purpose aur gaps dono sunna chahta hai.",
+  "real_world_analogy": "Office promotion rules: HR (member:manage) hi badal sakta hai, CEO-level (owner) sirf CEO de sakta hai, CEO ko sirf CEO hata sakta hai, aur aakhri CEO ko demote nahi kar sakte.",
+  "how_it_works": "require perm -> load target (tenant-filtered) -> owner-grant rule -> rank rule -> owner-target rule -> last-owner rule -> update + audit.",
+  "in_this_project": "`saas/services/tenancy.py::change_role`, `saas/core/rbac.py::can_assign_role`, `ROLE_RANK`; test `test_no_privilege_escalation_and_last_owner_protection`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/tenancy.py::change_role",
+   "projects/06-saas/saas/core/rbac.py::can_assign_role",
+   "projects/06-saas/tests/test_api.py::test_no_privilege_escalation_and_last_owner_protection"
+  ],
+  "code_example": "# real services/tenancy.py (checks)\nif body.role == \"owner\" and p.role != \"owner\":\n    raise Forbidden(\"only owners can grant owner\")\nif body.role != \"owner\" and not can_assign_role(p.role, body.role) and p.role != \"owner\":\n    raise Forbidden(\"cannot assign a role equal to or above your own\")\nif current == \"owner\" and p.role != \"owner\":\n    raise Forbidden(\"only owners can change an owner's role\")\nif current == \"owner\" and body.role != \"owner\" and await _owner_count(s) == 1:\n    raise Conflict(\"cannot demote the last owner\")",
+  "code_language": "python",
+  "advantages": [
+   "Each escalation path has an explicit check",
+   "Explicit tenant filters",
+   "Audited with old/new"
+  ],
+  "disadvantages": [
+   "No-op role change still writes an audit row",
+   "Rank model not enough for custom roles",
+   "Membership changes serialised per tenant"
+  ],
+  "common_mistakes": [
+   "Only checking the new role, not the target's current role",
+   "Rank comparison with None",
+   "Missing audit on role change"
+  ],
+  "follow_up_questions": [
+   "Peer demotion rokne ke liye exact condition kya likhoge?",
+   "Ownership transfer flow kaise design karoge?",
+   "API keys ko member management allow karna chahiye?"
+  ],
+  "concepts": [
+   "authorization logic",
+   "privilege escalation",
+   "code walkthrough"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Rank-based rules simple; per-permission subset rules zyada general (custom roles) par complex.",
+   "failure_scenarios": "Before the review: admin demoting other admins, API key 500, concurrent demotion to zero owners. All three fixed with regression tests; a guard bug would still mean tenant takeover, so each branch is tested.",
+   "alternatives": "Explicit transfer-ownership endpoint with confirmation; policy engine rules ('actor rank > max(target current, target new)').",
+   "scale_10x_100x": "Custom roles per tenant -> replace ROLE_RANK with permission-set comparison.",
+   "production_improvements": "Done: target-rank check, API-key rejection, tenant row lock. Next: no-op detection, explicit transfer-ownership flow."
+  }
+ },
+ {
+  "id": "SAAS-092",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "What do _bearer and current_user_id do, and why do user-only routes reject API keys?",
+  "answer_hinglish": "`_bearer(authorization)` header parse karta hai: missing ya 'bearer ' (case-insensitive) se start nahi hota toh `Unauthorized('missing bearer token')`; warna `authorization[7:].strip()` -- token. Dono auth types (JWT aur `sk_` API key) same header use karte hain, distinguish prefix se hota hai.\n\n`current_user_id` user-only routes ki dependency hai (`/me`, `POST /tenants`, `/invitations/accept`, aur `platform_admin` iske upar bani hai). Woh `_bearer` ke baad check karta hai `token.startswith(API_KEY_PREFIX)` -> `Unauthorized('this endpoint needs a user token, not an API key')`. Phir `decode_access_token(token, settings.jwt_secret)` -- PyJWT errors (expired, bad signature, missing claims, wrong typ) -> 401 'invalid or expired token' (`from None` original exception chain hide karta hai). Return user UUID.\n\nAPI keys ko user routes pe kyun reject? API key tenant-scoped machine credential hai -- ek tenant, limited scopes. User-only routes cross-tenant ya identity-level hain: `/me` user ke saare tenants dikhata hai, `POST /tenants` naya tenant banata hai, invitations accept naye tenant mein join karata hai. Agar API key yeh kar sake toh ek leaked CI key se attacker naye tenants bana sakta ya creator ki identity ke saath doosre tenants mein join ho sakta -- key ka blast radius tenant se bahar chala jaata. Test: key se `/me` -> 401.\n\nUlta bhi: `decode_access_token` `typ == 'access'` check karta hai -- agar future mein refresh JWT ya email-verification JWT same secret se bane, woh access token ki tarah use nahi ho sakte.",
+  "why_needed": "Credential types ka scope separation ek subtle security design hai.",
+  "real_world_analogy": "Company ka vendor pass (API key) sirf warehouse mein chalta hai; employee ID (JWT) HR office, cafeteria aur doosri branches mein -- vendor pass se HR office nahi khulta.",
+  "how_it_works": "Header -> bearer token -> prefix check -> JWT decode (alg, exp, sub, typ) -> UUID.",
+  "in_this_project": "`saas/api/deps.py::_bearer`, `current_user_id`, `platform_admin`; `saas/core/security.py::decode_access_token`, `API_KEY_PREFIX`; test `test_api_keys_scoped_and_bounded_by_creator` (`/me` with key -> 401).",
+  "implementation_files": [
+   "projects/06-saas/saas/api/deps.py::_bearer",
+   "projects/06-saas/saas/api/deps.py::current_user_id",
+   "projects/06-saas/saas/core/security.py::decode_access_token",
+   "projects/06-saas/tests/test_api.py::test_api_keys_scoped_and_bounded_by_creator"
+  ],
+  "code_example": "# real api/deps.py\nasync def current_user_id(request: Request, authorization: str | None = Header(default=None)) -> uuid.UUID:\n    token = _bearer(authorization)\n    if token.startswith(API_KEY_PREFIX):\n        raise Unauthorized(\"this endpoint needs a user token, not an API key\")\n    try:\n        return decode_access_token(token, request.app.state.settings.jwt_secret)\n    except jwt.PyJWTError:\n        raise Unauthorized(\"invalid or expired token\") from None",
+  "code_language": "python",
+  "advantages": [
+   "Clear credential scoping",
+   "Uniform 401 for all JWT failures",
+   "typ claim prevents token confusion"
+  ],
+  "disadvantages": [
+   "Prefix-based detection relies on JWTs never starting with sk_ (they start with eyJ)",
+   "Error messages differ (key vs token) -- minor info"
+  ],
+  "common_mistakes": [
+   "API keys ko full user powers dena",
+   "JWT errors ka detail client ko dena",
+   "typ claim skip karna"
+  ],
+  "follow_up_questions": [
+   "Personal access tokens (user-scoped keys) kaise design karoge?",
+   "Token confusion attacks kya hain?",
+   "WWW-Authenticate header kab bhejna chahiye?"
+  ],
+  "concepts": [
+   "authentication",
+   "credential scoping",
+   "JWT validation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-093",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "What input validation do the Pydantic models enforce, and why do some rules exist in both Pydantic and the database?",
+  "answer_hinglish": "Models aur unke rules: `RegisterIn` -- email regex `^[^@\\s]+@[^@\\s]+\\.[^@\\s]+$` max 320, password `min_length=10, max_length=72` (comment: bcrypt ignores bytes past 72), full_name max 200. `LoginIn` -- password max 72. `TenantCreate` -- slug `^[a-z0-9-]{3,40}$`, name 1-200. `InviteIn` -- role `^(admin|member|viewer)$` (owner invite se nahi). `RoleChange` -- `^(owner|admin|member|viewer)$`. `ProjectIn` -- name 1-200, description max 5000. `ApiKeyIn` -- `scopes: list[P]` with `min_length=1` -- P enum hai, toh unknown scope string automatically 422. Routes: `CheckoutIn.plan` `^(free|pro|enterprise)$`, `StatusIn.status` `^(active|suspended)$` aur reason max 500, audit-logs `limit` `Query(100, le=1000)`. Path params `uuid.UUID` typed -- invalid uuid 422.\n\nValidation fail -> bpcommon handler -> 422 `validation_error` with field-level errors. `test_registration_validation`: bad email 422, short password 422.\n\nDB mein duplicate rules kyun? `tenants.slug CHECK (slug ~ '^[a-z0-9-]{3,40}$')`, memberships role CHECK, invitations role CHECK (no owner), tenants status CHECK. Kyunki DB last line of defence hai: koi doosra code path (admin script, future endpoint, worker, manual SQL) Pydantic ko bypass kar sakta hai. Pydantic achhe error messages deta hai aur DB tak invalid request jaane hi nahi deta; DB invariant guarantee deta hai. Max lengths DoS bhi rokte hain (5 MB description ya 1 MB password bcrypt pe).",
+  "why_needed": "Input validation basic security hai; defence in depth at data layer interviewer ko impress karta hai.",
+  "real_world_analogy": "Airport pe check-in counter bag ka weight check karta hai (Pydantic) aur plane ke cargo door pe bhi limit hai (DB CHECK) -- counter galti kare tab bhi plane overload nahi hoga.",
+  "how_it_works": "Request JSON -> Pydantic model (regex, lengths, enums) -> 422 or typed object -> SQL with DB CHECKs as final guard.",
+  "in_this_project": "`saas/services/auth.py::RegisterIn`, `LoginIn`; `saas/services/tenancy.py::TenantCreate`, `InviteIn`, `RoleChange`, `ProjectIn`, `ApiKeyIn`; `saas/api/routes.py::CheckoutIn`, `StatusIn`; `migrations/versions/0001_initial.py` CHECKs.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/auth.py::RegisterIn",
+   "projects/06-saas/saas/services/tenancy.py::InviteIn",
+   "projects/06-saas/saas/services/tenancy.py::ApiKeyIn",
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/tests/test_api.py::test_registration_validation"
+  ],
+  "code_example": "# real services/tenancy.py\nclass InviteIn(BaseModel):\n    email: str = Field(pattern=EMAIL, max_length=320)\n    role: str = Field(pattern=r\"^(admin|member|viewer)$\")\n\nclass ApiKeyIn(BaseModel):\n    name: str = Field(min_length=1, max_length=100)\n    scopes: list[P] = Field(min_length=1)",
+  "code_language": "python",
+  "advantages": [
+   "Early, descriptive errors",
+   "Enums prevent unknown scopes",
+   "DB CHECKs as backstop",
+   "Length limits as DoS guard"
+  ],
+  "disadvantages": [
+   "Rules duplicated (can drift)",
+   "Simple email regex accepts some invalid emails"
+  ],
+  "common_mistakes": [
+   "Only DB validation (bad error UX)",
+   "Only app validation (bypassable)",
+   "No max length on passwords with bcrypt"
+  ],
+  "follow_up_questions": [
+   "Email validation kitni strict honi chahiye?",
+   "Pydantic aur DB rules drift kaise rokoge?",
+   "Unicode normalisation slugs/emails ke liye?"
+  ],
+  "concepts": [
+   "input validation",
+   "Pydantic",
+   "CHECK constraints",
+   "defence in depth"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-094",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Walk through accept_invitation. How does it find the tenant, what can go wrong, and what would you harden?",
+  "answer_hinglish": "Flow: `POST /invitations/accept` `{token}` -- user JWT se authenticated (`current_user_id`, API keys reject). Route pehle `global_tx` mein user ka email padhta hai. Phir `tenancy.accept_invitation(sm, user_id, email, token)`: (1) `global_tx` mein `SELECT * FROM accept_invitation_lookup(:h)` with `h = sha256(token)` -- SECURITY DEFINER (migration 0002) kyunki invitations RLS table hai aur tenant abhi pata nahi; function sirf `accepted_at IS NULL AND expires_at > now()` wali invitation deta hai, columns id, tenant_id, email, role. None -> 404 'invitation not found or expired'. (2) `row.email != email.lower()` -> 403 'sent to a different email address' -- token leak ho jaye toh bhi sirf intended email wala user accept kar sakta hai. (3) `tenant_tx(row.tenant_id, user_id)` mein memberships INSERT (role invitation se); IntegrityError (PK tenant_id,user_id) -> 409 'already a member'; `UPDATE invitations SET accepted_at = now()`; audit `member.joined` (`:ut` separate param). Invite token: `inv_` + 32 random bytes, sha256 stored, 7 din expiry.\n\nKya galat ho sakta hai / hardening (observations): (a) Email match bina email verification -- attacker invitee ka email pehle register kar le aur token bhi mil jaye (token inviter ko return hota hai, email nahi bheja jaata) toh accept kar sakta hai. Verified emails required hone chahiye. (b) Accept pe member limit re-check -- review ke baad FIXED (tenant lock + count). (c) Suspended tenant ki invitation accept -- FIXED (status check, 403). (d) `accepted_at` update conditional nahi (`AND accepted_at IS NULL`) -- do alag users same invitation accept nahi kar sakte (email match), lekin defensive conditional update + rowcount check better. (e) Lookup aur insert do alag transactions -- beech mein invitation revoke/expire ho toh bhi accept ho jayegi (small window).",
+  "why_needed": "Invitation flows mein classic account-takeover aur tenant-join bugs hote hain; detailed walkthrough expected.",
+  "real_world_analogy": "Shaadi ka invitation card jis pe naam likha hai (email match) -- gate pe card aur ID dono check. Lekin agar ID hi nakli ban sake (unverified email), toh card chor kaam aa sakta hai.",
+  "how_it_works": "Token hash -> definer lookup (valid, unexpired) -> email match -> tenant_tx insert membership + mark accepted + audit.",
+  "in_this_project": "`saas/services/tenancy.py::accept_invitation`, `invite`; `migrations/versions/0002_invitation_lookup.py::accept_invitation_lookup`; `saas/api/routes.py::accept`; helper `tests/helpers.py::join`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/tenancy.py::accept_invitation",
+   "projects/06-saas/migrations/versions/0002_invitation_lookup.py::accept_invitation_lookup",
+   "projects/06-saas/saas/api/routes.py::accept",
+   "projects/06-saas/tests/helpers.py::join"
+  ],
+  "code_example": "# real services/tenancy.py (trimmed)\nasync with global_tx(sm, user_id) as s:\n    row = (await s.execute(text(\"SELECT * FROM accept_invitation_lookup(:h)\"), {\"h\": sha256(token)})).first()\nif row is None:\n    raise NotFound(\"invitation not found or expired\")\nif row.email != email.lower():\n    raise Forbidden(\"this invitation was sent to a different email address\")",
+  "code_language": "python",
+  "advantages": [
+   "Token hashed, expiring, single-use (accepted_at)",
+   "Email binding",
+   "Narrow definer lookup"
+  ],
+  "disadvantages": [
+   "Unverified emails weaken binding",
+   "No limit/status checks at accept",
+   "Two-transaction window"
+  ],
+  "common_mistakes": [
+   "Token-only acceptance (anyone with link joins)",
+   "Lookup via OR policy instead of definer",
+   "Raw invite tokens stored"
+  ],
+  "follow_up_questions": [
+   "Email verification ke bina binding kitna strong hai?",
+   "Invitation revoke endpoint kaise design?",
+   "SSO tenants mein invitations ka role?"
+  ],
+  "concepts": [
+   "invitations",
+   "SECURITY DEFINER",
+   "account binding"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Email binding vs link-only invites: binding safer, link-only UX simpler; verification makes binding meaningful.",
+   "failure_scenarios": "Pre-registered attacker email; over-limit joins after downgrade; joining suspended tenant.",
+   "alternatives": "Magic-link invites sent by email (possession proves email); SSO domain capture (company domain auto-join).",
+   "scale_10x_100x": "Bulk invites at scale -> SCIM provisioning instead.",
+   "production_improvements": "Require verified email, re-check limits/status at accept in one tenant_tx with tenant lock, conditional update, revoke endpoint, rate-limit accept attempts."
+  }
+ },
+ {
+  "id": "SAAS-095",
+  "project_slug": "p06-saas",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "Why does rbac.py use a StrEnum for permissions and nested frozensets for roles?",
+  "answer_hinglish": "`P(StrEnum)` har permission ko ek named constant banata hai: `P.PROJECT_READ = 'project:read'`. Fayde: (1) Typos compile-time-ish pakde jaate hain -- `P.PROJCT_READ` AttributeError deta hai, jabki string 'projct:read' silently kabhi match nahi karti (deny-by-typo ya worse). (2) StrEnum hai toh value string bhi hai -- DB `api_keys.scopes text[]` mein seedha store, JSON mein serialise (`sorted(x.value for x in p.permissions)` tenant_info mein), aur `P(x)` se string wapas enum (unknown value -> ValueError). (3) Pydantic `scopes: list[P]` automatically validate karta hai -- invalid scope 422.\n\nRoles nested sets: `_VIEWER = {PROJECT_READ, MEMBER_READ}`, `_MEMBER = _VIEWER | {PROJECT_WRITE, REPORT_RUN}`, `_ADMIN = _MEMBER | {...}`, `_OWNER = _ADMIN | {BILLING_MANAGE, TENANT_MANAGE}`. Hierarchy explicit hai -- higher role automatically lower ki saari permissions rakhta hai, ek jagah define. `ROLE_PERMISSIONS` frozensets mein hai -- immutable, toh koi code galti se `ROLE_PERMISSIONS['viewer'].add(...)` karke saare requests ke liye viewer ko promote nahi kar sakta (shared module-level state mutation bug).\n\nSet operations natural fit hain: `perm in p.permissions` O(1); API key effective perms = `scopes & ROLE_PERMISSIONS[creator_role]` (intersection); create_api_key mein `set(body.scopes) - set(p.permissions)` (difference) se excess scopes. SECURITY.md ka RBAC matrix isi code se derive hota hai. `ROLE_RANK` alag dict hai escalation guard ke liye.",
+  "why_needed": "Code-level design choices (enums, immutability) chhote lagte hain par security bugs rokte hain.",
+  "real_world_analogy": "Permissions printed ID badges jaise (enum) -- haath se likhi chit (string) mein spelling galti ho sakti hai; aur role ki list laminated (frozen) hai -- koi pen se naam add nahi kar sakta.",
+  "how_it_works": "StrEnum values = strings; frozenset role maps; set algebra for checks (in, &, -).",
+  "in_this_project": "`saas/core/rbac.py::P`, `ROLE_PERMISSIONS`, `ROLE_RANK`; usages `saas/api/deps.py` (intersection), `saas/services/tenancy.py::create_api_key` (difference), `saas/api/routes.py::tenant_info` (sorted values).",
+  "implementation_files": [
+   "projects/06-saas/saas/core/rbac.py::P",
+   "projects/06-saas/saas/core/rbac.py::ROLE_PERMISSIONS",
+   "projects/06-saas/saas/services/tenancy.py::create_api_key",
+   "projects/06-saas/SECURITY.md"
+  ],
+  "code_example": "# real core/rbac.py\n_VIEWER = {P.PROJECT_READ, P.MEMBER_READ}\n_MEMBER = _VIEWER | {P.PROJECT_WRITE, P.REPORT_RUN}\n_ADMIN = _MEMBER | {P.PROJECT_DELETE, P.MEMBER_INVITE, P.MEMBER_MANAGE, P.APIKEY_MANAGE, P.AUDIT_READ}\n_OWNER = _ADMIN | {P.BILLING_MANAGE, P.TENANT_MANAGE}",
+  "code_language": "python",
+  "advantages": [
+   "Typo-safe",
+   "Immutable shared state",
+   "Set algebra matches the domain"
+  ],
+  "disadvantages": [
+   "Roles fixed in code (no custom roles)",
+   "Renaming a permission needs data migration (stored scopes)"
+  ],
+  "common_mistakes": [
+   "Raw strings everywhere",
+   "Mutable module-level dicts",
+   "Role checks via string comparison in routes"
+  ],
+  "follow_up_questions": [
+   "Custom roles per tenant kaise store karoge?",
+   "Permission rename ka migration?",
+   "Wildcard scopes (project:*) support karoge?"
+  ],
+  "concepts": [
+   "enums",
+   "immutability",
+   "RBAC implementation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-096",
+  "project_slug": "p06-saas",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you systematically test and govern RLS policies so a bug like the memberships OR can't come back?",
+  "answer_hinglish": "Ek bug fix karna kaafi nahi; bug class ko eliminate karna hai. Mera plan teen layers mein.\n\n(1) Generic policy tests: `TENANT_TABLES` (ya `pg_class` se 'tenant_id column wali saari tables') pe parametrised pytest: har table ke liye do tenants mein ek-ek row (minimal valid row factory per table), phir tenant A context mein (a) `SELECT count(*)` sirf A ki rows, (b) `SELECT ... WHERE <any non-tenant column> = B's value` -- jaise memberships pe `user_id` -- empty, (c) INSERT with B's tenant_id -> RLS error, (d) UPDATE/DELETE B's rows -> rowcount 0, (e) no context -> 0 rows. Point (b) exactly escalation bug pakadta -- 'user_id-only filter cross-tenant row na de'. Existing `test_unfiltered_membership_query_cannot_return_other_tenant_roles` isi pattern ka ek instance hai.\n\n(2) Static governance: CI mein migrate ke baad `pg_policies` query: har tenant table pe exactly expected policy, `qual` aur `with_check` expected canonical expression ke barabar (string compare after normalisation) -- koi OR, koi extra permissive policy nahi. Plus `relrowsecurity AND relforcerowsecurity` true, saas_app `NOT rolbypassrls`, aur `SECURITY DEFINER` functions ki allowlist (naya function -> CI fail until reviewed). Alternative: tenant check ko `AS RESTRICTIVE` policy bana do -- tab koi bhi future permissive policy AND ho jayegi, boundary nahi todegi.\n\n(3) HTTP-level isolation tests per route: route list (FastAPI `app.routes`) se auto-generate 'Bob (other tenant) gets 404' test -- jaise `test_tenant_isolation_over_http` ne bug pakda. Naya route add hua aur test nahi -> fail.",
+  "why_needed": "Senior engineers 'bug class' level pe sochte hain; governance + automated tests ka answer chahiye.",
+  "real_world_analogy": "Ek baar chor ghus gaya toh sirf woh khidki band mat karo -- har khidki ka monthly audit checklist banao, aur nayi khidki banne se pehle security approval.",
+  "how_it_works": "Parametrised SQL tests per table + pg_policies/pg_class assertions in CI + definer allowlist + route-generated HTTP isolation tests.",
+  "in_this_project": "Existing: `tests/test_rls.py` (9 tests incl. regression), `tests/test_api.py::test_tenant_isolation_over_http`, `migrations/versions/0001_initial.py::TENANT_TABLES`, `0003` docstring. Generic/CI governance proposed, not implemented.",
+  "implementation_files": [
+   "projects/06-saas/tests/test_rls.py::test_unfiltered_membership_query_cannot_return_other_tenant_roles",
+   "projects/06-saas/tests/test_api.py::test_tenant_isolation_over_http",
+   "projects/06-saas/migrations/versions/0001_initial.py::TENANT_TABLES",
+   "projects/06-saas/migrations/versions/0003_strict_memberships_policy.py"
+  ],
+  "code_example": "# illustrative CI governance test (not in repo)\nEXPECTED = \"(tenant_id = (NULLIF(current_setting('app.tenant_id'::text, true), ''::text))::uuid)\"\n\nasync def test_tenant_policies_are_strict(owner_conn):\n    rows = (await owner_conn.execute(text(\n        \"SELECT tablename, qual, with_check FROM pg_policies WHERE schemaname = 'public'\"))).all()\n    for r in rows:\n        assert r.qual == EXPECTED and r.with_check == EXPECTED, r.tablename",
+  "code_language": "python",
+  "advantages": [
+   "Eliminates bug class",
+   "Cheap to run in CI",
+   "Forces review of privileged functions"
+  ],
+  "disadvantages": [
+   "Row factories per table need maintenance",
+   "Canonical expression string brittle across PG versions"
+  ],
+  "common_mistakes": [
+   "Sirf ek regression test likh ke chhod dena",
+   "Policies ko code review pe chhod dena",
+   "Restrictive policies ke existence se anjaan rehna"
+  ],
+  "follow_up_questions": [
+   "RESTRICTIVE policies ke saath kaunse tests badlenge?",
+   "Route-generated tests ke liye fixtures kaise banaoge?",
+   "Policy changes ka approval process?"
+  ],
+  "concepts": [
+   "RLS governance",
+   "policy testing",
+   "bug classes",
+   "CI checks"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict canonical checks false positives de sakte hain (legit new policy) -- lekin wahi review trigger chahiye.",
+   "failure_scenarios": "Test row factories outdated -> tables skipped silently (assert coverage = all tenant tables).",
+   "alternatives": "pgTAP for in-DB tests; RESTRICTIVE base policy; schema linting tools (squawk-like custom rules).",
+   "scale_10x_100x": "Bahut tables/services pe policy-as-code generator: ek declaration se policy + tests dono generate.",
+   "production_improvements": "Coverage assertion, definer allowlist, route-isolation generator, quarterly pen test focused on tenant boundaries."
+  }
+ },
+ {
+  "id": "SAAS-097",
+  "project_slug": "p06-saas",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you implement immediate access-token revocation without giving up most of the benefit of stateless JWTs?",
+  "answer_hinglish": "Problem: 15-min JWT logout, password change, ya account compromise ke baad bhi valid. Abhi mitigation sirf tenant routes pe per-request membership check hai; user-level routes (`/me`, `POST /tenants`, invitations accept) aur platform admin routes pe token valid rehta hai.\n\nOptions: (1) jti denylist: har JWT mein `jti` already hai (`uuid4().hex` in `create_access_token`). Logout/revoke pe `SET saas:revoked:{jti} 1 EX <remaining ttl>` Redis mein. Verify pe ek `EXISTS`. Memory bounded kyunki entries max 15 min jeeti hain. Cost: har request ek Redis round trip -- lekin hum already 4-5 Redis calls kar rahe hain, toh pipeline mein merge. Logout ko access token bhi bhejna padega (abhi sirf refresh token leta hai). (2) Per-user token version: `users.token_version int`; JWT mein `ver` claim; verify pe user ka current version (cached in Redis, invalidated on bump) compare. 'Logout all devices' / password change = version++ -> saare tokens turant invalid. Sasta aur family-wide. (3) Revoke-after timestamp: `users.tokens_valid_after`; token `iat` usse pehle -> reject. Version jaisa hi. (4) Shorter TTL (5 min) + refresh -- window chhota, revocation nahi. (5) Opaque tokens + introspection -- fully stateful, JWT ka fayda gaya.\n\nMera choice: (2)/(3) for user-wide events (password change, compromise, reuse detection pe bhi -- refresh family revoke ke saath access tokens bhi), aur (1) agar per-session logout precise chahiye. Fail mode decide karna padega: Redis down pe denylist check fail open (availability) ya closed (security) -- admin routes ke liye closed.",
+  "why_needed": "JWT revocation classic senior question hai; interviewer options aur trade-offs ka spectrum sunna chahta hai.",
+  "real_world_analogy": "Concert wristbands (JWT) gate pe sirf dekh ke check hote hain; kisi ko nikalna ho toh gate pe 'blacklist numbers' ki chhoti list (denylist) ya 'aaj ke baad issued bands hi valid' (version/timestamp) rule.",
+  "how_it_works": "Verify signature -> check jti not in denylist OR claim ver == current user version -> accept.",
+  "in_this_project": "`saas/core/security.py::create_access_token` (jti claim present), `decode_access_token`; `saas/services/auth.py::AuthService.logout` (refresh family only); SECURITY.md gap; TRADEOFFS.md #5. Not implemented.",
+  "implementation_files": [
+   "projects/06-saas/saas/core/security.py::create_access_token",
+   "projects/06-saas/saas/core/security.py::decode_access_token",
+   "projects/06-saas/saas/services/auth.py::AuthService",
+   "projects/06-saas/SECURITY.md"
+  ],
+  "code_example": "# illustrative jti denylist (not in repo)\nasync def revoke_access(redis, claims):\n    ttl = max(1, claims[\"exp\"] - int(time.time()))\n    await redis.set(f\"saas:revoked:{claims['jti']}\", 1, ex=ttl)\n\nasync def is_revoked(redis, claims) -> bool:\n    return bool(await redis.exists(f\"saas:revoked:{claims['jti']}\"))",
+  "code_language": "python",
+  "advantages": [
+   "jti already in tokens",
+   "Bounded denylist memory",
+   "Version approach is cheap and user-wide"
+  ],
+  "disadvantages": [
+   "Extra lookup per request",
+   "New failure mode (Redis)",
+   "Logout API must accept access token"
+  ],
+  "common_mistakes": [
+   "Storing every issued token (unbounded)",
+   "Version check without caching (DB per request)",
+   "Forgetting user-level routes"
+  ],
+  "follow_up_questions": [
+   "Denylist vs version -- kab kaunsa?",
+   "Redis down pe denylist check fail open ya closed?",
+   "Microservices mein revocation propagate kaise?"
+  ],
+  "concepts": [
+   "token revocation",
+   "JWT",
+   "denylist",
+   "session management"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har revocation approach statelessness thoda khota hai; version check per user cacheable hai toh best ratio.",
+   "failure_scenarios": "Redis unavailable -> revoked tokens accepted (if fail open); cache stale version -> window up to cache TTL.",
+   "alternatives": "Opaque tokens + introspection (OAuth), very short TTL + aggressive refresh, DPoP/sender-constrained tokens.",
+   "scale_10x_100x": "Millions of users: version in JWT + per-user version cache; denylist sized by revocations x 15 min, small.",
+   "production_improvements": "Implement version claim, bump on password change/compromise/refresh reuse, admin routes fail closed, metrics on revocation checks."
+  }
+ },
+ {
+  "id": "SAAS-098",
+  "project_slug": "p06-saas",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you add per-tenant encryption keys (and crypto-shredding) to this pooled design?",
+  "answer_hinglish": "Is project mein implement nahi hai. Kyun chahiye: enterprise customers 'humara data humari key se encrypted ho' (BYOK) maangte hain, aur pooled model mein per-tenant deletion backups tak poori nahi hoti -- crypto-shredding iska jawab hai: tenant ki key delete karo toh backups mein pada data bhi unreadable.\n\nDesign: (1) Envelope encryption -- KMS mein ek master key (KEK); har tenant ke liye ek data encryption key (DEK) generate, KEK se wrapped DEK `tenant_keys` table mein (ya tenants row mein). (2) Sensitive columns (project descriptions, report results, audit metadata ka sensitive part) application-level encrypt: AES-GCM with tenant DEK, aur associated data mein `tenant_id` + row id -- taaki ek tenant ka ciphertext doosre tenant ki row mein copy kiya jaye toh decrypt fail (cross-tenant swap protection). (3) DEK cache in memory short TTL; KMS decrypt call per cache miss. Natural integration point: `tenant_tx` ya Principal pe tenant ka DEK resolve karna. (4) Crypto-shredding: tenant delete pe wrapped DEK delete (aur KMS mein BYOK revoke) -- backups mein ciphertext bekaar. (5) Key rotation: naya DEK version, lazy re-encrypt on write, background re-encrypt.\n\nTrade-offs: encrypted columns pe search/index/sort nahi (deterministic encryption ya blind index chahiye), CPU overhead, KMS dependency (outage = tenant data unreadable), aur key management ops. RLS ke saath compatible -- yeh ek aur layer hai: agar RLS bypass bhi ho jaye (owner misconfig), attacker ko ciphertext milega bina DEK ke -- agar DEK app memory/KMS mein hai, DB mein plain nahi.",
+  "why_needed": "Enterprise SaaS requirements (BYOK, GDPR erasure) senior system design mein aate hain.",
+  "real_world_analogy": "Shared godown mein har company ka saamaan uske apne taale wale box mein; godown ki chaabi (DB access) se box nahi khulta, aur company ki chaabi tod do toh box hamesha ke liye band -- chahe godown ki purani photocopies (backups) mein ho.",
+  "how_it_works": "KEK (KMS) wraps per-tenant DEK; app encrypts fields with DEK + AAD(tenant_id,row_id); delete DEK = shred.",
+  "in_this_project": "Not implemented. Integration points: `saas/db/session.py::tenant_tx` (tenant-scoped context), `saas/core/principal.py::Principal`, DATABASE_DESIGN.md tables; DEPLOYMENT.md mentions secrets manager.",
+  "implementation_files": [
+   "projects/06-saas/saas/db/session.py::tenant_tx",
+   "projects/06-saas/saas/core/principal.py::Principal",
+   "projects/06-saas/DATABASE_DESIGN.md",
+   "projects/06-saas/DEPLOYMENT.md"
+  ],
+  "code_example": "# illustrative field encryption with AAD (not in repo; uses 'cryptography' package)\nfrom cryptography.hazmat.primitives.ciphers.aead import AESGCM\n\ndef seal(dek: bytes, tenant_id: str, row_id: str, plaintext: bytes) -> bytes:\n    nonce = os.urandom(12)\n    return nonce + AESGCM(dek).encrypt(nonce, plaintext, f\"{tenant_id}:{row_id}\".encode())",
+  "code_language": "python",
+  "advantages": [
+   "Crypto-shredding for erasure",
+   "Extra layer beyond RLS",
+   "BYOK for enterprise"
+  ],
+  "disadvantages": [
+   "No queries on encrypted fields",
+   "KMS dependency",
+   "Key rotation complexity"
+  ],
+  "common_mistakes": [
+   "Same key for all tenants",
+   "No AAD (ciphertext swap attacks)",
+   "Storing unwrapped DEKs in DB"
+  ],
+  "follow_up_questions": [
+   "Encrypted field pe search kaise (blind index)?",
+   "KMS outage ka impact?",
+   "BYOK revoke pe service behaviour?"
+  ],
+  "concepts": [
+   "envelope encryption",
+   "crypto-shredding",
+   "BYOK",
+   "KMS"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Security/compliance vs queryability aur ops; sirf truly sensitive fields encrypt karo.",
+   "failure_scenarios": "KMS down -> reads fail for affected tenants; lost KEK -> permanent data loss; nonce reuse -> GCM break.",
+   "alternatives": "Postgres TDE (disk-level, not per-tenant); silo DB per tenant with its own disk key; pgcrypto in-DB (keys travel to DB -- weaker).",
+   "scale_10x_100x": "Thousands of tenants -> DEK cache sizing, KMS rate limits (batch unwrap).",
+   "production_improvements": "Start with sensitive columns, key versioning, rotation jobs, KMS multi-region, shred workflow tied to tenant deletion."
+  }
+ },
+ {
+  "id": "SAAS-099",
+  "project_slug": "p06-saas",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Enterprise plan lists an 'sso' feature that isn't implemented. How would you design SSO and SCIM per tenant?",
+  "answer_hinglish": "`PLANS['enterprise'].features` mein 'sso' hai -- yaani entitlement modelled hai, implementation nahi. Design:\n\n(1) Per-tenant IdP config: `tenant_sso` table (tenant-scoped, RLS) -- protocol (OIDC/SAML), issuer, client id, encrypted client secret / IdP certificate, allowed email domains, `enforce_sso` flag. Configure karne ke liye `tenant:manage` permission + `require_feature('sso')`.\n\n(2) Login flow: user email deta hai ya `/t/acme/sso/login` -- tenant resolve, IdP pe redirect (OIDC auth code + PKCE, state/nonce). Callback pe ID token/SAML assertion verify (signature, issuer, audience, expiry, nonce/InResponseTo replay protection). Phir email + IdP subject se local user map: `users` global hai, toh link table `user_identities (tenant_id, issuer, subject, user_id)` -- subject se map karo, sirf email se nahi (email reuse attacks). Domain verification zaroori -- warna koi tenant 'gmail.com' claim karke doosre users capture kar le. Phir humara normal `_issue` -- JWT access + refresh family. JIT provisioning: pehli baar user aaye toh membership default role ke saath.\n\n(3) Enforcement: `enforce_sso` tenant pe password login se aaye users ko `tenant_principal` mein reject (JWT mein `amr`/`idp` claim add karke check). Kyunki membership per tenant hai, ek user ek tenant mein SSO aur doosre mein password se ho sakta hai.\n\n(4) SCIM: IdP se users/groups ka push -- `/scim/v2/Users` endpoints tenant-scoped bearer token (API key jaisa, alag type) se; deactivate = membership remove + refresh families revoke. Yahi 5,000-user onboarding aur offboarding solve karta hai. Groups -> roles mapping.",
+  "why_needed": "Enterprise readiness ka standard ask; interviewer identity mapping aur security pitfalls dekhta hai.",
+  "real_world_analogy": "Office building mein har company apna ID card system (IdP) laati hai; reception company ke system se verify karti hai, aur jab company kisi ko nikalti hai toh HR automatically building access band karwata hai (SCIM).",
+  "how_it_works": "Tenant IdP config -> redirect -> verified assertion -> identity link (issuer+subject) -> local session -> SCIM lifecycle.",
+  "in_this_project": "`saas/core/plans.py::PLANS` ('sso' in enterprise features), `saas/core/principal.py::Principal.require_feature`, `saas/services/auth.py::AuthService` (`_issue` would be reused), SECURITY.md gaps. SSO/SCIM not implemented.",
+  "implementation_files": [
+   "projects/06-saas/saas/core/plans.py::PLANS",
+   "projects/06-saas/saas/core/principal.py::Principal",
+   "projects/06-saas/saas/services/auth.py::AuthService",
+   "projects/06-saas/SECURITY.md"
+  ],
+  "code_example": "-- illustrative identity link table (not in repo)\nCREATE TABLE user_identities (\n  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,\n  issuer text NOT NULL,\n  subject text NOT NULL,\n  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n  PRIMARY KEY (tenant_id, issuer, subject)\n);",
+  "code_language": "sql",
+  "advantages": [
+   "Reuses existing token issuance",
+   "Per-tenant config fits tenant model",
+   "SCIM solves offboarding"
+  ],
+  "disadvantages": [
+   "Big surface (SAML parsing, IdP quirks)",
+   "Global users vs per-tenant IdPs complexity"
+  ],
+  "common_mistakes": [
+   "Matching users by email only",
+   "No domain verification",
+   "SSO without SCIM (offboarded users keep sessions)"
+  ],
+  "follow_up_questions": [
+   "SAML vs OIDC kab kaunsa?",
+   "IdP-initiated SAML ke risks?",
+   "Break-glass admin access agar IdP down?"
+  ],
+  "concepts": [
+   "SSO",
+   "SCIM",
+   "OIDC",
+   "identity federation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Build vs buy (WorkOS/Auth0) -- SAML khud banana bug-prone; buy faster aur safer.",
+   "failure_scenarios": "IdP outage -> tenant login down (break-glass needed); assertion replay; email-claim takeover; SCIM token leak.",
+   "alternatives": "Managed identity broker; per-tenant Keycloak realms.",
+   "scale_10x_100x": "Hundreds of enterprise IdPs -> config management, cert rotation monitoring.",
+   "production_improvements": "Use a vetted library/broker, subject-based linking, domain verification, SCIM deprovision revokes refresh families + version bump."
+  }
+ },
+ {
+  "id": "SAAS-100",
+  "project_slug": "p06-saas",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Design a real billing-provider adapter (e.g. Stripe) on top of this abstraction: ordering, reconciliation, downgrades and dunning.",
+  "answer_hinglish": "Abstraction already hai (`BillingProvider` protocol, `BillingEvent`, `apply_event`); real adapter ko production edge cases handle karne honge jo mock nahi karta (TRADEOFFS #10, README: 'no proration/dunning; downgrades don't delete over-limit data').\n\n(1) Adapter: `StripeBillingProvider.create_checkout` -> Stripe Checkout Session with `client_reference_id = tenant_id` aur metadata; `verify_and_parse` -> Stripe signature header (`t=..,v1=..` -- same scheme as mock, isliye mock realistic hai), event types map karo: `checkout.session.completed`, `customer.subscription.updated/deleted`, `invoice.payment_failed`. Event ids ko provider-prefix ke saath store karo (`stripe:evt_...`) taaki multi-provider collisions na hon.\n\n(2) Ordering: webhooks out-of-order aate hain. Event payload ke state pe blindly bharosa mat karo -- ya toh event `created` timestamp ko `subscriptions.updated_at`/`provider_event_at` se compare karke older ignore karo, ya event ko sirf trigger maano aur provider API se current subscription re-fetch karke apply karo (state-based, ordering-proof).\n\n(3) Atomicity: dedup insert + tenants.plan + subscriptions + audit ek transaction mein (abhi do hain). Better: inbox pattern -- webhook raw event store karke 200, worker process kare.\n\n(4) Reconciliation: nightly job jo provider se active subscriptions list karke `subscriptions` table se diff kare -- missed webhooks ko heal kare.\n\n(5) Dunning: `invoice.payment_failed` -> `subscriptions.status = past_due`, grace period (7 din) with emails, phir downgrade/suspend. Abhi code non-active pe turant 'free' kar deta hai.\n\n(6) Downgrade with over-limit data: delete nahi; read-only for excess (block creates via existing limit checks -- woh already count >= limit pe 403 dete hain), UI mein 'archive to fit'.\n\n(7) Proration aur plan changes provider pe chhodo; hum sirf entitlement mirror karte hain.",
+  "why_needed": "Payments integration ke real problems senior candidates se expected hain; abstraction ka value yahan prove hota hai.",
+  "real_world_analogy": "Mock provider driving school ki car hai -- asli sadak (Stripe) pe traffic signals out-of-order, potholes (failed payments), aur toll reconciliation bhi handle karna padta hai.",
+  "how_it_works": "Webhook -> verify -> inbox -> worker: fetch latest state -> single-tx apply -> audit. Nightly reconcile. Dunning state machine.",
+  "in_this_project": "`saas/services/billing.py::BillingProvider`, `BillingEvent`, `apply_event`, `MockBillingProvider` (Stripe-style signature); README known limitations; TRADEOFFS.md #10; SYSTEM_DESIGN.md plan upgrade sequence.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/billing.py::BillingProvider",
+   "projects/06-saas/saas/services/billing.py::apply_event",
+   "projects/06-saas/TRADEOFFS.md",
+   "projects/06-saas/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# illustrative state-based guard (the repo implements the same idea in billing.py::apply_event with provider_event_at)\nUPDATE subscriptions SET plan = :p, status = :st, provider_event_at = :ts, updated_at = now()\n WHERE tenant_id = :t AND (provider_event_at IS NULL OR provider_event_at < :ts);\n-- rowcount 0 -> older event, ignore",
+  "code_language": "sql",
+  "advantages": [
+   "Abstraction keeps Stripe specifics in one class",
+   "Signature scheme already matches",
+   "Idempotency in place"
+  ],
+  "disadvantages": [
+   "Ordering, atomicity, dunning, reconciliation all missing today"
+  ],
+  "common_mistakes": [
+   "Trusting event payload order",
+   "Immediate downgrade on first payment failure",
+   "No reconciliation (missed webhooks = wrong plan forever)"
+  ],
+  "follow_up_questions": [
+   "State-based vs event-based processing?",
+   "Proration kis side handle karoge?",
+   "Provider outage pe checkout UX?"
+  ],
+  "concepts": [
+   "billing integration",
+   "event ordering",
+   "reconciliation",
+   "dunning"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Event-driven fast hai, state re-fetch robust hai (extra API calls); dono combine: event as trigger, provider as source of truth.",
+   "failure_scenarios": "Missed webhook, out-of-order, provider API rate limits, partial apply, double charge disputes.",
+   "alternatives": "Billing platforms (Chargebee/Lago) for entitlements; provider-hosted customer portal.",
+   "scale_10x_100x": "Many tenants -> webhook inbox queue, rate-limited provider fetches, reconciliation in batches.",
+   "production_improvements": "Inbox + single-tx apply + ordering guard + nightly reconcile + dunning state machine + provider-prefixed ids."
+  }
+ },
+ {
+  "id": "SAAS-101",
+  "project_slug": "p06-saas",
+  "category": "Coding Exercises",
+  "difficulty": "Beginner",
+  "question": "Exercise: write a SQL-level test proving that the reports table is tenant-isolated for reads and writes.",
+  "answer_hinglish": "Task: `tests/test_rls.py` style mein ek test jo `reports` table ke liye prove kare: (a) tenant A context mein unfiltered SELECT sirf A ke reports, (b) A context se B ka tenant_id daal ke INSERT -> RLS error, (c) global context -> 0 rows. Existing helpers reuse: `make_tenants(sm)` (tenants + projects banata hai), `tenant_tx`, `global_tx`, fixture `sm` (app role saas_app, clean DB).\n\nApproach: reports ke liye bas `tenant_id` aur `kind` required hain (`status` default 'queued'). A ke context mein do reports, B ke context mein ek. Assertions existing tests ke pattern pe -- `pytest.raises(DBAPIError, match='row-level security')` write ke liye. Important: test app role se chalna chahiye (`sm` fixture) -- owner se chalaoge toh superuser bypass karega aur test meaningless pass/fail karega.\n\nKyun valuable: `reports` RLS ka direct SQL test abhi nahi hai -- sirf `test_tenant_aware_background_job` HTTP + job level pe cover karta hai. Har tenant table ka SQL-level test hona chahiye taaki policy galti se drop ho toh turant pata chale. Isse generic parametrised test (Q96) ki taraf next step.",
+  "why_needed": "Coding round mein existing test patterns reuse karke naya test likhna common task hai.",
+  "real_world_analogy": "Naye locker ka test: apni chaabi se apna locker khule, doosre ka nahi, aur bina chaabi kuch na khule.",
+  "how_it_works": "Insert per tenant -> read per context -> cross-tenant insert expect error -> no-context expect zero.",
+  "in_this_project": "Pattern source: `tests/test_rls.py::make_tenants`, `test_cannot_write_into_another_tenant`, `test_no_tenant_context_sees_nothing`; table `reports` in 0001.",
+  "implementation_files": [
+   "projects/06-saas/tests/test_rls.py::make_tenants",
+   "projects/06-saas/tests/test_rls.py::test_cannot_write_into_another_tenant",
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/tests/conftest.py"
+  ],
+  "code_example": "# solution (add to tests/test_rls.py)\nasync def test_reports_are_tenant_isolated(sm):\n    a, b = await make_tenants(sm)\n    for t, n in ((a, 2), (b, 1)):\n        async with tenant_tx(sm, t) as s:\n            for _ in range(n):\n                await s.execute(text(\"INSERT INTO reports (tenant_id, kind) VALUES (:t, 'x')\"), {\"t\": t})\n    async with tenant_tx(sm, a) as s:\n        assert (await s.execute(text(\"SELECT count(*) FROM reports\"))).scalar() == 2\n    with pytest.raises(DBAPIError, match=\"row-level security\"):\n        async with tenant_tx(sm, a) as s:\n            await s.execute(text(\"INSERT INTO reports (tenant_id, kind) VALUES (:t, 'evil')\"), {\"t\": b})\n    async with global_tx(sm) as s:\n        assert (await s.execute(text(\"SELECT count(*) FROM reports\"))).scalar() == 0",
+  "code_language": "python",
+  "advantages": [
+   "Reuses existing fixtures",
+   "Runs as real app role",
+   "Fast (pure SQL)"
+  ],
+  "disadvantages": [
+   "One table at a time (not generic)"
+  ],
+  "common_mistakes": [
+   "Owner connection se test",
+   "Sirf read test, write nahi",
+   "Test data ka tenant_id hardcode"
+  ],
+  "follow_up_questions": [
+   "Isse saari TENANT_TABLES ke liye parametrise kaise karoge?",
+   "UPDATE/DELETE cross-tenant bhi add karo?",
+   "Kyun DBAPIError aur 'row-level security' match?"
+  ],
+  "concepts": [
+   "RLS testing",
+   "pytest",
+   "SQL-level tests"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-102",
+  "project_slug": "p06-saas",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Exercise: add migration 0004 creating a tenant-scoped 'webhook_endpoints' table, correctly protected.",
+  "answer_hinglish": "Task: tenants apne webhook URLs register kar sakein. Migration `0004_webhook_endpoints.py`, `down_revision = '0003'`. Checklist (Q84 wala): tenant_id NOT NULL FK CASCADE, ENABLE + FORCE RLS, strict policy (no OR) USING + WITH CHECK, tenant-first index, minimum grants to saas_app, aur downgrade. Signing secret plain store nahi -- hum yahan `secret_hash` rakhte hain agar sirf verification chahiye; lekin outgoing webhooks sign karne ke liye actual secret chahiye, toh production mein encrypted column (KMS) -- exercise mein note karte hain.\n\nSolution notes: `op.execute` har statement alag (asyncpg extended protocol -- 0001 ka lesson; yahan `run()` helper import nahi karte kyunki woh 0001 module mein hai, toh seedha alag calls). Unique `(tenant_id, url)` -- per-tenant uniqueness (Q35 lesson: global unique cross-tenant leak karta). Index `(tenant_id, created_at DESC)` list ke liye. Grants: SELECT, INSERT, UPDATE, DELETE (normal table). Downgrade: DROP TABLE (policies saath jaati hain).\n\nVerification: `alembic -x url=<test db> upgrade head`, phir Q101 jaisa SQL test webhook_endpoints ke liye, aur `SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE relname = 'webhook_endpoints'` -> true, true. Aur yeh bhi yaad rakho: `tests/conftest.py` ka `TABLES` truncate list update karna padega warna tests ke beech data leak hoga (test isolation, tenant isolation nahi!).",
+  "why_needed": "Real-world task: naya feature table add karna bina isolation tode -- interviewer checklist discipline dekhta hai.",
+  "real_world_analogy": "Naya kamra building mein: deewar, darwaza, taala, register entry, aur chaabi sirf tenant ko -- ek bhi step chhoota toh kamra sabke liye khula.",
+  "how_it_works": "CREATE TABLE -> indexes -> ENABLE/FORCE RLS -> CREATE POLICY -> GRANT -> downgrade -> test.",
+  "in_this_project": "Patterns from `migrations/versions/0001_initial.py` (policy text, grants), `0003_strict_memberships_policy.py` (op.execute style, revision chain), `tests/conftest.py::TABLES`.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/migrations/versions/0003_strict_memberships_policy.py",
+   "projects/06-saas/tests/conftest.py"
+  ],
+  "code_example": "# solution: migrations/versions/0004_webhook_endpoints.py\nfrom alembic import op\n\nrevision = \"0004\"\ndown_revision = \"0003\"\nbranch_labels = None\ndepends_on = None\n\nPOLICY = \"tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid\"\n\n\ndef upgrade() -> None:\n    op.execute(\"\"\"\n    CREATE TABLE webhook_endpoints (\n      id uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n      tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,\n      url text NOT NULL CHECK (url ~ '^https://'),\n      events text[] NOT NULL,\n      created_by uuid REFERENCES users(id),\n      created_at timestamptz NOT NULL DEFAULT now(),\n      UNIQUE (tenant_id, url)\n    )\"\"\")\n    op.execute(\"CREATE INDEX ix_webhook_endpoints_tenant ON webhook_endpoints (tenant_id, created_at DESC)\")\n    op.execute(\"ALTER TABLE webhook_endpoints ENABLE ROW LEVEL SECURITY\")\n    op.execute(\"ALTER TABLE webhook_endpoints FORCE ROW LEVEL SECURITY\")\n    op.execute(f\"CREATE POLICY tenant_isolation ON webhook_endpoints USING ({POLICY}) WITH CHECK ({POLICY})\")\n    op.execute(\"GRANT SELECT, INSERT, UPDATE, DELETE ON webhook_endpoints TO saas_app\")\n\n\ndef downgrade() -> None:\n    op.execute(\"DROP TABLE IF EXISTS webhook_endpoints\")",
+  "code_language": "python",
+  "advantages": [
+   "Follows established isolation checklist",
+   "Per-tenant uniqueness",
+   "HTTPS-only URLs at DB level"
+  ],
+  "disadvantages": [
+   "Secret storage needs KMS design",
+   "Manual checklist still error-prone"
+  ],
+  "common_mistakes": [
+   "Forgetting FORCE or the policy",
+   "Global UNIQUE(url)",
+   "Not updating test truncate list",
+   "Multi-statement op.execute under asyncpg"
+  ],
+  "follow_up_questions": [
+   "SSRF risk webhook URLs mein kaise rokoge?",
+   "CI mein 'har tenant table pe RLS' check kaise likhoge?",
+   "Secret ko encrypt kaise store karoge?"
+  ],
+  "concepts": [
+   "migrations",
+   "RLS checklist",
+   "schema design"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "DB-level CHECK (https) strict hai; flexibility (http for local dev) chahiye toh app-level validation.",
+   "failure_scenarios": "Policy missing -> silent cross-tenant reads; grant missing -> runtime permission denied; SSRF via internal URLs.",
+   "alternatives": "Generic 'tenant table' migration helper function that applies RLS + grants automatically.",
+   "scale_10x_100x": "Bahut saari tenant tables -> codegen helper + governance test (Q96).",
+   "production_improvements": "Helper `make_tenant_table(name)` in migrations, CI RLS assertion, SSRF protections (deny private IP ranges at send time)."
+  }
+ },
+ {
+  "id": "SAAS-103",
+  "project_slug": "p06-saas",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Exercise: make the last-owner protection race-safe and write a test that would have caught the race. (This fix is now in the repo -- compare your solution with it.)",
+  "answer_hinglish": "Task: Q43 wala write-skew fix karo (code review mein mila; repo mein ab `_lock_tenant` + `test_two_owners_cannot_demote_each_other_to_zero_owners` ke saath fixed hai). Change: `change_role` aur `remove_member` ke shuru mein tenant row lock -- same pattern jo `create_project` use karta hai. Ek helper banao taaki pattern ek jagah rahe. Lock ke baad `_owner_count` committed state dekhega (Read Committed mein har statement fresh snapshot), toh doosri transaction pehli ke commit ke baad count 1 dekhegi aur 409 degi.\n\nTest: tenant mein do owners chahiye. Owner Alice tenant banati hai; Carol ko pehle 'admin' invite karo (invite owner role nahi deta) phir Alice usse owner promote kare. Phir `asyncio.gather` se Alice -> Carol ko admin, aur Carol -> Alice ko admin, ek saath. Assert: exactly ek 200 aur ek 409, aur final state mein exactly ek owner. Fix ke bina yeh test kabhi-kabhi dono 200 dega (race nondeterministic) -- isliye loop mein kuch iterations ya do separate tenants pe repeat se confidence badhao. Note: rate limiter free plan burst 10 hai -- requests ki ginti us ke andar rakho.\n\nReal test ka ek nuance: lock ke baad doosra request jis user se aata hai woh ab owner hi nahi raha, toh use 409 ki jagah 403 bhi mil sakta hai -- isliye repo ka test `[200, 403 or 409]` aur 'exactly ek owner' assert karta hai. API key path bhi pehle reject hota hai (`p.role is None` -> 403).\n\nCache: role change route commit ke baad `member-role` invalidate karta hai -- test final state `/t/acme/members` (DB se, cache nahi) se verify karta hai.",
+  "why_needed": "Concurrency bug fix + concurrency test likhna coding round ka strong signal hai.",
+  "real_world_analogy": "Do doctors ek saath chhutti apply karein -- rule lagao ki chhutti register (tenant lock) ek time pe ek hi aadmi khol sakta hai.",
+  "how_it_works": "Lock tenant row -> count owners -> decide -> update -> commit; concurrent second waits then sees updated count.",
+  "in_this_project": "Shipped: `saas/services/tenancy.py::_lock_tenant` called in `change_role`, `remove_member`, `invite`, `accept_invitation`; test `tests/test_review_fixes.py::test_two_owners_cannot_demote_each_other_to_zero_owners`. Helpers `tests/helpers.py::join`, `user`, `tenant`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/tenancy.py::change_role",
+   "projects/06-saas/saas/services/tenancy.py::create_project",
+   "projects/06-saas/tests/helpers.py::join",
+   "projects/06-saas/tests/test_api.py::test_concurrent_creates_cannot_exceed_plan_limit",
+   "projects/06-saas/saas/services/tenancy.py::_lock_tenant",
+   "projects/06-saas/tests/test_review_fixes.py::test_two_owners_cannot_demote_each_other_to_zero_owners"
+  ],
+  "code_example": "# solution part 1: services/tenancy.py\nasync def _lock_tenant(s, tenant_id) -> None:\n    await s.execute(text(\"SELECT 1 FROM tenants WHERE id = :t FOR UPDATE\"), {\"t\": tenant_id})\n\n# first line after p.require(...) in change_role, and at the top of remove_member:\n#     await _lock_tenant(s, p.tenant_id)\n\n# solution part 2: tests/test_api.py\nasync def test_concurrent_owner_demotions_keep_one_owner(sm, redis):\n    async with client() as c:\n        ah, _ = await user(c, \"alice@acme.io\")\n        await tenant(c, ah, \"acme\")\n        ch = await join(c, ah, \"acme\", \"carol@acme.io\", \"admin\")\n        a_id = (await c.get(\"/me\", headers=ah)).json()[\"id\"]\n        c_id = (await c.get(\"/me\", headers=ch)).json()[\"id\"]\n        assert (await c.patch(f\"/t/acme/members/{c_id}\", json={\"role\": \"owner\"}, headers=ah)).status_code == 200\n        r1, r2 = await asyncio.gather(\n            c.patch(f\"/t/acme/members/{c_id}\", json={\"role\": \"admin\"}, headers=ah),\n            c.patch(f\"/t/acme/members/{a_id}\", json={\"role\": \"admin\"}, headers=ch))\n        assert sorted([r1.status_code, r2.status_code]) == [200, 409]\n        roles = [m[\"role\"] for m in (await c.get(\"/t/acme/members\", headers=ah)).json()[\"members\"]]\n        assert roles.count(\"owner\") == 1",
+  "code_language": "python",
+  "advantages": [
+   "Consistent locking pattern",
+   "Test asserts invariant, not just status codes"
+  ],
+  "disadvantages": [
+   "Race tests nondeterministic without lock",
+   "Serialises membership changes per tenant"
+  ],
+  "common_mistakes": [
+   "Locking memberships rows only for target (doesn't stop write skew)",
+   "Asserting only 'not both 200'",
+   "Reading final state from cache"
+  ],
+  "follow_up_questions": [
+   "Lock ke bina test kitni baar fail hoga -- deterministic kaise?",
+   "SERIALIZABLE se solve karo toh retry logic kahan?",
+   "remove_member ke liye bhi test?"
+  ],
+  "concepts": [
+   "write skew",
+   "row locking",
+   "concurrency testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Tenant-level lock simple aur broad; owner-rows lock narrow par subtle. Low-volume operation pe broad lock fine.",
+   "failure_scenarios": "Lock ordering deadlocks agar koi path pehle memberships phir tenants lock kare; long tx holding tenant lock blocks creates.",
+   "alternatives": "SERIALIZABLE + retry decorator; deferred constraint trigger counting owners at commit.",
+   "scale_10x_100x": "Same helper ko invite/accept limits pe bhi lagao -- ek tenant-mutex convention.",
+   "production_improvements": "lock_timeout, consistent lock order doc, concurrency tests for every invariant-protecting path."
+  }
+ },
+ {
+  "id": "SAAS-104",
+  "project_slug": "p06-saas",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Exercise: write a test proving that a suspended tenant also blocks API-key access, and that suspended calls are not metered.",
+  "answer_hinglish": "Task: `test_platform_admin_suspension` sirf JWT user ke saath suspension check karta hai. API key path alag branch hai `tenant_principal` mein -- humein prove karna hai ki suspension check dono branches ke baad hai, aur suspended requests usage counter nahi badhati (kyunki `check_rate`/`meter` suspension check ke baad hain).\n\nSteps: user register karo aur `saas.cli.promote('root@platform.io', OWNER_URL)` se platform admin banao (registration ab admin nahi deta -- review fix), owner tenant banaye, `project:read` key banaye, key se ek successful call (usage 1+), Redis se usage counter padho, admin se suspend, key se call -> 403 'suspended', counter unchanged, reactivate -> key se 200.\n\nUsage key format `saas:usage:{tid}:api_calls:{period()}` -- `period` `saas.services.limits` se import (existing test bhi aise karta hai). Tenant id `tenant()` helper ke return se milta hai.\n\nEk trap: usage verify karne ke liye `/t/acme/usage` endpoint use mat karo -- woh khud tenant route hai aur suspended tenant pe 403 dega; Redis key seedha padho (test ke paas `redis` fixture hai, same DB 7). Aur `client()` mein cache TTL 60s hai, lekin `set_status` slug cache invalidate karta hai -- isliye suspension turant dikhni chahiye; agar test flaky ho toh pehla shak invalidation pe. Yeh test future refactor (jaise koi suspension check ko JWT branch ke andar move kar de) ko turant pakdega.",
+  "why_needed": "Branch coverage aur ordering guarantees ko test se lock karna -- realistic coding exercise.",
+  "real_world_analogy": "Building band hai toh employee card aur vendor pass dono se darwaza nahi khulna chahiye -- aur gate counter pe entry bhi nahi gin-ni chahiye.",
+  "how_it_works": "Create key -> call ok -> read usage -> suspend -> key call 403 -> usage same -> activate -> 200.",
+  "in_this_project": "`saas/api/deps.py::tenant_principal` (suspension check after both branches, before check_rate/meter), `saas/api/routes.py::set_status`, `tests/test_api.py::test_platform_admin_suspension`, `tests/helpers.py::client`.",
+  "implementation_files": [
+   "projects/06-saas/saas/api/deps.py::tenant_principal",
+   "projects/06-saas/saas/api/routes.py::set_status",
+   "projects/06-saas/tests/test_api.py::test_platform_admin_suspension",
+   "projects/06-saas/tests/helpers.py::client"
+  ],
+  "code_example": "# solution: tests/test_api.py\nasync def test_suspension_blocks_api_keys_and_is_not_metered(sm, redis):\n    from saas.services.limits import period\n    async with client() as c:\n        root, _ = await user(c, \"root@platform.io\")\n        oh, _ = await user(c, \"owner@acme.io\")\n        t = await tenant(c, oh, \"acme\")\n        key = (await c.post(\"/t/acme/api-keys\", json={\"name\": \"ci\", \"scopes\": [\"project:read\"]}, headers=oh)).json()\n        kh = {\"Authorization\": f\"Bearer {key['api_key']}\"}\n        assert (await c.get(\"/t/acme/projects\", headers=kh)).status_code == 200\n        usage_key = f\"saas:usage:{t['id']}:api_calls:{period()}\"\n        before = int(await redis.get(usage_key))\n        await c.post(f\"/admin/tenants/{t['id']}/status\", json={\"status\": \"suspended\"}, headers=root)\n        r = await c.get(\"/t/acme/projects\", headers=kh)\n        assert r.status_code == 403 and \"suspended\" in r.json()[\"error\"][\"message\"]\n        assert int(await redis.get(usage_key)) == before\n        await c.post(f\"/admin/tenants/{t['id']}/status\", json={\"status\": \"active\"}, headers=root)\n        assert (await c.get(\"/t/acme/projects\", headers=kh)).status_code == 200",
+  "code_language": "python",
+  "advantages": [
+   "Covers second auth branch",
+   "Locks in metering order",
+   "Uses existing helpers"
+  ],
+  "disadvantages": [
+   "Depends on Redis key format (coupling)"
+  ],
+  "common_mistakes": [
+   "Testing only the JWT path",
+   "Asserting usage via /usage endpoint (which itself is a tenant route and would 403)",
+   "Registration se admin milne ki umeed rakhna (ab `saas.cli promote` chahiye)"
+  ],
+  "follow_up_questions": [
+   "Rate-limited requests meter hoti hain ya nahi -- test karo?",
+   "Suspension ke dauraan queued jobs ka test?",
+   "Key format coupling kaise kam karoge?"
+  ],
+  "concepts": [
+   "testing",
+   "branch coverage",
+   "suspension",
+   "metering"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-105",
+  "project_slug": "p06-saas",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Exercise: add a max_api_keys plan limit, enforced race-safely, with a test.",
+  "answer_hinglish": "Task: free plan pe max 2 active API keys, pro pe 20, enterprise unlimited. Steps: (1) `Plan` dataclass mein naya field `max_api_keys: int | None` -- frozen dataclass positional hai, toh PLANS entries update karo (keyword args se readability). (2) `create_api_key` mein `create_project` wala pattern: limit not None ho toh tenant row `FOR UPDATE`, phir `SELECT count(*) FROM api_keys WHERE revoked_at IS NULL` (RLS scope karega), `>= limit` pe `PlanLimitReached` with details. (3) `tenant_info` route ke `limits` dict mein `max_api_keys` add (client visibility). (4) Test: free tenant pe 2 keys 201, teesri 403 `plan_limit_reached`; ek revoke karo, phir create 201 (revoked count nahi hote). Concurrency ke liye `asyncio.gather` se 5 creates -> exactly 2 success (fresh tenant pe).\n\nDesign choices: revoked keys count nahi -- warna customers ko revoke ke baad bhi slot nahi milega. Check scopes validation ke BAAD rakho? Order: `p.require` -> scope subset check -> limit check (lock) -> insert. Lock sirf jab limit set hai -- enterprise ko serialize nahi karna. Index: `ix_api_keys_tenant (tenant_id)` count ko support karta hai.\n\nYeh exercise dikhata hai ki naya entitlement add karna = plan field + enforcement point + visibility + test -- aur race-safety pattern reuse.",
+  "why_needed": "Feature addition following existing patterns -- most realistic coding task.",
+  "real_world_analogy": "Parking society: har flat ko 2 car stickers (free) -- naya sticker dene se pehle register lock, gino, phir do; purana sticker wapas kiya toh slot khaali.",
+  "how_it_works": "Plan field -> lock tenant -> count active keys -> compare -> insert -> audit.",
+  "in_this_project": "`saas/core/plans.py::Plan`, `PLANS`; `saas/services/tenancy.py::create_api_key`, `create_project` (pattern); `saas/services/errors.py::PlanLimitReached`; `saas/api/routes.py::tenant_info`.",
+  "implementation_files": [
+   "projects/06-saas/saas/core/plans.py::Plan",
+   "projects/06-saas/saas/services/tenancy.py::create_api_key",
+   "projects/06-saas/saas/services/tenancy.py::create_project",
+   "projects/06-saas/saas/services/errors.py::PlanLimitReached"
+  ],
+  "code_example": "# solution (diff-style)\n# core/plans.py\n@dataclass(frozen=True)\nclass Plan:\n    ...\n    monthly_api_calls: int | None\n    max_api_keys: int | None = None\n# PLANS: Plan(\"free\", ..., 10_000, max_api_keys=2); Plan(\"pro\", ..., 1_000_000, max_api_keys=20)\n\n# services/tenancy.py -- in create_api_key, after the scope check\nif p.plan.max_api_keys is not None:\n    await s.execute(text(\"SELECT 1 FROM tenants WHERE id = :t FOR UPDATE\"), {\"t\": p.tenant_id})\n    active = await s.scalar(text(\"SELECT count(*) FROM api_keys WHERE revoked_at IS NULL\"))\n    if active >= p.plan.max_api_keys:\n        raise PlanLimitReached(f\"plan '{p.plan.name}' allows {p.plan.max_api_keys} API keys\",\n                               details={\"limit\": p.plan.max_api_keys, \"current\": active})\n\n# tests/test_api.py\nasync def test_api_key_plan_limit(sm, redis):\n    async with client() as c:\n        oh, _ = await user(c, \"owner@acme.io\")\n        await tenant(c, oh, \"acme\")\n        mk = lambda: c.post(\"/t/acme/api-keys\", json={\"name\": \"k\", \"scopes\": [\"project:read\"]}, headers=oh)\n        k1 = (await mk()).json(); assert (await mk()).status_code == 201\n        r = await mk()\n        assert r.status_code == 403 and r.json()[\"error\"][\"code\"] == \"plan_limit_reached\"\n        await c.delete(f\"/t/acme/api-keys/{k1['id']}\", headers=oh)\n        assert (await mk()).status_code == 201",
+  "code_language": "python",
+  "advantages": [
+   "Reuses lock pattern and error type",
+   "Revoked keys free slots",
+   "Default None keeps dataclass compatible"
+  ],
+  "disadvantages": [
+   "Another serialization point per tenant",
+   "Downgrade leaves excess keys active"
+  ],
+  "common_mistakes": [
+   "Counting revoked keys",
+   "Check without lock",
+   "Forgetting to expose the limit in tenant_info"
+  ],
+  "follow_up_questions": [
+   "Downgrade pe excess keys ka kya karoge?",
+   "Limit check ko generic helper mein kaise nikaloge?",
+   "Concurrency test bhi add karo?"
+  ],
+  "concepts": [
+   "entitlements",
+   "plan limits",
+   "row lock",
+   "feature development"
+  ],
+  "advanced": null
+ }
+]

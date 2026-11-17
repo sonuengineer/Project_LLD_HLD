@@ -1,0 +1,1176 @@
+[
+ {
+  "id": "WHK-088",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Your drain benchmark hung and never reached pending == 0. How did you debug it?",
+  "answer_hinglish": "Yeh real bug tha jo `TESTING.md` mein documented hai.\n\nSymptom: `bench_drain.py` dispatchers start karta hai aur loop karta hai jab tak `/stats` mein `pending == 0 and in_flight == 0` na ho. Ek run 240s timeout tak chala aur `TIMEOUT {stats}` print hua -- pending kabhi zero nahi hua, jabki receiver ne saari bench deliveries verify kar li thi.\n\nInvestigation: (1) `/stats` dekha -- pending count chhota lekin stuck, aur `oldest_pending_due_at` aage badh raha tha (retries schedule ho rahe the). (2) `GET /deliveries?status=pending` -- pending rows ka `endpoint_id` bench endpoint se alag tha. (3) `GET /endpoints` -- ek purana endpoint mila jo `seed.py` ke pehle run se tha, `*` subscribe kiya hua, aur uska URL/secret ab valid nahi tha -- har attempt fail (401 ya connect error) aur retry schedule ghanton lamba. Uski deliveries pending -> in_flight -> pending cycle mein thi.\n\nCause: benchmark ka \"done\" condition global tha (saari deliveries), lekin database mein purani state thi jo benchmark ka hissa hi nahi thi. Fan-out ne har bench event ki ek delivery us dead endpoint ko bhi bana di.\n\nFix: `fresh_stack()` -- har run `docker compose down -v` (volumes bhi delete) phir up. Clean state = reproducible benchmark. General lesson: benchmarks aur integration tests apni state khud banayein (tests bhi `TRUNCATE ... RESTART IDENTITY CASCADE` fixture use karte hain).",
+  "why_needed": "Real debugging story: stale state se distorted measurements.",
+  "real_world_analogy": "Exam hall mein ginti ki 'sab copies jama hui?' -- lekin pichhle exam ki ek student ki copy abhi bhi pending list mein thi, toh ginti kabhi poori nahi hui.",
+  "how_it_works": "Global completion condition + leftover subscribed failing endpoint -> perpetual pending; fixed by resetting state per run.",
+  "in_this_project": "`bench/bench_drain.py::fresh_stack` (docstring: 'Every run starts from an empty database so old endpoints/retries can't distort the result'), `seed.py` (registers `*` endpoint), `routes.py::stats`, `TESTING.md` ('A second attempt hung because an older endpoint from the seed was still subscribed and failing'). Tests ka `conftest.py::sm` fixture truncate karta hai.",
+  "implementation_files": [
+   "projects/04-webhooks/bench/bench_drain.py::fresh_stack",
+   "projects/04-webhooks/seed.py",
+   "projects/04-webhooks/TESTING.md",
+   "projects/04-webhooks/tests/conftest.py::sm"
+  ],
+  "code_example": "# real: tests/conftest.py\n@pytest.fixture\nasync def sm():\n    engine = make_engine(DB_URL)\n    async with engine.begin() as c:\n        await c.execute(text(\"TRUNCATE delivery_attempts, deliveries, events, endpoints RESTART IDENTITY CASCADE\"))\n    yield make_sessionmaker(engine)\n    await engine.dispose()",
+  "code_language": "python",
+  "advantages": [
+   "Reproducible runs",
+   "Root cause understood, not patched around"
+  ],
+  "disadvantages": [
+   "Full reset makes runs slower"
+  ],
+  "common_mistakes": [
+   "Benchmark ko existing dev database pe chalana",
+   "Timeout badha ke problem chhupana"
+  ],
+  "follow_up_questions": [
+   "Could the bench have scoped its completion check to its own endpoint instead?",
+   "What does /stats not tell you here?",
+   "How do tests isolate state?"
+  ],
+  "concepts": [
+   "debugging",
+   "test isolation",
+   "benchmarking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-089",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "A customer says every webhook fails signature verification. How do you troubleshoot?",
+  "answer_hinglish": "Main ek checklist follow karta hoon, sabse common cause pehle.\n\n1. Raw body: kya woh parsed JSON ko re-serialize karke verify kar rahe hain? (Express `express.json()` ke baad `JSON.stringify(req.body)` -- classic.) Raw bytes chahiye. Humari body compact JSON hai (`separators=(\",\", \":\")`), unka stringify alag ho sakta hai.\n\n2. Secret: kya woh poora `whsec_...` string use kar rahe hain aur hamari library ki tarah prefix hata ke base64-decode karke key bana rahe hain? Ya raw string ko key maan rahe hain? Kya unke paas latest secret hai -- recent rotation hua aur grace expire ho gaya? `GET /endpoints/{id}` mein `secret_rotation_in_progress` aur `/secret` se `previous_secret_expires_at` check.\n\n3. Signed content: `id.timestamp.body` -- kya woh sirf body sign kar rahe hain? Ya `webhook-id` ki jagah koi aur header?\n\n4. Clock: unki server clock 5 minute se zyada off hai toh error \"timestamp outside tolerance\" hoga, signature mismatch nahi -- error message dekh ke differentiate.\n\n5. Header parsing: multiple signatures space-separated (`v1,abc v1,def`) -- kya woh poora header ek signature maan rahe hain?\n\nKaise verify: humare side `GET /deliveries/{id}` se attempt log -- status 401 aur response snippet (unka error message) dikhta hai. Fir main unhe ek known delivery ka exact body + headers deke `signing.verify` se locally reproduce karne bolta hoon. Reference test vector (`test_standard_webhooks_reference_vector`) unki library ko validate karne ke liye best tool hai.",
+  "why_needed": "Sabse common customer support ticket; systematic checklist time bachata hai.",
+  "real_world_analogy": "Taala nahi khul raha: sahi chaabi hai? (secret) chaabi ulti to nahi? (encoding) taala badla to nahi? (rotation) darwaza sahi hai? (raw body).",
+  "how_it_works": "Recompute HMAC over exact bytes with decoded key; compare; differentiate tolerance vs mismatch errors.",
+  "in_this_project": "`services/signing.py::verify` (distinct error messages: missing headers / invalid timestamp / tolerance / no matching signature), `receiver/app.py` (returns `invalid signature: {exc}` 401 -- snippet attempt log mein aata hai), `routes.py::get_delivery`, reference vector test.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/signing.py::verify",
+   "projects/04-webhooks/webhooks/api/routes.py::get_delivery",
+   "projects/04-webhooks/webhooks/receiver/app.py::webhook",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_standard_webhooks_reference_vector"
+  ],
+  "code_example": "# real usage from API_DOCUMENTATION.md (receiver side)\nfrom webhooks.services.signing import verify, VerificationError\nverify([MY_SECRET], dict(request.headers), raw_body)   # raises VerificationError",
+  "code_language": "python",
+  "advantages": [
+   "Distinct error messages speed diagnosis",
+   "Attempt log shows receiver's response"
+  ],
+  "disadvantages": [
+   "We can't see the customer's code"
+  ],
+  "common_mistakes": [
+   "Customer ko 'aapki galti hai' bolna bina evidence",
+   "Clock skew aur signature mismatch ko same samajhna"
+  ],
+  "follow_up_questions": [
+   "How would you give customers a 'send test event' button?",
+   "What would make the reference vector useful to them?",
+   "How do you tell rotation problems apart?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "signature verification",
+   "customer support"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-090",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Throughput is far below expectations. How do you find the bottleneck systematically?",
+  "answer_hinglish": "Mera approach jo maine is project mein actually use kiya, aur production mein extend karunga.\n\n1. Define metric aur honest measurement: drain rate with backlog pre-built (`bench_drain.py`), fresh state. Bina iske baaki sab noise.\n\n2. Break down latency per phase: `phase_timing.py` jaise wrappers -- claim, ratelimit, send, record. Sawaal: time kahan ja raha hai? v1 mein answer tha `_record` 116ms vs send 1.7ms.\n\n3. Vary one variable: concurrency 1 vs 20. Agar phase concurrency ke saath slow hota hai -> contention (locks, pool, CPU). Agar concurrency 1 pe bhi slow -> per-operation cost (round trips).\n\n4. Check resource saturation: process CPU/wall ratio (82% = CPU-bound), DB CPU, connection pool waits, Redis latency. Production mein: `pg_stat_statements` (kaunsi query total time kha rahi), `pg_stat_activity` (wait_event -- Lock vs IO vs ClientRead), py-spy flame graph dispatcher pe, event loop lag.\n\n5. Hypotheses with predictions, test cheaply: hot row -> spread over 20 endpoints (50 -> 52, partial). fsync -> `synchronous_commit=off` (no change, rejected).\n\n6. Fix the dominant cost, re-measure same way: v2 -> 111/s, 3 dispatchers -> 189/s.\n\n7. Stop jab bottleneck shift ho jaaye ek aise resource pe jo scale-out se solve ho (CPU-bound single process -> more processes).\n\nKey mindset: pehle measure, phir guess; har guess ko ek experiment se kill karne ki koshish.",
+  "why_needed": "Performance debugging methodology interview mein code se zyada matter karti hai.",
+  "real_world_analogy": "Factory output kam: har station pe stopwatch (phase timing), dekho line kahan jam ho rahi hai, ek ek cheez badal ke test karo, sabse badi rukawat hatao, phir dobara naapo.",
+  "how_it_works": "Measure -> decompose -> vary concurrency -> check saturation -> hypothesis/experiment -> fix dominant -> re-measure.",
+  "in_this_project": "`bench/bench_drain.py`, `bench/phase_timing.py`, `bench/local_dispatch.py` (in-process, no Docker network -- 'Isolates dispatcher efficiency'), `TESTING.md` investigation section.",
+  "implementation_files": [
+   "projects/04-webhooks/bench/phase_timing.py",
+   "projects/04-webhooks/bench/local_dispatch.py",
+   "projects/04-webhooks/bench/bench_drain.py",
+   "projects/04-webhooks/TESTING.md"
+  ],
+  "code_example": "-- production companion queries (illustrative)\nSELECT query, calls, total_exec_time, mean_exec_time\n  FROM pg_stat_statements ORDER BY total_exec_time DESC LIMIT 10;\nSELECT wait_event_type, wait_event, count(*) FROM pg_stat_activity\n WHERE state <> 'idle' GROUP BY 1, 2 ORDER BY 3 DESC;",
+  "code_language": "sql",
+  "advantages": [
+   "Repeatable methodology",
+   "Avoids premature optimisation"
+  ],
+  "disadvantages": [
+   "Takes time; ad-hoc timers need cleanup"
+  ],
+  "common_mistakes": [
+   "Sabse 'suspicious' code pehle optimise karna bina data",
+   "Ek saath kai cheezein badalna (attribution kho jaata hai)"
+  ],
+  "follow_up_questions": [
+   "What does wait_event tell you in pg_stat_activity?",
+   "How would you profile an asyncio process live?",
+   "When do you stop optimising?"
+  ],
+  "concepts": [
+   "performance debugging",
+   "profiling",
+   "methodology"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Ad-hoc wrappers quick hain; permanent OpenTelemetry spans production-grade lekin overhead aur setup.",
+   "failure_scenarios": "Benchmark environment (shared machine) misleading ho sakta hai -- results ko capacity claims mat banao.",
+   "alternatives": "py-spy, cProfile, Postgres auto_explain, eBPF tools, distributed tracing.",
+   "scale_10x_100x": "Scale pe bottleneck shift karte rehte hain: dispatcher CPU -> DB -> network/NAT -> customer endpoints. Har stage pe same method.",
+   "production_improvements": "Per-phase Prometheus histograms in dispatcher, pg_stat_statements enabled, load test environment matching prod."
+  }
+ },
+ {
+  "id": "WHK-091",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Logs show a rising rate of stale_delivery_result warnings. What do you investigate?",
+  "answer_hinglish": "`stale_delivery_result` tab log hota hai jab `RECORD_SQL` 0 rows update kare -- matlab is dispatcher ka result fenced out ho gaya: delivery ab `in_flight` nahi hai ya `attempts` badal gaya. Normally yeh rare hona chahiye (sirf genuine crashes/zombies). Rising rate ka matlab hai dispatchers apni lease ke baad record kar rahe hain.\n\nHypotheses aur checks:\n\n1. Send + overhead > lease (30s). Request timeout 10s hai, toh pure HTTP se nahi hona chahiye. Lekin: event loop starved (CPU-bound process -- TESTING.md mein 82% CPU), ya batch > concurrency (deliveries semaphore pe wait karti hain jabki lease chal rahi hai), ya Redis hung (BlockingConnectionPool 2s + socket hang), ya DNS resolution slow (getaddrinfo thread pool exhausted). Check: attempt `duration_ms` (sirf HTTP), aur log timestamps claim vs record.\n\n2. Operator replays during in-flight? `retry_delivery` sirf dead/succeeded allow karta hai, toh yeh nahi.\n\n3. DB slow on record -- record statement khud lease ke bahar commit ho? Unlikely 30s, lekin lock waits (failing endpoint row hot) check: `pg_stat_activity` wait events.\n\n4. Clock: lease DB `now()` se, toh skew cause nahi.\n\n5. Deploy restarts: SIGKILL ke baad zombie? Woh process mar gaya toh log nahi karega -- toh stale logs live dispatchers se hain.\n\nEffect: har stale = customer ko duplicate request (doosre dispatcher ne bhi bheja). Fix depends: concurrency/batch align karo, dispatchers scale out (CPU), Redis/DNS timeouts set karo, ya lease badhao. Metric: `stats[\"stale\"]` -- export karke alert.",
+  "why_needed": "Stale results duplicates ka leading indicator hain; root cause usually capacity ya config.",
+  "real_world_analogy": "Hotel mein check-out time ke baad bhi guest room mein -- room kisi aur ko de diya gaya. Kyun late hua: traffic (CPU), lift slow (Redis), ya reception pe line (DB)?",
+  "how_it_works": "Stale = record after lease expiry/re-claim. Causes: claim-to-record time > lease due to queueing/starvation/hangs.",
+  "in_this_project": "`Dispatcher._record` (`log.warning(\"stale_delivery_result\", ...)`, `stats[\"stale\"]`), `config.py::lease_seconds`, `Dispatcher.__init__` batch/concurrency, `DEPLOYMENT.md` alerts list includes stale results.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_record",
+   "projects/04-webhooks/webhooks/config.py::lease_seconds",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::run_once",
+   "projects/04-webhooks/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: Dispatcher._record\nif not updated:\n    # Fencing: our lease expired and a newer attempt owns this delivery now.\n    self.stats[\"stale\"] += 1\n    log.warning(\"stale_delivery_result\", extra={\"delivery_id\": c.id, \"attempt\": c.attempt})\n    return \"stale\"",
+  "code_language": "python",
+  "advantages": [
+   "Fencing makes the problem visible instead of corrupting state",
+   "Structured log with delivery_id"
+  ],
+  "disadvantages": [
+   "Stats only in-process (not exported)",
+   "Duplicate already sent by the time we notice"
+  ],
+  "common_mistakes": [
+   "Lease badha dena bina cause samjhe",
+   "Stale warnings ignore karna"
+  ],
+  "follow_up_questions": [
+   "How would you measure claim-to-record latency?",
+   "Why can't clock skew cause this here?",
+   "What is the customer impact of each stale result?"
+  ],
+  "concepts": [
+   "fencing",
+   "lease",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lease badhana symptoms kam karta hai lekin crash recovery slow; capacity fix (scale out) better.",
+   "failure_scenarios": "CPU saturation spiral: more stale -> more re-sends -> more load -> more stale.",
+   "alternatives": "Heartbeat leases; claim smaller batches; separate DNS/Redis timeouts.",
+   "scale_10x_100x": "Bade fleet pe stale rate per dispatcher dekhna -- ek noisy host (CPU steal) identify ho jaata hai.",
+   "production_improvements": "Export stats as Prometheus counters, event loop lag metric, alert when stale/sent > 0.1%."
+  }
+ },
+ {
+  "id": "WHK-092",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "A delivery has been 'pending' for hours and never gets sent. What could be wrong?",
+  "answer_hinglish": "Checklist, sabse likely pehle:\n\n1. Endpoint disabled hai? `CLAIM_SQL` sirf `e.enabled` endpoints join karta hai. `GET /endpoints/{id}` -> `enabled: false` aur `disabled_reason` (410 Gone ya auto-disabled after N failures). Disabled endpoints ki deliveries dead nahi hoti -- woh wait karti hain. Fix: customer fix confirm, phir `PATCH enabled=true`.\n\n2. `next_attempt_at` future mein hai? `GET /deliveries/{id}` -- agar attempts > 0 aur next attempt 3h ya 6h baad schedule hai (later retries), ya receiver ne bada `Retry-After` diya (ab 24h pe capped). Delivery \"stuck\" nahi, scheduled hai. Fix: `POST /deliveries/{id}/retry` sirf dead/succeeded pe kaam karta hai -- pending ko force karne ka API route nahi hai (gap); manual SQL ya naya route.\n\n3. Rate limited loop? Endpoint ka rate bahut low (0.1/s) aur backlog bada -- delivery baar baar claim + refund (`attempts` 0 hi rahega). Dispatcher stats `rate_limited` badh rahe honge.\n\n4. Koi dispatcher chal hi nahi raha? `/stats` mein `in_flight` 0 aur `oldest_pending_due_at` purana -> dispatcher containers check (`docker compose ps`, logs). Claim failure pe dispatcher ab exit nahi karta, `dispatch_loop_error` log karke backoff karta hai -- logs mein woh dekho (DB issue).\n\n5. `in_flight` mein atka (pending nahi)? Lease expire hone ka wait; agar baar baar wahi row crash kare -> `deliver_crashed` logs aur `internal_error` attempts; woh retry schedule ke baad dead ho jaayegi (review fix).\n\nHar case ka data API se mil jaata hai -- isliye attempt log aur endpoint state expose kiye hain.",
+  "why_needed": "Stuck deliveries common support question; root causes alag hain aur fix alag.",
+  "real_world_analogy": "Parcel 'in transit' dikha raha hai: ho sakta hai address block hai (endpoint disabled), ya delivery kal ke liye scheduled hai (next_attempt_at), ya delivery boys hi chhutti pe hain (dispatcher down).",
+  "how_it_works": "Claimable = pending AND due AND endpoint enabled (or expired lease). Check each predicate.",
+  "in_this_project": "`CLAIM_SQL` predicates, `routes.py::get_delivery`, `routes.py::get_endpoint`, `routes.py::stats`, `routes.py::retry_delivery` (only dead/succeeded), test `test_410_gone_disables_endpoint` ('deliveries for a disabled endpoint wait').",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/api/routes.py::get_delivery",
+   "projects/04-webhooks/webhooks/api/routes.py::stats",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_410_gone_disables_endpoint"
+  ],
+  "code_example": "-- quick diagnosis query (illustrative)\nSELECT d.id, d.status, d.attempts, d.next_attempt_at, d.locked_until, e.enabled, e.disabled_reason\n  FROM deliveries d JOIN endpoints e ON e.id = d.endpoint_id\n WHERE d.id = :id;",
+  "code_language": "sql",
+  "advantages": [
+   "All state is queryable",
+   "Distinct causes visible via API"
+  ],
+  "disadvantages": [
+   "No 'force retry now' for pending",
+   "No customer notification on disable"
+  ],
+  "common_mistakes": [
+   "Disabled endpoint ko check kiye bina dispatcher restart karna",
+   "Pending ko dead samajh ke replay route try karna (409)"
+  ],
+  "follow_up_questions": [
+   "Should there be an API to force a pending delivery now?",
+   "How would the dashboard surface 'waiting on disabled endpoint'?",
+   "How do you detect that no dispatcher is running?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "queue state",
+   "ops"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-093",
+  "project_slug": "p04-webhooks",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "The oldest_pending_due_at in /stats keeps getting older. How do you respond?",
+  "answer_hinglish": "`oldest_pending_due_at` = `min(next_attempt_at) WHERE status='pending'`. Agar yeh now se door peeche ja raha hai, matlab due deliveries process hone se tez jama ho rahi hain -- queue lag badh raha hai. Yeh sabse important health signal hai (`DEPLOYMENT.md` alert #1).\n\nPehle false positive exclude karo: disabled endpoints ki pending rows bhi is metric mein aati hain (query endpoint enabled filter nahi karta), aur woh kabhi claim nahi hongi. Ek disabled endpoint ka purana backlog metric ko permanently purana dikhayega. Check: `SELECT e.enabled, count(*), min(next_attempt_at) FROM deliveries d JOIN endpoints e ... WHERE status='pending' GROUP BY 1`. Yeh metric ka design gap hai -- production mein enabled-only lag alag metric hona chahiye.\n\nAgar genuinely lag hai: (1) Dispatchers chal rahe hain? Count aur logs. (2) Throughput vs inflow: publish rate badha (marketing campaign, bulk import)? (3) Slow endpoints slots kha rahe hain -- attempt log mein `duration_ms` 10000 ke paas (timeouts). (4) Rate-limit churn: ek low-rate endpoint ka bada backlog. (5) DB slow -- claim latency, bloat (queue table vacuum).\n\nResponse: short term -- dispatcher replicas badhao (`--scale dispatcher=N`), slow/dead endpoints disable karo. Medium term -- batch size/concurrency tuning, bulkheads. Communicate: customers ko delayed delivery ka status page.",
+  "why_needed": "Queue lag hi delivery SLO ka direct measure hai.",
+  "real_world_analogy": "Bank ki line mein sabse purane token ka waiting time badh raha hai -- ya counters kam hain, ya customers zyada aaye, ya ek customer ka kaam bahut lamba chal raha hai.",
+  "how_it_works": "Lag = now - oldest due pending. Rising lag = arrival rate > service rate (for claimable rows).",
+  "in_this_project": "`routes.py::stats` (`oldest = ... min(Delivery.next_attempt_at) ... status == \"pending\"`), dashboard cards, `DEPLOYMENT.md` alerts ('oldest pending delivery age (/stats)').",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/api/routes.py::stats",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/webhooks/dashboard.html",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL"
+  ],
+  "code_example": "# real, trimmed: routes.stats\noldest = await s.scalar(select(func.min(Delivery.next_attempt_at)).where(Delivery.status == \"pending\"))\nreturn {..., \"oldest_pending_due_at\": oldest}",
+  "code_language": "python",
+  "advantages": [
+   "Single number captures backlog health",
+   "Cheap via partial index"
+  ],
+  "disadvantages": [
+   "Includes disabled-endpoint rows (false alarms)",
+   "No per-endpoint breakdown"
+  ],
+  "common_mistakes": [
+   "Sirf pending count pe alert (count bada lekin fresh ho sakta hai)",
+   "Disabled backlog ko lag samajhna"
+  ],
+  "follow_up_questions": [
+   "How would you redefine the metric to exclude disabled endpoints?",
+   "Count vs age -- which is the better alert?",
+   "What autoscaling signal would you use?"
+  ],
+  "concepts": [
+   "queue lag",
+   "monitoring",
+   "SLO"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-094",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why a fixed jittered retry schedule instead of pure exponential backoff, and how long should retries last?",
+  "answer_hinglish": "Schedule `5s, 30s, 2m, 10m, 30m, 1h, 3h, 6h` +-20% jitter -- roughly exponential shape lekin hand-picked values. `TRADEOFFS.md` #6: \"Predictable for customers ('we retry for ~11 hours') vs pure exponential\".\n\nFixed schedule ke fayde: (1) Customer contract clear -- docs mein table de sakte ho: \"Agar aapka endpoint down hai toh aapke paas ~11 ghante hain fix karne ke\". Pure exponential with full jitter mein total window random hota hai. (2) Shape tune kar sakte ho: shuru mein aggressive (5s, 30s -- transient blips, deploys jaldi recover), beech mein spaced, end mein lambe gaps. Pure exponential `base * 2^n` 9 attempts mein ya toh bahut jaldi khatam (base 1s -> total ~8 min) ya bahut lamba ho jaata hai. (3) Config se change: `retry_schedule_seconds` list.\n\nJitter +-20% kyun, full jitter kyun nahi? Full jitter (0 to delay) thundering herd ko best spread karta hai lekin individual delays unpredictable (30s schedule pe 1s retry possible). +-20% spread bhi deta hai aur predictability bhi.\n\nWindow length: 11 hours ek choice hai. Stripe ~3 din retry karta hai. Lamba window = customer ka weekend outage cover, lekin backlog zyada aur stale events (3 din purana \"order.paid\" kitna useful?). Chhota window = jaldi dead, replay pe depend. Main bolunga: window customer ke typical incident response time se lamba (overnight outage cover ho) -- isliye 11h ek reasonable minimum; production mein shayad 24-72h plus replay.",
+  "why_needed": "Retry policy customer contract hai, sirf implementation detail nahi.",
+  "real_world_analogy": "Doctor ke follow-ups: 1 din, 1 hafte, 1 mahine -- fixed schedule jo patient plan kar sake, vs 'kabhi bhi random' jo exponential jitter jaisa.",
+  "how_it_works": "delay_n = schedule[n-1] * U(0.8,1.2); max attempts = len(schedule) + 1; total ~ sum(schedule).",
+  "in_this_project": "`config.py::retry_schedule_seconds`, `Dispatcher._next_delay`, `SYSTEM_DESIGN.md` retry policy ('9 attempts over ~11 hours'), `TRADEOFFS.md` #6.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/config.py::retry_schedule_seconds",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_next_delay",
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/TRADEOFFS.md"
+  ],
+  "code_example": "# real: webhooks/config.py\n# Retry schedule in seconds after attempt 1, 2, ... (jitter +-20% applied). Length+1 = max attempts.\nretry_schedule_seconds: list[float] = [5, 30, 120, 600, 1800, 3600, 3 * 3600, 6 * 3600]",
+  "code_language": "python",
+  "advantages": [
+   "Predictable window",
+   "Tunable shape",
+   "Jitter avoids herds"
+  ],
+  "disadvantages": [
+   "Not adaptive to endpoint health",
+   "+-20% spreads less than full jitter"
+  ],
+  "common_mistakes": [
+   "Retry window itna chhota ki overnight outage mein sab dead",
+   "Jitter ke bina schedule"
+  ],
+  "follow_up_questions": [
+   "Would you make the schedule per-endpoint configurable?",
+   "How does Stripe's ~3 day window compare?",
+   "Full jitter vs equal jitter vs +-20%?"
+  ],
+  "concepts": [
+   "retry policy",
+   "backoff",
+   "jitter"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Predictability vs optimal spreading; long window vs stale events and backlog size.",
+   "failure_scenarios": "Bahut lamba window + bada outage = laakhon pending rows aur recovery pe flood (rate limit bachata hai).",
+   "alternatives": "Pure exponential with cap; full jitter (AWS); adaptive retries based on endpoint health (circuit breaker decides).",
+   "scale_10x_100x": "Scale pe retry traffic ka share failing customers ke saath badhta hai; schedule ka later part (3h, 6h) cheap hai, early part load deta hai.",
+   "production_improvements": "Per-endpoint/plan retry policy, docs mein retry table, dead-letter notifications."
+  }
+ },
+ {
+  "id": "WHK-095",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "Why does the rate limiter fail open instead of fail closed?",
+  "answer_hinglish": "Fail-open matlab Redis error pe limiter \"allow\" bolta hai; fail-closed matlab \"deny/wait\". Is project mein fail-open (`except RedisError: return 0`).\n\nReasoning: rate limiter ka purpose customer ko overload se bachana hai -- yeh protection hai, correctness nahi. Agar fail-closed hota, toh Redis ka outage poore webhook system ko rok deta: koi delivery nahi jaati, saare customers ke events delay. Ek auxiliary dependency core function ko down kar deti. Fail-open mein Redis outage ka worst case: kuch customers ko thodi der ke liye zyada traffic -- aur unke paas 429/503 + Retry-After ka option hai jo hum honour karte hain, plus timeouts aur retries.\n\nCompare Project 1 (API rate limiter): wahan bhi same sawaal aata hai -- abuse protection ke liye kabhi fail-closed better hota hai (e.g. login brute force). Rule of thumb: agar limiter security control hai (brute-force, fraud), fail-closed socho; agar capacity/politeness control hai, fail-open.\n\nCost honest: Redis outage silent ho sakta hai -- code error log/metric nahi karta, bas 0 return. Production mein ek counter (`ratelimit_fail_open_total`) aur alert chahiye, taaki pata chale protection off hai.",
+  "why_needed": "Har guard ka failure mode decide karna -- availability vs protection.",
+  "real_world_analogy": "Building ka visitor register kho gaya: building band karna (fail-closed) vs log ko andar aane dena aur guard dhyan rakhe (fail-open). Office building ke liye fail-open; bank vault ke liye fail-closed.",
+  "how_it_works": "try script -> except RedisError -> 0 (allow).",
+  "in_this_project": "`services/ratelimit.py::acquire` docstring ('Fails OPEN on Redis errors'), `FAILURE_SCENARIOS.md` #14.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/ratelimit.py::acquire",
+   "projects/04-webhooks/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Redis not a SPOF for delivery",
+   "Simple"
+  ],
+  "disadvantages": [
+   "Silent loss of protection",
+   "Customers may be flooded during outage"
+  ],
+  "common_mistakes": [
+   "Security limiter ko fail-open banana",
+   "Fail-open ko log/metric na karna"
+  ],
+  "follow_up_questions": [
+   "When would you choose fail-closed?",
+   "How would you detect fail-open mode in production?",
+   "Could a local in-process fallback limiter help?"
+  ],
+  "concepts": [
+   "fail-open",
+   "trade-off",
+   "rate limiting"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-096",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why update endpoint health only when it changes, and what does that cost in accuracy?",
+  "answer_hinglish": "`RECORD_SQL` ka endpoint CTE `WHERE ... AND (NOT :success OR consecutive_failures <> 0)` -- matlab: failure pe hamesha update; success pe sirf tab jab counter pehle se non-zero ho (reset karna hai). Routine success (counter already 0) pe endpoint row touch hi nahi hoti.\n\nKyun: v1 mein har successful delivery `UPDATE endpoints SET consecutive_failures = 0` karti thi. Ek busy endpoint ki 20 concurrent deliveries sab usi ek row ko update karna chahti hain -> row lock pe queue, aur har update ek naya tuple version (MVCC) -> dead tuples, hot row bloat. TESTING.md: hot row \"only partly right\" tha throughput ke liye (50 -> 52/s spread karne pe), lekin real contention tha jo multi-dispatcher production mein badhta. `TRADEOFFS.md` #8: \"Removes a hot-row write per delivery; the failure counter is still exact because every failure writes.\"\n\nAccuracy cost? Counter ka semantics \"consecutive failures\" hai. Success pe reset sirf zaroori tab hai jab counter > 0 -- aur tab hum likhte hain. Toh counter value exactly wahi hai jo har baar likhte toh hoti. Koi accuracy loss nahi -- yeh pure optimisation hai.\n\nJo nahi hai: `last_success_at` jaisa field (har success pe update) -- agar chahiye ho toh hot row wapas. Alternative: woh info `deliveries.delivered_at` se derive karo (`max(delivered_at) WHERE endpoint_id`) ya periodic aggregation.",
+  "why_needed": "Hot-row writes concurrency aur MVCC bloat ka common source hain; conditional writes clean fix.",
+  "real_world_analogy": "Register mein 'aaj koi problem nahi' har ghante likhne ki zaroorat nahi -- sirf jab problem ho ya problem khatam ho tab entry.",
+  "how_it_works": "Conditional UPDATE predicate skips no-op writes; failures always increment; first success after failures resets.",
+  "in_this_project": "`dispatcher.py::RECORD_SQL` comment ('The endpoint row is only touched when something changes...'), `TRADEOFFS.md` #8, `TESTING.md` v2 row ('no endpoint write on routine success').",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/04-webhooks/TRADEOFFS.md",
+   "projects/04-webhooks/TESTING.md"
+  ],
+  "code_example": "-- real, trimmed: RECORD_SQL\n   WHERE id = :endpoint_id AND EXISTS (SELECT 1 FROM d)\n     AND (NOT :success OR consecutive_failures <> 0))",
+  "code_language": "sql",
+  "advantages": [
+   "No hot-row write on the common path",
+   "Counter remains exact",
+   "Less MVCC churn"
+  ],
+  "disadvantages": [
+   "Failing endpoints still write every attempt",
+   "No cheap last_success_at"
+  ],
+  "common_mistakes": [
+   "No-op updates ko harmless samajhna (Postgres phir bhi naya tuple likhta hai)",
+   "Optimisation ke chakkar mein counter semantics todna"
+  ],
+  "follow_up_questions": [
+   "Does Postgres write a new tuple for an UPDATE that sets the same value?",
+   "How would you add last_success_at without a hot row?",
+   "What else in the system could become a hot row?"
+  ],
+  "concepts": [
+   "hot row",
+   "MVCC",
+   "write amplification"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Conditional write se correctness same, cost kam; trade sirf SQL readability.",
+   "failure_scenarios": "Massive failing endpoint (1000 failures/s) abhi bhi hot row -- auto-disable usko jaldi rokta hai, lekin threshold tak contention.",
+   "alternatives": "Health in Redis counters; async aggregation from attempts table; sharded counters.",
+   "scale_10x_100x": "100x pe health ko delivery path se bilkul alag karna (event stream -> aggregator).",
+   "production_improvements": "pg_stat_user_tables n_tup_upd/n_dead_tup on endpoints monitor."
+  }
+ },
+ {
+  "id": "WHK-097",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Thin events vs fat events: this system sends the full payload. Discuss the trade-off.",
+  "answer_hinglish": "Fat event: payload mein poora object (order with items, amount, customer). Thin event: sirf `{\"id\":\"evt_..\",\"type\":\"order.paid\",\"data\":{\"order_id\":\"ord_42\"}}` -- customer phir API se latest state fetch karta hai.\n\nIs project mein publisher jo `payload` deta hai woh as-is `data` mein jaata hai -- toh fat ya thin publisher decide karta hai; system dono support karta hai. Default usage (seed, tests) fat-ish hai.\n\nFat ke fayde: customer ko extra API call nahi; offline processing possible; low latency. Nuksan: (1) Stale data -- retry 6 ghante baad deliver hua toh payload 6 ghante purana state dikhata hai; out-of-order delivery mein purana payload naye ke baad aa sakta hai aur customer state overwrite kar dega. (2) Size -- bade payloads DB (JSONB in events), network, aur signatures pe cost. (3) Data exposure -- PII har webhook mein, logs mein, customer ke systems mein spread. (4) Schema versioning -- payload shape change = breaking change for every consumer.\n\nThin ke fayde: ordering problem almost khatam (customer hamesha latest fetch karta hai -- `SYSTEM_DESIGN.md` \"consumers fetch latest state\"), payload chhote, auth ka control API pe. Nuksan: customer pe API load, aur rate limits; latency.\n\nMera recommendation: hybrid -- thin-ish event with ids + key fields + `created_at`, aur docs mein \"for state, fetch\". Stripe fat bhejta hai lekin recommend karta hai ki critical logic latest object fetch kare. Ordering aur duplicates ka issue dono thin approach se soft ho jaate hain.",
+  "why_needed": "Payload design ordering, staleness, security aur API load sab ko affect karta hai.",
+  "real_world_analogy": "Fat = poori report courier se bhejna (purani ho sakti hai). Thin = sirf SMS 'aapki report ready hai', aap portal pe latest dekh lo.",
+  "how_it_works": "Payload stored in events.payload JSONB, serialized per attempt into body.data. Thin events make each webhook a notification, state comes from API.",
+  "in_this_project": "`services/events.py::EventCreate` (`payload: dict[str, Any]`), `Dispatcher.deliver` (`\"data\": c.payload`), `db/models.py::Event.payload` JSONB, `SYSTEM_DESIGN.md` ordering row ('include created_at, consumers fetch latest state').",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/events.py::EventCreate",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::deliver",
+   "projects/04-webhooks/webhooks/db/models.py::Event",
+   "projects/04-webhooks/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Fat: no extra calls",
+   "Thin: ordering-safe, small, less PII"
+  ],
+  "disadvantages": [
+   "Fat: stale/out-of-order state, PII spread",
+   "Thin: extra API load and latency"
+  ],
+  "common_mistakes": [
+   "Fat payload ko source of truth maan ke customer state overwrite karna",
+   "Payload mein secrets/PII bina soche"
+  ],
+  "follow_up_questions": [
+   "How does thin-event design interact with your ordering guarantee?",
+   "How would you version payload schemas?",
+   "What payload size limit would you enforce?"
+  ],
+  "concepts": [
+   "event design",
+   "payload",
+   "data freshness"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fat vs thin: convenience vs correctness under reordering. Hybrid common.",
+   "failure_scenarios": "Fat + retries: 3h-late delivery of stale state overwrites newer data in customer DB.",
+   "alternatives": "Event-carried state transfer with version numbers; thin + 'expand' fetch; CloudEvents spec for envelopes.",
+   "scale_10x_100x": "Scale pe payload size directly DB storage aur egress cost hai; thin events cheaper.",
+   "production_improvements": "Payload size cap on publish, schema versioning in `type` (order.paid.v2) ya header, docs guidance."
+  }
+ },
+ {
+  "id": "WHK-098",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "A large customer insists on strictly ordered webhooks per order. How would you design it?",
+  "answer_hinglish": "Pehle clarify: global ordering nahi, per-entity (per `order_id`) ordering -- yeh achievable hai aur cost sirf us key pe lagti hai.\n\nDesign: publish pe `ordering_key` (e.g. `order_42`) aur per-key monotonic `sequence` store karo. Delivery claim rule: ek (endpoint, ordering_key) ka sirf ek delivery in-flight ho sakta hai, aur sirf woh jiska sequence us key ka sabse chhota pending hai. SQL mein: claim condition mein `NOT EXISTS (SELECT 1 FROM deliveries d3 WHERE d3.endpoint_id = d2.endpoint_id AND d3.ordering_key = d2.ordering_key AND d3.seq < d2.seq AND d3.status IN ('pending','in_flight'))`. Index `(endpoint_id, ordering_key, seq) WHERE status IN (...)`.\n\nHead-of-line blocking: agar seq 5 fail ho raha hai, toh 6, 7, 8 us order ke liye rukte hain -- lekin doosre orders flow karte rehte hain. Agar seq 5 dead ho jaye? Policy choose karni padegi: (a) block until manual action (strict), ya (b) skip and continue (ordering toota, customer ko flag bhejo). Strict customers ke liye (a) with alerting.\n\nAlternatives: Kafka partition by `endpoint_id + ordering_key` -- per-partition ordering natural, lekin ek partition ka poison message poori partition rokta hai (bahut saari keys), toh retry topics se ordering phir tootti hai. Ya receiver-side: payload mein `sequence` do, customer out-of-order ko buffer/ignore kare -- sabse cheap aur scalable; mostly main yahi push karunga.\n\nIs project mein ordering implement nahi hai (`TRADEOFFS.md` #3). Throughput cost: ordered key ke liye max ~1/latency per key.",
+  "why_needed": "Ordering request aksar aati hai; scoped solution aur uski cost batana senior skill hai.",
+  "real_world_analogy": "Bank cheques ek hi account ke liye number order mein clear hote hain, lekin alag accounts ke cheques parallel -- ek account ka bounced cheque doosre accounts ko nahi rokta.",
+  "how_it_works": "Per-key serialization: at most one in-flight per (endpoint, key), next only after predecessor terminal; HOL scoped to key.",
+  "in_this_project": "Abhi nahi: `CLAIM_SQL` per-key exclusivity nahi rakhta, `Event` mein ordering_key/sequence columns nahi. `TRADEOFFS.md` #3 aur `SYSTEM_DESIGN.md` Guarantees mein ordering 'none'. Payload mein `created_at` hai jo receiver-side ordering ka basic tool hai.",
+  "implementation_files": [
+   "projects/04-webhooks/TRADEOFFS.md",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/db/models.py::Event",
+   "projects/04-webhooks/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- illustrative claim predicate for per-key ordering (NOT in this repo)\nAND NOT EXISTS (\n  SELECT 1 FROM deliveries d3\n   WHERE d3.endpoint_id = d2.endpoint_id AND d3.ordering_key = d2.ordering_key\n     AND d3.seq < d2.seq AND d3.status IN ('pending', 'in_flight'))",
+  "code_language": "sql",
+  "advantages": [
+   "Ordering scoped to entity",
+   "Other keys unaffected"
+  ],
+  "disadvantages": [
+   "Per-key throughput capped",
+   "Dead head blocks key",
+   "Claim query more expensive"
+  ],
+  "common_mistakes": [
+   "Global ordering promise",
+   "Dead head policy define na karna"
+  ],
+  "follow_up_questions": [
+   "What happens when the head event is dead?",
+   "How does Kafka partitioning compare?",
+   "Why might receiver-side sequencing be better?"
+  ],
+  "concepts": [
+   "ordering",
+   "per-key serialization",
+   "head-of-line blocking"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Sender-side ordering = complexity + HOL; receiver-side sequence = cheap aur scalable lekin customer pe kaam.",
+   "failure_scenarios": "Poison head event: key ke saare events 11h tak ruke; customer ka 'order shipped' event 'order paid' ke wait mein.",
+   "alternatives": "Kafka keyed partitions; receiver-side sequence numbers; thin events + fetch.",
+   "scale_10x_100x": "Laakhon keys pe NOT EXISTS subquery index-dependent; Kafka mein keys partitions pe hash hote hain -- partition count fixed.",
+   "production_improvements": "Opt-in per endpoint, metrics on blocked keys, dead-head alert and skip API."
+  }
+ },
+ {
+  "id": "WHK-099",
+  "project_slug": "p04-webhooks",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why dual signatures for secret rotation instead of key ids in the header?",
+  "answer_hinglish": "Do common rotation designs.\n\nDual signatures (is project): rotation ke grace window mein hum har secret se sign karke header mein saari signatures bhejte hain: `v1,<sig_new> v1,<sig_old>`. Receiver jo bhi secret rakhta hai, ek match ho jaata hai. Receiver ko pata hi nahi chahiye ki rotation chal raha hai. Standard Webhooks spec isi ko support karta hai (space-separated list). Test `test_rotation_dual_signatures` teeno combinations check karta hai.\n\nKey id (kid) approach: header mein `kid=key_2026_11` aur ek hi signature. Receiver kid dekh ke sahi secret choose karta hai. JWT/JWKS world mein common.\n\nDual signatures kyun chuna: (1) Receiver simplicity -- receiver ko kid mapping maintain nahi karni; \"koi bhi match = valid\". (2) Zero coordination -- customer naya secret deploy kare jab chahe (grace window ke andar), koi failed delivery nahi. `rotate_secret` docstring: \"zero failed deliveries\". (3) Spec compatible.\n\nCosts: (1) Header bada (do signatures) -- negligible. (2) Do HMAC computations per attempt during rotation -- negligible. (3) Sirf ek `previous_secret` slot -- grace ke andar doosra rotation pehle wale purane secret ko turant drop kar deta hai. (4) Leaked secret ke case mein grace 0 dena padta hai (`grace_seconds` ge=0 allowed) -- warna leaked secret bhi sign karta rahega.\n\nKid approach asymmetric keys (public key directory) ke saath zyada natural hai.",
+  "why_needed": "Zero-downtime credential rotation design choices.",
+  "real_world_analogy": "Naya aur purana dono ID card dikhana jab tak security desk naya register na kar le, vs card pe 'version number' likhna jise desk lookup kare.",
+  "how_it_works": "Multiple signatures; verifier any-of-any. vs single signature + kid lookup.",
+  "in_this_project": "`EndpointService.rotate_secret`, `Dispatcher._active_secrets`, `signing.signature_header`, `signing.verify`, `routes.py::Rotate` (`grace_seconds` 0..7 days), `TRADEOFFS.md` #7.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/endpoints.py::rotate_secret",
+   "projects/04-webhooks/webhooks/services/signing.py::signature_header",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_rotation_dual_signatures",
+   "projects/04-webhooks/TRADEOFFS.md"
+  ],
+  "code_example": "# real: tests/test_signing_ssrf.py\ndef test_rotation_dual_signatures():\n    old, new = generate_secret(), generate_secret()\n    h = headers([new, old], 1000)\n    assert len(h[\"webhook-signature\"].split()) == 2\n    verify([old], h, BODY, now=1000)          # customer not yet updated\n    verify([new], h, BODY, now=1000)          # customer already updated",
+  "code_language": "python",
+  "advantages": [
+   "Receiver needs no rotation awareness",
+   "Spec-compatible",
+   "Zero failed deliveries"
+  ],
+  "disadvantages": [
+   "Single previous slot",
+   "Leaked secret keeps signing during grace unless grace=0"
+  ],
+  "common_mistakes": [
+   "Rotation pe turant cut-over",
+   "Leak ke case mein default 24h grace use karna"
+  ],
+  "follow_up_questions": [
+   "What happens if you rotate twice within the grace window?",
+   "When would kid-based rotation be better?",
+   "How should grace differ for scheduled rotation vs leak?"
+  ],
+  "concepts": [
+   "secret rotation",
+   "key management",
+   "trade-off"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Any-of-any simple hai; kid explicit aur scalable to many keys.",
+   "failure_scenarios": "Double rotation in grace: first old secret drops instantly -> customers still on it fail. Leak with grace: attacker ke paas 24h valid secret.",
+   "alternatives": "kid header + key directory; asymmetric keys with JWKS endpoint.",
+   "scale_10x_100x": "Key count per endpoint 2 pe fixed -- scale issue nahi.",
+   "production_improvements": "Multiple previous secrets list, separate 'revoke now' API for leaks, rotation reminders."
+  }
+ },
+ {
+  "id": "WHK-100",
+  "project_slug": "p04-webhooks",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "A customer had a 4-hour outage and asks you to resend everything they missed. What do you do?",
+  "answer_hinglish": "Pehle samjho unka state kya hai -- `GET /endpoints/{id}`: enabled hai ya auto-disabled? `consecutive_failures`? Phir `GET /deliveries?endpoint_id=...&status=dead` aur `status=pending`.\n\n4 ghante mein schedule ke hisaab se: shuru ke events ke attempts 5s, 30s, 2m, 10m, 30m, 1h, 3h... -- 4h mein ~7 attempts ho chuke, abhi dead nahi (9 attempts ~11h). Toh zyada tar deliveries `pending` hain future retry ke saath, aur agar 20 consecutive failures hue toh endpoint auto-disabled.\n\nSteps:\n1. Customer confirm kare unka endpoint healthy hai -- dashboard pe last attempt ka response snippet dekho.\n2. Agar disabled: `PATCH /endpoints/{id}` `{\"enabled\": true}`. Disabled period ki saari pending rows ab claimable (agar due).\n3. Pending rows jinka next attempt 3h baad scheduled hai? Woh apne time pe jaayengi. Customer ko jaldi chahiye toh -- API mein \"pending ko abhi bhejo\" route nahi hai (gap). Ops SQL: `UPDATE deliveries SET next_attempt_at = now() WHERE endpoint_id = ... AND status = 'pending'`.\n4. Dead rows: `POST /endpoints/{id}/replay-dead`.\n5. Rate limit: 4 ghante ka backlog ek saath -- endpoint ka `rate_limit_per_second` check karo, customer se puchho kitna handle karenge.\n\nCustomer ko batao: order guarantee nahi, duplicates possible (dedupe on webhook-id), aur state ke liye latest fetch karein. Aur yeh feedback product mein: \"resend since timestamp\" self-serve button chahiye.",
+  "why_needed": "Real support scenario: API surface ko combine karke recovery.",
+  "real_world_analogy": "Ghar band tha 4 ghante: kuch parcels courier office mein (pending), kuch return to sender (dead). Pehle gate kholo, phir office se mangwao, phir returned dobara bhejwao -- ek saath sab nahi, building lift ki capacity dekh ke.",
+  "how_it_works": "Re-enable -> pull pending forward -> replay dead -> pace via token bucket.",
+  "in_this_project": "`routes.py::update_endpoint`, `routes.py::replay_dead`, `routes.py::list_deliveries`, `config.py::retry_schedule_seconds`, `config.py::auto_disable_after_failures`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/api/routes.py::replay_dead",
+   "projects/04-webhooks/webhooks/api/routes.py::update_endpoint",
+   "projects/04-webhooks/webhooks/api/routes.py::list_deliveries",
+   "projects/04-webhooks/webhooks/config.py::retry_schedule_seconds"
+  ],
+  "code_example": "-- ops helper (illustrative, not an API route): bring scheduled retries forward\nUPDATE deliveries SET next_attempt_at = now()\n WHERE endpoint_id = :endpoint_id AND status = 'pending' AND next_attempt_at > now();",
+  "code_language": "sql",
+  "advantages": [
+   "No data loss; everything recoverable",
+   "Rate limit protects the recovering customer"
+  ],
+  "disadvantages": [
+   "Some steps need SQL (no API)",
+   "No time-range replay"
+  ],
+  "common_mistakes": [
+   "Replay karte waqt rate limit bhool jaana",
+   "Succeeded deliveries bhi replay kar dena (duplicates)"
+  ],
+  "follow_up_questions": [
+   "What self-serve API would you add?",
+   "How do you avoid flooding them?",
+   "What do you tell them about ordering?"
+  ],
+  "concepts": [
+   "runbook",
+   "replay",
+   "customer support"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-101",
+  "project_slug": "p04-webhooks",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What would you monitor and alert on for this system in production? Define SLOs.",
+  "answer_hinglish": "SLOs pehle, kyunki alerts unhi se nikalte hain.\n\nSLO 1 -- Delivery latency: 99% deliveries ka pehla attempt publish ke 30s ke andar (endpoint healthy aur rate limit ke andar). Measure: `first attempt started_at - event created_at`. Proxy jo abhi available hai: `/stats` ka `oldest_pending_due_at`.\n\nSLO 2 -- Publish availability: `POST /events` 99.9% success (non-5xx). bpcommon Prometheus `http_requests_total` se.\n\nSLO 3 -- Correctness: zero lost deliveries (har event ki har subscribed endpoint ki delivery terminal state tak). Measure via reconciliation job.\n\nAlerts (`DEPLOYMENT.md` list + meri additions):\n1. Oldest pending (enabled endpoints only) age > 2 min -- page.\n2. Dead count growth rate spike -- warn (customer outage ya humara bug).\n3. Endpoints auto-disabled count jump -- warn; agar bahut saare ek saath disable ho rahe hain toh humari side ki problem (DNS, egress, signing bug), customer nahi.\n4. `deliver_crashed` logs > 0 -- page (bug / poison).\n5. `stale_delivery_result` rate > 0.1% -- warn (capacity/lease).\n6. Blocked outcome (SSRF) -- security warn.\n7. Publish 5xx rate, p99 latency.\n8. DB: connections used vs max, replication lag, dead tuples on deliveries, autovacuum lag.\n9. Redis down (limiter fail-open) -- warn.\n\nGap: dispatcher abhi in-process `stats` dict rakhta hai, Prometheus export nahi. Pehla kaam: dispatcher metrics endpoint (sent, succeeded, failed, dead, rate_limited, stale, claim latency, send latency histograms).",
+  "why_needed": "Production readiness ka core: kya measure karna aur kab jagaana.",
+  "real_world_analogy": "Hospital ICU monitors: heartbeat (lag), BP (error rate), oxygen (DB health) -- har ek ka threshold jispe nurse ko alarm.",
+  "how_it_works": "SLO -> SLI metric -> alert threshold with burn rate; dashboards for diagnosis.",
+  "in_this_project": "`DEPLOYMENT.md` alerts item 5, `routes.py::stats`, dispatcher `self.stats` dict aur log events (`delivery_attempt`, `stale_delivery_result`, `deliver_crashed`), `shared/bpcommon/http.py` metrics (API only).",
+  "implementation_files": [
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/webhooks/api/routes.py::stats",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::Dispatcher",
+   "shared/bpcommon/http.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Alerts tied to customer-visible outcomes",
+   "Distinguishes our failures from customer failures"
+  ],
+  "disadvantages": [
+   "Dispatcher metrics not exported yet",
+   "Lag metric includes disabled endpoints"
+  ],
+  "common_mistakes": [
+   "CPU/memory pe alert, lag pe nahi",
+   "Har customer failure pe page (noise)"
+  ],
+  "follow_up_questions": [
+   "How do you tell 'many customers down' from 'our egress is broken'?",
+   "What's an error-budget burn-rate alert?",
+   "Which metric would you autoscale on?"
+  ],
+  "concepts": [
+   "SLO",
+   "monitoring",
+   "alerting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Customer failures noisy hain -- alert sirf aggregate anomalies pe; per-customer dashboards self-serve.",
+   "failure_scenarios": "Silent failures: signing bug -> sab receivers 401 -> lagta hai customers down hain. Mass auto-disable alert isko pakadta hai.",
+   "alternatives": "Synthetic canary endpoint jo hum khud host karein aur har minute test event bhejein -- end-to-end SLI.",
+   "scale_10x_100x": "Scale pe per-endpoint metrics cardinality explode -- top-N aur sampling.",
+   "production_improvements": "Prometheus exporter in dispatcher, canary endpoint, error-budget based paging."
+  }
+ },
+ {
+  "id": "WHK-102",
+  "project_slug": "p04-webhooks",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "How do you budget database connections as dispatchers scale?",
+  "answer_hinglish": "Har process ka SQLAlchemy engine `pool_size=10, max_overflow=10` -- matlab peak 20 connections per process. `DEPLOYMENT.md` item 6: \"Postgres connection budget: each dispatcher uses up to pool 10 + overflow 10\".\n\nMath: 10 dispatchers x 20 = 200, plus API replicas (say 4 x 20 = 80), plus migrations/admin -> ~300. Postgres default `max_connections = 100`. Aur har Postgres connection ek OS process hai (~5-10MB memory, context switching) -- 300+ connections DB performance girate hain.\n\nDispatcher actually kitne use karta hai? Claim aur record short transactions hain; concurrency 20 hai lekin connection sirf DB phases mein chahiye, HTTP ke dauraan nahi (kyunki transaction HTTP ke bahar hai!). Toh steady state mein 20 se kaafi kam. Peak pe saare 20 concurrent `_record` ek saath ho sakte hain.\n\nOptions: (1) Pool size tune -- dispatcher ke liye pool_size 5, overflow 5 shayad kaafi; measure pool wait time. (2) PgBouncer transaction pooling -- hazaron client connections ko ~50 server connections pe multiplex. Caveat: asyncpg prepared statements transaction pooling ke saath issues dete hain (statement_cache_size=0 ya PgBouncer 1.21+ prepared statement support). (3) Batch records -- kam statements = kam connection time.\n\nBahut chhota pool = `_record` pool wait mein lease kha jaata hai -> stale results. Bahut bada = DB overload. Measure: pool checkout latency metric.",
+  "why_needed": "Horizontal scaling ka hidden limit DB connections hain.",
+  "real_world_analogy": "Ek restaurant ki 50 kursiyan (DB connections): har waiter (dispatcher) 20 kursiyan reserve kare toh 3 waiters mein jagah khatam. Head waiter (PgBouncer) kursiyan share karwata hai.",
+  "how_it_works": "Total = replicas x (pool + overflow); Postgres per-connection process cost; PgBouncer multiplexes transactions.",
+  "in_this_project": "`webhooks/db/session.py::make_engine` (`pool_size=10, max_overflow=10, pool_pre_ping=True`), `DEPLOYMENT.md` item 6, `docker-compose.yml` dispatcher replicas.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/db/session.py::make_engine",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/docker-compose.yml"
+  ],
+  "code_example": "# real: webhooks/db/session.py\ndef make_engine(url: str) -> AsyncEngine:\n    return create_async_engine(url, pool_size=10, max_overflow=10, pool_pre_ping=True)",
+  "code_language": "python",
+  "advantages": [
+   "Short transactions keep real usage low",
+   "Pool limits protect DB"
+  ],
+  "disadvantages": [
+   "Static pool sizes per role not differentiated",
+   "No pool metrics"
+  ],
+  "common_mistakes": [
+   "max_connections badha ke problem solve karna",
+   "PgBouncer transaction mode + server-side prepared statements bina config"
+  ],
+  "follow_up_questions": [
+   "Why does keeping HTTP outside the transaction help the connection budget?",
+   "Session vs transaction pooling in PgBouncer?",
+   "How do you detect pool starvation?"
+  ],
+  "concepts": [
+   "connection pooling",
+   "PgBouncer",
+   "capacity planning"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bade pools latency kam (no wait) lekin DB pe load; chhote pools DB safe lekin pool waits.",
+   "failure_scenarios": "Pool exhaustion -> claims/records queue -> lease expiry -> stale/duplicates; API pool exhaustion -> publish 500s.",
+   "alternatives": "PgBouncer, RDS Proxy, ya per-role pool sizing via settings.",
+   "scale_10x_100x": "100x pe PgBouncer mandatory, aur dispatchers ka DB access hi kam (Kafka).",
+   "production_improvements": "Pool size config ko settings mein expose karna, checkout latency metric, alerts on Postgres connections > 80%."
+  }
+ },
+ {
+  "id": "WHK-103",
+  "project_slug": "p04-webhooks",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "How do you deploy a schema change (e.g. adding a column used by CLAIM_SQL) while dispatchers keep running?",
+  "answer_hinglish": "Rule: expand -> migrate code -> contract. Kyunki rolling deploy ke dauraan purane aur naye dispatchers ek saath chalte hain, aur dono same table use karte hain.\n\nExample: `deliveries` mein `priority` column add karna aur claim `ORDER BY priority, next_attempt_at` karna.\n\nStep 1 (expand): migration `ADD COLUMN priority int` nullable ya with constant default (Postgres 11+ mein constant default metadata-only, table rewrite nahi). Purane dispatchers is column ko ignore karte hain -- `CLAIM_SQL` explicit columns select karta hai, `SELECT *` nahi, toh safe. Agar index chahiye: `CREATE INDEX CONCURRENTLY` (Alembic mein autocommit block), naya partial index `(priority, next_attempt_at) WHERE status IN (...)`.\n\nStep 2: naya code deploy (rolling). Naye dispatchers priority use karte hain; purane nahi -- dono ek saath safe hain kyunki claim semantic (SKIP LOCKED, lease, fencing) same hai.\n\nStep 3 (contract): jab saare purane gone, purana index drop, NOT NULL constraint add (`NOT VALID` + `VALIDATE` to avoid long locks).\n\nIs project mein: `migrate` compose service ek baar `alembic upgrade head` chalata hai aur api/dispatcher uske complete hone pe start hote hain -- yeh fresh deploys ke liye hai, zero-downtime ke liye nahi. Dispatcher graceful shutdown (SIGTERM -> current batch finish) rolling restarts ko safe banata hai.\n\nDanger zones: `ALTER TABLE` jo `ACCESS EXCLUSIVE` lock le aur lamba chale -> saare claims block -> lag spike. `lock_timeout` set karke migrations chalao taaki woh wait karke fail ho, queue block na kare.",
+  "why_needed": "Live queue table pe migration galat ho toh poora delivery pipeline ruk jaata hai.",
+  "real_world_analogy": "Chalti train mein naya coach jodna: pehle coach attach (expand), passengers dheere dheere shift (code deploy), phir purana coach hatao (contract) -- train rokni nahi.",
+  "how_it_works": "Backward-compatible schema first; code tolerant of both; cleanup later; concurrent index builds; lock_timeout.",
+  "in_this_project": "`migrations/versions/0001_initial.py`, `migrations/env.py`, `docker-compose.yml` (`migrate` service, `depends_on ... service_completed_successfully`), `CLAIM_SQL` explicit column list, `dispatcher/__main__.py` signal handling.",
+  "implementation_files": [
+   "projects/04-webhooks/migrations/versions/0001_initial.py",
+   "projects/04-webhooks/docker-compose.yml",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/dispatcher/__main__.py::main"
+  ],
+  "code_example": "# illustrative Alembic migration (NOT in this repo)\ndef upgrade() -> None:\n    op.execute(\"SET lock_timeout = '3s'\")\n    op.add_column(\"deliveries\", sa.Column(\"priority\", sa.Integer, nullable=True))\n    with op.get_context().autocommit_block():\n        op.create_index(\"ix_deliveries_due_prio\", \"deliveries\", [\"priority\", \"next_attempt_at\"],\n                        postgresql_where=sa.text(\"status IN ('pending', 'in_flight')\"),\n                        postgresql_concurrently=True)",
+  "code_language": "python",
+  "advantages": [
+   "No downtime",
+   "Old and new dispatchers coexist safely",
+   "Explicit column lists make expand safe"
+  ],
+  "disadvantages": [
+   "Multi-step deploys take longer",
+   "Concurrent index builds can fail and leave invalid indexes"
+  ],
+  "common_mistakes": [
+   "Column rename in one step",
+   "CREATE INDEX without CONCURRENTLY on the queue table",
+   "No lock_timeout"
+  ],
+  "follow_up_questions": [
+   "Why is SELECT * dangerous during expand/contract?",
+   "What lock does ADD COLUMN take?",
+   "How do you recover from a failed CONCURRENTLY build?"
+  ],
+  "concepts": [
+   "zero-downtime migration",
+   "expand-contract",
+   "Postgres locks"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Expand-contract safe lekin slow; big-bang migration simple lekin downtime.",
+   "failure_scenarios": "Migration waiting on ACCESS EXCLUSIVE lock behind a long claim transaction -> new claims queue behind the migration -> total stall (lock queue).",
+   "alternatives": "pg-osc / pgroll style tools; blue-green DB (heavy).",
+   "scale_10x_100x": "Bade tables pe backfills batched (UPDATE ... LIMIT), throttled to protect queue latency.",
+   "production_improvements": "Migration CI check (squawk linter), lock_timeout/statement_timeout defaults, runbooks for invalid index cleanup."
+  }
+ },
+ {
+  "id": "WHK-104",
+  "project_slug": "p04-webhooks",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "Design per-endpoint circuit breakers and bulkheads for this dispatcher.",
+  "answer_hinglish": "Problem: ek slow/failing endpoint dispatcher slots kha jaata hai (noisy neighbour), aur auto-disable bahut blunt hai (permanent, manual re-enable). Chahiye: temporary, automatic isolation.\n\nBulkhead (concurrency cap): har endpoint ke liye max in-flight requests across all dispatchers, e.g. 5. Redis mein ek counter-with-lease: `ZADD wh:inflight:{ep} expiry_ts delivery_id` aur `ZREMRANGEBYSCORE` se expired entries saaf -- crashed dispatcher ka slot apne aap free. Lua script: expired hatao, `ZCARD < cap` toh add + allow, warna deny. Deny pe `_reschedule_without_attempt` jaisa refund. Send ke baad `ZREM`. Rate limit (requests/sec) aur concurrency cap (in-flight) alag cheezein hain -- slow endpoint ke liye concurrency cap hi bachata hai (Little's law: in-flight = rate x latency).\n\nCircuit breaker: states closed -> open -> half-open per endpoint. Closed: normal; failures (timeouts/5xx) ek sliding window mein track. Threshold cross (e.g. 50% fail over last 20, ya 5 consecutive timeouts) -> open: endpoint ki deliveries claim hi mat karo (`breaker_open_until` column endpoints pe, `CLAIM_SQL` join mein `AND (e.breaker_open_until IS NULL OR e.breaker_open_until < now())`). Open period (30s, exponential up to 10 min) ke baad half-open: sirf 1 probe delivery; success -> closed, fail -> open again with longer period. Attempts open state mein consume nahi hote (deliveries bas wait karti hain).\n\nAuto-disable phir bhi rakhenge -- lekin time-based (failing > 3 days) aur customer notification ke saath. Yeh sab `SYSTEM_DESIGN.md` \"Slow customers\" row mein planned hai; implement nahi.",
+  "why_needed": "Multi-tenant reliability ka core pattern; senior design question.",
+  "real_world_analogy": "Bijli ka MCB: short circuit pe trip (open), thodi der baad ek baar test (half-open), theek hai toh wapas on. Aur har flat ka alag MCB (bulkhead) taaki ek flat ki problem poori building ki light na kaate.",
+  "how_it_works": "Bulkhead = per-endpoint in-flight cap (lease-based Redis set). Breaker = failure window -> open (skip claims) -> half-open probe -> closed.",
+  "in_this_project": "Abhi: per-endpoint token bucket (`services/ratelimit.py`), auto-disable (`RECORD_SQL`), timeouts. Planned: `SYSTEM_DESIGN.md` 'Slow customers: per-endpoint concurrency caps + circuit breaker (open after failures, half-open probe)'.",
+  "implementation_files": [
+   "projects/04-webhooks/SYSTEM_DESIGN.md",
+   "projects/04-webhooks/webhooks/services/ratelimit.py::EndpointRateLimiter",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL"
+  ],
+  "code_example": "-- illustrative bulkhead Lua (NOT in this repo)\n-- KEYS[1] = wh:inflight:{ep}; ARGV = now_ms, lease_ms, cap, delivery_id\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', ARGV[1])\nif redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[3]) then return 0 end\nredis.call('ZADD', KEYS[1], ARGV[1] + ARGV[2], ARGV[4])\nredis.call('PEXPIRE', KEYS[1], ARGV[2])\nreturn 1",
+  "code_language": "lua",
+  "advantages": [
+   "Slow customers isolated",
+   "Automatic recovery (half-open)",
+   "Attempts not burned while open"
+  ],
+  "disadvantages": [
+   "More per-endpoint state",
+   "Tuning thresholds per traffic level",
+   "Breaker state must be shared across dispatchers"
+  ],
+  "common_mistakes": [
+   "Breaker state in-process only (each dispatcher hammers separately)",
+   "Concurrency cap counter without lease (leaks on crash)"
+  ],
+  "follow_up_questions": [
+   "Where should breaker state live -- DB or Redis?",
+   "How do you choose thresholds for low-traffic endpoints?",
+   "How does the breaker interact with retry schedules?"
+  ],
+  "concepts": [
+   "circuit breaker",
+   "bulkhead",
+   "noisy neighbour",
+   "resilience"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "DB-backed breaker (column) claim query mein filter -- consistent; Redis-backed faster lekin claim ke baad check (wasted claims).",
+   "failure_scenarios": "Breaker flapping (open/close repeatedly) -- hysteresis aur exponential open periods; half-open probe khud slow ho toh lease consider.",
+   "alternatives": "Separate dispatcher pools per tier; per-endpoint queues; adaptive concurrency (AIMD like TCP).",
+   "scale_10x_100x": "100x pe yeh mandatory; per-endpoint state memory/Redis keys = endpoints count -- fine.",
+   "production_improvements": "Breaker state on dashboard, customer notification on open > N minutes, metrics per state transition."
+  }
+ },
+ {
+  "id": "WHK-105",
+  "project_slug": "p04-webhooks",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you make this webhook system highly available across regions?",
+  "answer_hinglish": "Pehle current: single region, single Postgres primary (SPOF), Redis (optional, fail-open), stateless API/dispatchers.\n\nStep 1 -- in-region HA: Postgres with synchronous standby + automatic failover (RDS Multi-AZ / Patroni). Failover ~30-60s; publishers retry with idempotency keys (safe). Dispatchers 2+ AZs mein; Redis with replica (fail-open anyway). NAT gateways per AZ for egress.\n\nStep 2 -- multi-region active-passive: async replica in region B. Region A down -> promote B, DNS/API gateway failover. Risk: async replication lag -> last few seconds ke committed events lose (RPO > 0). Webhooks ke liye matlab promised deliveries kho sakti hain. Mitigation: publishers ke paas bhi retry + idempotency; after failover, reconciliation.\n\nStep 3 -- active-active (bada jump): publishes kisi bhi region mein; har event ki home region (tenant-based sharding -- customer X ka data region A). Dispatchers apni region ke tenants ke liye. Cross-region sirf failover. Global uniqueness: ids already random (`evt_` + 24 hex), collisions negligible; idempotency keys tenant-scoped aur tenant ek region mein pinned.\n\nDuplicates across failover: region A ne send kiya, record replicate nahi hua, B promote hua -> B dobara bhejega -> same webhook-id -> receiver dedupe. At-least-once design multi-region failover ko naturally absorb karta hai -- yeh is architecture ki ek hidden strength hai.\n\nCustomer-facing: static egress IPs per region publish karne honge (customers allow-list both).",
+  "why_needed": "HA/DR design senior interviews mein expected; at-least-once ka failover ke saath interplay key insight.",
+  "real_world_analogy": "Bank branch ka backup branch doosre shehar mein: main branch band toh backup khulta hai, lekin aakhri kuch minutes ki entries shayad sync nahi hui -- isliye receipts (idempotency keys) customer ke paas bhi hain.",
+  "how_it_works": "HA = redundancy + failover; RPO/RTO trade; tenant-pinned active-active avoids multi-master conflicts; at-least-once + dedupe tolerates failover duplicates.",
+  "in_this_project": "Abhi single-region compose setup (`docker-compose.yml`), stateless dispatchers (`Dispatcher`), idempotent publish (`publish`), stable webhook-id. Multi-region implement nahi; `SECURITY.md` static egress IPs gap.",
+  "implementation_files": [
+   "projects/04-webhooks/docker-compose.yml",
+   "projects/04-webhooks/webhooks/services/events.py::publish",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::Dispatcher",
+   "projects/04-webhooks/SECURITY.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Stateless workers make regional failover easy",
+   "At-least-once absorbs failover duplicates",
+   "Idempotent publish makes client retries safe"
+  ],
+  "disadvantages": [
+   "Async replication RPO > 0",
+   "Active-active needs tenant sharding",
+   "Egress IPs per region"
+  ],
+  "common_mistakes": [
+   "Multi-master Postgres for a queue",
+   "Failover ke baad duplicates ko bug samajhna"
+  ],
+  "follow_up_questions": [
+   "What RPO is acceptable for webhook events?",
+   "How do you reconcile events lost in async replication?",
+   "Why pin tenants to a home region?"
+  ],
+  "concepts": [
+   "high availability",
+   "disaster recovery",
+   "multi-region",
+   "RPO/RTO"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Sync replication RPO 0 lekin publish latency + cross-region; async low latency lekin data loss window.",
+   "failure_scenarios": "Split brain (dono regions primary) -> double deliveries aur divergent state; fencing at DB level (Patroni with DCS).",
+   "alternatives": "Managed global DBs (Aurora Global, Spanner, CockroachDB); Kafka MirrorMaker for queue replication.",
+   "scale_10x_100x": "100x + multi-region = cell architecture: har cell independent stack, tenants assigned to cells.",
+   "production_improvements": "Regular failover drills, RPO/RTO documented, reconciliation job comparing publisher records vs events."
+  }
+ },
+ {
+  "id": "WHK-106",
+  "project_slug": "p04-webhooks",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How do you ensure fairness so one huge customer's backlog doesn't starve everyone else?",
+  "answer_hinglish": "Current claim: `ORDER BY next_attempt_at LIMIT 20` -- global FIFO by due time. Agar customer A ne 1 million events publish kiye (bulk import), toh unki 1M deliveries due hain aur sabse purani. Customer B ka naya event 1M rows ke peeche hai -- B ko ghanton wait (starvation), chahe dispatchers B ke liye idle capacity rakhte. Per-endpoint rate limit A ko slow karta hai, lekin claim slots phir bhi A ki rows se bharte hain aur refund churn hota hai (dekho WHK-063).\n\nFair scheduling options:\n\n1. Per-endpoint round robin in claim: window function se har endpoint ki top-k due rows (`row_number() OVER (PARTITION BY endpoint_id ORDER BY next_attempt_at) <= k`). SKIP LOCKED window ke saath directly nahi chalta -- two-phase: pehle candidate ids window se, phir `WHERE id = ANY(...) FOR UPDATE SKIP LOCKED`.\n\n2. Two-level queue: `endpoint_queue` table (ek row per endpoint with pending work, `next_ready_at`); dispatcher pehle endpoint claim kare (SKIP LOCKED on endpoints), phir us endpoint ki k deliveries. Endpoints rotate -- har endpoint ko fair share. Yeh per-tenant scheduling ka classic pattern hai (aur bulkhead naturally).\n\n3. Weighted fair queuing: plans ke hisaab se weights (enterprise > free).\n\n4. Separate pools: bulk imports ek \"bulk\" priority/lane mein, realtime events alag -- priority column + separate dispatcher pool.\n\nKafka world mein: partition by endpoint aur consumer per partition -- natural fairness, lekin hot partitions.\n\nIs project mein yeh implement nahi; mention karna ki global FIFO + rate limit sirf small multi-tenant scale tak theek hai.",
+  "why_needed": "Multi-tenant queues mein fairness ek first-class requirement hai, warna ek customer sabka SLO tod deta hai.",
+  "real_world_analogy": "Bank mein ek corporate client 500 cheques le aaya; agar ek hi line hai toh baaki sab ghanton wait. Fair system: har customer ko round-robin turn, ya corporate ke liye alag counter.",
+  "how_it_works": "Global FIFO -> starvation under skew. Fair: per-tenant round robin / two-level queues / weighted fair queuing / priority lanes.",
+  "in_this_project": "`dispatcher.py::CLAIM_SQL` (`ORDER BY d2.next_attempt_at LIMIT :batch`), `services/ratelimit.py` (per-endpoint rate only), `Dispatcher._reschedule_without_attempt`. Fair scheduling implement nahi.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/04-webhooks/webhooks/services/ratelimit.py::EndpointRateLimiter",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_reschedule_without_attempt",
+   "projects/04-webhooks/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- illustrative two-phase fair claim (NOT in this repo)\nWITH candidates AS (\n  SELECT id FROM (\n    SELECT d.id, row_number() OVER (PARTITION BY d.endpoint_id ORDER BY d.next_attempt_at) rn\n      FROM deliveries d JOIN endpoints e ON e.id = d.endpoint_id AND e.enabled\n     WHERE d.status = 'pending' AND d.next_attempt_at <= now()) x\n   WHERE rn <= 2 LIMIT 200)\nSELECT d.id FROM deliveries d WHERE d.id IN (SELECT id FROM candidates)\n LIMIT :batch FOR UPDATE SKIP LOCKED;",
+  "code_language": "sql",
+  "advantages": [
+   "Prevents starvation",
+   "Natural bulkhead per endpoint"
+  ],
+  "disadvantages": [
+   "More complex/expensive claim",
+   "Window over all due rows can be heavy with huge backlogs"
+  ],
+  "common_mistakes": [
+   "Rate limit ko fairness samajhna",
+   "Priority without aging (low priority starves forever)"
+  ],
+  "follow_up_questions": [
+   "How would the two-level queue handle lease and crash recovery?",
+   "Weighted fairness by plan -- how?",
+   "How does Kafka partitioning give fairness?"
+  ],
+  "concepts": [
+   "fair scheduling",
+   "multi-tenancy",
+   "starvation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fair claim CPU/DB cost badhata hai; global FIFO cheap lekin unfair. Two-level queue best balance lekin naya table aur invariants.",
+   "failure_scenarios": "Window query on 1M due rows har claim pe -- DB CPU spike; candidate sampling ya endpoint_queue table zaroori.",
+   "alternatives": "Per-endpoint queues in Redis/Kafka; DRR (deficit round robin) scheduler service; separate bulk lane.",
+   "scale_10x_100x": "Bade multi-tenant scale pe fairness + bulkheads + cells -- sab saath.",
+   "production_improvements": "Per-tenant lag metrics, starvation alerts (any endpoint oldest due > X while others flowing)."
+  }
+ },
+ {
+  "id": "WHK-107",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: write a test proving that two concurrent publishes with the same idempotency key create exactly one event and one set of deliveries.",
+  "answer_hinglish": "Repo mein sequential idempotency test hai (`test_publish_idempotency_key`), lekin concurrent race ka test nahi -- jabki `publish` ka \"lost a race\" branch specifically uske liye hai. Test likhne ka plan:\n\n1. Ek endpoint add karo (`add_endpoint`).\n2. Do alag sessions/transactions mein ek saath `publish` chalao same key ke saath -- `asyncio.gather` with `emit(sm, key=\"k-race\")` do baar. Har `emit` apna `sm()` session aur `s.begin()` kholta hai, toh do real concurrent DB transactions hain.\n3. Assert: dono ne same event id return kiya; exactly ek ne `created=True`; DB mein events count 1 aur deliveries count 1.\n\nRace actually hit ho, iske liye: dono pehle fast-path SELECT mein \"nahi mila\" dekhein -- concurrency se usually hota hai, lekin guarantee ke liye loop mein N baar (e.g. 20 different keys) chalao, ya `publish` ke fast path ko monkeypatch karke skip karo taaki dono INSERT tak pahunchein. Monkeypatch version deterministic hai: hum seedha ON CONFLICT path test karte hain.\n\nExpected behaviour: loser ka INSERT winner ke commit tak wait karta hai, phir DO NOTHING -> RETURNING empty -> winner event return with `created=False` aur deliveries 0 (yeh response count wala minor gap test mein document kar sakte ho).",
+  "why_needed": "Race-handling code bina concurrent test ke untested hai.",
+  "real_world_analogy": "Do log ek hi seat ek saath book karne ka 'mock drill' -- dekhna ki system ne sach mein ek hi booking banayi.",
+  "how_it_works": "gather two publishes in separate transactions; DB unique index arbitrates; assert single event and single delivery set.",
+  "in_this_project": "`services/events.py::publish` race branch, `tests/helpers.py::emit` (har call apna session), `tests/test_publish_api.py` mein naya test add hoga, fixtures `sm` from `conftest.py`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/events.py::publish",
+   "projects/04-webhooks/tests/helpers.py::emit",
+   "projects/04-webhooks/tests/test_publish_api.py::test_publish_idempotency_key",
+   "projects/04-webhooks/tests/conftest.py::sm"
+  ],
+  "code_example": "# solution (new test for tests/test_publish_api.py)\nimport asyncio\nfrom sqlalchemy import func, select\nfrom webhooks.db.models import Delivery, Event\nfrom .helpers import add_endpoint, emit\n\nasync def test_concurrent_publish_same_key_creates_one_event(sm):\n    await add_endpoint(sm)\n    for i in range(20):                                   # repeat to make the race likely\n        key = f\"race-{i}\"\n        (a, _, ca), (b, _, cb) = await asyncio.gather(emit(sm, key=key), emit(sm, key=key))\n        assert a == b and sorted([ca, cb]) == [False, True]\n    async with sm() as s:\n        assert await s.scalar(select(func.count()).select_from(Event)) == 20\n        assert await s.scalar(select(func.count()).select_from(Delivery)) == 20   # 1 endpoint x 20 events",
+  "code_language": "python",
+  "advantages": [
+   "Exercises the ON CONFLICT path",
+   "Uses real Postgres concurrency"
+  ],
+  "disadvantages": [
+   "Race not guaranteed every iteration without monkeypatching"
+  ],
+  "common_mistakes": [
+   "Ek hi session mein dono publishes chalana (no real concurrency)",
+   "Sirf event count assert karna, deliveries nahi"
+  ],
+  "follow_up_questions": [
+   "How would you force both requests past the fast-path SELECT deterministically?",
+   "What does the loser see if the winner rolls back?",
+   "Should the loser return the real delivery count?"
+  ],
+  "concepts": [
+   "testing",
+   "concurrency",
+   "idempotency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-108",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Beginner",
+  "question": "Coding exercise: extend _retry_after to support the HTTP-date form (the 24h cap is already in the repo).",
+  "answer_hinglish": "Abhi `_retry_after` sirf seconds parse karta hai; HTTP-date (`Wed, 21 Oct 2026 07:28:00 GMT`) pe None return karta hai (README limitation). Upper cap review fix mein already aa chuka hai: `MAX_RETRY_AFTER_SECONDS = 24 * 3600` (`test_retry_after_is_capped`) -- warna `Retry-After: 99999999` delivery ko saalon door schedule kar deta.\n\nPlan: (1) Pehle float try karo (existing behaviour). (2) Fail ho toh `email.utils.parsedate_to_datetime(raw)` -- stdlib function jo RFC 7231 HTTP-date parse karta hai aur timezone-aware datetime deta hai. Delay = `date - now`, minimum 0. (3) Dono cases mein existing `MAX_RETRY_AFTER_SECONDS` cap reuse karo. (4) NaN/inf guard: `math.isfinite`. (5) Unparseable -> None (schedule fallback).\n\n`now` ko parameter banana testability ke liye achha hai (signing.verify jaisa pattern). Tests: seconds, date in future, date in past (0), garbage (None), huge value (capped), \"inf\" (None).\n\nNote: `_next_delay` already `max(schedule_delay, retry_after)` karta hai sirf 429/503 pe -- woh logic same rahega.",
+  "why_needed": "Spec compliance aur defensive parsing -- external input ko trust nahi karna.",
+  "real_world_analogy": "Dukan pe board 'kal 10 baje khulega' (date) ya '2 ghante mein aate hain' (seconds) -- dono samajhne chahiye, aur 'agle saal aana' jaisa board ignore karke apna plan chalao (cap).",
+  "how_it_works": "float -> else parsedate_to_datetime -> delta -> clamp [0, cap]; non-finite or unparseable -> None.",
+  "in_this_project": "`webhooks/dispatcher/dispatcher.py::_retry_after` (current: seconds + 24h cap), `MAX_RETRY_AFTER_SECONDS`, test `test_retry_after_is_capped`, `_next_delay` (consumer), test style `tests/test_dispatcher.py::test_429_retry_after_is_honoured`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_retry_after",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_next_delay",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_429_retry_after_is_honoured",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_retry_after_is_capped"
+  ],
+  "code_example": "# solution: drop-in replacement for _retry_after\nimport math\nfrom datetime import datetime, timezone\nfrom email.utils import parsedate_to_datetime\n\n# MAX_RETRY_AFTER_SECONDS = 24 * 3600 already exists in dispatcher.py\n\ndef _retry_after(resp: httpx.Response, now: datetime | None = None) -> float | None:\n    raw = resp.headers.get(\"retry-after\")\n    if raw is None:\n        return None\n    try:\n        delay = float(raw)\n    except ValueError:\n        try:\n            when = parsedate_to_datetime(raw)\n        except (TypeError, ValueError):\n            return None\n        if when.tzinfo is None:\n            when = when.replace(tzinfo=timezone.utc)\n        delay = (when - (now or datetime.now(timezone.utc))).total_seconds()\n    if not math.isfinite(delay):\n        return None\n    return min(max(delay, 0.0), MAX_RETRY_AFTER_SECONDS)\n\n# tests (illustrative)\ndef test_retry_after_forms():\n    now = datetime(2026, 11, 16, 12, 0, tzinfo=timezone.utc)\n    r = lambda v: httpx.Response(429, headers={\"retry-after\": v})\n    assert _retry_after(r(\"120\"), now) == 120\n    assert _retry_after(r(\"Mon, 16 Nov 2026 12:02:00 GMT\"), now) == 120\n    assert _retry_after(r(\"Mon, 16 Nov 2026 11:00:00 GMT\"), now) == 0\n    assert _retry_after(r(\"99999999\"), now) == 24 * 3600\n    assert _retry_after(r(\"inf\"), now) is None and _retry_after(r(\"soon\"), now) is None",
+  "code_language": "python",
+  "advantages": [
+   "Spec-complete",
+   "Bounded delays",
+   "Testable via now"
+  ],
+  "disadvantages": [
+   "Slightly more code on the hot path (only on non-2xx)"
+  ],
+  "common_mistakes": [
+   "Naive datetime compare (TypeError)",
+   "Cap bhool jaana",
+   "float('inf') accept karna"
+  ],
+  "follow_up_questions": [
+   "Why cap Retry-After at all?",
+   "Should the cap be per endpoint?",
+   "Where else should external numeric input be clamped?"
+  ],
+  "concepts": [
+   "HTTP",
+   "parsing",
+   "defensive programming"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-109",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: implement a TypeScript (Express) receiver that verifies these webhooks correctly.",
+  "answer_hinglish": "Customers aksar Node use karte hain, toh reference verifier dena useful hai. Requirements wahi jo `signing.verify` karta hai: raw body, `whsec_` prefix strip + base64 decode key, signed content `${id}.${ts}.${body}`, multiple `v1,` signatures, constant-time compare, 5-minute tolerance, aur dedupe on webhook-id.\n\nKey Express gotcha: `express.json()` body parse karke raw bytes kho deta hai. Isliye is route pe `express.raw({ type: \"application/json\" })` use karo -- `req.body` Buffer milega. Verify ke baad hi `JSON.parse`.\n\nConstant-time: Node ka `crypto.timingSafeEqual` -- lekin yeh unequal lengths pe throw karta hai, toh pehle length check (length leak acceptable -- signature length public hai).\n\nDedupe: demo ke liye Set; production mein DB table with unique constraint, business write ke same transaction mein.\n\nResponse: verify fail -> 401; duplicate -> 200; success -> 200 jaldi, heavy kaam queue mein.\n\nIs solution ko main reference vector (`test_standard_webhooks_reference_vector` ke values) se validate karunga -- same secret, id, timestamp, body pe exactly `v1,g0hM9SsE+OTPJTGt/tmIKtSyZlE3uFJELVlNIOLJ1OE=` aana chahiye.",
+  "why_needed": "Customers ke language mein correct verifier dena integration failures kam karta hai.",
+  "real_world_analogy": "Same taala, alag chaabi banane wala -- design (spec) same follow kiya toh chaabi kaam karegi; test vector woh master taala hai jispe har nayi chaabi try karte hain.",
+  "how_it_works": "Raw Buffer -> headers -> tolerance -> HMAC-SHA256(base64decode(secret sans prefix), id.ts.body) -> base64 -> timingSafeEqual against each v1 sig -> dedupe.",
+  "in_this_project": "Python equivalent: `services/signing.py::verify` aur `receiver/app.py`. Reference vector `tests/test_signing_ssrf.py::test_standard_webhooks_reference_vector`. Customer contract `API_DOCUMENTATION.md`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/signing.py::verify",
+   "projects/04-webhooks/webhooks/receiver/app.py::webhook",
+   "projects/04-webhooks/tests/test_signing_ssrf.py::test_standard_webhooks_reference_vector",
+   "projects/04-webhooks/API_DOCUMENTATION.md"
+  ],
+  "code_example": "// solution: receiver.ts\nimport express from \"express\";\nimport crypto from \"node:crypto\";\n\nconst SECRETS = (process.env.WEBHOOK_SECRETS ?? \"\").split(\",\").filter(Boolean);\nconst TOLERANCE_S = 300;\nconst seen = new Set<string>();              // demo only; use a DB unique constraint in production\n\nfunction sign(secret: string, id: string, ts: string, body: Buffer): Buffer {\n  const key = Buffer.from(secret.replace(/^whsec_/, \"\"), \"base64\");\n  return crypto.createHmac(\"sha256\", key).update(`${id}.${ts}.`).update(body).digest();\n}\n\nexport function verify(headers: Record<string, string | undefined>, body: Buffer, now = Date.now() / 1000) {\n  const id = headers[\"webhook-id\"], ts = headers[\"webhook-timestamp\"], sigs = headers[\"webhook-signature\"];\n  if (!id || !ts || !sigs) throw new Error(\"missing webhook headers\");\n  if (!/^\\d+$/.test(ts) || Math.abs(now - Number(ts)) > TOLERANCE_S) throw new Error(\"timestamp outside tolerance\");\n  const provided = sigs.split(\" \").filter(s => s.startsWith(\"v1,\")).map(s => Buffer.from(s.slice(3), \"base64\"));\n  for (const secret of SECRETS) {\n    const expected = sign(secret, id, ts, body);\n    if (provided.some(p => p.length === expected.length && crypto.timingSafeEqual(p, expected))) return id;\n  }\n  throw new Error(\"no matching signature\");\n}\n\nconst app = express();\napp.post(\"/webhook\", express.raw({ type: \"application/json\" }), (req, res) => {\n  let id: string;\n  try { id = verify(req.headers as Record<string, string>, req.body as Buffer); }\n  catch (e) { return res.status(401).send(String(e)); }\n  if (seen.has(id)) return res.status(200).send(\"duplicate ignored\");\n  seen.add(id);\n  const event = JSON.parse((req.body as Buffer).toString(\"utf8\"));   // parse only AFTER verifying\n  queueForProcessing(event);                                           // do slow work async\n  res.status(200).send(\"ok\");\n});\ndeclare function queueForProcessing(e: unknown): void;",
+  "code_language": "typescript",
+  "advantages": [
+   "Mirrors the Python verifier exactly",
+   "Handles rotation (multiple sigs and secrets)",
+   "Raw-body correct"
+  ],
+  "disadvantages": [
+   "In-memory dedupe for demo",
+   "Error text returned to caller"
+  ],
+  "common_mistakes": [
+   "express.json() before verification",
+   "timingSafeEqual on unequal lengths (throws)",
+   "Using the whsec_ string itself as the key"
+  ],
+  "follow_up_questions": [
+   "How would you validate this against the reference vector?",
+   "How do you get raw body in Next.js API routes?",
+   "Where should the dedupe record be written?"
+  ],
+  "concepts": [
+   "TypeScript",
+   "signature verification",
+   "Express"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "WHK-110",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Coding exercise: write a retention job that deletes delivery_attempts older than N days in batches without hurting the queue.",
+  "answer_hinglish": "Requirement: purane attempt logs delete karo (README limitation: never pruned), lekin ek giant `DELETE` mat chalao -- woh lamba transaction hoga, WAL spike, replication lag, aur vacuum horizon rok dega jisse queue table bloat. Batched delete chahiye.\n\nDesign: loop -- `DELETE FROM delivery_attempts WHERE id IN (SELECT id FROM delivery_attempts WHERE started_at < cutoff ORDER BY id LIMIT :batch) RETURNING 1` -- har batch apna short transaction, commit, phir chhota sleep (throttle) taaki IO queue latency ko na maare. Rowcount 0 -> done. `started_at` pe index chahiye (abhi sirf `delivery_id` index hai) -- warna har batch seq scan. Alternative: `id` monotonic hai aur started_at ke saath roughly correlated, toh pehle cutoff id dhoondo (`max(id) WHERE started_at < cutoff` -- ek baar) aur phir `id <= cutoff_id` batches by id range -- PK index use hota hai, extra index nahi chahiye.\n\nSafety: `SET LOCAL statement_timeout` per batch; `lock_timeout`; metrics (deleted count, duration). Run as cron / one-shot container (same image, like `migrate`).\n\nLong term better: monthly partitions aur `DROP TABLE` (WHK-054). Batched delete partitioning ke pehle ka practical step hai. Terminal `deliveries` aur `events` ke liye bhi same pattern -- lekin cascade FKs dhyan: event delete cascade deliveries aur attempts -- children pehle delete karna sasta.",
+  "why_needed": "Retention without outages -- real production chore jo interview mein practical skill dikhata hai.",
+  "real_world_analogy": "Godown saaf karna: ek din mein poora godown khaali karoge toh gate block aur trucks ruk jaayenge; roz thoda thoda hatao jab traffic kam ho.",
+  "how_it_works": "Find cutoff id once -> loop DELETE ... WHERE id <= cutoff ORDER BY id LIMIT batch -> commit -> sleep -> until 0 rows.",
+  "in_this_project": "Table `db/models.py::DeliveryAttempt` (id BIGINT autoincrement, started_at, delivery_id index), session helpers `db/session.py`, `DEPLOYMENT.md` item 4 retention. Job repo mein nahi hai -- yeh solution naya file hoga (e.g. `webhooks/retention.py`).",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/db/models.py::DeliveryAttempt",
+   "projects/04-webhooks/webhooks/db/session.py::make_sessionmaker",
+   "projects/04-webhooks/DEPLOYMENT.md",
+   "projects/04-webhooks/README.md"
+  ],
+  "code_example": "# solution: webhooks/retention.py (new)\nimport asyncio\nfrom datetime import datetime, timedelta, timezone\nfrom sqlalchemy import text\n\nFIND_CUTOFF = text(\"SELECT max(id) FROM delivery_attempts WHERE started_at < :cutoff\")\nDELETE_BATCH = text(\"\"\"\nDELETE FROM delivery_attempts\n WHERE id IN (SELECT id FROM delivery_attempts WHERE id <= :max_id ORDER BY id LIMIT :batch)\n\"\"\")\n\nasync def prune_attempts(sm, days: int, batch: int = 5000, pause_s: float = 0.2) -> int:\n    cutoff = datetime.now(timezone.utc) - timedelta(days=days)\n    async with sm() as s:\n        max_id = await s.scalar(FIND_CUTOFF, {\"cutoff\": cutoff})\n    if max_id is None:\n        return 0\n    total = 0\n    while True:\n        async with sm() as s, s.begin():                   # one short transaction per batch\n            await s.execute(text(\"SET LOCAL statement_timeout = '5s'\"))\n            n = (await s.execute(DELETE_BATCH, {\"max_id\": max_id, \"batch\": batch})).rowcount\n        total += n\n        if n == 0:\n            return total\n        await asyncio.sleep(pause_s)                       # throttle: leave IO for the queue",
+  "code_language": "python",
+  "advantages": [
+   "Short transactions, no vacuum horizon hold",
+   "Uses PK index, no new index needed",
+   "Throttled"
+  ],
+  "disadvantages": [
+   "Still generates dead tuples and WAL (vacuum must follow)",
+   "One-time max(id) scan on started_at without index"
+  ],
+  "common_mistakes": [
+   "Single huge DELETE",
+   "Deleting by started_at without an index (seq scan per batch)",
+   "Running at peak hours without throttle"
+  ],
+  "follow_up_questions": [
+   "Why is id-range deletion cheaper than started_at filtering?",
+   "How would partitioning change this job?",
+   "How do you delete events with cascading children efficiently?"
+  ],
+  "concepts": [
+   "retention",
+   "batch processing",
+   "Postgres maintenance"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Batched delete simple aur abhi possible; partition drop O(1) lekin schema change. Long term partition.",
+   "failure_scenarios": "Job crash mid-way -- idempotent hai (dobara chalao, wahi se continue). Concurrent job instances -- advisory lock lo taaki ek hi chale.",
+   "alternatives": "pg_partman + DROP; TimescaleDB retention policies; archive to object storage before delete.",
+   "scale_10x_100x": "100M+ rows pe batches hours le sakte hain -- partitioning tab mandatory.",
+   "production_improvements": "Cron schedule off-peak, metrics, advisory lock, followed by VACUUM (autovacuum tuned)."
+  }
+ },
+ {
+  "id": "WHK-111",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Coding exercise: add a per-endpoint concurrency cap (bulkhead) to the dispatcher using Redis.",
+  "answer_hinglish": "Goal: kisi bhi endpoint pe saare dispatchers milke max `cap` concurrent requests (e.g. 5). Rate limit (per second) slow endpoint ke in-flight count ko control nahi karta -- concurrency cap karta hai.\n\nDesign: Redis sorted set `wh:inflight:{endpoint_id}`, member = `delivery_id:attempt`, score = expiry timestamp (ms). Acquire Lua: expired members hatao (crashed dispatcher ke slots apne aap free -- lease idea), `ZCARD >= cap` -> deny, warna `ZADD` + return 1. Release: `ZREM` after send (finally block). Expiry = request timeout + margin (15s) -- send kabhi usse lamba nahi.\n\nDispatcher integration: `deliver()` mein rate limit ke baad `acquire_slot`; deny pe wahi `_reschedule_without_attempt(c, wait_ms=200)` -- attempt refund, kyunki yeh bhi hamari policy hai. Allowed pe `try: send/record finally: release`. Fail-open on RedisError (consistent with rate limiter).\n\nTime: Lua mein `redis.call('TIME')` -- single clock, existing limiter jaisa.\n\nTest: `test_per_endpoint_rate_limit_does_not_burn_attempts` jaisa -- cap 2, MockTransport jo `asyncio.sleep(0.05)` kare aur peak concurrency track kare; assert peak <= 2 aur deferred rows ka `attempts == 0`.",
+  "why_needed": "Noisy-neighbour isolation ka practical implementation.",
+  "real_world_analogy": "Lift mein max 5 log: guard ek register rakhta hai kaun andar hai; koi bahar nikalna bhool gaya (crash) toh 15 minute baad uska naam apne aap kat jaata hai.",
+  "how_it_works": "ZSET of in-flight members with expiry scores; Lua acquire: purge expired, check ZCARD, ZADD; release ZREM; fail-open.",
+  "in_this_project": "Existing pattern `services/ratelimit.py` (`register_script`, fail-open, key naming `wh:rl:`), integration point `Dispatcher.deliver`, refund `Dispatcher._reschedule_without_attempt`, test style `tests/test_dispatcher.py::test_per_endpoint_rate_limit_does_not_burn_attempts`.",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/ratelimit.py::EndpointRateLimiter",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::deliver",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::_reschedule_without_attempt",
+   "projects/04-webhooks/tests/test_dispatcher.py::test_per_endpoint_rate_limit_does_not_burn_attempts"
+  ],
+  "code_example": "# solution: add to webhooks/services/ratelimit.py\n_SLOT_LUA = \"\"\"\nlocal t = redis.call('TIME'); local now = t[1] * 1000 + math.floor(t[2] / 1000)\nredis.call('ZREMRANGEBYSCORE', KEYS[1], '-inf', now)\nif redis.call('ZCARD', KEYS[1]) >= tonumber(ARGV[1]) then return 0 end\nredis.call('ZADD', KEYS[1], now + tonumber(ARGV[2]), ARGV[3])\nredis.call('PEXPIRE', KEYS[1], tonumber(ARGV[2]))\nreturn 1\n\"\"\"\n\nclass EndpointConcurrency:\n    def __init__(self, redis: Redis, cap: int = 5, lease_ms: int = 15000):\n        self._redis, self.cap, self.lease_ms = redis, cap, lease_ms\n        self._script = redis.register_script(_SLOT_LUA)\n\n    async def acquire(self, endpoint_id: str, member: str) -> bool:\n        try:\n            return bool(await self._script(keys=[f\"wh:inflight:{endpoint_id}\"], args=[self.cap, self.lease_ms, member]))\n        except RedisError:\n            return True                                   # fail open, like the rate limiter\n\n    async def release(self, endpoint_id: str, member: str) -> None:\n        try:\n            await self._redis.zrem(f\"wh:inflight:{endpoint_id}\", member)\n        except RedisError:\n            pass                                          # expiry will free the slot\n\n# in Dispatcher.deliver, after the rate-limit check:\n#     member = f\"{c.id}:{c.attempt}\"\n#     if not await self.slots.acquire(c.endpoint_id, member):\n#         return await self._reschedule_without_attempt(c, 200)\n#     try:\n#         result = await self._send(c, body)\n#         return await self._record(c, result)\n#     finally:\n#         await self.slots.release(c.endpoint_id, member)",
+  "code_language": "python",
+  "advantages": [
+   "Bounds in-flight per endpoint across dispatchers",
+   "Crash-safe via expiring members",
+   "Reuses existing patterns"
+  ],
+  "disadvantages": [
+   "Another Redis round trip per delivery",
+   "Deferred rows add claim/refund churn"
+  ],
+  "common_mistakes": [
+   "INCR/DECR counter without expiry (leaks on crash)",
+   "Releasing in the wrong place (before record)"
+  ],
+  "follow_up_questions": [
+   "Why a sorted set instead of INCR/DECR?",
+   "How do you pick cap per endpoint?",
+   "How would you avoid claiming rows that will be deferred?"
+  ],
+  "concepts": [
+   "bulkhead",
+   "Redis Lua",
+   "concurrency control"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "ZSET lease-based slots crash-safe hain lekin extra Redis call; INCR/DECR fast lekin crash pe leak.",
+   "failure_scenarios": "Redis failover -> slots reset -> momentary over-cap; acceptable. Clock is Redis TIME so no skew.",
+   "alternatives": "Per-endpoint semaphores in Postgres (advisory locks per endpoint with slot numbers); per-endpoint queues with fixed consumers.",
+   "scale_10x_100x": "Bade scale pe cap ko adaptive banana (AIMD based on latency/errors).",
+   "production_improvements": "Per-endpoint cap configurable in endpoints table, metrics on deferrals, combine with breaker."
+  }
+ },
+ {
+  "id": "WHK-112",
+  "project_slug": "p04-webhooks",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: write a test for POST /deliveries/{id}/retry covering dead -> requeued and in_flight -> 409.",
+  "answer_hinglish": "Route behaviour: sirf `dead` ya `succeeded` deliveries ko `pending, attempts=0, next_attempt_at=now(), last_error=None` karta hai; baaki (pending/in_flight/not found) pe 409 Conflict. Existing `test_api_flow` sirf pending -> 409 cover karta hai. Main teen cases test karunga: dead -> 200 `requeued: true` aur row pending; in_flight -> 409; non-existent id -> 409.\n\nSetup: `api()` context manager (test_publish_api.py mein) real app create karta hai ASGI transport ke saath. Endpoint aur event `add_endpoint`/`emit` helpers se. Delivery ko dead banane ke liye seedha DB update (fast-forward, jaise `make_all_due` karta hai) -- ya MockTransport 500 ke saath drain. Direct update simpler aur test ka focus route pe rehta hai.\n\nPhir dispatcher se end-to-end bhi verify kar sakte ho: requeue ke baad `run_once` deliver kare aur receiver pe duplicate count -- woh `test_receiver_dedupes_replayed_delivery` already karta hai, toh yahan sirf API contract.",
+  "why_needed": "Replay API ops ka critical tool hai; uska contract test hona chahiye.",
+  "real_world_analogy": "Returned parcel ko 'dobara bhejo' button: sirf returned (dead) parcels pe kaam kare, jo raste mein hai (in_flight) uspe nahi.",
+  "how_it_works": "Arrange state via DB update -> call API -> assert status code + DB state.",
+  "in_this_project": "`webhooks/api/routes.py::retry_delivery`, `tests/test_publish_api.py::api` context manager aur `AUTH`, `tests/helpers.py` (`add_endpoint`, `emit`, `deliveries`).",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/api/routes.py::retry_delivery",
+   "projects/04-webhooks/tests/test_publish_api.py::api",
+   "projects/04-webhooks/tests/helpers.py::deliveries",
+   "projects/04-webhooks/tests/helpers.py::add_endpoint"
+  ],
+  "code_example": "# solution: add to tests/test_publish_api.py\nfrom sqlalchemy import update\nfrom webhooks.db.models import Delivery\nfrom .helpers import deliveries\n\nasync def test_retry_endpoint_requeues_dead_and_rejects_in_flight(sm):\n    await add_endpoint(sm)\n    await emit(sm)\n    await emit(sm)\n    d1, d2 = await deliveries(sm)\n    async with sm() as s, s.begin():\n        await s.execute(update(Delivery).where(Delivery.id == d1.id)\n                        .values(status=\"dead\", attempts=9, last_error=\"HTTP 500\"))\n        await s.execute(update(Delivery).where(Delivery.id == d2.id).values(status=\"in_flight\", attempts=1))\n    async with api() as c:\n        r = await c.post(f\"/deliveries/{d1.id}/retry\", headers=AUTH)\n        assert r.status_code == 200 and r.json() == {\"requeued\": True}\n        assert (await c.post(f\"/deliveries/{d2.id}/retry\", headers=AUTH)).status_code == 409\n        assert (await c.post(\"/deliveries/999999/retry\", headers=AUTH)).status_code == 409\n    row = (await deliveries(sm))[0]\n    assert row.status == \"pending\" and row.attempts == 0 and row.last_error is None",
+  "code_language": "python",
+  "advantages": [
+   "Covers success and both rejection paths",
+   "Uses real app + DB"
+  ],
+  "disadvantages": [
+   "Arranges state via direct DB writes (bypasses dispatcher)"
+  ],
+  "common_mistakes": [
+   "Sirf status code assert karna, DB state nahi",
+   "Test order pe depend karna (fixture truncate karta hai, theek)"
+  ],
+  "follow_up_questions": [
+   "Should not-found be 404 instead of 409?",
+   "Should retry of a succeeded delivery require a confirmation flag?",
+   "How would you test replay-dead?"
+  ],
+  "concepts": [
+   "API testing",
+   "replay",
+   "pytest"
+  ],
+  "advanced": null
+ }
+]

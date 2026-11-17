@@ -1,0 +1,1077 @@
+[
+ {
+  "id": "MRDS-065",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "The minidis process crashes. What data is lost under appendfsync always, everysec, and no -- and why exactly?",
+  "answer_hinglish": "Pehle do layers samjho: `flush()` data ko Python buffer se OS page cache mein bhejta hai; `fsync()` OS ko force karta hai ki disk pe likhe. Process crash (kill -9, exception) aur machine crash (power loss, kernel panic) alag hain.\n\n`always`: `_handle_client` batch ke end pe `aof.fsync()` karta hai aur uske baad hi reply bhejta hai. Toh jo bhi write client ko acknowledge hua, woh disk pe hai -- process crash ho ya power jaye, kuch acknowledged nahi khota. Sirf woh batch jo fsync se pehle crash hua, uske replies kabhi gaye hi nahi (client retry karega). FAILURE_SCENARIOS #1, `test_aof_restart_without_snapshot[always]`.\n\n`everysec`: har batch pe sirf `flush()` (OS tak), aur cron har >= 1s pe `fsync_in_thread()`. Process crash: data OS page cache mein hai, OS usse disk pe likh dega -- practically kuch nahi khota. Machine crash: last fsync ke baad ka ~1s (thoda zyada bhi, agar fsync slow ho) acknowledged data lose.\n\n`no`: har batch pe `flush()`, fsync kabhi explicitly nahi (sirf shutdown pe `close()` mein). Process crash: OS cache se disk pe jayega, theek. Machine crash: jo OS ne flush nahi kiya -- SYSTEM_DESIGN.md ke hisaab se Linux pe typically ~30s tak.\n\nSnapshot-only (AOF off): last snapshot ke baad ka sab, chahe process crash ho ya machine.\n\nInterview line: \"Process crash aur power loss ko alag karo; fsync sirf power loss ke against matter karta hai, flush process crash ke against.\"",
+  "why_needed": "Durability claims ko precisely bolna (kaunsa failure, kitna loss) senior signal hai; 'AOF hai toh safe' vague hai.",
+  "real_world_analogy": "Diary mein likha (flush) lekin almaari mein lock nahi kiya (fsync): agar sirf tum behosh hue (process crash) toh diary table pe safe hai; ghar jal gaya (power loss) toh gayi.",
+  "how_it_works": "Python buffer -> flush -> OS page cache -> fsync -> disk. Policy decide karti hai kab fsync aur kya reply usse pehle wait karta hai.",
+  "in_this_project": "`server.py::_handle_client` (always -> fsync, else flush), `_cron` (everysec fsync_in_thread), `persistence/aof.py::flush`, `fsync`, `close`. Test parametrized over `[\"always\", \"everysec\", \"no\"]` -- lekin yeh graceful stop hai, process crash nahi, toh teeno pass karte hain.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/aof.py::fsync",
+   "projects/02-mini-redis/minidis/server.py::_cron",
+   "projects/02-mini-redis/tests/test_persistence.py::test_aof_restart_without_snapshot",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Operator ko clear choice",
+   "always: zero acknowledged loss"
+  ],
+  "disadvantages": [
+   "always: fsync latency every batch",
+   "everysec/no: power loss pe loss"
+  ],
+  "common_mistakes": [
+   "flush ko durable samajhna",
+   "Test pass hone ko crash-durability proof samajhna (test graceful shutdown karta hai)",
+   "Process crash aur power loss ko same treat karna"
+  ],
+  "follow_up_questions": [
+   "Real power-loss test kaise karoge?",
+   "fsync bhi jhooth bol sakta hai (disk cache) -- kya karoge?",
+   "everysec mein fsync slow ho toh loss window kitni badi?"
+  ],
+  "concepts": [
+   "fsync",
+   "crash recovery",
+   "durability"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-066",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens if minidis crashes or the disk fills up while writing a snapshot? Is write_atomic fully crash-safe?",
+  "answer_hinglish": "`snapshot.write_atomic(path, data)`: pehle `dump.mdb.tmp` mein likho, `flush()`, `os.fsync()`, phir `os.replace(tmp, path)`. `os.replace` same volume pe atomic rename hai (POSIX aur Windows dono) -- koi bhi observer ya toh puri purani file dekhega ya puri nayi, aadhi kabhi nahi.\n\nFailure cases:\n- Crash/disk full temp likhte waqt: exception ya process death, `dump.mdb` ko touch hi nahi kiya -- purani file intact. Ek adhoori `.tmp` file pad sakti hai (agli successful save use overwrite kar degi).\n- `os.replace` fail ho: `test_snapshot_atomic_write_keeps_old_file_on_failure` `os.replace` ko monkeypatch karke `OSError(\"disk full\")` raise karta hai aur check karta hai ki `dump.mdb` abhi bhi `OLD` hai.\n- BGSAVE mein failure: thread exception `_write` mein catch, `last_bgsave_ok = False`, INFO `rdb_last_bgsave_status:err`, dirty counter reset nahi hota (taaki agli save phir try kare).\n\nFully crash-safe? Ek gap hai (code padh ke): POSIX pe rename ke baad parent directory ka fsync nahi hota. Power loss rename ke turant baad hua toh filesystem ke journal ke hisaab se rename khud lost ho sakta hai -- purani file wapas dikhegi. Yeh corruption nahi hai (purani consistent file), lekin \"SAVE ne OK bola aur snapshot purana nikla\". Fix: `os.open(dir, O_RDONLY)` + `os.fsync(dirfd)` (Linux pe; Windows pe yeh API alag hai). Same baat AOF rewrite ke `os.replace` pe bhi lagti hai.\n\nPlus, load side pe CRC32 kisi bhi residual corruption ko pakad leta hai.",
+  "why_needed": "Atomic file replacement har persistence system ka building block hai; iski subtle gaps (directory fsync) senior interviews mein poochi jaati hain.",
+  "real_world_analogy": "Jaise nayi chaabi banwa ke pehle test karo, phir purani taale mein lagao -- beech mein koi gadbad ho toh purani chaabi kaam karti rahe.",
+  "how_it_works": "Write temp -> fsync temp (data durable) -> rename (atomic metadata switch) -> [missing] fsync dir (rename durable).",
+  "in_this_project": "`persistence/snapshot.py::write_atomic` (comment: \"atomic on POSIX and Windows (same volume)\"), `server.py::start_bgsave` / `_snapshot_done`. FAILURE_SCENARIOS #5. Test `test_snapshot_atomic_write_keeps_old_file_on_failure`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::write_atomic",
+   "projects/02-mini-redis/tests/test_persistence.py::test_snapshot_atomic_write_keeps_old_file_on_failure",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: minidis/persistence/snapshot.py\ndef write_atomic(path: Path, data: bytes) -> None:\n    tmp = path.with_suffix(path.suffix + \".tmp\")\n    with open(tmp, \"wb\") as f:\n        f.write(data)\n        f.flush()\n        os.fsync(f.fileno())\n    os.replace(tmp, path)  # atomic on POSIX and Windows (same volume)",
+  "code_language": "python",
+  "advantages": [
+   "Purani snapshot kabhi corrupt nahi hoti",
+   "Backups ke liye consistent file hamesha",
+   "Simple, standard pattern"
+  ],
+  "disadvantages": [
+   "Directory fsync missing (power loss pe rename lost ho sakta hai)",
+   "Disk pe temporarily 2x space chahiye",
+   "Leftover .tmp files cleanup nahi"
+  ],
+  "common_mistakes": [
+   "Seedha target file pe overwrite karna",
+   "Temp file fsync kiye bina rename",
+   "Temp file alag volume pe (rename atomic nahi, copy ban jaata hai)"
+  ],
+  "follow_up_questions": [
+   "Directory fsync kyun zaroori hai?",
+   "Windows pe rename atomicity ki guarantee kya hai?",
+   "Leftover .tmp ko startup pe kya karoge?"
+  ],
+  "concepts": [
+   "atomic rename",
+   "crash safety",
+   "fsync"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Temp + rename ke liye 2x disk space aur ek extra fsync; badle mein never-corrupt guarantee. In-place update sasta hai lekin crash pe torn file.",
+   "failure_scenarios": "Disk full -> BGSAVE baar baar fail (cron har tick save rules check karta hai aur dirty reset nahi hota) -> log spam aur CPU waste on repeated dumps. Power loss after rename without dir fsync -> stale snapshot.",
+   "alternatives": "Copy-on-write filesystems (ZFS, btrfs) atomic semantics dete hain; databases WAL + checkpoints use karte hain jahan rename ki zaroorat nahi.",
+   "scale_10x_100x": "Bade snapshots pe temp + final dono ka space; disk planning mein 2x snapshot size + AOF.",
+   "production_improvements": "Directory fsync after replace, startup pe stale `.tmp` cleanup, BGSAVE failure backoff, aur `rdb_last_bgsave_status:err` pe alert."
+  }
+ },
+ {
+  "id": "MRDS-067",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens if dump.mdb is corrupted or truncated? Show how the test proves it.",
+  "answer_hinglish": "Snapshot ke end mein CRC32 checksum hai jo baaki saari bytes pe compute hota hai. `snapshot.load` sabse pehle check karta hai: file `MINIDIS\\x01` se shuru hoti hai aur minimum length hai (warna `bad magic / too short`); phir last 4 bytes ko CRC maan ke body ka CRC compute karta hai. Match nahi hua -> `CorruptSnapshot(\"checksum mismatch (truncated or corrupted file)\")`. Data ko `ks` mein daalne se pehle hi yeh check hota hai -- `ks.flush()` CRC verify hone ke baad hi chalta hai, toh corrupt file aadha dataset load nahi karti.\n\nKaunse cases pakde jaate hain: disk bit rot (ek bit flip), truncation (copy beech mein ruki, disk full), galat file. CRC32 accidental corruption ke liye bahut reliable hai (generic fact: saare single-bit aur chhote burst errors detect karta hai), lekin cryptographic nahi -- jaan boojh ke banayi gayi file ko nahi rokta.\n\nStartup pe kya hota hai: `_load_from_disk` exception propagate karta hai aur server start nahi hota (FAILURE_SCENARIOS #4: \"load refused\"). Yeh deliberate hai -- empty ya partial dataset ke saath silently chalna production mein bahut bura surprise hai. Operator backup restore kare ya file hata ke empty start kare.\n\nTest `test_corrupted_snapshot_is_rejected`: ek key ka snapshot dump, `data[12] ^= 0xFF` (ek byte flip) -> `CorruptSnapshot`; aur `data[:-3]` (truncate) -> `CorruptSnapshot`.",
+  "why_needed": "Corrupt data ko silently load karna data loss se bhi bura hai, kyunki galat data serve hota hai aur kisi ko pata nahi chalta.",
+  "real_world_analogy": "Jaise dawai ki seal tooti ho toh pharmacist woh bottle nahi deta -- chahe andar dawai shayad theek ho.",
+  "how_it_works": "Integrity check before mutation: verify -> flush -> parse. Failure = exception = startup abort.",
+  "in_this_project": "`persistence/snapshot.py::load`, `CorruptSnapshot`; `server.py::_load_from_disk`. Test `tests/test_persistence.py::test_corrupted_snapshot_is_rejected`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::load",
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::CorruptSnapshot",
+   "projects/02-mini-redis/tests/test_persistence.py::test_corrupted_snapshot_is_rejected"
+  ],
+  "code_example": "# real: tests/test_persistence.py\ndef test_corrupted_snapshot_is_rejected():\n    ks = Keyspace()\n    ks.store(b\"k\", b\"v\")\n    data = bytearray(snapshot.dump(ks))\n    data[12] ^= 0xFF   # flip a bit\n    with pytest.raises(snapshot.CorruptSnapshot):\n        snapshot.load(bytes(data), Keyspace())\n    with pytest.raises(snapshot.CorruptSnapshot):\n        snapshot.load(bytes(data[:-3]), Keyspace())  # truncated",
+  "code_language": "python",
+  "advantages": [
+   "Corruption kabhi silently load nahi hota",
+   "Verification dataset touch karne se pehle",
+   "Cheap (zlib.crc32 C mein)"
+  ],
+  "disadvantages": [
+   "Ek bit flip = poori file reject (koi partial recovery nahi)",
+   "Malicious files ke against protection nahi"
+  ],
+  "common_mistakes": [
+   "CRC verify karne se pehle keyspace flush karna",
+   "Corrupt file pe empty start kar dena",
+   "CRC ko security feature samajhna"
+  ],
+  "follow_up_questions": [
+   "CRC32 vs SHA-256 -- kab kya?",
+   "Corrupt snapshot pe recovery options kya hain?",
+   "Replica ko corrupt snapshot mile toh?"
+  ],
+  "concepts": [
+   "checksums",
+   "data integrity",
+   "fail-fast"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-068",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Writes happen while a BGSAVE is in progress. Are they in the snapshot, and how does the dirty counter stay correct?",
+  "answer_hinglish": "Nahi, woh snapshot mein nahi hain -- aur yeh sahi hai. `start_bgsave` ne `snapshot.dump(self.ks)` synchronously call karke ek moment ki photo le li; uske baad ke writes us `payload` bytes mein nahi aa sakte. Disk write thread mein chal raha hota hai, aur us dauraan clients ke writes keyspace badalte rehte hain.\n\nToh sawal: save khatam hone ke baad `persistence.dirty` (changes since last save, INFO mein `rdb_changes_since_last_save`) kya hona chahiye? Agar 0 kar diya, toh save rules (jaise \"300s mein 100 changes\") sochenge sab saved hai, jabki BGSAVE ke dauraan aaye writes sirf memory mein hain -- agla auto-save late hoga aur crash pe zyada loss.\n\nYahi ek real bug tha (TESTING.md #2): pehle completion pe counter 0 reset hota tha aur phir kuch subtract hota tha -> -1. Fix: `start_bgsave` start pe `dirty_at_start = self.persistence.dirty` capture karta hai, aur `_snapshot_done(True, saved_changes=dirty_at_start)` mein `dirty = max(dirty - saved_changes, 0)`. Matlab sirf woh changes \"saved\" maane jaate hain jo snapshot mein actually the. Sync `SAVE` mein `saved_changes=None` -> seedha 0, kyunki SAVE blocking hai aur beech mein koi write ho hi nahi sakta.\n\nRegression test `test_writes_during_bgsave_stay_dirty`: do SET, `start_bgsave()`, phir ek aur SET (\"during\"), BGSAVE khatam hone ka wait, aur assert `dirty == 1`.",
+  "why_needed": "Persistence bookkeeping bugs silent hote hain -- crash ke baad hi pata chalta hai ki auto-save kabhi trigger nahi hua.",
+  "real_world_analogy": "Jaise stock-taking ki photo 10 baje li; 10 se 11 ke beech bike items photo mein nahi hain, toh unhe 'counted' mark mat karo.",
+  "how_it_works": "Snapshot point pe counter value capture; completion pe sirf utna subtract. Failure pe kuch subtract nahi.",
+  "in_this_project": "`server.py::start_bgsave` (`dirty_at_start`), `_snapshot_done` (docstring: \"Changes made while a background save was running are NOT in the file, so they must stay 'dirty'\"), `_check_save_rules`. FAILURE_SCENARIOS #6.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_snapshot_done",
+   "projects/02-mini-redis/minidis/server.py::start_bgsave",
+   "projects/02-mini-redis/tests/test_persistence.py::test_writes_during_bgsave_stay_dirty"
+  ],
+  "code_example": "# real: minidis/server.py::_snapshot_done\nself.persistence.last_bgsave_ok = ok\nif ok:\n    self.persistence.last_save_time = time.time()\n    if saved_changes is None:\n        self.persistence.dirty = 0\n    else:\n        self.persistence.dirty = max(self.persistence.dirty - saved_changes, 0)",
+  "code_language": "python",
+  "advantages": [
+   "Save rules accurate rehte hain",
+   "Bug ka regression test hai"
+  ],
+  "disadvantages": [
+   "BGSAVE ke dauraan writes ek aur save tak sirf memory/AOF mein"
+  ],
+  "common_mistakes": [
+   "Completion pe dirty = 0",
+   "SAVE aur BGSAVE ko same treat karna",
+   "Failure pe bhi dirty reset karna"
+  ],
+  "follow_up_questions": [
+   "Redis fork-based BGSAVE mein yeh kaise handle karta hai?",
+   "max(..., 0) kyun lagaya?",
+   "Is bug ko test se pehle kaise pakdoge?"
+  ],
+  "concepts": [
+   "BGSAVE",
+   "dirty tracking",
+   "regression test"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-069",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "The disk fills up. How does each persistence path in minidis (AOF append, everysec fsync, BGSAVE, AOF rewrite) behave?",
+  "answer_hinglish": "Disk full ek realistic incident hai, aur har path alag behave karta hai (code padh ke analysis):\n\n1. AOF append/flush on the request path: `aof.append` Python buffered file mein likhta hai; buffer bhar ke ya `flush()` pe OS error (`OSError: No space left`) aa sakta hai. `flush()` `_handle_client` mein execute ke BAAD aur reply se pehle call hota hai. Exception `_handle_client` ke `except (ConnectionError, IncompleteReadError)` mein nahi aata, toh connection task fail hoke connection close -- client ko reply nahi milta, lekin command memory mein already apply ho chuka hai. Matlab memory aur AOF diverge: restart pe woh write gayab. `always` mode mein `fsync()` bhi isi tarah fail.\n2. everysec fsync (cron): exception `_cron` ke generic `except` mein `cron_error` log hota hai aur cron chalta rehta hai -- server writes accept karta rehta hai lekin durability silently gayi. Real Redis yahan writes reject karta hai (`MISCONF` error) jab tak persistence theek na ho.\n3. BGSAVE: `write_atomic` thread mein fail, `last_bgsave_ok = False`, purani snapshot intact, dirty same. Save rule agli tick phir trigger karega -> repeated in-loop dumps (CPU waste).\n4. AOF rewrite: `except` mein `last_rewrite_ok = False`, purani AOF chalu (reopen agar close ho chuki thi), rewrite buffer discard -- data purani AOF mein already hai, toh loss nahi.\n\nLesson: atomic-rename paths (3, 4) safe fail karte hain; append path (1, 2) ko explicit \"stop accepting writes\" policy chahiye.",
+  "why_needed": "Ops incidents mein disk full common hai; system ko 'fail loudly and safely' hona chahiye, silently non-durable nahi.",
+  "real_world_analogy": "Jaise register ke pages khatam -- cashier ko bechna band karna chahiye, na ki bina likhe bechte rehna.",
+  "how_it_works": "Request-path I/O errors -> connection failure; background I/O errors -> logged, state flags; atomic-rename paths -> old file preserved.",
+  "in_this_project": "`server.py::_handle_client` (flush/fsync before reply), `_cron` (`log.exception(\"cron_error\")`), `start_bgsave` (`bgsave_failed`), `persistence/aof.py::rewrite` (`aof_rewrite_failed`, reopen). INFO: `rdb_last_bgsave_status`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_handle_client",
+   "projects/02-mini-redis/minidis/server.py::_cron",
+   "projects/02-mini-redis/minidis/persistence/aof.py::rewrite",
+   "projects/02-mini-redis/minidis/server.py::start_bgsave"
+  ],
+  "code_example": "# illustrative (not in repo): Redis-style MISCONF guard in Server.execute\nif cmd.write and self.persistence.last_bgsave_ok is False and self.config.stop_writes_on_bgsave_error:\n    return RespError(\"MISCONF Errors writing to disk; writes disabled until persistence recovers\")",
+  "code_language": "python",
+  "advantages": [
+   "Snapshot aur rewrite failures purani files nahi bigaadte",
+   "Failures logged with structured events"
+  ],
+  "disadvantages": [
+   "Append path pe memory-AOF divergence",
+   "everysec fsync failure silent (sirf log)",
+   "BGSAVE retry storm"
+  ],
+  "common_mistakes": [
+   "Background persistence errors ko sirf log karna",
+   "Disk full pe bhi writes accept karte rehna",
+   "Alert na lagana rdb_last_bgsave_status pe"
+  ],
+  "follow_up_questions": [
+   "MISCONF jaisa guard kaise add karoge?",
+   "Disk full se recover hone pe kya karna chahiye?",
+   "Write apply hone ke baad AOF fail ho toh kya rollback possible hai?"
+  ],
+  "concepts": [
+   "disk full",
+   "error handling",
+   "durability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Availability (writes chalte rahein) vs durability (writes ruk jaayein jab persist na ho sake). Redis default durability choose karta hai (stop-writes-on-bgsave-error yes); minidis abhi implicitly availability choose karta hai.",
+   "failure_scenarios": "AOF append fail ke baad agar disk free ho gayi, toh AOF mein beech ke commands missing hain -- replay pe state galat (e.g. INCR count kam). Yeh silent corruption hai -- isliye fail-stop better.",
+   "alternatives": "Write-ahead: pehle AOF mein likho phir apply (WAL) -- lekin Redis/minidis apply-first hain kyunki rewrite (PEXPIREAT) execution ke baad pata chalta hai.",
+   "scale_10x_100x": "Bade AOF ke saath disk jaldi bharti hai; auto rewrite + disk usage alerts zaroori.",
+   "production_improvements": "MISCONF-style write rejection, disk usage metrics, AOF error counter, BGSAVE failure backoff, aur health check jo persistence status include kare."
+  }
+ },
+ {
+  "id": "MRDS-070",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens when minidis reaches maxmemory under each eviction policy?",
+  "answer_hinglish": "`maxmemory` set ho toh har write command se pehle `evict_until_fits` chalta hai (replica apply path ko chhod ke).\n\n`noeviction` (default): koi victim nahi milta, function `False` deta hai, aur client ko `OOM command not allowed when used memory > 'maxmemory'.` error milta hai. Reads (GET, LRANGE) chalte rehte hain, aur DEL bhi. Yeh review fix hai: pehle check `if cmd.write and self.config.maxmemory` tha -- DEL bhi write hai, toh noeviction pe DEL bhi OOM se refuse hota aur memory free karne ka koi tareeka nahi bachta tha (sirf CONFIG SET). Ab check `if cmd.may_grow and ...` hai: `Command.may_grow` (Redis ka `denyoom`) default write commands ke liye True, lekin DEL, UNLINK, HDEL, EXPIRE family, PERSIST, FLUSHDB/FLUSHALL `may_grow=False` declare karte hain. Regression: `test_noeviction_returns_oom_error` ab OOM ke baad `DEL k0` == 1 aur phir naya SET succeed assert karta hai.\n\n`allkeys-lru`: OrderedDict ki pehli (least recently used) key hatao, jab tak fit na ho. Har evicted key `DEL` ban ke AOF aur replicas tak jaati hai, aur `evicted_keys` stat badhta hai. `test_allkeys_lru_server_keeps_hot_key`: hot key baar baar GET hoti hai aur 200 cold writes ke baad bhi bachi rehti hai.\n\n`volatile-lru` / `volatile-ttl`: sirf TTL wali keys mein se sample. Agar TTL wali koi key hi nahi, toh `None` -> OOM error, chahe persistent keys kitni bhi hon (`test_volatile_policy_cannot_free_persistent_keys`).\n\n`test_noeviction_returns_oom_error`: maxmemory 2000, 100 SETs mein se kisi pe error, `k0` abhi bhi readable, DEL chalta hai aur space free hone pe writes wapas kaam karte hain.",
+  "why_needed": "Memory full hona production mein common hai; har policy ka exact behaviour pata hona chahiye taaki galat surprise na ho.",
+  "real_world_analogy": "Jaise parking full: noeviction = gate band; allkeys-lru = sabse purani khadi gaadi tow karo; volatile = sirf 'temporary parking' wali gaadiyan tow ho sakti hain.",
+  "how_it_works": "Pre-write check -> eviction loop -> victim per policy -> remove + DEL propagate -> ya OOM.",
+  "in_this_project": "`server.py::execute` (OOM error, `cmd.may_grow` check), `commands/__init__.py::command` (`may_grow` flag), `commands/keys.py` (`DEL` with `may_grow=False`), `keyspace.py::evict_until_fits`, `_pick_victim`. FAILURE_SCENARIOS #8. Tests in `tests/test_expiry_eviction.py`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::execute",
+   "projects/02-mini-redis/minidis/keyspace.py::evict_until_fits",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_noeviction_returns_oom_error",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_volatile_policy_cannot_free_persistent_keys",
+   "projects/02-mini-redis/minidis/commands/keys.py::may_grow=False"
+  ],
+  "code_example": "# real: tests/test_expiry_eviction.py\nasync def test_noeviction_returns_oom_error(tmp_path):\n    async with running(tmp_path, maxmemory=2000) as s:\n        c = client_for(s)\n        with pytest.raises(ResponseError, match=\"maxmemory\"):  # redis-py strips the OOM prefix\n            for i in range(100):\n                await c.set(f\"k{i}\", \"x\" * 100)\n        assert await c.get(\"k0\") == b\"x\" * 100  # reads still work\n        # Regression: commands that FREE memory must not be refused with OOM.\n        assert await c.delete(\"k0\") == 1\n        assert await c.set(\"after-del\", \"x\" * 100)   # space freed -> writes work again",
+  "code_language": "python",
+  "advantages": [
+   "Predictable per policy",
+   "Reads OOM mein bhi kaam karte hain",
+   "Evictions replicate hoti hain"
+  ],
+  "disadvantages": [
+   "may_grow flag har naye command pe sahi declare karna padta hai (galti = Redis se alag behaviour)",
+   "volatile policies persistent-only data pe useless"
+  ],
+  "common_mistakes": [
+   "Cache pe noeviction",
+   "volatile-* lagana jab keys pe TTL nahi",
+   "OOM check ko saare write commands pe lagana (DEL bhi block ho jaata -- minidis mein yahi bug tha)"
+  ],
+  "follow_up_questions": [
+   "DEL ko OOM se exempt karne ke liye may_grow flag kyun, write flag kyun nahi?",
+   "Eviction rate spike ka kya matlab hai?",
+   "maxmemory kitna set karoge container limit ke relative?"
+  ],
+  "concepts": [
+   "maxmemory",
+   "OOM",
+   "eviction"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-071",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A replica cannot keep up with the replication stream. What happens on the master, and why is the 64MB limit there?",
+  "answer_hinglish": "Master `_flush_replication` mein har replica ke `writer.write(chunk)` karta hai -- bina `drain()` ke. Yeh deliberate hai: master ka loop ek slow replica ke liye ruk nahi sakta. Lekin agar replica (ya network) slow hai, toh asyncio transport ka write buffer master ki memory mein badhta rehta hai. Infinite growth = master OOM, aur master gira toh sab gaya -- ek slow replica poore system ko maar sakta hai.\n\nProtection: cron har tick `_check_replica_buffers()` chalata hai: har replica ke liye `r.writer.transport.get_write_buffer_size()` dekho; agar `replica_output_buffer_limit` (default 64MB) se zyada, toh `replica_output_buffer_overflow` warning, `rejected_replica_buffers += 1` (INFO stats mein `replica_buffer_disconnects`), connection close aur `replicas` se hatao. Redis ka `client-output-buffer-limit replica 256mb 64mb 60` isi ka production version hai.\n\nReplica side: connection toota -> `ReplicaLink._run` backoff ke saath reconnect -> full sync. Agar replica slow hone ka reason persistent hai (weak network, overloaded replica), toh yeh loop ban sakta hai: full sync (bada snapshot + naya buffer) -> phir overflow -> phir full sync. Master pe har baar in-loop dump ka pause bhi.\n\nTest: is path ka dedicated test nahi hai; FAILURE_SCENARIOS #13 `Server._check_replica_buffers` ko reference karta hai.\n\nMonitoring: `lag_bytes` badhta dikhe aur `replica_buffer_disconnects` badhe -- replica capacity ya network dekho.",
+  "why_needed": "Ek component ki slowness ko doosre ki failure banne se rokna (bulkheading) distributed systems ka core principle hai.",
+  "real_world_analogy": "Jaise ek dost jo tumhare messages padhta hi nahi -- 64MB ke unread messages ke baad tum use group se nikaal dete ho; woh wapas aaye toh poori chat history se shuru.",
+  "how_it_works": "Unbounded async writes + periodic size check + disconnect on threshold. Recovery = full resync.",
+  "in_this_project": "`server.py::_check_replica_buffers`, `_flush_replication`, `config.py::replica_output_buffer_limit = 64 * 1024 * 1024`, INFO `replica_buffer_disconnects`. SYSTEM_DESIGN.md \"Slow replica protection\".",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_check_replica_buffers",
+   "projects/02-mini-redis/minidis/server.py::_flush_replication",
+   "projects/02-mini-redis/minidis/config.py::ServerConfig",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: minidis/server.py\ndef _check_replica_buffers(self) -> None:\n    for r in list(self.replicas.values()):\n        if r.writer.transport.get_write_buffer_size() > self.config.replica_output_buffer_limit:\n            log.warning(\"replica_output_buffer_overflow\", extra={\"replica\": r.addr})\n            self.rejected_replica_buffers += 1\n            r.writer.close()\n            self.replicas.pop(r.id, None)",
+  "code_language": "python",
+  "advantages": [
+   "Master memory bounded",
+   "Slow replica master ko nahi giraata",
+   "Observable (log + counter)"
+  ],
+  "disadvantages": [
+   "Check sirf 10Hz -- burst mein limit se upar ja sakta hai",
+   "Hard limit only (Redis ka soft limit + time window nahi)",
+   "Full sync loop possible"
+  ],
+  "common_mistakes": [
+   "Replica writes pe drain() karna (master block ho jayega)",
+   "Koi limit hi na lagana",
+   "Disconnect ke baad reason monitor na karna"
+  ],
+  "follow_up_questions": [
+   "Soft limit (X MB for Y seconds) kyun better hai?",
+   "Full sync loop kaise todoge?",
+   "Normal clients ke liye output buffer limit kaise?"
+  ],
+  "concepts": [
+   "backpressure",
+   "bulkhead",
+   "replication"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Disconnect replica (availability of master) vs block master (consistency of replica). Master hamesha jeet ta hai. Limit chhoti = jaldi disconnect, badi = zyada memory risk.",
+   "failure_scenarios": "Persistent slow network -> resync loop, har resync master pe dump pause. Write burst -> 100ms window mein 64MB cross ho sakta hai before check. Multiple slow replicas -> N x 64MB.",
+   "alternatives": "Redis soft/hard limits with time window, PSYNC backlog (reconnect cheap), replica-side throttling, ya dedicated replication thread.",
+   "scale_10x_100x": "10x write rate pe 64MB jaldi bharega; limit ko write_rate x tolerated_delay ke hisaab se size karo.",
+   "production_improvements": "Soft limit + duration, resync loop detection (alert jab same replica N baar disconnect ho), aur PSYNC taaki disconnect sasta ho."
+  }
+ },
+ {
+  "id": "MRDS-072",
+  "project_slug": "p02-mini-redis",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "A client sends malformed RESP. Why does minidis close the connection instead of just returning an error and continuing?",
+  "answer_hinglish": "Do tarah ke errors hain aur minidis unhe alag treat karta hai:\n\n1. Command-level error (`RespError`): jaise WRONGTYPE, wrong number of arguments, unknown command, syntax error in SET options. Yahan bytes sahi parse hue the, sirf command galat hai. Reply `-ERR ...` jaata hai aur connection open rehta hai -- agla command normal chalta hai.\n\n2. Protocol-level error (`ProtocolError`): bytes hi RESP nahi hain -- jaise `*1\\r\\n:5\\r\\n` (array ke andar `$` ki jagah `:`), length number nahi hai, ya limits cross. Yahan problem yeh hai ki parser ko ab pata hi nahi ki stream mein agla command kahan se shuru hota hai. RESP mein koi resync marker nahi hai; length-prefixed format mein ek galat length ke baad saare boundaries galat ho jaate hain. Guess karke aage parse karna = attacker-controlled bytes ko commands ki tarah execute karna (request smuggling jaisa risk).\n\nIsliye `_handle_client` ProtocolError pe `ERR Protocol error: ...` reply add karta hai, `close_after = True` set karta hai, pehle ke valid commands ke replies ke saath bhejta hai, aur connection band. `ProtocolError` class ka docstring hi kehta hai: \"the connection must be closed (stream can't be resynchronised)\". Real Redis bhi exactly yahi karta hai.\n\nTest: `test_malformed_input_raises` (parser level) -- `*1\\r\\n:5\\r\\n` pe `ProtocolError`. FAILURE_SCENARIOS #14.",
+  "why_needed": "Corrupted stream ke saath chalna security aur correctness dono ke liye risky hai; fail-fast per connection sahi hai.",
+  "real_world_analogy": "Jaise phone pe line itni kharab ho gayi ki pata hi nahi chal raha kaunsa word kahan khatam -- andaaza lagane se better hai call kaat ke dobara milao.",
+  "how_it_works": "Parser raise -> handler catches -> error reply + close flag -> batch replies written -> connection closed. Doosre clients unaffected.",
+  "in_this_project": "`protocol.py::ProtocolError` vs `RespError` (connection stays open). `server.py::_handle_client` `except ProtocolError` branch. AOF replay mein bhi same ProtocolError -> start refuse.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/protocol.py::ProtocolError",
+   "projects/02-mini-redis/minidis/server.py::_handle_client",
+   "projects/02-mini-redis/tests/test_protocol.py::test_malformed_input_raises"
+  ],
+  "code_example": "# real: minidis/server.py::_handle_client\nexcept ProtocolError as exc:\n    replies.append(encode(RespError(f\"ERR Protocol error: {exc}\")))\n    close_after = True",
+  "code_language": "python",
+  "advantages": [
+   "Stream desync se koi galat command execute nahi hota",
+   "Doosre clients pe asar nahi",
+   "Client ko reason milta hai"
+  ],
+  "disadvantages": [
+   "Ek bug wala client baar baar disconnect hoga"
+  ],
+  "common_mistakes": [
+   "Protocol error ke baad parse continue karna",
+   "Command errors pe bhi connection kaatna",
+   "Error reply bheje bina close karna"
+  ],
+  "follow_up_questions": [
+   "RespError ka message prefix kaise decide hota hai?",
+   "Request smuggling kya hai?",
+   "Inline parser mein bhi aisa hi hota hai?"
+  ],
+  "concepts": [
+   "protocol errors",
+   "fail-fast",
+   "error handling"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-073",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "After upgrading to redis-py 8, every connection to minidis failed. How would you debug it, and what was the fix?",
+  "answer_hinglish": "Symptom: purane client se sab chal raha tha; redis-py 8 pe har connection pehle hi command pe fail -- koi data command chala hi nahi.\n\nInvestigate:\n1. Kya bheja ja raha hai? Server pe har command log karo, ya `tcpdump`/Wireshark se pehle bytes dekho, ya `redis-cli MONITOR` jaisa. Pehla command `HELLO 3` tha.\n2. Server ne kya reply kiya? minidis ke paas pehle HELLO tha hi nahi (ya sirf RESP2) -> `ERR unknown command 'HELLO'` ya RESP2 reply. redis-py 8 ne `protocol=3` default rakha hai, toh woh connection setup pe hi fail mark kar deta hai.\n3. Confirm: client mein `protocol=2` explicitly set karo -- agar chal jaye, toh protocol negotiation hi root cause hai.\n\nCause: redis-py 8 connect hote hi RESP3 negotiate karta hai (`HELLO 3`); minidis sirf RESP2 bolta tha (TESTING.md bug #4).\n\nFix: proper RESP3 support. `hello` command jo version validate kare (2/3, warna `NOPROTO`), `ClientState.proto` set kare, aur server info map return kare. `encode(value, proto)` mein RESP3 types: map `%`, set `~`, null `_`, boolean `#`, double `,`. Handlers protocol-agnostic Python types return karte hain. Test `test_resp3_client` `protocol=3` se HGETALL dict aur SMEMBERS set verify karta hai; `conftest.py` ke default fixtures `protocol=2` use karte hain taaki dono paths covered rahein.\n\nLesson: dependencies ke major upgrades ke changelog mein default behaviour changes padho, aur protocol tests real clients ke dono modes mein chalao.",
+  "why_needed": "Client library upgrades protocol defaults badal dete hain; yeh real-world compatibility debugging ka classic case hai.",
+  "real_world_analogy": "Jaise naya phone default 5G pe connect karne ki koshish kare aur purana tower sirf 4G jaanta ho -- call hi nahi lagti.",
+  "how_it_works": "Capture first bytes -> compare expected handshake -> force old protocol to confirm -> implement negotiation.",
+  "in_this_project": "`commands/server_cmds.py::hello`, `server.py::ClientState.proto`, `protocol.py::encode`. `tests/conftest.py` `protocol=2` fixtures + `client_for(server, proto=3)`. TESTING.md bug #4, LEARNING_GUIDE Step 2.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/commands/server_cmds.py::hello",
+   "projects/02-mini-redis/tests/conftest.py::client_for",
+   "projects/02-mini-redis/tests/test_commands.py::test_resp3_client",
+   "projects/02-mini-redis/TESTING.md"
+  ],
+  "code_example": "# real: tests/test_commands.py\nasync def test_resp3_client(server):\n    c = client_for(server, proto=3)\n    await c.hset(\"h\", \"f\", \"v\")\n    await c.sadd(\"s\", \"x\")\n    assert await c.hgetall(\"h\") == {b\"f\": b\"v\"}\n    assert await c.smembers(\"s\") == {b\"x\"}",
+  "code_language": "python",
+  "advantages": [
+   "Ab dono protocol versions supported",
+   "Test matrix dono cover karta hai"
+  ],
+  "disadvantages": [
+   "Do encodings maintain karni padti hain"
+  ],
+  "common_mistakes": [
+   "Sirf ek client version se test karna",
+   "Client ko protocol=2 pe force karke 'fix' maan lena",
+   "Wire bytes dekhe bina guess karna"
+  ],
+  "follow_up_questions": [
+   "HELLO ka reply RESP3 mein kaise jaata hai jab handler hi proto badal raha hai?",
+   "RESP3 mein kaunse types abhi missing hain?",
+   "Aise regressions CI mein kaise pakdoge?"
+  ],
+  "concepts": [
+   "debugging",
+   "RESP3",
+   "compatibility"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-074",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "The minidis test suite took 94 seconds on Windows. How was this tracked down to localhost and IPv6, and what was the fix?",
+  "answer_hinglish": "Symptom: ~50 tests (us waqt), har test sirf kuch ms ka kaam, lekin suite 94s. Har test jo naya client connection banata tha, ~2s extra le raha tha.\n\nInvestigate:\n1. Per-test timing (`pytest --durations=10`): saare slow tests mein common factor -- naya connection banana. Pure parser tests (bina network) fast the.\n2. Time kahan ja raha hai: connection establish vs command. Ek client se `ping` ko time karo, connect alag. Connect hi ~2s.\n3. Name resolution: client `localhost` se connect kar raha tha. Windows pe `localhost` pehle IPv6 `::1` resolve hota hai. Server `127.0.0.1` (IPv4 only) pe listen kar raha tha. Toh client pehle `::1` pe try karta hai -- koi listener nahi -- aur Windows pe yeh failure turant refuse nahi hota, ~2s ke baad fallback hota hai IPv4 pe. Har connection pe yeh tax.\n\nFix: tests mein host `127.0.0.1` explicitly. `conftest.py` mein comment ke saath: \"on Windows localhost resolves to ::1 first and the IPv6 attempt against an IPv4-only listener costs ~2s per connection before falling back.\" Result (TESTING.md #5): 94s se 11s.\n\nAlternative fixes: server ko dual-stack bind karna (`::` with IPv4-mapped, ya dono addresses), ya hosts file. Lekin tests ke liye explicit IPv4 sabse simple aur deterministic hai.\n\nLesson: jab har operation pe ek constant delay ho (jaise exactly ~2s), toh woh timeout/fallback ka signature hai -- DNS, IPv6, TCP retransmit ya Nagle dekhna chahiye.",
+  "why_needed": "Constant per-connection delays production mein bhi aate hain (microservices ke localhost calls, Docker networking); pattern pehchanna valuable hai.",
+  "real_world_analogy": "Jaise courier pehle purane address pe jaata hai, wahan koi nahi milta, 2 minute wait karta hai, phir naye address pe -- har delivery pe.",
+  "how_it_works": "getaddrinfo('localhost') -> [::1, 127.0.0.1]; client tries in order; IPv6 attempt fails slowly; fallback to IPv4.",
+  "in_this_project": "`tests/conftest.py::client_for` (comment) aur `r` fixture dono `host=\"127.0.0.1\"`. `config.py` default host bhi `127.0.0.1`. TESTING.md finding #5.",
+  "implementation_files": [
+   "projects/02-mini-redis/tests/conftest.py::client_for",
+   "projects/02-mini-redis/minidis/config.py::ServerConfig",
+   "projects/02-mini-redis/TESTING.md"
+  ],
+  "code_example": "# real: tests/conftest.py\ndef client_for(server: Server, proto: int = 2) -> R.Redis:\n    # 127.0.0.1, not \"localhost\": on Windows localhost resolves to ::1 first and the IPv6\n    # attempt against an IPv4-only listener costs ~2s per connection before falling back.\n    return R.Redis(host=\"127.0.0.1\", port=server.port, protocol=proto)",
+  "code_language": "python",
+  "advantages": [
+   "8x faster feedback loop",
+   "Root cause documented in code"
+  ],
+  "disadvantages": [
+   "Server abhi bhi IPv6 clients serve nahi karta"
+  ],
+  "common_mistakes": [
+   "Slow tests ko 'Windows slow hai' bol ke ignore karna",
+   "Timeouts badha dena bina root cause",
+   "localhost aur 127.0.0.1 ko hamesha same samajhna"
+  ],
+  "follow_up_questions": [
+   "Server ko dual-stack kaise banaoge?",
+   "Constant delay patterns ke aur kya causes ho sakte hain?",
+   "Production mein yeh kaise dikhta?"
+  ],
+  "concepts": [
+   "debugging",
+   "IPv6",
+   "test performance"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-075",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Replica memory keeps growing even though keys have TTLs and the master's memory is stable. How do you investigate, and what was the actual bug?",
+  "answer_hinglish": "Symptom: master pe `used_memory` aur `DBSIZE` stable (keys expire ho rahi hain), replica pe dono badhte ja rahe hain. Replica reads sahi hain -- expired keys dikhti nahi.\n\nInvestigate:\n1. Compare `INFO keyspace` dono pe: replica pe `keys=` aur `expires=` zyada.\n2. Kya master DELs bhej raha hai? Master `INFO stats` mein `expired_keys` badh raha hai; replication stream (ya master AOF) mein `DEL` entries dikh rahi hain. Toh master side theek.\n3. Replica pe kya hota hai jab DEL aata hai? Ek expired key bana ke, replica pe wait karke, master pe us key ko GET (lazy expiry -> DEL) karo, aur replica ka `ks.data` inspect karo -- key abhi bhi wahan hai.\n4. Code path: replica `apply_from_master(DEL k)` -> `delete` handler -> `Keyspace.delete(k)`. Purane code mein `delete` pehle check karta tha \"kya key exist karti hai (logically)?\" -- replica pe expired key logically gone hai, toh \"already gone, return 0\" aur early return. Physical delete kabhi nahi.\n\nRoot cause: \"replica hides expired keys\" aur \"delete only existing keys\" -- do sahi rules ka combination. Replica kabhi khud delete nahi karta, aur master ka DEL ignore hota tha -> permanent leak (TESTING.md bug #1).\n\nFix (`Keyspace.delete`): agar key `data` mein hai aur replica hai, toh expired ho tab bhi `_remove`; return value `not expired` (reply semantics: logically already gone tha). Master pe expired key ka delete `_expire_if_needed` se (counts as expiry, propagates DEL).\n\nRegression: `test_replica_physically_deletes_on_master_del` -- delete returns False, lekin `b\"k\" not in ks.data` aur `used_memory == 0`.",
+  "why_needed": "Replica-only leaks monitoring mein late pakde jaate hain; master-replica comparison ek powerful debugging technique hai.",
+  "real_world_analogy": "Jaise branch office ko head office se 'yeh file shred karo' ka order aaye, aur branch bole 'yeh file toh expired hai, already nahi hai' -- lekin almaari mein padi rehti hai.",
+  "how_it_works": "Logical existence (TTL check) vs physical existence (in dict). Delete from master must act on physical presence on replicas.",
+  "in_this_project": "`keyspace.py::delete` (comment: \"Replica: a DEL from the master must physically remove the key even if it is already logically expired, otherwise expired keys would leak on replicas forever.\"). Tests: `test_replica_physically_deletes_on_master_del`, `test_master_expiry_propagates_as_del`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::delete",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_replica_physically_deletes_on_master_del",
+   "projects/02-mini-redis/tests/test_replication.py::test_master_expiry_propagates_as_del",
+   "projects/02-mini-redis/TESTING.md"
+  ],
+  "code_example": "# real: minidis/keyspace.py\ndef delete(self, key: bytes) -> bool:\n    if key not in self.data:\n        return False\n    expired = self._is_expired(key)\n    if expired and not self.is_replica:\n        self._expire_if_needed(key)  # master: counts as an expiry, propagates DEL\n        return False\n    self._remove(key)\n    return not expired",
+  "code_language": "python",
+  "advantages": [
+   "Fix chhota aur localized",
+   "Reply semantics preserved (0 for logically-gone)",
+   "Unit + integration regression tests"
+  ],
+  "disadvantages": [
+   "Logical vs physical existence ka distinction har delete-like path pe yaad rakhna padta hai"
+  ],
+  "common_mistakes": [
+   "Sirf replica reads check karna aur memory nahi",
+   "Master-replica ko INFO se compare na karna",
+   "Fix mein replica pe bhi DEL count badha dena"
+  ],
+  "follow_up_questions": [
+   "Aur kaunse commands logical existence check karke skip karte hain?",
+   "Is class ke bugs ko property test se kaise pakdoge?",
+   "Replica memory ka alert kaise design karoge?"
+  ],
+  "concepts": [
+   "debugging",
+   "replication",
+   "memory leak"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hide-but-keep design replica consistency deta hai lekin har delete path ko physical presence handle karna padta hai. Alternative (replica khud expire kare) leak nahi karta lekin divergence laata hai.",
+   "failure_scenarios": "Same class ka risk: GETDEL ya future commands jo `exists()` check karke skip karein -- replica pe expired key ke liye master ka effect apply na ho.",
+   "alternatives": "Replica pe 'apply effects blindly' mode -- stream se aaye commands ke liye logical checks skip. Ya master DEL ki jagah special 'EXPIRED k' command bheje.",
+   "scale_10x_100x": "High-churn TTL workloads (sessions) pe leak bahut tez -- ghanton mein replica OOM. Isliye replica memory vs master memory ratio alert.",
+   "production_improvements": "Replica `used_memory`/master ratio alert, periodic consistency check (key count + sample digest), aur property tests jo random ops ke baad master/replica `data` compare karein."
+  }
+ },
+ {
+  "id": "MRDS-076",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "redis-py's bgsave() call failed against minidis with an arguments error. What happened?",
+  "answer_hinglish": "Symptom: `await c.bgsave()` pe `ERR wrong number of arguments for 'bgsave' command`, jabki `redis-cli BGSAVE` chal raha tha.\n\nInvestigate: error message arity check ka hai, toh dekho client ne actually kitne args bheje. redis-py ka `bgsave()` method by default `BGSAVE SCHEDULE` bhejta hai (schedule=True) -- real Redis mein `SCHEDULE` ka matlab hai \"agar AOF rewrite chal raha hai toh BGSAVE ko baad mein schedule karo, error mat do\". redis-cli plain `BGSAVE` bhejta tha, isliye woh chal raha tha.\n\nCause: minidis ne `BGSAVE` ka arity `1` (exact, sirf command naam) register kiya tha. 2 args aaye -> `check_arity` fail (TESTING.md bug #3).\n\nFix: arity `-1` (kam se kam 1) -- `@command(\"BGSAVE\", -1)`. Handler extra argument ko accept karta hai aur turant start karta hai, comment ke saath: \"Clients may send BGSAVE SCHEDULE (redis-py does); we accept and start immediately.\" minidis mein AOF rewrite aur BGSAVE ka \"schedule\" interaction implement nahi hai, toh turant start karna reasonable simplification hai; agar BGSAVE already chal raha hai toh `ERR Background save already in progress`.\n\nTest `test_bgsave_writes_snapshot` redis-py ka `bgsave()` use karta hai, toh yeh regression cover hai.\n\nLesson: wire compatibility ka matlab sirf command names nahi, real clients jo exact args bhejte hain woh bhi -- isliye tests real client se chalana valuable hai.",
+  "why_needed": "Compatibility bugs aksar optional arguments mein chhupte hain jo ek client bhejta hai aur doosra nahi.",
+  "real_world_analogy": "Jaise form mein 'optional: preferred time' field ho aur clerk bole 'sirf naam likhna tha, form reject' -- jabki doosre log blank chhod ke bhar rahe the.",
+  "how_it_works": "Arity check generic hai; exact arity strict compatibility todti hai jab clients optional flags bhejein.",
+  "in_this_project": "`commands/server_cmds.py::bgsave` (`@command(\"BGSAVE\", -1)`), `commands/__init__.py::check_arity`. TESTING.md bug #3. `tests/test_persistence.py::test_bgsave_writes_snapshot`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/commands/server_cmds.py::bgsave",
+   "projects/02-mini-redis/minidis/commands/__init__.py::check_arity",
+   "projects/02-mini-redis/tests/test_persistence.py::test_bgsave_writes_snapshot"
+  ],
+  "code_example": "# real: minidis/commands/server_cmds.py\n@command(\"BGSAVE\", -1)\ndef bgsave(ctx: Context, args):\n    # Clients may send \"BGSAVE SCHEDULE\" (redis-py does); we accept and start immediately.\n    if not ctx.server.start_bgsave():\n        raise RespError(\"ERR Background save already in progress\")\n    return SimpleString(\"Background saving started\")",
+  "code_language": "python",
+  "advantages": [
+   "One-line fix, real client covered by test"
+  ],
+  "disadvantages": [
+   "Unknown extra args bhi silently accept ho jaate hain (`BGSAVE foo`)"
+  ],
+  "common_mistakes": [
+   "Sirf redis-cli se test karna",
+   "Error message dekhe bina client code debug karna"
+  ],
+  "follow_up_questions": [
+   "SCHEDULE ka real semantics kya hai?",
+   "Extra unknown args ko validate karna chahiye?",
+   "Aur kaunse commands ke optional args ho sakte hain jo miss hon?"
+  ],
+  "concepts": [
+   "debugging",
+   "compatibility",
+   "arity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-077",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Clients of minidis report latency spikes every few minutes, while average latency is fine. How do you investigate?",
+  "answer_hinglish": "Periodic spikes + normal average = koi periodic O(N) kaam jo event loop block karta hai. Single-threaded server mein jo bhi loop pe lamba chale, sab clients ki latency mein dikhta hai.\n\nCandidates (code se):\n1. Auto BGSAVE: save rules (`3600 1`, `300 100`, `60 10000`) -> `start_bgsave` -> `snapshot.dump` event loop pe poora dataset serialize. Busy server pe har ~60-300s. Check: spikes ka time `INFO persistence` ke `rdb_last_save_time` changes se match karo; logs mein `bgsave_failed` nahi toh bhi.\n2. AOF rewrite: `minimal_commands` loop pe. `aof_rewrite_in_progress` toggles se correlate.\n3. Replica connect/reconnect: `_serve_replica` ka `snapshot.dump` -- logs mein `replica_attached` with `snapshot_bytes`. Flapping replica (buffer overflow -> resync loop) = periodic spikes. `replica_buffer_disconnects` dekho.\n4. `appendfsync always` with slow disk: har batch pe sync fsync on loop.\n5. Clients: koi cron job `KEYS *` ya bada `LRANGE 0 -1` / `SMEMBERS` chala raha hai. `CLIENT LIST` mein `cmds=` counts, ya command logging.\n6. Active expiry mass-expiry: bounded (16 rounds), unlikely big.\n\nMethod: client side pe latency timestamps, server side pe in events ke timestamps (bpcommon JSON logs), aur correlate. Experiment: save rules disable karo (`--save \"\"`) ya replica detach karo aur dekho spikes jaate hain kya -- wahi isolation technique jo benchmark investigation mein use ki.\n\nFixes: save rules tune karo/ snapshots replica pe lo, Linux pe fork-based BGSAVE, KEYS ko SCAN se replace, aur event-loop-lag metric add karo (minidis mein abhi nahi hai).",
+  "why_needed": "p99 latency spikes production mein SLO tod te hain jabki dashboards ka average green dikhta hai.",
+  "real_world_analogy": "Jaise dukaan har ghante 2 minute band hoti hai stock-taking ke liye -- din ka average service time theek, lekin us waqt aane wale customers naraz.",
+  "how_it_works": "Correlate spike timestamps with periodic server events -> isolate by disabling one at a time -> fix the blocking operation.",
+  "in_this_project": "`server.py::_check_save_rules`, `start_bgsave`, `_serve_replica`, `persistence/aof.py::rewrite`, `commands/keys.py::keys`. INFO fields: `rdb_last_save_time`, `rdb_bgsave_in_progress`, `aof_rewrite_in_progress`, `replica_buffer_disconnects`. `config.py` default `save_rules`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_check_save_rules",
+   "projects/02-mini-redis/minidis/server.py::start_bgsave",
+   "projects/02-mini-redis/minidis/server.py::info",
+   "projects/02-mini-redis/minidis/config.py::ServerConfig"
+  ],
+  "code_example": "# investigation commands (illustrative)\nredis-cli -p 6380 --latency-history -i 5          # client-side latency over time\nredis-cli -p 6380 info persistence | grep -E \"rdb_last_save_time|rdb_bgsave_in_progress|aof_rewrite\"\nredis-cli -p 6380 info stats | grep replica_buffer_disconnects\npython -m minidis --port 6380 --save \"\"           # experiment: disable auto snapshots",
+  "code_language": "bash",
+  "advantages": [
+   "Systematic isolation",
+   "INFO fields already expose most signals"
+  ],
+  "disadvantages": [
+   "Event loop lag metric missing",
+   "Per-command slowlog missing"
+  ],
+  "common_mistakes": [
+   "Average latency dekh ke 'sab theek' bolna",
+   "Ek saath kai cheezein badal dena experiment mein",
+   "Client-side network issues ko server blame karna bina correlation"
+  ],
+  "follow_up_questions": [
+   "SLOWLOG kaise implement karoge?",
+   "Event loop lag kaise measure karte hain?",
+   "Snapshot replica pe lena kyun common practice hai?"
+  ],
+  "concepts": [
+   "latency",
+   "debugging",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Snapshots durability dete hain lekin pause; master pe snapshots disable karke replica pe lena common trade -- master ka RPO replication + AOF pe depend karega.",
+   "failure_scenarios": "Spikes > client timeout -> retries -> load amplification. Flapping replica resync loop -> regular spikes + network saturation.",
+   "alternatives": "fork-based snapshots, incremental serialization (har tick thode keys), dedicated persistence replica, latency-aware scheduling.",
+   "scale_10x_100x": "Dataset 10x -> spikes 10x lambe; jo pehle 50ms tha woh 500ms -- SLO breach.",
+   "production_improvements": "SLOWLOG, LATENCY MONITOR jaisa event-loop-lag histogram, BGSAVE duration metric, aur spikes ke saath auto-correlation dashboards."
+  }
+ },
+ {
+  "id": "MRDS-078",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "minidis refuses to start with an aof_corrupted error. Walk through diagnosing and repairing it safely.",
+  "answer_hinglish": "Pehle samjho kya hua: `AppendOnlyFile.replay` ko file ke beech mein invalid RESP mila (`ProtocolError`), ya ek unknown command (`_apply_replay`: \"unknown command in AOF\"). Truncated tail hota toh server khud handle kar leta -- yeh usse alag hai, isliye refuse.\n\nDiagnose:\n1. Log: `aof_corrupted` event mein `offset` (last good byte) aur `error` hai (bpcommon JSON log). Woh offset hi starting point hai.\n2. File ko us offset ke aas paas dekho: `xxd -s <offset> -l 256 appendonly.aof` -- garbage kaisa hai? Zeroes ka block (filesystem/disk issue, ya pre-allocated space), random bytes (bit rot), ya valid RESP lekin unknown command (version mismatch -- naye binary ka AOF purane binary ne padha).\n3. Offset ke baad valid commands hain kya? Agar haan, toh sirf truncate karne se woh bhi khoyenge.\n\nRepair options (sabse pehle file ki backup copy banao):\na. Snapshot recent hai? Server ko AOF disabled + snapshot se start karo (`--appendonly no`), data verify karo, phir AOF enable -- minidis AOF ko snapshot se seed kar dega (`_load_from_disk` ka seeding path, agar purani AOF hata di ho).\nb. Truncate at offset: `truncate -s <offset> appendonly.aof` -- offset ke baad ka sab lose. Redis ka `redis-check-aof --fix` yahi karta hai. minidis mein aisa tool nahi hai.\nc. Unknown command case: sahi binary version deploy karo.\n\nRoot cause bhi dhoondo: disk errors (`dmesg`, SMART), do processes same file pe (do instances same `--dir`), ya manual edit. Aur decide karo ki fix ke baad replicas ko full sync karwana hai.",
+  "why_needed": "Corruption recovery mein ek galat step (bina backup truncate) recoverable data ko permanently mita deta hai.",
+  "real_world_analogy": "Jaise hisaab ki diary ke beech ke pages kharab -- pehle photocopy, phir dekho kaunse pages bach sakte hain, phir decide karo kahan se kaatna hai.",
+  "how_it_works": "Replay stops at first invalid byte; good_offset logged. Repair = choose between data after offset vs clean state, with backup first.",
+  "in_this_project": "`persistence/aof.py::replay` (`log.error(\"aof_corrupted\", extra={\"offset\": good_offset, ...})`), `server.py::_apply_replay`, `_load_from_disk` (seeding from snapshot). FAILURE_SCENARIOS #3.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/aof.py::replay",
+   "projects/02-mini-redis/minidis/server.py::_apply_replay",
+   "projects/02-mini-redis/minidis/server.py::_load_from_disk",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# illustrative repair session\ncp data/appendonly.aof data/appendonly.aof.bak\nxxd -s 18234 -l 128 data/appendonly.aof            # inspect bytes at the logged good offset\ntruncate -s 18234 data/appendonly.aof              # only if data after it is unrecoverable\npython -m minidis --dir ./data --appendonly yes    # loaded_from shows commands applied",
+  "code_language": "bash",
+  "advantages": [
+   "Fail-fast ne galat data serve hone se bachaya",
+   "Log mein exact offset"
+  ],
+  "disadvantages": [
+   "No built-in check/repair tool",
+   "No per-entry checksum -- corruption ka exact extent unclear"
+  ],
+  "common_mistakes": [
+   "Bina backup truncate",
+   "Beech ka garbage delete karke baaki splice karna bina samjhe",
+   "Root cause (disk) ignore karna"
+  ],
+  "follow_up_questions": [
+   "minidis-check-aof tool kaise design karoge?",
+   "Per-entry checksums ka overhead?",
+   "Replica se recover karna option hai?"
+  ],
+  "concepts": [
+   "corruption",
+   "recovery",
+   "operations"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Auto-truncate (availability) vs refuse (safety) -- operator decide kare. Tool support se decision fast aur safe.",
+   "failure_scenarios": "Truncate ke baad replicas ke paas zyada data hai (unke paas woh writes the) -- replica promote karna better option ho sakta hai. Galat binary se replay = unknown command errors.",
+   "alternatives": "Replica ko promote karo (agar uska data zyada complete hai), snapshot + partial AOF, ya backups se point-in-time restore.",
+   "scale_10x_100x": "Bade AOF pe manual hexdump impractical -- tooling zaroori; per-segment files (multi-part AOF) blast radius kam karte hain.",
+   "production_improvements": "`minidis --check-aof [--fix]`, per-entry CRC, AOF segments with manifest, aur runbook in DEPLOYMENT.md."
+  }
+ },
+ {
+  "id": "MRDS-079",
+  "project_slug": "p02-mini-redis",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "INFO replication on a replica shows master_link_status:down. How do you troubleshoot it?",
+  "answer_hinglish": "`master_link_status` `up` tabhi hai jab `ReplicaLink.state == \"connected\"`; warna `down` (states: connecting, sync). Steps:\n\n1. Replica logs: `replication_link_down` warning har failed attempt pe `master` address aur `error` (repr) ke saath. Error type batata hai:\n- `ConnectionRefusedError`: master port pe kuch listen nahi kar raha -- master down, galat port, ya master `127.0.0.1` pe bind hai aur replica doosri machine/container se aa raha hai.\n- DNS/getaddrinfo error: galat host (Docker mein service name `master` sahi hai, compose ke bahar nahi).\n- `RuntimeError: unexpected SYNC reply`: kisi aur cheez se connect ho gaya (real Redis RESP reply, ya proxy).\n- `ConnectionError: master closed the connection`: sync hua tha, phir master ne close kiya -- master logs mein `replica_output_buffer_overflow` dekho (slow replica) ya master restart.\n- `CorruptSnapshot`: transfer mein snapshot corrupt.\n2. Master side: `INFO replication` -- `connected_slaves`, aur logs mein `replica_attached` / `replica_detached`.\n3. `full_syncs` counter replica pe: tezi se badh raha hai matlab connect hota hai aur toot ta hai (flapping) -- buffer limit ya network.\n4. Network: replica host se `redis-cli -h master -p 6380 ping`.\n\nEk code-level note: backoff 2s pe cap hai aur reset nahi hota, toh recovery ke baad bhi max ~2s mein reconnect -- theek hai.\n\nCommon Docker gotcha: compose mein replica `--replicaof master:6380` use karta hai, master container ke andar `--host 0.0.0.0` pe listen karta hai (Dockerfile CMD) -- agar koi master ko `--host 127.0.0.1` se chala de toh replica connect hi nahi kar payega.",
+  "why_needed": "Replication link down = stale replicas aur failover ke liye unsafe; jaldi diagnose karna ops ka core skill hai.",
+  "real_world_analogy": "Jaise branch office ki head office se phone line kati -- pehle dekho phone dead hai, number galat hai, ya head office ne khud phone rakh diya.",
+  "how_it_works": "Error classification from logs -> check master side view -> check counters (full_syncs) -> network test.",
+  "in_this_project": "`replication.py::_run` (`replication_link_down` log), `_sync_once` (`unexpected SYNC reply`, `master closed the connection`), `server.py::info` (`master_link_status`, `full_syncs`), `_check_replica_buffers`. `docker-compose.yml` replica command.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/replication.py::_sync_once",
+   "projects/02-mini-redis/minidis/replication.py::_run",
+   "projects/02-mini-redis/minidis/server.py::info",
+   "projects/02-mini-redis/docker-compose.yml"
+  ],
+  "code_example": "# real, trimmed: minidis/server.py::info (replica side)\ns[\"replication\"] = {\"role\": \"slave\", \"master_host\": rl.host, \"master_port\": rl.port,\n                    \"master_link_status\": \"up\" if rl.state == \"connected\" else \"down\",\n                    \"slave_repl_offset\": rl.offset, \"full_syncs\": rl.full_syncs}",
+  "code_language": "python",
+  "advantages": [
+   "Structured logs with error repr",
+   "full_syncs counter flapping dikhata hai"
+  ],
+  "disadvantages": [
+   "master_link_down_since metric nahi",
+   "Replica-side lag (seconds) nahi"
+  ],
+  "common_mistakes": [
+   "Sirf replica dekhna, master logs nahi",
+   "Bind address (127.0.0.1 vs 0.0.0.0) bhool jana",
+   "Flapping ko 'up hai' maan lena"
+  ],
+  "follow_up_questions": [
+   "Link down hone pe replica reads serve kare ya nahi?",
+   "Flapping detect karne ka alert kaise?",
+   "master_link_down_since_seconds kaise add karoge?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "replication",
+   "networking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-080",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Defend the choice of single-threaded command execution. When does it hurt, and why did Redis keep it?",
+  "answer_hinglish": "Choice: saare commands ek event loop thread pe, ek ke baad ek. TRADEOFFS #1.\n\nKyun:\n1. Correctness free mein: har command atomic, koi lock nahi, koi deadlock nahi, koi race nahi. `test_concurrent_incr_is_exact` (50x200 = 10000) bina ek bhi lock ke.\n2. In-memory ops itne fast hain (microseconds) ki bottleneck CPU nahi, usually network aur syscalls hote hain. Locks ka overhead aur contention multi-threaded execution ka fayda kha jaata.\n3. Simplicity: data structures plain Python dict/deque/set -- thread-safe versions ki zaroorat nahi. Code reason karna aasaan.\n4. Python mein GIL ki wajah se threads waise bhi CPU parallelism nahi dete.\n\nKab hurt karta hai:\n1. Ek slow command sabko rokta hai -- `test_slow_command_blocks_all_clients`: DEBUG SLEEP 0.3 pe doosre client ka PING 0.28s+ ruka. KEYS, bade LRANGE, SAVE, BGSAVE ka in-loop dump.\n2. Ek CPU core ki limit -- throughput ceiling. Multi-core machine pe baaki cores idle.\n3. CPU-heavy commands (set intersections on huge sets) latency-unfriendly.\n\nRedis ne kyun rakha: Redis 6 ne threaded I/O add kiya (socket read/parse aur write threads pe) lekin execution single thread pe hi rakha -- kyunki atomicity model hi Redis ki API ka contract hai (MULTI/EXEC, Lua sab is pe based). Scale-out ke liye Cluster (sharding), scale-up ke liye nahi. Dragonfly/KeyDB jaise systems ne multi-threaded execution try kiya with complex locking/sharded-per-thread designs.",
+  "why_needed": "Yeh Redis ka defining design decision hai; har Redis interview mein poocha jaata hai.",
+  "real_world_analogy": "Ek bahut tez cashier vs paanch cashiers jo ek hi cash drawer share karte hain aur baar baar ek doosre ka wait karte hain.",
+  "how_it_works": "Serial execution = linearizable per command. Throughput = 1 / (avg command CPU time). Latency = queue wait + own time.",
+  "in_this_project": "`commands/__init__.py` docstring, `server.py::execute` (\"Never awaits -> atomic\"), `commands/server_cmds.py::debug` (deliberately blocking), `tests/test_concurrency.py`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::execute",
+   "projects/02-mini-redis/minidis/commands/server_cmds.py::debug",
+   "projects/02-mini-redis/tests/test_concurrency.py::test_slow_command_blocks_all_clients",
+   "projects/02-mini-redis/TRADEOFFS.md"
+  ],
+  "code_example": "# real: tests/test_concurrency.py\nt0 = time.perf_counter()\ntask = asyncio.create_task(slow.execute_command(\"DEBUG\", \"SLEEP\", \"0.3\"))\nawait asyncio.sleep(0.02)\nawait fast.ping()   # must wait for DEBUG SLEEP to finish\nassert time.perf_counter() - t0 >= 0.28",
+  "code_language": "python",
+  "advantages": [
+   "Lock-free atomicity",
+   "Simple, debuggable",
+   "Predictable ordering"
+  ],
+  "disadvantages": [
+   "Slow command head-of-line blocking",
+   "Single core ceiling"
+  ],
+  "common_mistakes": [
+   "Yeh bolna ki single-threaded hai toh slow hai",
+   "Threads add karke speed ki ummeed (GIL + locks)",
+   "O(N) commands production mein allow karna"
+  ],
+  "follow_up_questions": [
+   "Redis 6 threaded I/O kya karta hai?",
+   "Multi-core kaise use karoge bina atomicity tode?",
+   "Kaunse minidis commands O(N) hain?"
+  ],
+  "concepts": [
+   "single-threaded",
+   "concurrency model",
+   "trade-offs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-081",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "minidis implements both exact LRU (allkeys-lru) and sampled LRU (volatile-lru). Compare them and explain why Redis uses sampling.",
+  "answer_hinglish": "Exact LRU (`allkeys-lru`): OrderedDict ka order hi recency hai. Har access pe `move_to_end`, victim = `next(iter(self.data))`. Hamesha sach mein least recently used key evict hoti hai. Cost: OrderedDict internally har key ke liye linked-list node (prev/next pointers) rakhta hai, aur har read pe list update. `test_allkeys_lru_evicts_least_recently_used`: a, b, c store, a ko read, eviction pe b jaata hai.\n\nSampled LRU (`volatile-lru`): `_atime` dict mein har key ka logical access tick (`itertools.count`). Eviction pe `_volatile.sample(5)` -- 5 random TTL wali keys -- aur unme se sabse purana tick wala hatao. Kabhi kabhi \"sabse purani\" key sample mein hi nahi aayegi, toh thodi recent key evict ho sakti hai -- approximate.\n\nRedis sampling kyun karta hai: millions of keys pe har key ke liye do pointers (16 bytes on 64-bit) + list maintenance memory aur cache misses mein mehenga hai. Redis har object mein pehle se 24-bit LRU clock field rakhta hai, toh sampling ka extra memory cost zero hai. Redis docs ke hisaab se 5 samples pe approximation exact LRU ke kaafi kareeb hai aur 10 samples pe aur kareeb (`maxmemory-samples` config) -- yeh minidis mein `maxmemory_samples=5` hai.\n\nminidis mein dono isliye hain taaki difference code se dikha sakun (TRADEOFFS #3). Honest note: minidis `_atime` sab keys ke liye maintain karta hai, aur OrderedDict bhi -- toh yahan memory saving demonstrate nahi hoti, sirf algorithm.",
+  "why_needed": "Exact vs approximate algorithms ka trade-off (accuracy vs memory/CPU) systems design ka recurring theme hai.",
+  "real_world_analogy": "Exact LRU = har customer ki last visit ka register maintain karna. Sampled = 5 random customers bulao aur jo sabse pehle aaya tha usko 'regular nahi' maan lo.",
+  "how_it_works": "Exact: ordered structure, O(1) victim, O(1) touch with pointer updates. Sampled: per-key timestamp, O(k) victim from k samples, no ordering structure.",
+  "in_this_project": "`keyspace.py::_pick_victim`, `lookup` (move_to_end + `_atime`), `config.py::maxmemory_samples = 5`. Tests: `test_allkeys_lru_evicts_least_recently_used`, `test_allkeys_lru_server_keeps_hot_key`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::_pick_victim",
+   "projects/02-mini-redis/minidis/keyspace.py::lookup",
+   "projects/02-mini-redis/TRADEOFFS.md",
+   "projects/02-mini-redis/tests/test_expiry_eviction.py::test_allkeys_lru_evicts_least_recently_used"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Exact: deterministic, testable",
+   "Sampled: no ordering structure, tunable accuracy"
+  ],
+  "disadvantages": [
+   "Exact: memory + per-read mutation",
+   "Sampled: occasionally evicts a warmer key"
+  ],
+  "common_mistakes": [
+   "Yeh bolna ki sampled LRU 'galat' hai -- practically kaafi accurate",
+   "Samples bahut kam rakhna (1-2)",
+   "LRU ko scan-resistant samajhna (ek full scan saari hot keys hata sakta hai)"
+  ],
+  "follow_up_questions": [
+   "LFU kya hai aur kab better?",
+   "Redis eviction pool kya hai?",
+   "Samples badhane ka CPU cost?"
+  ],
+  "concepts": [
+   "LRU",
+   "approximation",
+   "eviction"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-082",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "How do the snapshot save rules work, and how would you tune them?",
+  "answer_hinglish": "Save rules \"seconds changes\" pairs hain: default `3600 1 300 100 60 10000` -- matlab \"1 ghante mein kam se kam 1 change\", \"5 minute mein 100 changes\", ya \"1 minute mein 10000 changes\" -- inme se koi bhi satisfy ho toh BGSAVE. Redis ka classic default yahi tha.\n\nCode: `_check_save_rules` cron se har tick chalta hai. Agar BGSAVE chal raha hai ya `dirty == 0` toh skip. Warna `elapsed = now - last_save_time` aur har rule ke liye `elapsed >= seconds and dirty >= changes` -> `start_bgsave()`. `dirty` har write command pe +1 hota hai (jo kuch propagate kare), aur save ke baad sahi tarike se ghatata hai.\n\nLogic: busy server (bahut changes) jaldi save kare taaki loss window chhoti ho; idle server bekaar saves na kare; aur thodi si change bhi ho toh ghante mein ek baar save ho jaye.\n\nTuning trade-offs:\n- Zyada frequent saves: chhota data-loss window (snapshot-only mode mein), lekin har save = in-loop serialization pause (minidis mein) + disk I/O. Bade dataset pe yeh latency spikes.\n- Kam frequent: kam pauses, bada loss window.\n- AOF on hai toh snapshots durability ke liye nahi, sirf fast restart/backups ke liye -- unhe kam frequent kar sakte ho.\n- Master pe disable (`--save \"\"`) aur replica pe snapshots: master latency bachao. Tests (`conftest.py`) `save_rules=[]` set karte hain taaki background saves tests ko flaky na banayein.\n- `save_on_shutdown`: graceful stop pe dirty ho toh final SAVE.",
+  "why_needed": "Snapshot frequency RPO aur latency dono decide karti hai; default ko blindly use karna bade datasets pe problem hai.",
+  "real_world_analogy": "Jaise document autosave: zyada kaam ho raha hai toh har minute save, kam ho raha hai toh ghante mein ek baar, kuch nahi badla toh kabhi nahi.",
+  "how_it_works": "Periodic check: (time since last save, changes since last save) vs thresholds; first match triggers BGSAVE.",
+  "in_this_project": "`config.py::ServerConfig.save_rules` default `[(3600, 1), (300, 100), (60, 10000)]`, `parse_args` (`--save`, empty disables), `server.py::_check_save_rules`, `stop` (save_on_shutdown). `tests/conftest.py` `cfg.setdefault(\"save_rules\", [])`.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::_check_save_rules",
+   "projects/02-mini-redis/minidis/config.py::parse_args",
+   "projects/02-mini-redis/tests/conftest.py::running",
+   "projects/02-mini-redis/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: minidis/server.py\ndef _check_save_rules(self) -> None:\n    p = self.persistence\n    if p.bgsave_in_progress or not p.dirty:\n        return\n    elapsed = time.time() - p.last_save_time\n    for seconds, changes in self.config.save_rules:\n        if elapsed >= seconds and p.dirty >= changes:\n            self.start_bgsave()\n            return",
+  "code_language": "python",
+  "advantages": [
+   "Adaptive to write rate",
+   "Idle server pe zero cost",
+   "Simple config"
+  ],
+  "disadvantages": [
+   "Change count, size nahi -- 10000 tiny writes aur 10000 huge writes same",
+   "Busy server pe frequent pauses"
+  ],
+  "common_mistakes": [
+   "AOF on hone ke bawajood aggressive snapshot rules",
+   "Tests mein background saves on chhodna (flaky)",
+   "Save rules ko durability guarantee samajhna"
+  ],
+  "follow_up_questions": [
+   "Snapshot ko replica pe offload kaise?",
+   "Bytes-based rule kaise add karoge?",
+   "BGSAVE fail ho raha ho toh save rules kya karenge?"
+  ],
+  "concepts": [
+   "snapshots",
+   "configuration",
+   "RPO"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-083",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Explain fork plus copy-on-write for BGSAVE, and compare it with minidis's serialize-in-loop approach. What would you choose on Linux?",
+  "answer_hinglish": "fork + COW (real Redis): `fork()` parent process ki ek copy banata hai, lekin memory pages copy nahi hote -- dono processes same physical pages share karte hain, read-only mark karke. Child ko ek frozen point-in-time view milta hai aur woh aaram se poora dataset disk pe likhta hai. Parent clients serve karta rehta hai; jab parent kisi page ko modify karta hai, kernel us page (typically 4KB) ki copy banata hai (copy-on-write) -- sirf badle hue pages duplicate hote hain.\n\nCost: fork khud page tables copy karta hai -- bade heaps (tens of GB) pe fork bhi tens-hundreds of ms le sakta hai (generic ballpark), aur transparent huge pages on hon toh COW 2MB pages copy karta hai -- latency aur memory dono kharab. Worst case (write-heavy during save) memory 2x. Isliye Redis docs overcommit settings aur THP disable recommend karte hain.\n\nminidis (TRADEOFFS #7): Windows pe fork nahi, toh `snapshot.dump` event loop pe -- consistent, lekin pause = poore dataset ka Python serialization time; memory: ek extra serialized copy (bytes). Disk I/O thread mein.\n\nPython-specific twist: CPython reference counting objects ko touch karta hai (refcount increment) -- child process mein sirf padhne se bhi pages dirty hote hain, toh COW sharing Python mein kaafi degrade hoti hai (generic known issue; `gc.freeze()` partially help karta hai). Matlab Python mein fork ka memory fayda Redis jitna nahi.\n\nLinux pe main kya chunta: `os.fork()` path (configurable), child mein `snapshot.dump` + `write_atomic` + `os._exit`, parent `waitpid` non-blocking cron mein. Memory headroom 2x plan karke, aur Windows/dev pe current approach fallback. Bade datasets pe pause ka fark itna bada hai ki fork worth it hai.",
+  "why_needed": "fork/COW OS-level concept hai jo Redis persistence, Postgres, aur Python multiprocessing sab mein aata hai; senior interviews mein deep dive common.",
+  "real_world_analogy": "Jaise ek ghar ka blueprint share karna: jab tak koi kamra renovate nahi hota dono same naksha dekhte hain; jo kamra badla sirf uski nayi copy banti hai.",
+  "how_it_works": "fork -> shared pages (read-only) -> write fault -> kernel copies page -> child sees old, parent sees new. Child writes snapshot, exits; parent reaps.",
+  "in_this_project": "`server.py::start_bgsave` docstring: \"Real Redis fork()s and lets copy-on-write give the child a frozen view. Python on Windows can't fork, so: serialize in-loop ..., then do the slow disk I/O + fsync in a thread\". TRADEOFFS #7, README limitations.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::start_bgsave",
+   "projects/02-mini-redis/minidis/persistence/snapshot.py::dump",
+   "projects/02-mini-redis/TRADEOFFS.md",
+   "projects/02-mini-redis/README.md"
+  ],
+  "code_example": "# illustrative (not in repo): Linux fork path\nimport os\npid = os.fork()\nif pid == 0:                      # child: frozen copy-on-write view of the keyspace\n    try:\n        snapshot.write_atomic(path, snapshot.dump(ks))\n        os._exit(0)\n    except Exception:\n        os._exit(1)\n# parent: keep serving; cron calls os.waitpid(pid, os.WNOHANG) and then _snapshot_done(...)",
+  "code_language": "python",
+  "advantages": [
+   "fork: near-zero pause, no extra serialized copy in parent",
+   "in-loop: portable, simple, deterministic"
+  ],
+  "disadvantages": [
+   "fork: memory up to 2x, fork latency on big heaps, CPython refcount COW degradation, asyncio + fork pitfalls",
+   "in-loop: pause proportional to dataset"
+  ],
+  "common_mistakes": [
+   "Yeh maan lena ki fork memory copy karta hai (nahi, lazily)",
+   "fork ke baad child mein event loop use karna",
+   "THP aur overcommit settings ignore karna"
+  ],
+  "follow_up_questions": [
+   "vm.overcommit_memory ka fork se kya relation?",
+   "Python refcounting COW ko kaise break karta hai?",
+   "fork ke baad child mein threads ka kya hota hai?"
+  ],
+  "concepts": [
+   "fork",
+   "copy-on-write",
+   "snapshots"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pause vs memory: fork pause ko almost khatam karta hai lekin memory risk laata hai; in-loop memory predictable lekin pause linear. Portability bhi factor.",
+   "failure_scenarios": "fork with low free memory + overcommit off -> fork fails (Redis 'Can't save in background: fork: Cannot allocate memory'). Write-heavy during save -> RSS 2x -> OOM killer. Child crash -> parent ko exit status se pata chalna chahiye.",
+   "alternatives": "Incremental/chunked serialization in-loop, persistent immutable data structures (O(1) snapshot), replica-based snapshots, ya Redis 7 jaisa forkless approaches for some ops.",
+   "scale_10x_100x": "10x heap pe fork latency bhi badhti hai (page table size); 100x pe huge pages vs fork trade-off critical -- isliye bade Redis instances avoid kiye jaate hain (sharding).",
+   "production_improvements": "Platform-aware strategy, `rdb_last_fork_usec` jaisa metric, memory headroom alerts, `gc.freeze()` before fork, aur snapshots on replicas."
+  }
+ },
+ {
+  "id": "MRDS-084",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why asyncio with one task per connection, rather than a thread per connection or multiple processes?",
+  "answer_hinglish": "Teen models compare karo for a Python in-memory server:\n\n1. Thread per connection: har client ka OS thread, blocking sockets. Problem: shared keyspace pe har command ke liye lock chahiye (atomicity), GIL ki wajah se CPU parallelism milta hi nahi, aur hazaron threads ka memory (stack per thread) + context switch overhead. Correctness bugs (lock bhoolna) ka risk.\n\n2. Multiple processes: CPU parallelism milta hai, lekin keyspace shared nahi ho sakta (alag memory). Ya toh sharding (har process apni keys -- client ya proxy routing chahiye) ya shared memory with locks (complex). Atomicity across processes nahi.\n\n3. asyncio single thread (minidis): ek event loop, har connection ek lightweight task (coroutine, KBs mein). Waiting connections free hain. Atomicity free (sync handlers). Redis ka same model (ae event loop). Limitation: ek core, blocking calls dangerous.\n\nMere decision ke reasons: (a) Redis semantics (per-command atomicity) bina locks ke, (b) workload I/O-bound per connection (chhote commands), (c) 200 concurrent connections test (`test_many_concurrent_clients`) trivially pass, (d) asyncio stdlib mein hai -- no third-party runtime deps.\n\nMulti-core chahiye toh mera path: multiple minidis processes as shards (har ek apna event loop) -- woh model jo Redis Cluster use karta hai -- na ki ek process mein threads. Ek hybrid bhi possible hai: Redis 6 jaisa I/O threads for parse/encode, lekin Python mein GIL ki wajah se gain limited.\n\nBlocking work ke liye asyncio mein escape hatch hai: `asyncio.to_thread` -- minidis fsync aur snapshot writes ke liye yahi use karta hai.",
+  "why_needed": "Concurrency model choice poore system ki correctness, performance aur complexity decide karti hai.",
+  "real_world_analogy": "Thread-per-connection = har customer ka personal waiter jo kitchen mein ek doosre se takraate hain. asyncio = ek bahut efficient waiter. Processes = alag restaurants, har ek ka apna menu section.",
+  "how_it_works": "asyncio: epoll/IOCP readiness -> resume task -> run until await. Threads: preemptive, shared memory, locks. Processes: isolated memory, IPC.",
+  "in_this_project": "`server.py::start` (`asyncio.start_server`), `_handle_client` (per-connection task), `asyncio.to_thread` in `start_bgsave` aur `aof.py::fsync_in_thread`. `tests/test_concurrency.py::test_many_concurrent_clients`. DEPLOYMENT.md: no third-party runtime deps.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/server.py::start",
+   "projects/02-mini-redis/minidis/persistence/aof.py::fsync_in_thread",
+   "projects/02-mini-redis/tests/test_concurrency.py::test_many_concurrent_clients",
+   "projects/02-mini-redis/ARCHITECTURE.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Lock-free atomicity",
+   "Cheap connections",
+   "Matches Redis model"
+  ],
+  "disadvantages": [
+   "Single core",
+   "Blocking calls catastrophic",
+   "async/sync boundary pe discipline chahiye"
+  ],
+  "common_mistakes": [
+   "Threads + GIL se CPU scaling ki ummeed",
+   "asyncio mein blocking file I/O on loop",
+   "Processes ke saath shared state assume karna"
+  ],
+  "follow_up_questions": [
+   "Free-threaded Python (no-GIL builds) is decision ko badlega?",
+   "uvloop se kya badlega?",
+   "to_thread kab use karna chahiye?"
+  ],
+  "concepts": [
+   "concurrency models",
+   "asyncio",
+   "GIL"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "asyncio simplicity + atomicity vs multi-core. Threads ka fayda Python mein mainly blocking I/O ke liye hai, jo asyncio already solve karta hai. Processes scale dete hain lekin data partitioning force karte hain.",
+   "failure_scenarios": "Koi blocking call loop pe (DEBUG SLEEP, big KEYS, sync fsync in always mode) -> sab clients stall. Thread model mein ek lock bug -> deadlock -> poora server hang.",
+   "alternatives": "Free-threaded CPython (3.13+ experimental) with fine-grained locks; Rust/Go with goroutines; shared-nothing per-core (Seastar/Dragonfly style).",
+   "scale_10x_100x": "10x connections: asyncio fine (memory per task chhoti). 10x CPU demand: shards across processes/nodes.",
+   "production_improvements": "uvloop, event-loop lag monitoring, process-per-core sharding with a routing layer, aur strict lint rule: no blocking calls in handlers."
+  }
+ },
+ {
+  "id": "MRDS-085",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "minidis stores lists as deques, sets as Python sets and hashes as dicts. What does it give up compared to Redis's internal encodings?",
+  "answer_hinglish": "Python built-ins correctness aur simplicity dete hain, lekin Redis ke memory aur CPU optimizations nahi.\n\nRedis small collections ke liye compact encodings use karta hai: chhote hashes/lists/sorted sets `listpack` mein (ek contiguous byte array, koi pointers nahi), chhote integer sets `intset` mein (sorted integer array), aur bade hone pe automatically hashtable/quicklist pe convert. Quicklist = linked list of listpacks. Strings ke liye `int`, `embstr` (header + data ek allocation), `raw`. Isse millions of chhoti keys pe memory dramatically kam hoti hai aur cache locality achhi.\n\nminidis mein:\n- `deque`: dono ends O(1) (Redis quicklist jaisa behaviour) -- LPUSH/RPOP queues ke liye sahi. Lekin middle indexing O(n), aur `LRANGE` `list(lst)[start:stop+1]` poore deque ko copy karta hai (code comment yeh admit karta hai: \"slicing via list() keeps the code simple\").\n- `set`/`dict`: O(1) ops, lekin har element ek Python bytes object (~33+ bytes header, generic CPython figure) + hash table slot.\n- Har value Python object; `ENTRY_OVERHEAD = 64` / `ELEMENT_OVERHEAD = 16` estimates real Python overhead ko under-count karte hain.\n\nKya milta hai: code chhota, bugs kam, Python ke battle-tested structures. Is project ka goal architecture sikhana tha (TRADEOFFS #2), memory engineering nahi.\n\nProduction direction: chhote hashes ke liye ek packed `bytes` representation, integer strings ko int ki tarah store, aur LRANGE ke liye `itertools.islice` (copy avoid, lekin deque mein seek abhi bhi O(n)).",
+  "why_needed": "Memory efficiency in-memory databases ki cost decide karti hai; Redis ke encodings ek classic optimization example hain.",
+  "real_world_analogy": "Jaise chhote saman ke liye ek tiffin box (listpack) vs har item ka alag dabba (Python objects) -- dabbe zyada jagah lete hain.",
+  "how_it_works": "Redis: encoding per object, auto-conversion thresholds (`hash-max-listpack-entries` etc.). minidis: one encoding per type.",
+  "in_this_project": "`keyspace.py` module docstring (type mapping, \"deque ... like Redis quicklist\"), `value_size`, `commands/lists.py::lrange` (list() copy comment), `DATABASE_DESIGN.md` value types.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/keyspace.py::value_size",
+   "projects/02-mini-redis/minidis/commands/lists.py::lrange",
+   "projects/02-mini-redis/DATABASE_DESIGN.md",
+   "projects/02-mini-redis/TRADEOFFS.md"
+  ],
+  "code_example": "# real: minidis/commands/lists.py::lrange\nstart, stop = _norm_range(to_int(args[2]), to_int(args[3]), len(lst))\nif start > stop:\n    return []\n# deque indexing is O(n) in the middle; slicing via list() keeps the code simple.\nreturn list(lst)[start:stop + 1]",
+  "code_language": "python",
+  "advantages": [
+   "Simple, correct, fast to build",
+   "O(1) for common ops"
+  ],
+  "disadvantages": [
+   "High per-element memory",
+   "LRANGE copies whole list",
+   "No small-collection optimizations"
+  ],
+  "common_mistakes": [
+   "Python list for queues (O(n) left ops)",
+   "Memory estimate ko real samajhna",
+   "LRANGE 0 -1 on huge lists"
+  ],
+  "follow_up_questions": [
+   "listpack kaise kaam karta hai?",
+   "LRANGE ko efficient kaise banaoge?",
+   "Integer strings ko kaise optimize karoge?"
+  ],
+  "concepts": [
+   "data structures",
+   "memory encoding",
+   "trade-offs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MRDS-086",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why is appendfsync everysec the recommended default, and how does minidis implement it without blocking clients?",
+  "answer_hinglish": "Teen options ka spectrum: `always` (koi acknowledged write nahi khota, har batch pe fsync latency), `no` (fastest, OS ki marzi -- Linux pe typically ~30s tak loss), `everysec` (~1s max loss, fsync cost amortized). DEPLOYMENT.md everysec ko default trade-off bolta hai: zyadatar apps ke liye 1 second ka worst-case loss acceptable hai, aur throughput `no` ke kareeb rehta hai. Real Redis ka default bhi yahi hai.\n\nminidis implementation do hisson mein:\n1. Request path: batch ke end pe sirf `aof.flush()` -- Python buffer se OS page cache (ek `write` syscall). Sasta, aur process crash ke against kaafi.\n2. Cron: har tick check `fsync_policy == \"everysec\" and time.monotonic() - last_fsync >= 1`; tab `await self.aof.fsync_in_thread()` -- jo pehle loop pe `flush()` karta hai aur phir `asyncio.to_thread(os.fsync, fd)`. fsync disk ka wait karta hai (slow), lekin woh thread pool mein hai, toh event loop clients serve karta rehta hai. Monotonic clock use hota hai taaki wall-clock jumps interval na bigaadein.\n\nSubtleties:\n- `await` cron coroutine ko suspend karta hai jab tak fsync khatam na ho -- slow disk pe agla fsync aur active expiry late. Loss window tab 1s se zyada ho sakti hai. Redis yahan \"Asynchronous AOF fsync is taking too long\" log karta hai aur 2s se zyada delay pe writes ko delay karta hai; minidis mein yeh guard nahi.\n- fsync thread mein chal raha hai jabki loop same file pe naye writes kar raha hai -- fsync fd-level hai, toh concurrent writes safe hain; jo fsync ke time tak OS mein pahunch gaya woh durable.\n- `CONFIG SET appendfsync` runtime pe policy badal sakta hai.",
+  "why_needed": "Default durability setting choose karna = product decision; isko quantify karke explain karna aana chahiye.",
+  "real_world_analogy": "Jaise har ek minute pe bank mein cash jama karna -- har transaction pe bank jaana (always) bahut slow, kabhi na jaana (no) risky.",
+  "how_it_works": "Write path: append + flush (cheap). Background: periodic fsync off-loop. Loss bound = time since last completed fsync.",
+  "in_this_project": "`server.py::_cron` (everysec branch), `persistence/aof.py::fsync_in_thread`, `_handle_client` (else: flush), `commands/server_cmds.py::config` (CONFIG SET appendfsync). DEPLOYMENT.md config table.",
+  "implementation_files": [
+   "projects/02-mini-redis/minidis/persistence/aof.py::fsync_in_thread",
+   "projects/02-mini-redis/minidis/server.py::_cron",
+   "projects/02-mini-redis/minidis/commands/server_cmds.py::config",
+   "projects/02-mini-redis/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: minidis/persistence/aof.py\nasync def fsync_in_thread(self) -> None:\n    self._file.flush()\n    fd = self._file.fileno()\n    await asyncio.to_thread(os.fsync, fd)",
+  "code_language": "python",
+  "advantages": [
+   "Bounded loss (~1s) at near-'no' throughput",
+   "fsync never blocks clients"
+  ],
+  "disadvantages": [
+   "Slow disk pe loss window silently badhti hai",
+   "Power loss pe up to ~1s acknowledged writes"
+  ],
+  "common_mistakes": [
+   "everysec ko 'exactly 1s max' guarantee bolna",
+   "fsync event loop pe chalana",
+   "wall clock se interval naapna"
+  ],
+  "follow_up_questions": [
+   "Disk slow ho toh Redis kya karta hai?",
+   "always vs everysec ka throughput difference kaise measure karoge?",
+   "fdatasync use karna chahiye?"
+  ],
+  "concepts": [
+   "fsync",
+   "durability",
+   "defaults"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "1s RPO vs throughput. always strict hai lekin minidis mein loop pe sync fsync -- sab clients pe latency. everysec ek balanced default; critical data ke liye always ya replication + WAIT.",
+   "failure_scenarios": "Disk stall (cloud volume throttling) -> fsync seconds le -> loss window badhe, aur cron ruk jaye (active expiry delay). Thread pool exhaust nahi hoga (ek fsync at a time, kyunki await).",
+   "alternatives": "Group commit with fsync thread (always ka better version), O_DSYNC writes, battery-backed caches, ya replication as durability.",
+   "scale_10x_100x": "Zyada write rate pe ek second ka data zyada -- loss in bytes badhta hai, time nahi. Bade AOF pe fsync time bhi.",
+   "production_improvements": "fsync duration metric, 'aof_delayed_fsync' counter, writes throttle jab fsync >2s pending ho (Redis behaviour), aur alert."
+  }
+ },
+ {
+  "id": "MRDS-087",
+  "project_slug": "p02-mini-redis",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Would you use minidis (or Redis) as a primary database rather than a cache? Give a decision framework.",
+  "answer_hinglish": "Pehle minidis ke baare mein seedha jawab: production primary store ke liye nahi -- no auth/TLS, no PSYNC, no automatic failover, Python performance, aur kuch gaps (disk-full handling; DEL under OOM wala gap review mein fix ho chuka). Yeh learning-grade hai, aur README ki limitations yahi kehti hain.\n\nRedis (aur concept level pe minidis ka design) ke liye framework:\n\n1. Data fit: dataset RAM mein fit hota hai (aur growth plan)? Cost per GB RAM disk se kaafi zyada.\n2. Durability requirement (RPO): kitna data loss acceptable? AOF `always` single node pe acknowledged writes bachata hai, lekin async replication failover pe loss kar sakta hai. Agar zero-loss across failures chahiye (payments, ledgers) -> nahi, consensus-based DB (Postgres sync replication, CockroachDB, etc.).\n3. Query patterns: key-based access, counters, queues, sets? Haan. Ad-hoc queries, joins, secondary indexes, multi-key transactions with constraints? Nahi -- relational DB.\n4. Recovery time (RTO): restart pe poora dataset load (AOF replay ya snapshot) -- bade datasets pe minutes.\n5. Consistency: per-command atomicity hai, transactions limited (minidis mein MULTI/EXEC hi nahi).\n6. Ops maturity: persistence, replication, failover, backups, memory monitoring chalane ki team capability.\n\nTypical good primary-store uses: session store, rate limit counters, leaderboards, job queues, feature flags -- jahan data recompute ho sakta hai ya chhota loss acceptable hai. Configuration: `noeviction`, AOF `everysec`/`always`, snapshots for backups, replicas + failover tool, `maxmemory` alerts. DEPLOYMENT.md bhi yahi bolta hai: \"allkeys-lru for caches, noeviction for data you can't lose\".",
+  "why_needed": "'Redis ko database ki tarah use karein?' ek common architecture debate hai; framework se jawab dena senior signal hai.",
+  "real_world_analogy": "Jaise wallet vs bank locker: wallet (in-memory) tez aur convenient, lekin sab paisa usme nahi rakhte -- rakhte ho toh insurance (persistence, replicas) chahiye.",
+  "how_it_works": "Requirements -> (fit, RPO, RTO, query model, consistency, ops) -> decision + config.",
+  "in_this_project": "README \"Known limitations\", DEPLOYMENT.md settings table, SYSTEM_DESIGN durability spectrum, FAILURE_SCENARIOS \"Known data-loss windows\".",
+  "implementation_files": [
+   "projects/02-mini-redis/README.md",
+   "projects/02-mini-redis/DEPLOYMENT.md",
+   "projects/02-mini-redis/SYSTEM_DESIGN.md",
+   "projects/02-mini-redis/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Very low latency",
+   "Rich data structures",
+   "Simple ops model for key-based data"
+  ],
+  "disadvantages": [
+   "RAM cost",
+   "Async replication loss window",
+   "Limited query/transaction model"
+  ],
+  "common_mistakes": [
+   "Cache config (allkeys-lru) primary data pe",
+   "Durability ko AOF on/off tak simplify karna",
+   "RTO ignore karna"
+  ],
+  "follow_up_questions": [
+   "Session store ke liye kaunsi settings?",
+   "Redis + Postgres saath mein kaise (cache-aside, write-through)?",
+   "Zero-loss requirement pe kya choose karoge?"
+  ],
+  "concepts": [
+   "architecture decisions",
+   "durability",
+   "data stores"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Latency aur simplicity vs durability aur query power. Hybrid (Redis for hot path + RDBMS as source of truth) aksar best hai.",
+   "failure_scenarios": "Failover pe recent writes lost; memory full pe OOM errors; long restart on big datasets; replica lag pe stale reads.",
+   "alternatives": "Postgres (source of truth) + Redis cache, DynamoDB/Cassandra for scale, Redis with Raft-based modules, managed MemoryDB (durable multi-AZ log).",
+   "scale_10x_100x": "10x data -> RAM cost dominates, sharding needed; 100x -> disk-based store usually cheaper.",
+   "production_improvements": "Clear SLOs (RPO/RTO), backup + restore drills, failover drills, memory capacity planning, aur data classification (kaunsa data cache hai, kaunsa source of truth)."
+  }
+ }
+]

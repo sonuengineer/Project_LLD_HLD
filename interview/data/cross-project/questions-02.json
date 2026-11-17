@@ -1,0 +1,802 @@
+[
+ {
+  "id": "SYSD-016",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "How do you design idempotency end to end across multiple services?",
+  "answer_hinglish": "Short answer: har hop pe ek stable identity chahiye jo retries ke across same rahe, aur har receiver us identity pe dedupe kare -- ideally usi transaction mein jisme side effect likha jaata hai.\n\nClarify: kaun retry karta hai? Client (network timeout), hum khud (worker redelivery), upstream (webhook retries). Har layer ka apna key: (1) API layer -- client-supplied Idempotency-Key + request hash; (2) internal hops -- deterministic key derive karo, e.g. `capture-{payment_id}`, `{workflow_id}:{seq}`, `job_id`; (3) external providers -- wahi derived key forward karo; (4) inbound webhooks -- provider event id pe dedupe.\n\nDesign rules jo main follow karta hoon: key ko request hash ke saath store karo (same key + different body = 422); 'in progress' state ke saath lease, taaki crash ke baad takeover ho sake; deterministic 4xx ka response store karo, 5xx ka nahi; aur dedupe record + side effect ek hi ACID transaction mein (processed_jobs pattern), warna crash beech mein gap bana deta hai.\n\nMere projects mein yeh har level pe hai: Project 9 API keys, Project 3 enqueue key + processed_jobs ledger, Project 4 event idempotency key + stable `webhook-id`, Project 5 producer id + sequence, Project 10 business workflow id + activity key. Scaling: idempotency table grow karti hai -- TTL (24h-7d) aur partitioning. Trade-off: storage + ek extra write per request, badle mein retries safe.",
+  "why_needed": "Distributed system mein 'did it happen?' ka answer aksar 'pata nahi' hota hai. Retry hi solution hai, aur retry tabhi safe hai jab operation idempotent ho.",
+  "real_world_analogy": "Train ticket ka PNR: aap booking page refresh karo ya dobara submit karo, same PNR pe system bolta hai 'already booked' -- naya seat nahi deta.",
+  "how_it_works": "Layers:\n1) Client -> API: Idempotency-Key header, row (key, request_hash, state, locked_until, response).\n2) API -> queue: enqueue with idempotency key (201 vs 200).\n3) Worker -> DB: processed_jobs insert ON CONFLICT in same tx as effect.\n4) Service -> provider: deterministic key per operation.\n5) Provider -> us (webhook): dedupe on event id.\n6) Stream: producer id + sequence per partition.\n\nKey derivation must be deterministic from business identity, never random per attempt.",
+  "in_this_project": "Project 9 `services/idempotency.py::begin` (replay, mismatch 422, in-progress 409, crash takeover via `locked_until`). Project 3 `core/lua/enqueue.lua` (idempotent enqueue) + `handlers/builtin.py::send_email` (processed_jobs). Project 4 `events.py::publish` (`ON CONFLICT DO NOTHING` on idempotency_key, race loser returns winner). Project 5 `partition.py::check_sequence`. Project 10 `ActivityContext.idempotency_key` -- tests exact effect counts assert karte hain (20 workflows -> reserve 20, charge 20).",
+  "implementation_files": [
+   "projects/09-payments/payments/services/idempotency.py::begin",
+   "projects/03-job-queue/jobqueue/core/lua/enqueue.lua",
+   "projects/04-webhooks/webhooks/services/events.py::publish",
+   "projects/10-workflow-engine/flowengine/activities.py::idempotency_key"
+  ],
+  "code_example": "# real, trimmed: projects/04-webhooks/webhooks/services/events.py (publish)\nstmt = (insert(Event).values(id=event_id, type=body.type, payload=body.payload,\n                             idempotency_key=body.idempotency_key)\n        .on_conflict_do_nothing(index_elements=[\"idempotency_key\"]).returning(Event.id))\nif (await s.execute(stmt)).scalar_one_or_none() is None:\n    # Lost a race with a concurrent request using the same key: return the winner.\n    existing = await s.scalar(select(Event).where(Event.idempotency_key == body.idempotency_key))\n    return existing, 0, False",
+  "code_language": "python",
+  "advantages": [
+   "Retries har layer pe safe",
+   "Crash recovery simple: bas phir se chalao",
+   "Duplicate charges/emails structurally impossible (jahan key DB tx mein hai)"
+  ],
+  "disadvantages": [
+   "Har request pe extra write",
+   "Key storage aur expiry management",
+   "External systems jo keys support nahi karte unke saath gap rehta hai"
+  ],
+  "common_mistakes": [
+   "Retry pe naya random key generate karna",
+   "Dedupe check aur side effect alag transactions mein",
+   "Request hash store na karna (key reuse with different body)",
+   "5xx response ko permanently store karna"
+  ],
+  "follow_up_questions": [
+   "What happens if two requests with the same key arrive concurrently?",
+   "How long should idempotency keys be retained?",
+   "How do you make an external call idempotent if the provider has no key support?"
+  ],
+  "concepts": [
+   "idempotency",
+   "deduplication",
+   "retries",
+   "exactly-once effects"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Client-supplied keys (client controls retry semantics) vs server-derived keys (no client cooperation). Store full response (exact replay, storage) vs only status. Synchronous dedupe in DB (strong) vs Redis SETNX (fast, can lose on failover).",
+   "failure_scenarios": "Crash after insert in_progress before completion -> lease expires, next request takes over. Concurrent same key -> 409 in progress (Project 9) ya race loser returns winner (Project 4). Idempotency store failover with lag -> duplicates possible if store is async-replicated Redis.",
+   "alternatives": "Natural idempotency (PUT with full state, upserts), conditional writes (version/ETag), dedupe windows in streams (Kafka idempotent producer), outbox + consumer inbox table.",
+   "scale_10x_100x": "10x: idempotency table partitioned by day, index on (merchant, key). 100x: shard by tenant, TTL drop of partitions, bloom filter front for quick 'new key' path.",
+   "production_improvements": "Expiry job, metrics on replay rate (high replay = client retry storm), documentation for clients on key scope, inbox table for every event consumer."
+  }
+ },
+ {
+  "id": "SYSD-017",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "Is exactly-once delivery possible? Explain using your projects.",
+  "answer_hinglish": "Mera seedha answer: exactly-once DELIVERY network ke upar possible nahi; jo milta hai woh at-least-once delivery + idempotent processing = exactly-once EFFECT. Interview mein main yeh distinction pehle line mein bolta hoon.\n\nKyun: sender message bhejta hai, receiver process karta hai, ack network mein lose ho jaata hai. Sender ke paas do options -- retry (duplicate risk) ya na kare (loss risk). Two Generals problem. Project 4 ka TRADEOFFS #2 exactly yahi kehta hai: customer ne process kar liya aur 2xx lose ho gaya, toh hum retry karenge.\n\nTo kya karte hain? Teen tools: (1) dedupe identity -- `webhook-id`, job id, producer sequence; (2) dedupe record aur effect ek atomic transaction mein -- Project 3 ka processed_jobs; (3) fencing -- zombie ka purana result reject. Kafka ka 'exactly-once' bhi isi ka form hai: idempotent producer + transactions jo consume offset aur produce ko atomic banate hain -- lekin sirf Kafka ke andar; external side effect (email, HTTP) phir bhi at-least-once hai.\n\nMere projects mein evidence: Project 3 `test_kill_minus_nine_worker_process` -- worker kill, dusra process job dobara chalata hai (`attempts=2`, `duplicate=true`) par exactly 1 email row. Project 5 at-least-once redelivery test + idempotent producer dedupe. Project 10 activities at-least-once, idempotency key se effect once. Project 9 provider retry same key se 'done once, never twice'.",
+  "why_needed": "Interviewers is myth ko test karte hain. 'Hum exactly-once dete hain' bolna red flag hai; sahi framing dikhata hai ki aap failure modes samajhte ho.",
+  "real_world_analogy": "Courier ne parcel diya, lekin signature wali slip raste mein gir gayi. Company dobara bhejegi. Aapka kaam: order number dekh ke 'yeh toh mil chuka' bolna -- exactly-once receiving, at-least-once sending.",
+  "how_it_works": "- Delivery semantics: at-most-once (ack before process), at-least-once (ack after process), effectively-once (at-least-once + dedupe).\n- Atomicity boundary: dedupe marker aur effect ek system/transaction mein hone chahiye. Agar effect external hai (HTTP), toh downstream ko key forward karo.\n- Fencing: lease-based systems mein zombie writes reject karo.\n- Kafka EOS: idempotent producer + transactional offsets; scope = Kafka-to-Kafka.",
+  "in_this_project": "Project 3: `handlers/builtin.py::send_email` -- processed_jobs + email_outbox same tx. Project 4: `receiver/app.py` `webhook-id` dedupe (`test_receiver_dedupes_replayed_delivery`). Project 5: `partition.py::check_sequence` (same batch retry -> same offset) aur documented gap: producer state replicated nahi, failover straddling retry duplicate kar sakta hai. Project 10: `test_retries_with_backoff_then_success_effect_once`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/04-webhooks/webhooks/receiver/app.py",
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::check_sequence",
+   "projects/10-workflow-engine/flowengine/activities.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Honest guarantees jo test se prove hote hain",
+   "Simple building blocks (ids, transactions, fencing)"
+  ],
+  "disadvantages": [
+   "Har consumer ko dedupe logic chahiye",
+   "Dedupe state ka storage/retention"
+  ],
+  "common_mistakes": [
+   "'Exactly-once' ko marketing term ki tarah bolna",
+   "Dedupe ko memory mein rakhna (restart pe lose)",
+   "Kafka EOS ko external side effects tak extend samajhna"
+  ],
+  "follow_up_questions": [
+   "How does Kafka's transactional producer work?",
+   "Where exactly is the atomicity boundary in your job queue?",
+   "What if the side effect is in a system that can't dedupe?"
+  ],
+  "concepts": [
+   "exactly-once",
+   "at-least-once",
+   "idempotency",
+   "two generals problem",
+   "fencing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "At-most-once (no duplicates, loss) vs at-least-once + dedupe (no loss, dedupe cost). Dedupe in same DB (strong) vs separate store (gap window).",
+   "failure_scenarios": "Crash between effect and ack -> redelivery -> dedupe hit. Crash between dedupe insert and effect in different systems -> effect lost (isliye same tx). Leader failover in Project 5 with retry -> possible duplicate (documented).",
+   "alternatives": "Kafka transactions, Flink checkpoints with two-phase commit sinks, inbox/outbox tables, idempotent HTTP APIs with keys.",
+   "scale_10x_100x": "10x: dedupe tables partitioned/TTL. 100x: dedupe windows bounded by time, probabilistic filters for fast path, per-partition dedupe state colocated with consumer.",
+   "production_improvements": "Replicate producer state, consumer inbox tables everywhere, contract tests asserting handlers are idempotent, metrics on duplicate rate."
+  }
+ },
+ {
+  "id": "SYSD-018",
+  "project_slug": "cross-project",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Explain the transactional outbox pattern end to end, using Projects 4 and 9.",
+  "answer_hinglish": "Outbox ka problem: service ko DB update bhi karna hai aur event/message bhi bhejna hai. Do alag systems mein do writes (dual write) -- ek succeed, dusra fail = inconsistency. Outbox: event ko usi DB transaction mein ek table mein likho jisme business change hai; phir ek relay/dispatcher us table se padh ke bhejta hai, at-least-once.\n\nEnd to end: (1) business tx: `INSERT order` + `INSERT outbox(event)` + COMMIT -- dono ya koi nahi. (2) relay: `SELECT ... FOR UPDATE SKIP LOCKED` se batch claim, lease ke saath, bheje, mark sent. (3) crash after send before mark -> dobara bhejega, isliye consumer dedupe on event id. (4) cleanup: sent rows ko retention ke baad delete/partition drop.\n\nProject 4 mein outbox aur queue same rows hain: `publish` ek transaction mein event + har subscriber ke liye delivery row likhta hai, aur dispatcher seedha unhi rows ko claim karta hai -- `test_publish_is_atomic` rollback prove karta hai. Project 9 mein pattern 'intent first' ke form mein hai: provider call se pehle `capturing` state + event row commit, call ke baad result -- crash ke baad recovery worker DB se dekh ke resume karta hai. Project 3 TRADEOFFS #1 honestly bolta hai ki uska Redis enqueue producer ke DB tx ke saath atomic nahi -- fix outbox hai.\n\nScaling: Postgres outbox thousands/s tak theek (Project 4 measured 189 deliveries/s with 3 dispatchers on a shared laptop, CPU-bound). Beyond: relay into Kafka ya CDC (Debezium WAL tail).",
+  "why_needed": "Dual write sabse common distributed bug hai: order save hua par event nahi gaya (ya ulta). Outbox ek ACID transaction ka use karke yeh gap khatam karta hai.",
+  "real_world_analogy": "Dukaan mein bill aur delivery slip ek hi carbon copy se bante hain -- bill bana toh slip bhi bani. Delivery boy baad mein slips uthata hai.",
+  "how_it_works": "1) Write: business row + outbox row, one tx.\n2) Relay: poll (SKIP LOCKED + lease) or CDC (logical replication).\n3) Publish: to broker/HTTP; at-least-once.\n4) Mark: sent_at / status; fenced by attempt.\n5) Consumer: inbox/dedupe by event id.\n6) Cleanup: retention.\n\nOrdering: per aggregate order chahiye toh relay per-aggregate sequential ho, ya event mein version ho.",
+  "in_this_project": "Project 4 `services/events.py::publish` + `dispatcher/dispatcher.py::CLAIM_SQL`/`RECORD_SQL`; Project 9 `services/state.py::transition` (CAS + payment_events same tx) aur `recovery.py::run_recovery`; Project 3 `handlers/builtin.py` mein `email_outbox` table (handler ka effect outbox mein jaata hai, actual SMTP baad mein).",
+  "implementation_files": [
+   "projects/04-webhooks/webhooks/services/events.py::publish",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/09-payments/payments/services/state.py::transition",
+   "projects/03-job-queue/jobqueue/db/models.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No dual write",
+   "Event loss impossible once tx commits",
+   "Audit trail free"
+  ],
+  "disadvantages": [
+   "Extra table + relay process",
+   "Latency (poll interval)",
+   "Duplicates possible, consumers must dedupe"
+  ],
+  "common_mistakes": [
+   "Outbox row ko alag transaction mein likhna",
+   "Relay ko single instance bina lease (SPOF) ya bina SKIP LOCKED (duplicate sends)",
+   "Outbox table kabhi clean na karna (Project 4 limitation documented)"
+  ],
+  "follow_up_questions": [
+   "Polling relay vs CDC: which would you pick?",
+   "How do you preserve ordering per aggregate?",
+   "What is the inbox pattern?"
+  ],
+  "concepts": [
+   "transactional outbox",
+   "dual write",
+   "CDC",
+   "at-least-once"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Polling relay (simple, DB load) vs CDC (low latency, infra). Outbox = queue (Project 4, fewer components) vs outbox -> Kafka (scale). Delete after send vs keep for audit.",
+   "failure_scenarios": "Relay crash after send -> re-send -> consumer dedupe. Broker down -> outbox grows, alert on backlog age. DB failover -> committed outbox rows survive, relay resumes.",
+   "alternatives": "Debezium CDC, Postgres LISTEN/NOTIFY as wakeup, event sourcing (events are the state), 2PC/XA (avoid).",
+   "scale_10x_100x": "10x: batch relay, partition outbox by time. 100x: CDC to Kafka, per-aggregate partitioning, drop old partitions instead of DELETE.",
+   "production_improvements": "Backlog age metric, retention job, inbox table on consumers, schema versioning for events."
+  }
+ },
+ {
+  "id": "SYSD-019",
+  "project_slug": "cross-project",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Saga with compensations vs a workflow engine: compare Project 9's saga and Project 10's engine.",
+  "answer_hinglish": "Dono same problem solve karte hain -- multi-step process jisme 2PC possible nahi (third parties), toh har step local commit karta hai aur failure pe compensating actions chalte hain. Fark hai ki durability kaun own karta hai.\n\nProject 9 saga (`services/saga.py::checkout`): reserve inventory -> charge -> ship; har step aur compensation DB mein persist hota hai (`_step`, `_status`). Shipping fail -> `compensate` refund + release. Simple, ek file, explicit. Limitation (README): process crash mid-saga ke baad automatic resume nahi -- steps persisted hain par koi orchestrator unhe pick nahi karta.\n\nProject 10 engine: wahi flow ek `@workflow` function mein likho; har step activity hai, history mein record hota hai, worker crash pe koi aur worker replay karke resume karta hai (`test_worker_crash_another_worker_resumes_from_history`). Retries, timers (e.g. '3 din wait for signal'), cancellation sab framework deta hai. Cost: determinism rules, replay CPU, aur 97 SQL statements per 4-activity workflow measured.\n\nKab kya: 2-3 steps, short-lived, ek team -> hand-written saga (orchestrated) ya choreography events. Bahut saare long-running flows, human waits, timers, versioning -> workflow engine. Interview line: 'saga ek pattern hai, workflow engine us pattern ko durable banane wala runtime hai.' 100x pe engine ka history store shard karna padta hai; saga ka state table simple partition ho jaata hai.",
+  "why_needed": "Microservices aur third-party APIs ke across ACID transaction nahi milta. Saga/workflow choose karna architecture ka bada decision hai -- complexity aur reliability ka trade.",
+  "real_world_analogy": "Shaadi ki planning: saga = ek checklist jo aap khud track karte ho (hall, caterer, band; cancel hua toh advance wapas maango). Workflow engine = wedding planner company jo checklist khud chalati hai, aapke beemar padne pe bhi.",
+  "how_it_works": "Saga types: orchestration (central coordinator) vs choreography (events). Compensation != rollback: refund customer statement pe dikhta hai.\n\nWorkflow engine adds: durable history, automatic resume, retries/timeouts per step, timers, signals, cancellation scopes, visibility.\n\nDecision factors: number of steps, duration, human-in-the-loop, number of teams, ops maturity.",
+  "in_this_project": "Project 9 `services/saga.py` (`checkout`, `compensate`, `ShippingFailed`), test `test_saga_success_and_compensation`. Project 10 `examples/workflows.py` (order processing with compensation, payment & refund with signal vs timer), `test_non_retryable_failure_runs_compensation`. Project 10 README: no child workflows/versioning API -- honest gaps.",
+  "implementation_files": [
+   "projects/09-payments/payments/services/saga.py::checkout",
+   "projects/09-payments/payments/services/saga.py::compensate",
+   "projects/10-workflow-engine/flowengine/examples/workflows.py",
+   "projects/10-workflow-engine/flowengine/runtime.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Saga: simple, explicit, no new infra",
+   "Engine: automatic resume, timers, retries, visibility"
+  ],
+  "disadvantages": [
+   "Saga: crash-resume khud banana padta hai",
+   "Engine: determinism rules, infra cost, replay overhead"
+  ],
+  "common_mistakes": [
+   "Compensation ko 'rollback' samajhna (side effects visible hote hain)",
+   "Compensations ko non-idempotent likhna",
+   "Choreography mein flow itna bikhar jaana ki koi poora picture na dekh sake"
+  ],
+  "follow_up_questions": [
+   "How would you add crash-resume to Project 9's saga?",
+   "What if a compensation itself fails?",
+   "Orchestration vs choreography: when would you choose events?"
+  ],
+  "concepts": [
+   "saga",
+   "compensation",
+   "workflow engine",
+   "orchestration vs choreography"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hand-written saga (low infra, manual resume) vs engine (durable, overhead). Orchestration (visible flow) vs choreography (loose coupling, hard to trace).",
+   "failure_scenarios": "Saga process crash -> stuck in middle (Project 9 limitation) -> needs recovery scanner. Compensation fails -> retry with backoff, eventually manual ops queue. Engine bad deploy -> blocked, rollback resumes.",
+   "alternatives": "Temporal/Cadence, AWS Step Functions, Camunda (BPMN), event choreography with Kafka.",
+   "scale_10x_100x": "10x: saga state table + recovery worker scanning stuck sagas. 100x: engine with sharded history, task queues per activity type, archival.",
+   "production_improvements": "Saga resume worker (scan sagas by status + age), compensation retry policies, workflow versioning, tracing across steps."
+  }
+ },
+ {
+  "id": "SYSD-020",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "Leases and fencing tokens: how do Projects 3, 4 and 10 use them, and why is a lease alone not enough?",
+  "answer_hinglish": "Lease: 'yeh kaam mera hai jab tak T' -- worker crash kare toh T ke baad koi aur le sakta hai, bina kisi coordinator ke. Problem: lease expire hone ka matlab yeh nahi ki purana worker mar gaya; woh GC pause, network hiccup ya blocked event loop mein ho sakta hai, aur jaag ke apna result likh dega -- zombie write. Fencing token is zombie ko rokta hai: har claim pe ek monotonic number milta hai, aur write tabhi accept hota hai jab token abhi bhi current ho.\n\nProject 3: attempt number hi fencing token hai -- `claim.lua` attempts++ karta hai, `ack.lua`/`fail.lua`/`extend_lease.lua` check karte hain `attempts == token`. Test: zombie ack/fail/extend rejected. Lease 30s + grace, lease/3 pe extend; crash detection ~35s independent of job timeout.\n\nProject 4: `CLAIM_SQL` `attempts + 1` aur `locked_until` set karta hai; `RECORD_SQL` `WHERE id = :id AND attempts = :attempt AND status = 'in_flight'` -- fenced update. Test `test_crashed_dispatcher_lease_expires_and_zombie_result_is_rejected`.\n\nProject 10: workflow task lease + optimistic check on `last_event_id`; activity heartbeat `store.heartbeat(task_id, attempt)` attempt match pe hi.\n\nImportant nuance: fencing tabhi kaam karta hai jab resource (Redis/Postgres row) khud token check kare. External HTTP call (webhook POST) ko fence nahi kar sakte -- isliye wahan idempotency key. Aur Project 3 TRADEOFFS #4: CPU-bound handler event loop block kare toh extensions miss, duplicate execution -- fencing result ko safe rakhta hai, effect ko idempotency.",
+  "why_needed": "Distributed locks/leases bina fencing ke unsafe hain (Kleppmann ka Redlock critique). Har crash-recovery design mein yeh sawal aata hai.",
+  "real_world_analogy": "Hotel room key card: checkout time ke baad card expire, naye guest ko naya card (higher number). Purana guest late aaye toh uska card lock nahi kholta -- lock khud number check karta hai.",
+  "how_it_works": "- Lease = TTL ownership; needs renewal (heartbeat/extend).\n- Fencing token = monotonic counter issued at claim; storage rejects stale tokens.\n- Choose lease length: crash detection time vs renewal traffic vs false expiry risk.\n- Renewal loop must survive transient errors (Project 3 bug: `_keep_lease` had no error handling).\n- External effects can't be fenced -> idempotency keys.",
+  "in_this_project": "Project 3 `core/lua/ack.lua`, `extend_lease.lua`, `worker/worker.py::_keep_lease` (fixed bug: one Redis error ended lease extension -> silent expiry -> duplicate; `test_lease_keeper_survives_transient_redis_errors`). Project 4 `RECORD_SQL`. Project 10 `store.py::heartbeat`, `complete_workflow_task`. Project 5 analog: consumer group generation number commit ko fence karta hai, aur leader epoch.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/extend_lease.lua",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_keep_lease",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::RECORD_SQL",
+   "projects/10-workflow-engine/flowengine/store.py::heartbeat"
+  ],
+  "code_example": "-- real, trimmed: projects/04-webhooks/webhooks/dispatcher/dispatcher.py (RECORD_SQL)\nUPDATE deliveries\n   SET status = :status, next_attempt_at = COALESCE(:next_at, next_attempt_at), ...\n WHERE id = :id AND attempts = :attempt AND status = 'in_flight'   -- fencing\nRETURNING id",
+  "code_language": "sql",
+  "advantages": [
+   "Coordinator-free crash recovery",
+   "Zombie writes structurally rejected",
+   "Attempt counter reuse = no extra state"
+  ],
+  "disadvantages": [
+   "Lease length tuning tricky",
+   "External effects not fenceable",
+   "Renewal traffic"
+  ],
+  "common_mistakes": [
+   "Lease ko mutual exclusion guarantee samajhna",
+   "Fencing check application mein karna instead of storage mein (race)",
+   "Lease renewal loop crash hone pe silently ruk jaana",
+   "Lease = job timeout (hours)"
+  ],
+  "follow_up_questions": [
+   "What is wrong with Redlock without fencing?",
+   "How do you pick a lease duration?",
+   "How would you fence a write to S3 or an external API?"
+  ],
+  "concepts": [
+   "leases",
+   "fencing tokens",
+   "zombie workers",
+   "heartbeats"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Short lease + renewal (fast detection, traffic) vs long lease (slow detection). Attempt as token (free) vs separate epoch. Optimistic version check (Project 10) vs pessimistic lock.",
+   "failure_scenarios": "GC pause longer than lease -> another worker claims -> zombie write rejected by token. Clock skew -> use storage server time (Redis TIME, Postgres now()). Renewal loop dies -> duplicate execution (fixed in P3).",
+   "alternatives": "ZooKeeper ephemeral nodes + zxid as token, etcd leases with revision, Chubby sequencers, DB advisory locks (session bound).",
+   "scale_10x_100x": "10x: batch lease extensions, reapers on every worker (Project 3). 100x: partition ownership leases (one lease per shard instead of per job), like Kafka group generations.",
+   "production_improvements": "Metrics on lease expiries and stale-token rejections, alert when zombie rate rises (sign of blocked loops), CPU-bound work offloaded to processes."
+  }
+ },
+ {
+  "id": "SYSD-021",
+  "project_slug": "cross-project",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Redis vs Postgres vs Kafka as a queue: how did Projects 3, 4 and 5 choose, and what would you pick?",
+  "answer_hinglish": "Teeno queues bana sakte hain; choice transactional needs, throughput aur replay pe depend karti hai.\n\nRedis (Project 3): sorted sets + Lua scripts -> atomic state transitions, delay/priority natural (score), fast. Measured 1,227 jobs/s with 4 worker processes on a shared laptop. Weakness: producer ki Postgres tx ke saath atomic nahi (dual write), aur durability AOF/replication pe depend; async replication failover pe recent jobs lose ho sakte hain.\n\nPostgres (Project 4, Project 10): `FOR UPDATE SKIP LOCKED` + lease. Biggest win: enqueue business data ke saath ek transaction mein -- outbox = queue. SQL se audit/inspection easy. Cost: har delivery DB round trips aur vacuum churn; Project 4 measured 111 deliveries/s (1 dispatcher) / 189 (3) after optimisation. 'Thousands/s tak theek' -- usse upar relay.\n\nKafka-style log (Project 5): partitioned append-only, consumers offsets track karte hain, replay possible, multiple consumer groups. Throughput order of magnitude zyada (Project 5 storage 526k msg/s batched). Weakness: per-message ack/retry/delay/DLQ nahi -- ek slow message partition block karta hai (HOL), retries ke liye retry topics banane padte hain.\n\nMeri pick: business-critical side effects jo DB change ke saath atomic chahiye -> Postgres queue/outbox. High-volume background jobs with priorities/delays -> Redis (AOF on) ya SQS. Event streaming, fan-out, replay -> Kafka. Aur common hybrid: Postgres outbox -> Kafka -> consumers.",
+  "why_needed": "Galat queue choose karna ya toh dual-write bugs deta hai ya scaling wall. Interviewer dekhna chahta hai ki aap trade-offs measure kar ke bol sakte ho.",
+  "real_world_analogy": "Redis = express counter (fast, par register kabhi kabhi kho sakta hai bina backup), Postgres = bank ka main ledger (slow par sab ek register mein), Kafka = CCTV recording (sab record, koi bhi rewind kar ke dekh sakta hai).",
+  "how_it_works": "Comparison axes:\n- Atomic with business data: Postgres yes; Redis/Kafka no (need outbox).\n- Per-message ack/retry/delay: Redis yes (Lua), Postgres yes, Kafka no (offset-based).\n- Priority: Redis zset score, Postgres ORDER BY, Kafka separate topics.\n- Replay: Kafka yes, others only via DLQ.\n- Throughput: Kafka >> Redis > Postgres (order of magnitude, typical).\n- Ops: Postgres already there; Kafka heaviest.",
+  "in_this_project": "Project 3 TRADEOFFS #1 (Redis vs Postgres, outbox note), Project 4 TRADEOFFS #1 (Postgres queue vs Redis/Kafka, 'relay the outbox into a log beyond thousands/s'), Project 5 consumer groups + retention. Project 10 bhi Postgres queues use karta hai (TRADEOFFS #3: becomes bottleneck, ~97 statements per workflow).",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py::CLAIM_SQL",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py",
+   "projects/03-job-queue/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Har tool apne use case mein strong",
+   "Hybrid (outbox -> Kafka) dono duniya ka best"
+  ],
+  "disadvantages": [
+   "Har extra system operational cost",
+   "Galat fit = HOL blocking (Kafka) ya DB overload (Postgres)"
+  ],
+  "common_mistakes": [
+   "Kafka ko task queue ki tarah use karna jisme per-job retry/delay chahiye",
+   "Redis queue bina AOF ke critical jobs ke liye",
+   "Postgres queue bina SKIP LOCKED (workers ek dusre pe block)",
+   "Postgres queue table ko kabhi vacuum/prune na karna"
+  ],
+  "follow_up_questions": [
+   "How would you implement delayed retries on Kafka?",
+   "At what point does a Postgres queue stop scaling?",
+   "How do you make a Redis enqueue atomic with a DB commit?"
+  ],
+  "concepts": [
+   "message queues",
+   "SKIP LOCKED",
+   "commit log",
+   "outbox",
+   "trade-offs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Transactional coupling (Postgres) vs speed (Redis) vs replayable throughput (Kafka). Ek system kam (simplicity) vs best-fit per workload.",
+   "failure_scenarios": "Redis failover -> lost recent jobs. Postgres queue -> bloat/vacuum lag, lock contention on hot rows (Project 4 endpoint row). Kafka -> poison message blocks partition, rebalance storms.",
+   "alternatives": "SQS/SNS, RabbitMQ (rich routing, per-message ack), NATS JetStream, Pulsar (queue + stream).",
+   "scale_10x_100x": "10x: Redis Cluster per queue (hash tags), Postgres partitioned queue tables, Kafka more partitions. 100x: Kafka/Pulsar backbone with outbox relay; per-job state in a separate store.",
+   "production_improvements": "Metrics: queue depth, oldest message age, DLQ size, consumer lag; runbooks per backend."
+  }
+ },
+ {
+  "id": "SYSD-022",
+  "project_slug": "cross-project",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How do you design for backpressure? Give examples from your projects.",
+  "answer_hinglish": "Backpressure ka matlab: jab consumer slow ho, toh producer ko signal mile aur system bounded resources ke saath degrade kare -- unbounded queue/memory mein nahi. Rule: har queue bounded ho, aur 'full' pe ek explicit policy ho: wait, reject (429/503), drop, ya shed low priority.\n\nMere projects mein examples:\n1) Project 1: redis-py default pool exhaust hone pe error raise karta tha jise code ne 'Redis down' samjha aur fail-open kar diya. Fix: `BlockingConnectionPool` -- caller pool_timeout tak wait karta hai. Yeh backpressure hai: excess load wait karta hai instead of silently bypassing limits.\n2) Project 3: worker sirf utne jobs claim karta hai jitne free slots hain (batch claim up to free slots) -- pull-based backpressure. Queue Redis mein buffer hai.\n3) Project 4: per-endpoint token bucket; bucket khaali toh delivery wapas pending, attempt refund -- slow customer apni speed pe.\n4) Project 5: consumers pull karte hain apni pace se; producer batching + linger; acks=all timeout jab ISR slow.\n5) Project 7: S3 adapter mein bounded streaming queue -- upload memory mein poora buffer nahi hota.\n6) Project 8: slow WebSocket consumer drop kar diya jaata hai; reconnect pe catch-up. Ek slow client room ko block nahi karta.\n\nDesign walkthrough: identify every buffer -> bound it -> choose policy per buffer -> expose signals (429 + Retry-After, queue depth metrics) -> autoscale consumers on lag. 100x pe load shedding by priority aur admission control at the edge.",
+  "why_needed": "Bina backpressure ke spike aane pe memory badhti hai, latency explode hoti hai, aur system crash karta hai -- jo phir retry storm laata hai.",
+  "real_world_analogy": "Pani ki tanki: input pipe tez, output slow. Overflow valve (reject) ya input tap band karna (wait) chahiye; warna ghar mein baadh.",
+  "how_it_works": "Mechanisms: bounded queues, blocking pools, credit-based flow control (consumer requests N), pull-based consumption, token buckets, 429/503 + Retry-After, load shedding, circuit breakers.\n\nSignals to monitor: queue depth, consumer lag, pool wait time, event-loop lag.\n\nPush vs pull: pull naturally applies backpressure (consumer controls rate).",
+  "in_this_project": "Project 1 `main.py` (`BlockingConnectionPool`, test 'small pool waits instead of failing open'); Project 3 `core/queue.py::claim_many`; Project 4 `services/ratelimit.py::acquire`; Project 7 `storage/s3.py` (bounded streaming queue); Project 8 `realtime.py::Hub` (drop slow consumers, TRADEOFFS #8).",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/main.py::BlockingConnectionPool",
+   "projects/03-job-queue/jobqueue/core/queue.py::claim_many",
+   "projects/07-object-storage/objstore/storage/s3.py",
+   "projects/08-collab/collab/realtime.py::Hub"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Bounded memory, predictable degradation",
+   "Slow component isolation",
+   "Clear signals to clients"
+  ],
+  "disadvantages": [
+   "Rejections visible to users",
+   "Tuning bounds is empirical",
+   "Waiting increases tail latency"
+  ],
+  "common_mistakes": [
+   "Unbounded in-memory queues",
+   "Pool exhaustion ko backend failure treat karna",
+   "Retry without Retry-After (amplifies overload)",
+   "Push-based fan-out without slow consumer handling"
+  ],
+  "follow_up_questions": [
+   "How do you detect that backpressure is happening in production?",
+   "Wait vs reject: how do you choose?",
+   "How does TCP flow control relate to this?"
+  ],
+  "concepts": [
+   "backpressure",
+   "flow control",
+   "load shedding",
+   "bounded queues"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Wait (no loss, latency) vs reject (fast fail, client retries) vs drop (lossy, for ephemeral data like cursors). Pull (natural backpressure) vs push (low latency, needs credits).",
+   "failure_scenarios": "Retry storm after outage -> jittered backoff + Retry-After. Pool wait timeout -> 503 not silent fail-open. Slow consumer in fan-out -> dropped and catch-up.",
+   "alternatives": "Reactive streams (request(n)), gRPC flow control, Kafka quotas, adaptive concurrency limits (Netflix concurrency-limits).",
+   "scale_10x_100x": "10x: autoscale on lag/queue depth. 100x: admission control per tenant, priority-based shedding, edge rate limiting.",
+   "production_improvements": "Event-loop lag metric, queue age SLOs, adaptive concurrency limiters, documented Retry-After everywhere."
+  }
+ },
+ {
+  "id": "SYSD-023",
+  "project_slug": "cross-project",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "How would you take one of these systems multi-region? Walk through the hard parts.",
+  "answer_hinglish": "Pehle honest disclaimer: koi bhi project multi-region implement nahi karta; main design bataunga aur projects ke concepts use karunga.\n\nClarify kyun multi-region chahiye: latency (users close), availability (region outage), ya data residency. Answer different hai. Teen models: (1) active-passive -- ek primary region, async replica standby; simple, RPO > 0. (2) active-active with partitioned ownership -- har tenant/user ka 'home region', writes wahan; cross-region reads async. (3) active-active everywhere -- conflict resolution (CRDT/LWW) ya global consensus (Spanner-style) -- mehenga.\n\nPer system: Payments (Project 9) -- home-region per merchant, ledger kabhi do regions mein simultaneously writable nahi; failover pe in-flight `requires_reconciliation` payments recovery worker resolve karta hai, idempotency keys region-independent hon. Rate limiter (Project 1) -- per-region Redis aur budget split; exact global count ke liye cross-region hop mehenga, approximate accept. Webhooks (Project 4) -- outbox per region, dispatcher region-local; failover pe duplicates possible -> `webhook-id` dedupe. Kafka (Project 5) -- clusters per region + mirroring; offsets translate karne padte hain. Collab (Project 8) -- doc ka sequencer ek region mein (home), dusre region ke users zyada latency; ya CRDT.\n\nKey concepts: RPO/RTO define karo, async replication ka data loss window (Project 2 TRADEOFFS #9 aur Project 5 acks=1 test yahi dikhate hain), split brain avoid karne ke liye fencing/epochs, aur clocks pe bharosa mat karo.",
+  "why_needed": "Senior interviews mein 'what if a whole region goes down?' standard follow-up hai; jawab dikhata hai ki aap consistency vs latency vs availability ko practically samajhte ho.",
+  "real_world_analogy": "Ek company ke do branch offices: har customer ka account ek 'home branch' mein, dusri branch sirf dekh sakti hai. Agar dono branches ek hi account pe cheque clear karein toh double payment.",
+  "how_it_works": "- Define RPO/RTO.\n- Ownership: home region per tenant/entity; route writes there.\n- Replication: async (low latency, RPO>0) vs sync (RPO=0, cross-region latency on every write).\n- Failover: fencing via epochs so the old primary can't write (Project 5 leader epoch idea).\n- Idempotency keys globally unique so retries across regions dedupe.\n- Conflict resolution for active-active: LWW, CRDT, or avoid by ownership.\n- Data residency constraints may force per-region silos (Project 6 silo model).",
+  "in_this_project": "Concepts in code: Project 5 `cluster.py::_elect` (epochs, clean vs unclean election), `test_acks_1_can_lose_acknowledged_write_on_failover`; Project 2 `replication.py` (async replication, promote); Project 1 Redis TIME (single clock source per region); Project 9 `recovery.py` (resolving ambiguous states after failover).",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_elect",
+   "projects/02-mini-redis/minidis/replication.py",
+   "projects/09-payments/payments/services/recovery.py::run_recovery",
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/token_bucket.lua"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Region outage survivable",
+   "Lower latency for global users",
+   "Data residency compliance"
+  ],
+  "disadvantages": [
+   "Huge complexity, cost 2x+",
+   "Async replication data loss window",
+   "Conflict and split-brain risks"
+  ],
+  "common_mistakes": [
+   "Active-active bina conflict strategy",
+   "Failover bina fencing (old primary keeps writing)",
+   "Global strict rate limit cross-region sync calls se",
+   "Region-local idempotency keys"
+  ],
+  "follow_up_questions": [
+   "What RPO is acceptable for payments?",
+   "How do you prevent split brain during a regional failover?",
+   "How do you route a user to their home region?"
+  ],
+  "concepts": [
+   "multi-region",
+   "replication",
+   "RPO/RTO",
+   "split brain",
+   "data residency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Active-passive (simple, RPO>0) vs active-active partitioned (complex routing) vs global consensus (latency). Sync (RPO 0) vs async (latency).",
+   "failure_scenarios": "Region down -> promote standby, fence old primary. Network partition between regions -> both think they're primary without epochs. Replication lag -> stale reads after failover.",
+   "alternatives": "Spanner/CockroachDB (consensus), DynamoDB global tables (LWW), Aurora global database (async), CRDTs.",
+   "scale_10x_100x": "10x: read replicas per region. 100x: tenant home regions, cell-based architecture (each cell independent), global routing layer.",
+   "production_improvements": "Game days for region failover, replication lag alerting, per-region capacity buffers, documented RPO per data class."
+  }
+ },
+ {
+  "id": "SYSD-024",
+  "project_slug": "cross-project",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What is your observability strategy across these services?",
+  "answer_hinglish": "Mera strategy teen layers: (1) structured logs with request/correlation id, (2) metrics (RED: rate, errors, duration + saturation like queue depth/lag), (3) domain audit trails jo khud debugging tool hain. Tracing distributed flows ke liye next step hai.\n\nShared foundation: sab projects `shared/bpcommon` use karte hain -- JSON logging aur errors. Ek real lesson: Project 1 load test mein synchronous stdout logging ne event loop block kiya, Redis 50ms timeouts fire hue, 67 HTTP 500s aur 357 allowed instead of 300. Fix: `QueueHandler`/`QueueListener` logging bpcommon mein. Matlab observability khud performance bug create kar sakti hai.\n\nMetrics: Project 1 Prometheus counters/histograms (`rate_limit_backend_errors_total` pe alert mandatory, warna fail-open silently protection hata deta hai). Project 3 queue depth, workers heartbeat, DLQ size dashboard. Project 5 consumer lag aur ISR state dashboard.\n\nDomain audit trails: Project 4 `delivery_attempts` (har attempt ka status, duration, error, response snippet), Project 9 `payment_events` (append-only timeline), Project 10 `history_events` (poora execution), Project 6 append-only audit log. Ye 'what happened to this one entity?' ka jawab dete hain jo logs se mushkil hai.\n\nDesign walkthrough for new system: SLOs define karo (e.g. webhook delivered within 1 min p99), har SLO ke liye metric, alerts on symptoms not causes, aur runbooks. 100x pe log volume costly -- sampling, aur high-cardinality labels (tenant id) metrics mein avoid.",
+  "why_needed": "Distributed system mein bug ek service mein nahi, interaction mein hota hai. Bina correlation ids, metrics aur audit trails ke incidents mein andhere mein teer.",
+  "real_world_analogy": "Hospital: vitals monitor (metrics), nurse ki notes (logs), aur patient ki case file (audit trail) -- teeno alag sawalon ka jawab dete hain.",
+  "how_it_works": "- Logs: JSON, request id, non-blocking handler.\n- Metrics: RED per endpoint, USE per resource, domain metrics (queue depth, oldest age, lag, DLQ size, requires_reconciliation count).\n- Traces: propagate trace id via headers and message metadata (outbox rows, job payloads).\n- Audit/event tables: per-entity history.\n- Alerts: SLO burn rates; specific ones like backend_errors (fail-open), stale workers, ISR shrink.",
+  "in_this_project": "`shared/bpcommon/logging.py` (QueueHandler fix), Project 1 `services/metrics.py`, Project 4 `delivery_attempts` table (`db/models.py`), Project 9 `payment_events`, Project 10 `/workers`, dashboard, `history`. Project 1 `/admin/stats` per instance hai -- cluster-wide ke liye Prometheus aggregation (README limitation).",
+  "implementation_files": [
+   "shared/bpcommon/logging.py",
+   "projects/01-rate-limiter/ratelimiter/services/metrics.py",
+   "projects/04-webhooks/webhooks/db/models.py",
+   "projects/10-workflow-engine/flowengine/api.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Fast incident diagnosis",
+   "Silent failures (fail-open, stuck jobs) visible",
+   "Audit trails double as customer support tools"
+  ],
+  "disadvantages": [
+   "Storage and cost",
+   "Logging can hurt performance (real bug)",
+   "Cardinality explosions"
+  ],
+  "common_mistakes": [
+   "Synchronous logging in async event loop",
+   "Alerting on causes instead of user-facing symptoms",
+   "Tenant/user id as metric label at scale",
+   "No alert on fail-open degraded mode"
+  ],
+  "follow_up_questions": [
+   "How would you trace one webhook from publish to customer 2xx?",
+   "Which three alerts would you set for the job queue?",
+   "How do you keep log costs under control?"
+  ],
+  "concepts": [
+   "observability",
+   "metrics",
+   "structured logging",
+   "audit trails",
+   "SLOs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Logs (rich, expensive) vs metrics (cheap, aggregated) vs traces (causal, sampling). Audit tables in primary DB (consistent) vs separate store (scale).",
+   "failure_scenarios": "Logging pipeline down -> app must not block (async handler, drop with counter). Metrics scrape fails -> alert on absence. Audit table bloat -> partitioning.",
+   "alternatives": "OpenTelemetry end to end, vendor APM, eBPF-based profiling, event analytics (ClickHouse).",
+   "scale_10x_100x": "10x: log sampling, aggregation per instance. 100x: tracing with tail sampling, metrics federation, audit tables partitioned and archived.",
+   "production_improvements": "OpenTelemetry tracing with ids in outbox/job payloads, SLO dashboards, runbooks linked from alerts, event-loop lag metrics."
+  }
+ },
+ {
+  "id": "SYSD-025",
+  "project_slug": "cross-project",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How did you find the real bottlenecks in these projects? Walk through your method with examples.",
+  "answer_hinglish": "Method har baar same: (1) honest benchmark harness, (2) measure, (3) hypothesis likho, (4) ek variable change karke test, (5) reject ya confirm, (6) fix ke baad re-measure. Aur mere TESTING.md files mein rejected hypotheses bhi likhi hain, kyunki wahi method dikhata hai.\n\nExamples (sab numbers Windows 11 + Docker Desktop shared machine pe, isliye relative compare ke liye):\n1) Project 4 webhooks: pehla benchmark publish ke saath-saath measure kar raha tha aur 7,526/s print kiya -- meaningless, discard. Sahi method: backlog pehle banao, phir dispatchers start karke drain time. `phase_timing.py` ne dikhaya `_record` 116ms vs HTTP send 1.7ms. 'Hot endpoint row lock' partly sahi (50 -> 52/s), 'WAL fsync' `synchronous_commit=off` se rejected. Fix: claim returns all data, record = 1 statement -> 48 -> 111/s.\n2) Project 5: acks=all slow (8,702 msg/s). Timer resolution hypothesis rejected (1ms vs 50ms same), reads fast (0.83ms). cProfile: `io.open` 65% time -> reusable read handle -> 73,795 (7.7x).\n3) Project 3: claim loop serial (claim + HGETALL per job) -> batch claim inline hashes -> 158 -> 577 jobs/s.\n4) Project 2: writes 2-6x slower than reads; replica stop karne pe pipelined SET double -> one socket write per propagated command -> batch per loop tick.\n5) Project 7: bucket row lock har write serialize kar raha tha; phir CPU 122% at c=4 -> process CPU-bound -> answer: more processes.\n6) Project 6: RLS overhead suspect tha; EXPLAIN ANALYZE ne dikhaya index se 0.148 ms vs 2.938 ms -- RLS nahi, index matter karta hai.",
+  "why_needed": "Interviewers 'I optimized X' sunte rehte hain; 'maine measure kiya, hypothesis reject ki, phir yeh mila' credibility deta hai.",
+  "real_world_analogy": "Doctor: symptoms -> tests -> diagnosis -> treatment -> follow-up test. Bina test ke dawai dena (guess optimisation) risky hai.",
+  "how_it_works": "Checklist:\n- Harness measures the right thing (steady state, no warmup/startup confusion).\n- Separate client and server time (Project 1: server p50 0.77ms vs client 51.9ms -> queueing).\n- Profile (cProfile, phase timers, EXPLAIN ANALYZE).\n- Check CPU% of wall time to detect CPU-bound process.\n- One change at a time; record rejected hypotheses.\n- Re-measure; note environment caveats.",
+  "in_this_project": "Har project ka TESTING.md: Project 4 `bench/phase_timing.py` + `bench_drain.py`; Project 5 `bench/bench.py`; Project 3 `bench/throughput.py`; Project 2 `bench/` compare; Project 7 `bench/throughput.py`; Project 6 `bench/rls_bench.py`; Project 8 `bench/latency.py` (sequencer bound ~45-66 ops/s); Project 9 `bench/throughput.py` (26 statements x ~3ms = ~128ms).",
+  "implementation_files": [
+   "projects/04-webhooks/bench/phase_timing.py",
+   "projects/05-mini-kafka/bench/bench.py",
+   "projects/03-job-queue/bench/throughput.py",
+   "projects/06-saas/bench/rls_bench.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Fixes targeted, not guessed",
+   "Documented rejected hypotheses save future time",
+   "Honest numbers with caveats"
+  ],
+  "disadvantages": [
+   "Shared dev machine numbers are noisy (GET P=16 ranged 32k-74k)",
+   "Benchmarks take time to build right"
+  ],
+  "common_mistakes": [
+   "Benchmark mein startup ya warmup mix karna",
+   "Client-side latency ko server latency samajhna",
+   "Ek saath kai changes karna",
+   "Absolute numbers ko production capacity claim karna"
+  ],
+  "follow_up_questions": [
+   "What would you measure first if p99 latency doubled in production?",
+   "How do you tell if a process is CPU-bound or IO-bound?",
+   "Why did synchronous_commit=off not help in Project 4?"
+  ],
+  "concepts": [
+   "performance engineering",
+   "profiling",
+   "benchmarking",
+   "bottleneck analysis"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Micro-benchmarks (precise, unrealistic) vs end-to-end (realistic, noisy). Optimise per-request round trips vs add processes.",
+   "failure_scenarios": "Wrong benchmark -> wrong conclusion (7,526/s). Shared machine variance -> repeat runs. Fix that helps benchmark but hurts correctness (Project 9 deliberately kept 26 statements).",
+   "alternatives": "Continuous profiling (py-spy, Pyroscope), load testing in prod-like env (k6), tracing-based critical path analysis.",
+   "scale_10x_100x": "At 10x/100x the bottleneck moves: Python CPU -> DB connections -> DB write throughput -> network; re-measure at each step.",
+   "production_improvements": "Benchmarks in CI with trend tracking, production profiling, capacity models per service."
+  }
+ },
+ {
+  "id": "SYSD-026",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "Compare the consistency models across your ten projects.",
+  "answer_hinglish": "Har project alag consistency choice karta hai, aur yeh deliberately hai:\n\nStrong / linearizable (single authority): Project 1 -- har check ek Redis pe atomic Lua, toh limit exact (3 'servers', 200 requests, exactly 50 allowed). Project 2 -- single-threaded node, har command atomic. Project 9 ledger -- Postgres ACID + DB-enforced invariants; read-your-writes. Project 6 -- per-request tenant tx, RLS.\n\nPer-entity total order: Project 8 -- per-document sequencer (row lock) total order deta hai; clients eventually converge (OT). Project 5 -- per-partition order; consumers sirf HW tak dekhte hain (committed data hi visible). Project 10 -- per-workflow history order; replay deterministic.\n\nEventual consistency (deliberate): Project 1 policy cache 5s, API key cache 30s -- revocation 30s tak late. Project 7 secret cache 60s. Project 6 JWT 15 min. Project 4 -- no ordering, receivers fetch latest state. Project 2 replicas async -- replica reads stale ho sakte hain, failover pe acknowledged writes lose.\n\nTunable: Project 5 acks=0/1/all + min ISR -- user CAP-style choice karta hai.\n\nInterview framing: main pehle per-data-type poochta hoon 'stale read ka cost kya hai?'. Paisa -> strong. Config/permissions -> bounded staleness with TTL (aur explicit invalidation on own writes). Notifications/webhooks -> at-least-once + eventually. Collaborative text -> convergence (strong eventual).",
+  "why_needed": "'Strong ya eventual?' ka ek global jawab nahi hota. Senior engineer har data class ke liye staleness ka business cost dekh ke choose karta hai.",
+  "real_world_analogy": "Bank balance (strong -- turant sahi), newspaper (eventual -- kal ki khabar aaj), WhatsApp group chat order (per-group order, sab eventually same dekhte hain).",
+  "how_it_works": "Models: linearizable > sequential > causal > read-your-writes / monotonic reads > eventual. Strong eventual consistency (CRDT/OT convergence).\n\nMechanisms: single leader + sync replication, quorum, caches with TTL (bounded staleness), high watermark (only committed visible), sequencer (total order).\n\nPACELC: partition pe availability vs consistency; else latency vs consistency.",
+  "in_this_project": "Project 1 `test_distributed_correctness.py` (exact 50), Project 1 `services/policy_store.py` (5s TTL); Project 5 `cluster/cluster.py` HW + acks; Project 8 `service.py::submit`; Project 2 `replication.py` async; Project 9 ledger trigger. Project 7: one latest version per key DB-enforced via partial unique index -- strong read-after-write for metadata.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/09-payments/payments/services/ledger.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Right guarantee per data class",
+   "Performance where staleness is cheap"
+  ],
+  "disadvantages": [
+   "Multiple models to reason about",
+   "Caches create revocation windows"
+  ],
+  "common_mistakes": [
+   "Sab kuch strong banana (latency/availability cost)",
+   "Permissions ko long TTL cache karna bina invalidation",
+   "Async replica se read-after-write expect karna",
+   "Eventual consistency ko 'kabhi bhi' samajhna -- bound define karo"
+  ],
+  "follow_up_questions": [
+   "What is the difference between linearizability and serializability?",
+   "How do you give read-your-writes with async replicas?",
+   "Which data in a SaaS app can tolerate staleness?"
+  ],
+  "concepts": [
+   "consistency models",
+   "CAP/PACELC",
+   "bounded staleness",
+   "linearizability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strong (correct, latency/availability cost) vs eventual (fast, anomalies). TTL caches = performance vs revocation latency. Sync vs async replication.",
+   "failure_scenarios": "Stale cache grants access to revoked key for up to TTL. Async replica failover loses writes. Cross-policy checks non-atomic in Project 1 (TRADEOFFS #4).",
+   "alternatives": "Consensus stores (etcd) for config, CRDTs for collaborative data, session consistency via sticky reads to primary.",
+   "scale_10x_100x": "At scale strong consistency gets expensive (cross-shard transactions); partition data so strong consistency is needed only within a shard.",
+   "production_improvements": "Document per-endpoint consistency guarantees in API docs, add cache invalidation pub/sub, monitor replica lag."
+  }
+ },
+ {
+  "id": "SYSD-027",
+  "project_slug": "cross-project",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "How do you design retries so they don't cause retry storms? Compare the retry policies in Projects 3, 4, 9 and 10.",
+  "answer_hinglish": "Retries reliability dete hain par galat retries outage ko bada bana dete hain. Mere rules: (1) sirf retryable errors retry karo (timeout, 5xx, 429), 4xx validation nahi; (2) exponential backoff + jitter; (3) max attempts ya deadline, phir DLQ; (4) server ka Retry-After respect karo; (5) retry hamesha same idempotency key ke saath; (6) retries ek hi layer pe -- har layer pe 3 retries = 3x3x3 = 27x amplification.\n\nProjects:\n- Project 3: full jitter -- delay = random(0, min(cap, base x 2^attempt)); `test_backoff_is_bounded_and_jittered`. PermanentError retries skip karta hai seedha dead.\n- Project 4: jittered fixed schedule ('we retry for ~11 hours') -- customer ke liye predictable; 429 pe Retry-After honour, capped at 24h (review fix: unbounded tha). Rate-limited attempt refund hota hai.\n- Project 9: provider call short deadline (1s) aur 2 retries SAME provider key ke saath; uske baad bhi ambiguous toh retry nahi -- `requires_reconciliation`, recovery worker baad mein. Yeh important: payments mein blind retries nahi, 'unknown' state.\n- Project 10: RetryPolicy per activity (backoff, max attempts, non-retryable error types) -- framework level.\n\nRetry storm scenario: downstream 2 minute down, saare clients ek saath retry -> recover hote hi spike -> phir down. Jitter + circuit breaker + Retry-After isse todte hain.",
+  "why_needed": "Har distributed call fail ho sakti hai; retry policy decide karti hai ki failure absorb hoga ya cascade karega.",
+  "real_world_analogy": "Lift ka button: sab log baar baar dabate hain toh lift jaldi nahi aati. Better: ek baar dabao, thoda ruk ke phir (backoff), aur sab alag alag time pe (jitter).",
+  "how_it_works": "- Backoff: exponential with cap.\n- Jitter: full (random 0..delay) best for spreading; equal/decorrelated variants.\n- Budget: max attempts / total deadline / retry budget per client (e.g. retries <= 10% of requests).\n- Classification: retryable vs permanent.\n- Idempotency key constant across retries.\n- Circuit breaker: stop calling a failing dependency for a window.",
+  "in_this_project": "Project 3 `core/backoff.py`, `fail.lua`; Project 4 `Dispatcher._next_delay` in `dispatcher/dispatcher.py`; Project 9 `services/provider.py::_call` (deadline, retries with same key, ProviderTimeout); Project 10 `runtime.py` RetryPolicy + `store.py::fail_activity`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/backoff.py",
+   "projects/04-webhooks/webhooks/dispatcher/dispatcher.py",
+   "projects/09-payments/payments/services/provider.py::_call",
+   "projects/10-workflow-engine/flowengine/runtime.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Transient failures absorbed",
+   "Thundering herd avoided",
+   "Clear end state (DLQ / reconciliation)"
+  ],
+  "disadvantages": [
+   "Latency for eventual success",
+   "Individual retry times unpredictable with jitter",
+   "Tuning per dependency"
+  ],
+  "common_mistakes": [
+   "Retry without jitter",
+   "Retrying non-idempotent operations",
+   "Retries at every layer (multiplication)",
+   "Infinite retries without DLQ",
+   "Ignoring Retry-After"
+  ],
+  "follow_up_questions": [
+   "What is full jitter vs equal jitter?",
+   "How do you implement a retry budget?",
+   "Why does Project 9 stop retrying and mark the payment requires_reconciliation?"
+  ],
+  "concepts": [
+   "retries",
+   "exponential backoff",
+   "jitter",
+   "circuit breaker",
+   "retry storms"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Predictable schedule (customer-friendly) vs pure exponential with jitter (load-friendly). Aggressive retry (fast recovery) vs conservative (protect dependency).",
+   "failure_scenarios": "Retry storm after outage. Retry of non-idempotent op -> duplicate. Unbounded Retry-After -> stuck for years (fixed in P4).",
+   "alternatives": "Circuit breakers (resilience4j-style), hedged requests for reads, client retry budgets (gRPC), queue-based retries (DLQ + replay).",
+   "scale_10x_100x": "10x/100x: retries become a large share of load; enforce retry budgets, centralized retry via queues, adaptive concurrency.",
+   "production_improvements": "Metrics on retry rate per dependency, circuit breakers, retry budgets, chaos tests for downstream outages."
+  }
+ },
+ {
+  "id": "SYSD-028",
+  "project_slug": "cross-project",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Fail-open vs fail-closed: how do you decide, and where did your projects choose each?",
+  "answer_hinglish": "Decision rule: agar dependency fail hone pe request allow karne ka worst case 'thoda abuse' hai, fail-open; agar worst case 'security breach ya paisa' hai, fail-closed. Aur fail-open hamesha alerting ke saath, kyunki woh silently protection hata deta hai.\n\nProjects:\n- Project 1: per-policy `fail_mode`. Normal APIs fail-open (header `X-RateLimit-Status: degraded`, metric degraded_allow); login policy fail-closed (503 + Retry-After) taaki Redis outage brute-force window na bane. API-key auth hamesha fail-closed -- aur 503 return karta hai, 500 nahi (`test_api_key_auth_fails_closed_with_503_not_500`).\n- Project 6: tenant rate limits aur quota fail-open (paying customers kaam karte rahein); `/usage` Redis down pe graceful null (review fix). Lekin tenant isolation (RLS) kabhi 'open' nahi -- DB hi enforce karta hai.\n- Project 4: SSRF check fail -> delivery blocked/dead -- security check fail-closed.\n- Project 9: provider ambiguous -> na success, na failure -- 'unknown' third state. Yeh fail-safe hai.\n\nSubtle real bug (Project 1): pool exhaustion ko code ne 'Redis down' samjha aur fail-open kar diya -- spike ke time limits gayab. Isliye 'dependency down' ka detection bhi sahi hona chahiye, aur timeouts itne chhote nahi ki apna busy event loop false 'down' bana de (50ms -> 250ms fix).",
+  "why_needed": "Har external dependency kabhi fail hogi. Pehle se decide na kiya toh code accidental behaviour dega -- aksar galat wala.",
+  "real_world_analogy": "Bijli jaane pe: office ka main door electronic lock fail-closed (security), fire exit fail-open (safety). Alag doors, alag policy.",
+  "how_it_works": "- List dependencies per request path.\n- For each: consequence of allow vs deny when unknown.\n- Implement explicitly (policy flag), not via exception fallthrough.\n- Emit degraded signal (header/metric) and alert.\n- Make failure detection accurate (timeouts, pool waits).\n- Consider a third option: queue/defer, or 'unknown' state.",
+  "in_this_project": "Project 1 `services/rate_limit_service.py` (`fail_mode`), `services/api_keys.py`, `tests/test_failure_modes.py`; Project 6 `services/limits.py` (TRADEOFFS #8, #9); Project 4 `services/ssrf.py`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::fail_mode",
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py",
+   "projects/06-saas/saas/services/limits.py",
+   "projects/04-webhooks/webhooks/services/ssrf.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Availability where it's cheap",
+   "Security where it matters",
+   "Explicit, testable behaviour"
+  ],
+  "disadvantages": [
+   "Fail-open removes protection silently without alerts",
+   "Fail-closed turns a dependency outage into your outage"
+  ],
+  "common_mistakes": [
+   "Global single fail mode",
+   "Exception handler accidentally failing open",
+   "Returning 500 instead of 503 + Retry-After",
+   "No metric/alert on degraded mode"
+  ],
+  "follow_up_questions": [
+   "How would you test fail modes?",
+   "What should a client do on 503 with Retry-After?",
+   "Can you have partial fail-open (e.g. local fallback limiter)?"
+  ],
+  "concepts": [
+   "fail-open",
+   "fail-closed",
+   "graceful degradation",
+   "availability vs security"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Availability (open) vs protection (closed). Local fallback limiter (approximate protection during outage) vs pure open.",
+   "failure_scenarios": "Redis outage -> open APIs unprotected (alert), login 503. Pool exhaustion misdetected as down (bug). Event loop saturation false timeouts.",
+   "alternatives": "Local in-memory fallback limiter with conservative limits, cached last-known decisions, circuit breakers.",
+   "scale_10x_100x": "At scale, dependency outages are frequent; degrade gracefully per feature, cell-based isolation so one Redis outage affects a cell only.",
+   "production_improvements": "Chaos testing (kill Redis in staging), dashboards for degraded decisions, local fallback limiter."
+  }
+ },
+ {
+  "id": "SYSD-029",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do your projects handle leader election and avoid split brain?",
+  "answer_hinglish": "Split brain: do nodes dono khud ko leader samjhein aur dono writes accept karein -- divergence ya data loss. Solution ke do hisse: (1) ek authority jo leader choose kare (controller/consensus), (2) epoch/term number jo purane leader ke writes ko reject karwaye.\n\nProject 5 (minikafka): controller broker heartbeats dekhta hai; session timeout pe leader dead, ISR mein se naya leader with epoch+1. Purana leader wapas aaye toh stale epoch dekh ke follower ban jaata hai aur HW tak truncate karta hai (`test_leader_failover_keeps_committed_data`, divergence truncation test). Clean vs unclean election config hai: unclean = availability, data loss risk. Honest limitation: in-process cluster hai, real network partitions nahi -- aur HW-based truncation (pre-KIP-101) rapid failovers mein theoretically unsafe.\n\nProject 2 (minidis): manual `promote` replica ko master banata hai; koi automatic election nahi (Sentinel jaisa). Async replication -> promote pe acknowledged writes lose ho sakte hain.\n\nProjects 3/4/10 leader avoid karte hain: koi single leader nahi, har worker reaper/scheduler chalata hai aur atomic scripts/SKIP LOCKED + fencing correctness dete hain. Yeh 'leaderless with atomic claims' pattern hai -- election ki complexity se bachne ka sabse simple tarika jab shared strongly-consistent store already ho.\n\nProject 8: sequencer Postgres row lock hai -- leader election DB pe delegate.\n\nInterview line: 'Main pehle dekhta hoon ki leader chahiye bhi kya. Agar ek consistent store hai toh atomic claims + fencing. Agar nahi, toh Raft/ZooKeeper/etcd lease + epoch.'",
+  "why_needed": "Replication aur coordination wale har system mein failover aata hai; split brain silent data corruption ka sabse bada source hai.",
+  "real_world_analogy": "Cricket team ka captain injured: umpire (controller) naya captain announce karta hai with new armband number. Purana captain wapas aaye toh purane armband se decisions valid nahi.",
+  "how_it_works": "- Failure detection: heartbeats + session timeout (false positives possible).\n- Election: controller choice from in-sync set, or consensus (Raft majority).\n- Epoch/term: monotonic, attached to every leader action.\n- Fencing at storage/followers: reject lower epoch.\n- Quorum: majority prevents two leaders in partitions.\n- Leaderless alternative: atomic claims on a shared store.",
+  "in_this_project": "Project 5 `cluster/cluster.py::_elect`, `_check_isr`, `_controller_loop`; Project 2 `replication.py` (promote, reconnect with backoff); Project 3 `core/lua/schedule_tick.lua` (no leader needed, single-fire by atomic script); Project 10 reaper in every worker.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_elect",
+   "projects/02-mini-redis/minidis/replication.py",
+   "projects/03-job-queue/jobqueue/core/lua/schedule_tick.lua",
+   "projects/10-workflow-engine/flowengine/worker.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Epochs make stale leaders harmless",
+   "Leaderless designs avoid election entirely"
+  ],
+  "disadvantages": [
+   "Timeouts trade detection speed vs false failovers",
+   "Consensus adds latency and ops"
+  ],
+  "common_mistakes": [
+   "Leader election via timeouts only, without epochs",
+   "Two-node clusters without a tie breaker",
+   "Unclean election on critical data",
+   "Assuming a paused process is dead"
+  ],
+  "follow_up_questions": [
+   "How does Raft prevent two leaders in the same term?",
+   "What is KIP-101 and what problem does it fix?",
+   "How would you add automatic failover to Project 2?"
+  ],
+  "concepts": [
+   "leader election",
+   "split brain",
+   "epochs",
+   "quorum",
+   "failover"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Controller-based (simple, controller is SPOF unless replicated) vs consensus (robust, complex) vs leaderless atomic claims (needs consistent store).",
+   "failure_scenarios": "Network partition: old leader isolated keeps accepting acks=1 writes -> lost on heal. Controller failure -> no elections. Flapping heartbeats -> repeated failovers.",
+   "alternatives": "Raft (etcd/Consul), ZooKeeper, KRaft, Redis Sentinel, Postgres Patroni.",
+   "scale_10x_100x": "At scale: many partitions -> many leaders; spread leadership, rate-limit elections, controller quorum.",
+   "production_improvements": "Leader epochs for truncation, automated failover with fencing for Project 2, failover drills."
+  }
+ },
+ {
+  "id": "SYSD-030",
+  "project_slug": "cross-project",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What ordering guarantees does each project give, and how would you provide per-entity ordering in a webhook system?",
+  "answer_hinglish": "Ordering hamesha kisi scope mein hota hai; global ordering expensive aur aksar unnecessary.\n\n- Project 5: per-partition order; key -> partition, isliye per-key order (`test_key_ordering_and_group_consumption`). Rebalance ke time duplicates possible par order per partition maintained.\n- Project 8: per-document total order via sequencer (revision numbers); ordered forwarder pub/sub ke out-of-order messages ko rev order mein arrange karta hai, gaps Postgres se fill.\n- Project 10: per-workflow history order; signal vs timer race history order se deterministic resolve.\n- Project 3: priority + FIFO within priority for claiming -- lekin execution concurrent, completion order guaranteed nahi.\n- Project 4: koi ordering nahi -- deliberate. Retries events reorder kar dete hain; receivers `created_at` ya 'fetch latest state' use karein (Stripe bhi yahi karta hai).\n\nPer-entity ordered webhooks kaise: deliveries ko (endpoint, entity_key) se serialize karo -- ek entity ka next event tabhi claim ho jab pichla terminal ho. Cost: head-of-line blocking -- ek failing event us entity ke saare later events rok deta hai (hours of retries). Alternatives: event mein version/sequence number bhejo aur receiver older versions ignore kare (cheaper, receiver-side), ya 'thin events' (sirf id) + receiver API se latest fetch kare. Meri recommendation: unordered + versioned payloads, aur strict ordering sirf opt-in.",
+  "why_needed": "Business logic aksar order assume karta hai (created before updated). Galat assumption pe stale state overwrite hota hai.",
+  "real_world_analogy": "Ek hi customer ke courier parcels: agar 'cancel order' wala parcel 'place order' se pehle pahunch jaaye toh confusion. Ya toh dono ek hi delivery boy le jaaye in sequence (serialization), ya har parcel pe sequence number likho.",
+  "how_it_works": "- Scope: global / per partition / per key / per entity.\n- Mechanisms: single sequencer, partitioning by key, per-key serialization, version numbers + last-writer-wins at receiver.\n- Cost: parallelism reduced, HOL blocking.\n- Retries break naive ordering unless retry blocks successors.",
+  "in_this_project": "Project 5 `client/producer.py` (key partitioning); Project 8 `realtime.py::Hub` ordered forwarder; Project 10 `runtime.py::replay`; Project 4 README limitation + TRADEOFFS #3.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/client/producer.py",
+   "projects/08-collab/collab/realtime.py::Hub",
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/04-webhooks/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Scoped ordering keeps parallelism",
+   "Version numbers move ordering cost to cheap receiver check"
+  ],
+  "disadvantages": [
+   "Per-key serialization causes HOL blocking",
+   "Hot keys limit throughput"
+  ],
+  "common_mistakes": [
+   "Promising global ordering",
+   "Assuming retries preserve order",
+   "Ordering by wall-clock timestamps from different machines"
+  ],
+  "follow_up_questions": [
+   "How do you preserve per-key order when increasing Kafka partitions?",
+   "What is head-of-line blocking?",
+   "How does Project 8 handle pub/sub messages arriving out of order?"
+  ],
+  "concepts": [
+   "ordering",
+   "partitioning",
+   "sequencer",
+   "head-of-line blocking",
+   "versioning"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict ordering (simple consumers, HOL blocking) vs unordered + versions (parallel, smarter consumers).",
+   "failure_scenarios": "Partition count change remaps keys -> temporary reordering. Failed event blocks entity queue. Clock-based ordering wrong under skew.",
+   "alternatives": "Kafka per-key, SQS FIFO with message group id, versioned events, thin events + fetch.",
+   "scale_10x_100x": "10x/100x: per-key serialization needs many keys to keep parallelism; hot entities need splitting or relaxed ordering.",
+   "production_improvements": "Include sequence/version in every event payload, document guarantees, opt-in ordered endpoints."
+  }
+ }
+]

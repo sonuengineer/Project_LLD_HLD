@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Collab Editor Demo</title>
+<style>
+:root{--bg:#0f1115;--fg:#e6e6e6;--mut:#9aa4b2;--line:#2a2f3a;--card:#161a22;--ok:#7ee787;--warn:#e3b341}
+body{font-family:system-ui,sans-serif;margin:0;padding:16px;background:var(--bg);color:var(--fg)}
+h1{font-size:18px;margin:0 0 10px}input,button,select{background:var(--card);color:var(--fg);border:1px solid var(--line);padding:6px 8px;border-radius:4px}
+button{cursor:pointer}textarea{width:100%;box-sizing:border-box;height:55vh;background:var(--card);color:var(--fg);border:1px solid var(--line);border-radius:6px;padding:12px;font:15px/1.5 ui-monospace,Consolas,monospace}
+.row{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:8px}.mut{color:var(--mut);font-size:13px}#status.ok{color:var(--ok)}#status.warn{color:var(--warn)}
+.chip{display:inline-block;padding:2px 8px;border-radius:10px;background:var(--card);border:1px solid var(--line);margin-right:4px;font-size:12px}
+</style></head><body>
+<h1>Collaborative editor (OT over WebSocket)</h1>
+<div class="row"><input id="name" placeholder="your name" size="12"><button id="mkuser">Create user</button>
+<input id="token" placeholder="user token" size="34"></div>
+<div class="row"><button id="mkdoc">New document</button><input id="doc" placeholder="document id" size="38"><button id="join">Join</button>
+<span id="status" class="mut">offline</span> <span class="mut" id="rev"></span></div>
+<div class="row mut">Open this page in two tabs with the same document (share it from the owner via POST /docs/{id}/share or use the same user) and type in both.</div>
+<div id="people" class="row"></div>
+<textarea id="ta" disabled></textarea>
+<p class="mut">Pending: <span id="pending">none</span>. Toggle <button id="offline">go offline</button> to edit offline and resync.</p>
+<script>
+// ---- TextOp (port of collab/ot.py) -----------------------------------------------------------------
+const isR=c=>typeof c==='number'&&c>0, isI=c=>typeof c==='string', isD=c=>typeof c==='number'&&c<0;
+class Op{constructor(){this.ops=[];this.base=0;this.target=0}
+ retain(n){if(!n)return this;this.base+=n;this.target+=n;const l=this.ops.length;if(l&&isR(this.ops[l-1]))this.ops[l-1]+=n;else this.ops.push(n);return this}
+ insert(s){if(!s)return this;this.target+=s.length;const o=this.ops,l=o.length;
+  if(l&&isI(o[l-1]))o[l-1]+=s;else if(l&&isD(o[l-1])){if(l>1&&isI(o[l-2]))o[l-2]+=s;else{o.push(o[l-1]);o[l-1]=s}}else o.push(s);return this}
+ delete(n){if(!n)return this;this.base+=n;const l=this.ops.length;if(l&&isD(this.ops[l-1]))this.ops[l-1]-=n;else this.ops.push(-n);return this}
+ static from(a){const o=new Op();for(const c of a){if(isR(c))o.retain(c);else if(isI(c))o.insert(c);else o.delete(-c)}return o}}
+function applyOp(doc,op){if(doc.length!==op.base)throw Error('length mismatch');let out='',i=0;
+ for(const c of op.ops){if(isR(c)){out+=doc.slice(i,i+c);i+=c}else if(isI(c))out+=c;else i-=c}return out}
+function compose(a,b){const o=new Op();let i=0,j=0,x=a.ops[i++],y=b.ops[j++];
+ while(x!==undefined||y!==undefined){
+  if(isD(x)){o.delete(-x);x=a.ops[i++];continue} if(isI(y)){o.insert(y);y=b.ops[j++];continue}
+  if(isR(x)&&isR(y)){const m=Math.min(x,y);o.retain(m);x-=m;y-=m;if(!x)x=a.ops[i++];if(!y)y=b.ops[j++]}
+  else if(isI(x)&&isD(y)){if(x.length>-y){x=x.slice(-y);y=b.ops[j++]}else if(x.length===-y){x=a.ops[i++];y=b.ops[j++]}else{y+=x.length;x=a.ops[i++]}}
+  else if(isI(x)&&isR(y)){if(x.length>y){o.insert(x.slice(0,y));x=x.slice(y);y=b.ops[j++]}else if(x.length===y){o.insert(x);x=a.ops[i++];y=b.ops[j++]}else{o.insert(x);y-=x.length;x=a.ops[i++]}}
+  else if(isR(x)&&isD(y)){if(x>-y){o.delete(-y);x+=y;y=b.ops[j++]}else if(x===-y){o.delete(-y);x=a.ops[i++];y=b.ops[j++]}else{o.delete(x);y+=x;x=a.ops[i++]}}
+  else throw Error('compose')}return o}
+function transform(a,b){const ap=new Op(),bp=new Op();let i=0,j=0,x=a.ops[i++],y=b.ops[j++];
+ while(x!==undefined||y!==undefined){
+  if(isI(x)){ap.insert(x);bp.retain(x.length);x=a.ops[i++];continue} if(isI(y)){ap.retain(y.length);bp.insert(y);y=b.ops[j++];continue}
+  let m;
+  if(isR(x)&&isR(y)){m=Math.min(x,y);ap.retain(m);bp.retain(m);x-=m;y-=m}
+  else if(isD(x)&&isD(y)){m=Math.min(-x,-y);x+=m;y+=m}
+  else if(isD(x)&&isR(y)){m=Math.min(-x,y);ap.delete(m);x+=m;y-=m}
+  else if(isR(x)&&isD(y)){m=Math.min(x,-y);bp.delete(m);x-=m;y+=m}
+  else throw Error('transform');
+  if(!x)x=a.ops[i++];if(!y)y=b.ops[j++]}return[ap,bp]}
+function tIndex(op,idx){let n=idx;for(const c of op.ops){if(isR(c))idx-=c;else if(isI(c))n+=c.length;else{n-=Math.min(idx,-c);idx+=c}if(idx<0)break}return n}
+function diffOp(a,b){let p=0;while(p<a.length&&p<b.length&&a[p]===b[p])p++;let s=0;
+ while(s<a.length-p&&s<b.length-p&&a[a.length-1-s]===b[b.length-1-s])s++;
+ return new Op().retain(p).delete(a.length-p-s).insert(b.slice(p,b.length-s)).retain(s)}
+// ---- client state machine (same as collab/client.py) ------------------------------------------------
+const $=id=>document.getElementById(id);let ws=null,doc='',rev=0,out=null,buf=null,seq=1,joinedOnce=false,online=true;
+const clientId=crypto.randomUUID?crypto.randomUUID():String(Math.random());
+const st=(t,c)=>{$('status').textContent=t;$('status').className=c||'mut'};
+const show=()=>{$('rev').textContent='rev '+rev;$('pending').textContent=out?('in flight'+(buf?' + buffered':'')):(buf?'buffered (offline)':'none')};
+function send(m){if(ws&&ws.readyState===1)ws.send(JSON.stringify(m))}
+function flush(){if(!out&&buf&&online&&ws&&ws.readyState===1){out=[seq++,buf];buf=null;send({type:'op',client_seq:out[0],base_rev:rev,op:out[1].ops})}show()}
+function setText(next,op){const ta=$('ta');let s=ta.selectionStart,e=ta.selectionEnd;ta.value=next;if(op){s=tIndex(op,s);e=tIndex(op,e)}ta.setSelectionRange(s,e)}
+function onServerOp(r,op){if(out){const[a,b]=transform(out[1],op);out=[out[0],a];op=b}
+ if(buf){const[a,b]=transform(buf,op);buf=a;op=b}doc=applyOp(doc,op);rev=r;setText(doc,op);show()}
+$('ta').addEventListener('input',()=>{const now=$('ta').value;if(now===doc)return;const op=diffOp(doc,now);doc=now;buf=buf?compose(buf,op):op;flush();
+ send({type:'cursor',position:$('ta').selectionStart,rev})});
+async function api(path,body){const r=await fetch(path,{method:'POST',headers:{'content-type':'application/json',...($('token').value?{Authorization:'Bearer '+$('token').value}:{})},body:JSON.stringify(body||{})});return r.json()}
+$('mkuser').onclick=async()=>{const u=await api('/users',{name:$('name').value||'guest'});$('token').value=u.token};
+$('mkdoc').onclick=async()=>{const d=await api('/docs',{title:'Demo',content:'Hello, collaborative world!'});$('doc').value=d.id};
+async function connect(){const t=await api('/ws-tickets');ws=new WebSocket((location.protocol==='https:'?'wss://':'ws://')+location.host+'/ws?ticket='+t.ticket);
+ ws.onopen=()=>{const j={type:'join',doc_id:$('doc').value,client_id:clientId};if(joinedOnce)j.last_rev=rev;ws.send(JSON.stringify(j))};
+ ws.onmessage=e=>{const m=JSON.parse(e.data);
+  if(m.type==='joined'){if(!m.catchup){doc=m.content;rev=m.rev;setText(doc)}joinedOnce=true;$('ta').disabled=false;st('online','ok');
+    $('people').innerHTML=(m.presence||[]).map(p=>`<span class=chip>${p.name.replace(/[<&>]/g,'')}</span>`).join('');
+    if(out)send({type:'op',client_seq:out[0],base_rev:rev,op:out[1].ops});else flush()}
+  else if(m.type==='op')onServerOp(m.rev,Op.from(m.op));
+  else if(m.type==='ack'){out=null;rev=m.rev;flush()}
+  else if(m.type==='presence'){st('online','ok')}
+  else if(m.type==='role'){st('online ('+m.role+')','ok')}
+  else if(m.type==='error'){st('error: '+m.message,'warn');
+    // our in-flight op was rejected: it will never be acked and the buffer depends on it -> reload the doc
+    if(out&&m.client_seq===out[0]&&m.code!=='access_revoked'){out=null;buf=null;joinedOnce=false;ws.close()}}};
+ ws.onclose=e=>{if(e.code===4403){st('access revoked','warn');$('ta').disabled=true;return}
+  st('disconnected - edits are buffered','warn');if(online)setTimeout(connect,1000)}}
+$('join').onclick=connect;
+$('offline').onclick=()=>{online=!online;$('offline').textContent=online?'go offline':'go online';if(online)connect();else{ws&&ws.close();st('offline (editing locally)','warn')}};
+setInterval(()=>send({type:'ping'}),10000);
+</script></body></html>

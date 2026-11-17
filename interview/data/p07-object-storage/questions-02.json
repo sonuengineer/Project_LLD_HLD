@@ -1,0 +1,1049 @@
+[
+ {
+  "id": "OBJS-022",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does parse_range handle the different HTTP Range header forms, and when does it return 416?",
+  "answer_hinglish": "`parse_range` teen forms support karta hai: `bytes=0-99` (explicit start-end), `bytes=100-` (100 se end tak) aur `bytes=-50` (suffix -- last 50 bytes). Sirf ek single range allowed hai; multi-range (comma wala) ya `bytes=` ke bina kuch bhi aaye toh seedha `InvalidRange` (416).\n\nLogic simple hai: header ko `-` pe partition karo. Agar start khaali hai toh suffix form hai: `start = max(size - n, 0)`, `end = size - 1` -- matlab file 30 bytes ki hai aur client ne last 50 maange toh pura file milega, error nahi. Warna start parse hota hai aur end diya ho toh woh, nahi toh `size - 1`. Phir end ko clamp karte hain `min(end, size - 1)` -- client ne 0-999999 maanga aur file chhoti hai toh bhi valid hai, jitna hai utna milega.\n\n416 tab aata hai jab range satisfy hi nahi ho sakti: `start > end` ya `start >= size` (jaise `bytes=99999-` ek 25600-byte file pe, jo test mein check hai), ya number parse na ho (`malformed Range`). Size 0 wale object pe bhi koi range valid nahi, toh 416.\n\nRoute mein agar range mila toh response 206 hota hai `Content-Range: bytes start-end/size` aur `Content-Length = end - start + 1` ke saath, aur adapter ko `storage.get(blob_key, start, end)` diya jata hai -- toh sirf zaroori bytes disk/S3 se padhe jaate hain.",
+  "why_needed": "Resume downloads, video seeking aur parallel chunked downloads ke liye client ko object ka ek hissa chahiye hota hai; pura 5GB dobara bhejna waste hai.",
+  "real_world_analogy": "Kitaab ki photocopy shop: 'page 100 se 199 tak' bolo toh wahi milta hai; 'last 10 pages' bolo toh bhi chalega; '5000 se aage' bolo aur kitaab 300 page ki hai toh dukaandaar mana kar dega (416).",
+  "how_it_works": "Header string -> `(start, end)` inclusive tuple ya None. Route None pe 200 full stream karta hai, tuple pe 206. Local adapter `f.seek(start)` karke `remaining = end - start + 1` bytes chunk mein padhta hai; S3 adapter `Range=bytes=start-end` boto3 `get_object` ko pass karta hai, toh backend hi slicing karta hai.",
+  "in_this_project": "`objstore/services/objects.py::parse_range` pure function hai (DB nahi chahiye), aur `api/routes.py::get_object` usse call karta hai. Test `test_range_requests_and_conditional_get` teeno cases check karta hai: `bytes=100-199` -> 206 + exact `Content-Range`, `bytes=-10` -> last 10 bytes, `bytes=99999-` -> 416. S3 adapter pe bhi `test_full_flow_on_s3_backend` ek `bytes=1000-1999` range verify karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::parse_range",
+   "projects/07-object-storage/objstore/api/routes.py::get_object",
+   "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+   "projects/07-object-storage/tests/test_objects.py::test_range_requests_and_conditional_get"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\ndef parse_range(header, size):\n    if not header:\n        return None\n    if not header.startswith(\"bytes=\") or \",\" in header:\n        raise InvalidRange(\"only a single bytes range is supported\")\n    a, _, b = header[6:].partition(\"-\")\n    if a == \"\":\n        n = int(b)\n        start, end = max(size - n, 0), size - 1\n    else:\n        start = int(a)\n        end = int(b) if b else size - 1\n    end = min(end, size - 1)\n    if start > end or start >= size:\n        raise InvalidRange(f\"range not satisfiable for size {size}\")\n    return start, end",
+  "code_language": "python",
+  "advantages": [
+   "Pure function -- unit test karna aasaan",
+   "End clamp karne se lenient behaviour, jaisa browsers expect karte hain",
+   "Adapter sirf maange gaye bytes padhta hai"
+  ],
+  "disadvantages": [
+   "Multi-range (multipart/byteranges) support nahi",
+   "If-Range header support nahi, toh resume ke beech object badla toh client ko pata nahi chalega"
+  ],
+  "common_mistakes": [
+   "Suffix range `-50` ko 'start 0, end 50' samajh lena",
+   "end ko clamp na karna aur oversize range pe 416 de dena",
+   "Content-Length full size bhej dena 206 response mein"
+  ],
+  "follow_up_questions": [
+   "How would you support If-Range so a resumed download detects a changed object?",
+   "What happens for a Range request on a zero-byte object?",
+   "Why does S3 ignore multi-range requests in practice?"
+  ],
+  "concepts": [
+   "HTTP Range",
+   "206 Partial Content",
+   "416",
+   "resumable download"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-023",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does _verify_digests check Content-MD5, x-obj-checksum-sha256 and the signed payload hash?",
+  "answer_hinglish": "Upload stream hote waqt `HashingStream` MD5 aur SHA-256 dono compute karta hai. Blob likhne ke baad `_verify_digests` teen optional claims ko compare karta hai: `Content-MD5` header, `x-obj-checksum-sha256` header, aur signature mein covered body hash (`signed_sha256`). Koi bhi mismatch -> `BadDigest` 400, aur `put_object` ka except block naya blob delete kar deta hai, metadata kabhi likha hi nahi jata.\n\nContent-MD5 HTTP standard ke hisaab se base64 of raw 16-byte digest hota hai, hex nahi. Isliye code pehle `base64.b64decode(content_md5, validate=True).hex()` karta hai aur phir `info.md5` (hex) se compare. Agar base64 hi invalid hai toh alag message: 'Content-MD5 is not valid base64'. SHA-256 dono jagah hex mein hai toh bas lowercase karke compare.\n\nTeesra check sabse interesting hai: signed request mein `x-obj-content-sha256` string-to-sign ka part hai. Toh agar koi proxy body badal de aur header same rakhe, signature valid rahega lekin body ka actual SHA-256 alag hoga -> BadDigest. Agar client ne `UNSIGNED-PAYLOAD` bheja toh `Caller.signed_sha256` None hai aur yeh check skip hota hai.\n\nImportant point: verification bytes store hone ke BAAD hoti hai, kyunki streaming mein digest end pe hi pata chalta hai. Isliye cleanup zaroori hai.",
+  "why_needed": "Network, proxies, buggy clients body corrupt kar sakte hain; storage system ko galat bytes ko 'success' bol ke save nahi karna chahiye.",
+  "real_world_analogy": "Courier parcel ke saath ek seal number bhejta hai; warehouse parcel kholke weight/seal match karta hai, mismatch hua toh parcel wapas aur entry register mein nahi hoti.",
+  "how_it_works": "Digest stream ke saath incrementally update hota hai (`md5.update(chunk)`), end pe `info()` hex digests deta hai. `_verify_digests(info, content_md5, sha256_header, signed_sha256)` ek loop mein dono SHA checks label ke saath karta hai taaki error message batata hai ki kaunsa claim fail hua.",
+  "in_this_project": "`objstore/services/objects.py::_verify_digests` ko `put_object` aur `upload_part` (sirf Content-MD5) dono call karte hain. Tests: `test_integrity_checks_reject_corrupted_uploads` galat MD5 aur `\"0\" * 64` SHA bhejta hai, 400 BadDigest expect karta hai, aur `tmp_path/blobs` khaali hai yeh bhi check karta hai. `test_signed_body_cannot_be_swapped` body `original` pe sign karke `tampered` bhejta hai -> BadDigest.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_verify_digests",
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/auth.py::Caller",
+   "projects/07-object-storage/tests/test_objects.py::test_signed_body_cannot_be_swapped"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\ndef _verify_digests(info, content_md5, sha256_header, signed_sha256):\n    if content_md5:\n        try:\n            expected = base64.b64decode(content_md5, validate=True).hex()\n        except (binascii.Error, ValueError):\n            raise BadDigest(\"Content-MD5 is not valid base64\") from None\n        if expected != info.md5:\n            raise BadDigest(\"Content-MD5 does not match the received body (corrupted in transit?)\")\n    for label, value in ((\"x-obj-checksum-sha256\", sha256_header), (\"signed payload\", signed_sha256)):\n        if value and value.lower() != info.sha256:\n            raise BadDigest(f\"{label} does not match the received body\")",
+  "code_language": "python",
+  "advantages": [
+   "End-to-end integrity bina body ko memory mein rakhe",
+   "Teen independent claims -- client jo bhi de sake",
+   "Signed hash proxy tampering bhi pakadta hai"
+  ],
+  "disadvantages": [
+   "Check bytes likhne ke baad hota hai -- bad upload ka I/O waste",
+   "Multipart parts pe sirf Content-MD5, SHA-256 header part level pe nahi"
+  ],
+  "common_mistakes": [
+   "Content-MD5 ko hex samajhna (woh base64 hota hai)",
+   "Mismatch pe blob delete karna bhool jana",
+   "UNSIGNED-PAYLOAD ke saath bhi signed hash check expect karna"
+  ],
+  "follow_up_questions": [
+   "Why is the check done after the blob is written instead of before?",
+   "What protects body integrity when the client sends UNSIGNED-PAYLOAD?",
+   "Why does S3 now prefer CRC32C/SHA-256 checksums over Content-MD5?"
+  ],
+  "concepts": [
+   "Content-MD5",
+   "SHA-256",
+   "BadDigest",
+   "payload signing",
+   "integrity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-024",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Walk through commit_version: how does it handle enabled versus disabled/suspended versioning?",
+  "answer_hinglish": "`commit_version` naya version (ya delete marker) ko latest banata hai, aur yeh kaam bucket ke versioning state pe depend karta hai. Precondition: caller ne same transaction mein key ka advisory lock le rakha hai.\n\nPehle current latest row padhi jati hai (`WHERE bucket AND key AND is_latest`). **Enabled** bucket mein: naya random `version_id` (uuid hex) banta hai, purane latest ko `is_latest = false` kiya jata hai, aur naya row `is_latest = true` insert hota hai. Kuch delete nahi hota -- har version zinda rehta hai.\n\n**Disabled ya suspended** mein version id literal `'null'` hota hai. Code `version_id = 'null'` wala row dhoondta hai; mila toh DELETE karta hai aur uska blob `blob_deletions` mein queue karta hai (overwrite in place). Agar current latest koi doosra row tha (suspended bucket mein ek purana real version) toh usko `is_latest = false` karta hai. Phir naya `'null'` row insert. Isse S3 semantics milte hain: suspend karne ke baad purane real versions safe rehte hain, sirf null version replace hota hai.\n\nOrder important hai: pehle purane latest ko false karo, phir insert -- warna partial unique index `uq_objects_latest` (ek key ka ek hi latest) violate ho jayega. Wahi index ek safety net bhi hai: agar kabhi lock ka bug aaye toh DB insert reject karega, do latest nahi banenge.",
+  "why_needed": "Versioning state ke hisaab se 'overwrite' ka matlab badalta hai; ek central function mein yeh logic rakhne se PUT, multipart complete aur DELETE marker sab consistent rehte hain.",
+  "real_world_analogy": "Office register: versioning on hai toh har nayi entry neeche likhi jati hai aur purani pe 'superseded' stamp; off hai toh 'current' wali line mita ke nayi likhte ho.",
+  "how_it_works": "SQL steps (ek transaction): SELECT current latest -> (enabled) UPDATE is_latest=false -> INSERT new; (disabled/suspended) SELECT null row -> DELETE + queue blob -> UPDATE old latest false if different -> INSERT 'null'. `user_metadata` `CAST(:md AS jsonb)` se jata hai.",
+  "in_this_project": "`objects.py::commit_version` ko `put_object`, `complete_multipart` aur `delete_object` (delete marker ke liye `delete_marker=True, blob_key=None`) call karte hain. Test `test_versioning_and_delete_markers` v1/v2/marker sequence check karta hai, `test_unversioned_overwrite_queues_old_blob` disabled overwrite pe 1 row + 1 blob_deletions verify karta hai, aur `test_concurrent_writes_to_same_key` 20 parallel writes ke baad 'plain' bucket mein 1 row aur 19 queued blobs.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/objstore/services/objects.py::_queue_blob_deletion",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::uq_objects_latest",
+   "projects/07-object-storage/tests/test_objects.py::test_unversioned_overwrite_queues_old_blob"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nif versioning == \"enabled\":\n    version_id = new_version_id()\n    if current:\n        await s.execute(text(\"UPDATE objects SET is_latest = false WHERE id = :i\"), {\"i\": current.id})\nelse:\n    version_id = \"null\"\n    null_row = (await s.execute(text(\"SELECT id, blob_key, is_latest FROM objects WHERE bucket = :b AND key = :k \"\n                                     \"AND version_id = 'null'\"), {...})).first()\n    if null_row:\n        await s.execute(text(\"DELETE FROM objects WHERE id = :i\"), {\"i\": null_row.id})\n        await _queue_blob_deletion(s, null_row.blob_key)\n    if current and (not null_row or current.id != null_row.id):\n        await s.execute(text(\"UPDATE objects SET is_latest = false WHERE id = :i\"), {\"i\": current.id})",
+  "code_language": "python",
+  "advantages": [
+   "Ek hi jagah versioning semantics -- PUT, multipart, delete marker sab reuse karte hain",
+   "Suspended state S3 jaisa sahi behave karta hai",
+   "DB index last line of defence"
+  ],
+  "disadvantages": [
+   "Caller pe depend ki advisory lock liya ho -- function khud enforce nahi karta",
+   "Har write 2-4 SQL round trips"
+  ],
+  "common_mistakes": [
+   "Insert pehle aur flip baad mein karna -> unique index violation",
+   "Suspended mein purane real versions bhi delete kar dena",
+   "Overwritten blob ko inline delete karna instead of queueing"
+  ],
+  "follow_up_questions": [
+   "What happens to a delete marker that has version_id 'null' in a suspended bucket?",
+   "Why must the caller hold the advisory lock rather than the function taking it?",
+   "How would you add a 'max versions per key' limit here?"
+  ],
+  "concepts": [
+   "versioning",
+   "null version",
+   "suspended versioning",
+   "is_latest flip"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Logic app code mein hai aur invariant DB index mein; do layers. Alternative trigger-based approach hidden magic hota, debugging mushkil.",
+   "failure_scenarios": "Agar lock na liya ho aur do writers same time flip karein toh doosra INSERT `uq_objects_latest` pe IntegrityError -> 500. Data corrupt nahi hota, bas request fail.",
+   "alternatives": "Version rows ko append-only rakh ke 'latest' ek alag pointer table mein (key -> version_id) rakhna; ya created_at se latest derive karna (lekin phir unique enforcement mushkil).",
+   "scale_10x_100x": "Hot keys pe 10x writes se advisory lock pe queue lambi hogi; versions table bahut badi hogi -> partition by bucket ya hash, aur noncurrent lifecycle zaroori.",
+   "production_improvements": "Ek `UPDATE ... RETURNING` + `INSERT` ko single CTE mein combine karke round trips kam karna; per-key version count limit; metrics for versions per key."
+  }
+ },
+ {
+  "id": "OBJS-025",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does delete_object handle a permanent version delete, and how is the next latest version promoted?",
+  "answer_hinglish": "`delete_object` ke teen paths hain, aur teeno key advisory lock ke andar ek transaction mein chalte hain.\n\n1) **versionId diya hai**: yeh permanent delete hai. `DELETE ... WHERE version_id = :v RETURNING is_latest, blob_key, is_delete_marker`. Row nahi mila toh `NoSuchVersion` 404. Mila toh blob queue mein jata hai. Agar deleted row latest tha, toh bacha hua sabse naya row promote hota hai: `UPDATE objects SET is_latest = true WHERE id = (SELECT id ... ORDER BY created_at DESC, id DESC LIMIT 1)`. `id DESC` tie-breaker hai -- same timestamp wale do rows pe bhi deterministic.\n\nYahi 'undelete' ka mechanism hai: delete marker bhi ek version hai, uska versionId deke delete karo -> marker hata, aur pichla real version latest ban jata hai.\n\n2) **Disabled bucket, no versionId**: row hi delete, blob queue. Return `{deleted: bool}` -- key exist na kare toh bhi success, jaisa S3 204 idempotent delete karta hai.\n\n3) **Enabled/suspended, no versionId**: kuch delete nahi hota! `commit_version(..., delete_marker=True, blob_key=None, size=0)` ek marker ko latest bana deta hai. Data recoverable rehta hai.\n\nPromotion ka subtle point: agar marker ke neeche sirf ek aur marker ho toh woh latest ban jayega aur GET phir bhi 404 dega -- jo sahi S3 behaviour hai.",
+  "why_needed": "Versioned buckets mein delete ka matlab 'chhupana' hai, aur permanent delete ke baad bhi key ka ek consistent latest hona chahiye -- warna GET random version dikhayega.",
+  "real_world_analogy": "Photo album ke pages: upar ek 'removed' sticker lagao (marker) toh photo chhup jati hai; sticker utha do toh photo wapas. Kisi photo ko phaad do (permanent delete) toh uske neeche wali photo upar aa jati hai.",
+  "how_it_works": "DELETE ... RETURNING ek round trip mein row hatata bhi hai aur batata bhi hai ki woh latest tha ya nahi. Promotion subquery `ix_objects_versions (bucket, key, created_at DESC)` index use kar sakti hai.",
+  "in_this_project": "`objects.py::delete_object` route `api/routes.py::delete_object` se aata hai (Action.WRITE). Lifecycle expiration bhi isi function ko `version_id=None` ke saath call karta hai taaki semantics same rahein. Test `test_versioning_and_delete_markers`: marker delete -> v2 wapas, phir v2 permanently delete -> v1 latest. `test_bucket_rules` disabled bucket pe delete ke baad bucket delete 204.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::delete_object",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::ix_objects_versions",
+   "projects/07-object-storage/tests/test_objects.py::test_versioning_and_delete_markers"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nif version_id:\n    row = (await s.execute(text(\"DELETE FROM objects WHERE bucket = :b AND key = :k AND version_id = :v \"\n                                \"RETURNING is_latest, blob_key, is_delete_marker\"), {...})).first()\n    if row is None:\n        raise NotFound(\"version not found\", details={\"code\": \"NoSuchVersion\"})\n    await _queue_blob_deletion(s, row.blob_key)\n    if row.is_latest:\n        await s.execute(text(\n            \"UPDATE objects SET is_latest = true WHERE id = (SELECT id FROM objects WHERE bucket = :b AND key = :k \"\n            \"ORDER BY created_at DESC, id DESC LIMIT 1)\"), {...})",
+  "code_language": "python",
+  "advantages": [
+   "Undelete free mein milta hai -- marker bhi ek version",
+   "Promotion deterministic (id tie-breaker)",
+   "Idempotent unversioned delete"
+  ],
+  "disadvantages": [
+   "Permanent delete irreversible -- koi soft delete/object lock nahi (SECURITY.md gap)",
+   "Promotion created_at pe depend -- clock jumps se order ajeeb ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Versioned bucket mein plain DELETE ko data delete samajhna",
+   "Latest delete karne ke baad promote karna bhool jana",
+   "Delete marker ka blob_key NULL hai, use queue karne ki koshish (helper None skip karta hai)"
+  ],
+  "follow_up_questions": [
+   "Why is DELETE of a non-existent key a success instead of 404?",
+   "What happens if the promoted version is itself a delete marker?",
+   "Who should be allowed to permanently delete versions in a production system?"
+  ],
+  "concepts": [
+   "delete marker",
+   "undelete",
+   "version promotion",
+   "DELETE RETURNING"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Permanent delete aur marker ek hi endpoint pe versionId se differentiate hote hain (S3 jaisa). Simple API, lekin galat client param se data loss possible.",
+   "failure_scenarios": "Promotion UPDATE fail ho toh transaction rollback -> delete bhi undo; koi half state nahi. created_at same ho toh id DESC decide karta hai.",
+   "alternatives": "Version delete ke liye alag permission (S3 mein s3:DeleteObjectVersion) ya MFA delete; soft-delete with retention.",
+   "scale_10x_100x": "Bahut versions wali key pe promotion subquery index se fast hai; real issue lifecycle/GC load hai jab bulk version deletes hon.",
+   "production_improvements": "Version delete ko alag Action (e.g. ADMIN ya separate grant) banana, audit log, aur object lock retention check before permanent delete."
+  }
+ },
+ {
+  "id": "OBJS-026",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does list_objects build common prefixes with a delimiter, and what is the U+10FFFF skip-ahead trick?",
+  "answer_hinglish": "`list_objects` S3 ListObjectsV2 semantics deta hai: prefix filter, optional delimiter jo 'folders' ko `common_prefixes` mein group karta hai, `start_after` pagination aur `max_keys` (max 1000).\n\nAlgorithm: Postgres se keys sorted order mein batch mein aati hain (`key LIKE prefix% AND key > :after ORDER BY key LIMIT max_keys+1`). Har key ka prefix ke baad wala hissa (`rest`) dekha jata hai. Agar rest mein delimiter hai, toh `prefix + rest.split(delimiter,1)[0] + delimiter` ek common prefix hai, jaise `docs/`.\n\nAb trick: `docs/` ke neeche lakhon keys ho sakti hain; har ek ko padhna waste hai. Isliye cursor ko `after = cp + '\\U0010ffff'` set karke loop `break` karta hai aur nayi query chalata hai. U+10FFFF sabse bada Unicode code point hai, toh `docs/` se shuru hone wali har key isse chhoti hai -- agli query seedha `docs/` ke baad wali key pe jump karti hai. Ek folder = ek query, chahe usme kitni bhi files ho.\n\nPagination: jab `contents + prefixes` count `max_keys` tak pahunch jaye toh `is_truncated: true` aur `next_start_after` = last cursor. Client wahi `start_after` bhejta hai.\n\nObservation (O8): ordering aur `key > :a` DB collation pe chalte hain; skip-trick tabhi sahi hai jab collation ordering codepoint jaisi ho (C collation safest). Production mein EXPLAIN aur collation check karna chahiye.",
+  "why_needed": "Object store flat hai; users phir bhi folder view chahte hain. Bina skip-ahead ke ek 'folder' jisme 1M keys hon, listing ko 1M rows scan karwa dega.",
+  "real_world_analogy": "Library ka card catalogue: 'History' drawer dekha toh uske saare cards nahi padhte, drawer label likh ke seedha agle drawer pe chale jaate ho.",
+  "how_it_works": "Loop: while results < max_keys -> query batch -> for each row: delimiter mila toh prefix add, cursor jump, break (requery); nahi toh content add, cursor = key. Batch khatam aur koi skip nahi hua aur rows <= max_keys -> done.",
+  "in_this_project": "`objects.py::list_objects` route `GET /buckets/{b}/objects` se aata hai. `ix_objects_list (bucket, key text_pattern_ops) WHERE is_latest AND NOT is_delete_marker` index prefix scan ke liye hai. Test `test_listing_prefix_delimiter_pagination`: root listing mein contents `100%_done.txt, 100xxdone.txt, a.txt` aur prefixes `docs/, img/`; `prefix=docs/` pe `docs/sub/` prefix; `max_keys=3` page1 truncated aur page1+page2 = 7 keys.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::list_objects",
+   "projects/07-object-storage/objstore/services/objects.py::_escape_like",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::ix_objects_list",
+   "projects/07-object-storage/tests/test_objects.py::test_listing_prefix_delimiter_pagination"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nfor r in rows:\n    if len(contents) + len(prefixes) >= max_keys:\n        return {\"contents\": contents, \"common_prefixes\": prefixes, \"is_truncated\": True,\n                \"next_start_after\": after}\n    rest = r[\"key\"][len(prefix):]\n    if delimiter and delimiter in rest:\n        cp = prefix + rest.split(delimiter, 1)[0] + delimiter\n        prefixes.append(cp)\n        after = skipped_to = cp + \"\\U0010ffff\"   # jump past every key under this \"folder\"\n        break\n    contents.append(dict(r))\n    after = r[\"key\"]",
+  "code_language": "python",
+  "advantages": [
+   "Folder size se independent cost -- har prefix ek query",
+   "Keyset pagination (key > cursor), OFFSET nahi",
+   "Delete markers aur noncurrent versions partial index se bahar"
+  ],
+  "disadvantages": [
+   "Bahut saare folders ho toh query count = folders count",
+   "Collation dependence (observation O8)",
+   "Cursor ek raw key/sentinel hai, opaque continuation token nahi"
+  ],
+  "common_mistakes": [
+   "OFFSET pagination use karna -- bade buckets pe O(n) aur concurrent writes se skip/duplicate",
+   "Common prefix ke baad cursor sirf cp pe set karna -- phir same folder ki keys dobara aati",
+   "LIKE pattern escape na karna"
+  ],
+  "follow_up_questions": [
+   "Why keyset pagination instead of OFFSET here?",
+   "How would you return an opaque continuation token like S3 does?",
+   "What changes if the bucket has 10 million top-level 'folders'?"
+  ],
+  "concepts": [
+   "ListObjectsV2",
+   "common prefixes",
+   "keyset pagination",
+   "skip scan"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Application-level skip scan simple aur index-friendly hai, lekin many-folder case mein N queries. Pure SQL alternative (recursive CTE loose index scan) faster lekin padhna mushkil.",
+   "failure_scenarios": "Galat collation pe ordering aur U+10FFFF sentinel galat ho sakte hain -> keys miss ya duplicate. Concurrent writes ke beech pages mein naya key aa sakta hai (normal eventual listing behaviour).",
+   "alternatives": "Recursive CTE 'loose index scan'; ya dedicated listing index/service (DynamoDB/FoundationDB style) jaisa SYSTEM_DESIGN.md 100x pe suggest karta hai.",
+   "scale_10x_100x": "100x pe listing ek single Postgres pe bottleneck banegi -> read replicas (10x) aur alag listing index (100x), metadata sharding by bucket.",
+   "production_improvements": "Opaque base64 continuation token, COLLATE \"C\" explicitly in queries/index, aur listing latency metrics per bucket."
+  }
+ },
+ {
+  "id": "OBJS-027",
+  "project_slug": "p07-object-storage",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What validations does complete_multipart run before assembling the object?",
+  "answer_hinglish": "`complete_multipart` client ki di hui part list ko DB mein stored parts se match karta hai, aur chaar rules enforce karta hai:\n\n1) **Kam se kam ek part** -- khaali list -> `InvalidPart`.\n2) **Ascending order, no duplicates** -- `numbers != sorted(numbers) or len(set(numbers)) != len(numbers)` -> `InvalidPart` with code `InvalidPartOrder`. Test mein `[2, 1]` order bhejke 400 check hota hai.\n3) **ETag match** -- har part number stored hona chahiye aur client ka etag (quotes strip karke) stored etag se match kare. Isse client confirm karta hai ki 'mere paas jo version hai wahi part assemble karo' -- agar part retry hua aur client ke paas purana ETag hai toh mismatch pakda jata hai.\n4) **Min part size** -- last part ko chhod ke har part `>= min_part` (config `min_part_bytes` default 5 MiB). Chhota hai toh `EntityTooSmall`.\n\nNote: client parts ka subset choose kar sakta hai (jaise 1, 3 skip 2) -- jo stored but unchosen parts hain, unke blobs bhi completion pe queue ho jaate hain.\n\nValidation ke baad composite ETag `md5(concat(binary part md5s)) + '-N'` banta hai, parts ko re-stream karke ek naya blob likha jata hai, aur phir key lock ke andar version commit hota hai.",
+  "why_needed": "Multipart mein client aur server ke beech 'final object kya hai' pe agreement chahiye; validation ke bina galat order ya stale part ke saath corrupted object ban sakta hai.",
+  "real_world_analogy": "Furniture assembly: manual ke steps ascending order mein, har part ka serial number box pe likhe number se match ho, aur sirf last wala chhota screw ho sakta hai.",
+  "how_it_works": "Stored parts ek dict `{part_number: row}` mein load hote hain (bina transaction ke ek read). Phir pure Python validation, phir `HashingStream(concatenated(), sum(sizes))` se final blob.",
+  "in_this_project": "`objects.py::complete_multipart` ko route `POST /buckets/{b}/multipart/{upload_id}/complete` `settings.min_part_bytes` pass karta hai. Tests: `test_multipart_upload` (wrong order 400, part 2 retry, expected composite etag `-3`, size 23) aur `test_multipart_min_part_size_and_abort` (`min_part_bytes=8`, 4-byte first part -> `EntityTooSmall`). conftest `min_part_bytes=5` set karta hai taaki tests chhote parts use kar sakein.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::complete_multipart",
+   "projects/07-object-storage/objstore/config.py::min_part_bytes",
+   "projects/07-object-storage/tests/test_objects.py::test_multipart_min_part_size_and_abort",
+   "projects/07-object-storage/tests/test_objects.py::test_multipart_upload"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nnumbers = [p[\"part_number\"] for p in parts]\nif numbers != sorted(numbers) or len(set(numbers)) != len(numbers):\n    raise InvalidPart(\"parts must be listed in ascending order without duplicates\",\n                      details={\"code\": \"InvalidPartOrder\"})\nfor i, p in enumerate(parts):\n    st = stored.get(p[\"part_number\"])\n    if st is None or st.etag != p[\"etag\"].strip('\"'):\n        raise InvalidPart(f\"part {p['part_number']} missing or ETag mismatch\")\n    if i < len(parts) - 1 and st.size < min_part:\n        raise InvalidPart(..., details={\"code\": \"EntityTooSmall\"})",
+  "code_language": "python",
+  "advantages": [
+   "S3-compatible rules -- client SDKs ki expectations match",
+   "Stale retry ETag mismatch pe pakda jata hai",
+   "Min size se tiny-part abuse (10000 x 1 byte) rukta hai"
+  ],
+  "disadvantages": [
+   "Min-part check complete pe hota hai, upload_part pe nahi -- client ko late pata chalta hai",
+   "Validation read aur commit ke beech parts change ho sakte hain (commit pe upload DELETE ... RETURNING se race pakdi jati hai)"
+  ],
+  "common_mistakes": [
+   "Last part pe bhi min size lagana",
+   "Quoted ETag compare karna bina strip ke",
+   "Composite ETag ko full-object MD5 samajhna"
+  ],
+  "follow_up_questions": [
+   "Why is the minimum part size only checked at completion?",
+   "Why does S3 require the client to send part ETags at completion?",
+   "What happens to parts uploaded but not listed in the complete request?"
+  ],
+  "concepts": [
+   "multipart upload",
+   "part validation",
+   "EntityTooSmall",
+   "composite ETag"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-028",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Walk through the database schema of the object store.",
+  "answer_hinglish": "Schema ek single Alembic migration `0001_initial.py` mein hai, aur saat tables hain:\n\n- **access_keys**: `access_key_id` PK, `secret` (plaintext -- HMAC verify karne ke liye chahiye), owner, `is_admin`, `revoked_at`.\n- **buckets**: `name` PK with DNS-style CHECK, `owner_key` FK, `versioning` (disabled/enabled/suspended CHECK), `public_read`, `quota_bytes` (NULL = unlimited).\n- **bucket_grants**: (bucket, access_key_id, permission read/write) -- ACL.\n- **objects**: har VERSION ek row: bucket, key, `version_id` ('null' jab unversioned), `is_latest`, `is_delete_marker`, size, etag, sha256, content_type, `user_metadata jsonb`, `blob_key` (random, key se derive nahi), created_at. `UNIQUE (bucket, key, version_id)`.\n- **multipart_uploads** aur **multipart_parts**: in-progress uploads; parts ka PK (upload_id, part_number), part_number CHECK 1..10000.\n- **lifecycle_rules**: per bucket rules (prefix, expiration_days, noncurrent_expiration_days, abort_multipart_days).\n- **blob_deletions**: queue of blob keys jinka metadata chala gaya; GC inhe delete karta hai.\n\nMain design idea: objects table mein bytes nahi, sirf pointer (`blob_key`). Indexes: `uq_objects_latest` (ek latest per key), `ix_objects_list` (prefix listing), `ix_objects_versions`, `ix_objects_blob`. Bucket delete hone pe `ON DELETE CASCADE` child rows saaf karta hai (lekin route pehle hi non-empty bucket ko 409 deta hai).",
+  "why_needed": "Object store ka 'dimaag' metadata hai: naming, versions, permissions, lifecycle. Isko relational DB mein rakhne se constraints aur transactions free milte hain.",
+  "real_world_analogy": "Library: catalogue register (Postgres) mein book ka naam, edition, shelf number; asli books godown (blob store) mein random shelf number pe.",
+  "how_it_works": "Versions ko alag table ke bajaye objects mein hi rows ke roop mein rakha hai aur `is_latest` flag se current pata chalta hai. Multipart parts apne blob ke saath alag table mein, taaki complete hone tak object visible na ho.",
+  "in_this_project": "`migrations/versions/0001_initial.py::STATEMENTS` raw SQL list hai jo `upgrade()` mein execute hoti hai. `DATABASE_DESIGN.md` mein ER diagram aur har index ka reason hai. Tests `conftest.py` mein in sab tables ko `TRUNCATE ... RESTART IDENTITY CASCADE` karte hain har test se pehle.",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/07-object-storage/DATABASE_DESIGN.md",
+   "projects/07-object-storage/tests/conftest.py::TABLES"
+  ],
+  "code_example": "-- real, trimmed: migrations/versions/0001_initial.py\nCREATE TABLE objects (\n  id bigserial PRIMARY KEY,\n  bucket text NOT NULL REFERENCES buckets(name) ON DELETE CASCADE,\n  key text NOT NULL,\n  version_id text NOT NULL,           -- 'null' when versioning was never enabled\n  is_latest boolean NOT NULL,\n  is_delete_marker boolean NOT NULL DEFAULT false,\n  size bigint NOT NULL DEFAULT 0,\n  etag text, sha256 text, content_type text,\n  user_metadata jsonb NOT NULL DEFAULT '{}',\n  blob_key text,                      -- random id in the storage adapter; NEVER derived from key\n  created_at timestamptz NOT NULL DEFAULT now(),\n  UNIQUE (bucket, key, version_id));",
+  "code_language": "sql",
+  "advantages": [
+   "Constraints DB level pe -- code bug se bhi data invalid nahi hota",
+   "Versions ek table mein -> lifecycle window queries simple",
+   "jsonb user metadata flexible"
+  ],
+  "disadvantages": [
+   "Ek Postgres sab metadata ka bottleneck (TRADEOFFS #1)",
+   "Secrets plaintext table mein",
+   "Blob store DB ke bina bekaar -- dono ka backup saath chahiye"
+  ],
+  "common_mistakes": [
+   "Bytes DB mein (bytea) rakhna -- WAL, backups, replicas sab phool jaate hain",
+   "version_id NULL rakhna -- UNIQUE NULLs ko distinct maanta hai",
+   "Delete marker ke liye alag table banana"
+  ],
+  "follow_up_questions": [
+   "Why is version_id the text 'null' rather than SQL NULL?",
+   "Which index supports prefix listing and why is it partial?",
+   "How would you partition the objects table at scale?"
+  ],
+  "concepts": [
+   "schema design",
+   "metadata",
+   "Alembic",
+   "constraints"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-029",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "What does the partial unique index uq_objects_latest guarantee, and why enforce it in the database instead of code?",
+  "answer_hinglish": "`CREATE UNIQUE INDEX uq_objects_latest ON objects (bucket, key) WHERE is_latest` ka matlab: ek (bucket, key) ke liye maximum EK row `is_latest = true` ho sakta hai. Partial hai, toh noncurrent versions (is_latest false) pe koi restriction nahi -- ek key ke 1000 purane versions ho sakte hain, lekin latest sirf ek.\n\nYeh invariant system ka sabse important hai: GET bina versionId ke `WHERE is_latest` se row uthata hai. Do latest rows hon toh `.first()` random version dega, listing duplicate dikhayegi, aur lifecycle galat versions expire karega.\n\nCode mein bhi protection hai: `key_lock_sql()` advisory lock har writer ko serialize karta hai, aur `commit_version` pehle purana latest flip karta hai phir insert. Toh DB mein kyun? Kyunki code ke invariants 'normal path' pe sahi hote hain, lekin future bug, ek naya code path jo lock lena bhool jaye, manual SQL fix, ya lifecycle job -- koi bhi do latest bana sakta hai. Index ke saath woh write `IntegrityError` se fail hota hai: request 500 de, lekin data kabhi corrupt nahi hota. Defence in depth.\n\nTest `test_concurrent_writes_to_same_key` 20 parallel PUTs ke baad `count(*) WHERE is_latest = 1` assert karta hai. DATABASE_DESIGN.md isko 'enforced by the DB even under concurrency bugs' bolta hai.",
+  "why_needed": "Concurrency invariants ko sirf application logic pe chhodna risky hai; database constraint ek hard guarantee deta hai jo har client, har code path pe lagu hota hai.",
+  "real_world_analogy": "Cricket team mein ek hi captain: coach (code) dhyan rakhta hai, lekin rulebook (DB) bhi kehti hai do captain toss pe nahi aa sakte -- coach bhool bhi jaye toh umpire rok dega.",
+  "how_it_works": "Partial index sirf un rows ko index karta hai jahan predicate true hai. Unique check bhi sirf unhi pe. Insert/update jo predicate ko true banaye, index check trigger karta hai -- isliye flip (false) pehle aur insert (true) baad mein.",
+  "in_this_project": "`0001_initial.py` mein index migration ka part hai with comment 'Exactly one latest version per key -- enforced by the database, not just by code'. `commit_version` aur `delete_object` ka promotion UPDATE dono is index ke saath compatible order mein likhe hain. Is index ka ek side benefit: `WHERE bucket AND key AND is_latest` lookups (GET, HEAD) isi index se fast hote hain.",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py::uq_objects_latest",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key"
+  ],
+  "code_example": "-- real: migrations/versions/0001_initial.py\nCREATE UNIQUE INDEX uq_objects_latest ON objects (bucket, key) WHERE is_latest;\n\n-- illustrative: what the DB rejects\nINSERT INTO objects (bucket, key, version_id, is_latest) VALUES ('b', 'k', 'v2', true);\n-- ERROR: duplicate key value violates unique constraint \"uq_objects_latest\" (if v1 is still latest)",
+  "code_language": "sql",
+  "advantages": [
+   "Hard invariant, har code path pe",
+   "Latest lookups ke liye index bhi",
+   "Partial -- noncurrent versions free"
+  ],
+  "disadvantages": [
+   "Invariant violation runtime 500 hai, graceful retry nahi",
+   "Flip-then-insert order follow karna padta hai",
+   "Har write pe index maintenance cost"
+  ],
+  "common_mistakes": [
+   "Full unique (bucket, key) laga dena -- versions hi impossible ho jaate",
+   "Sirf index pe rely karna aur lock na lena -> concurrent writers mein random 500s",
+   "Insert pehle, flip baad mein"
+  ],
+  "follow_up_questions": [
+   "Why is the advisory lock still needed if the index exists?",
+   "How would a deferrable constraint change the flip ordering?",
+   "How would you enforce the same invariant in a sharded or NoSQL metadata store?"
+  ],
+  "concepts": [
+   "partial unique index",
+   "invariants",
+   "defence in depth",
+   "is_latest"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Index = correctness guarantee, lock = good UX (no failures). Sirf index se optimistic approach banta (unique violation pe retry), lekin hot key pe retries storm.",
+   "failure_scenarios": "Agar koi path lock na le toh concurrent commit mein ek IntegrityError -> 500; client retry kare toh theek. Data corruption impossible.",
+   "alternatives": "Deferrable unique constraint (commit pe check) -- flip order free ho jata; ya alag `latest_versions(bucket,key)->version_id` table with PK.",
+   "scale_10x_100x": "Sharded metadata mein yeh invariant per-shard local rehta hai agar shard key (bucket ya hash(bucket,key)) mein bucket+key aate hain -- isliye shard key choice important.",
+   "production_improvements": "IntegrityError ko catch karke 409/503 retryable map karna instead of 500; metric for constraint violations as a bug signal."
+  }
+ },
+ {
+  "id": "OBJS-030",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "Why does the listing index use text_pattern_ops, and why must LIKE wildcards in the prefix be escaped?",
+  "answer_hinglish": "Prefix listing SQL `key LIKE 'docs/%'` jaisi hai. Postgres B-tree index LIKE prefix ke liye tabhi use kar sakta hai jab comparisons byte-wise/C-collation semantics se hon. Agar database ka collation `en_US.UTF-8` jaisa hai, toh normal text index pe `LIKE 'abc%'` index range scan nahi banega, kyunki locale collation mein ordering characters ke 'linguistic' rules se hoti hai. `text_pattern_ops` operator class index ko character-by-character compare karwata hai, toh planner `LIKE 'docs/%'` ko `key >= 'docs/' AND key < 'docs0'` jaise range scan mein badal sakta hai.\n\nIndex `ix_objects_list ON objects (bucket, key text_pattern_ops) WHERE is_latest AND NOT is_delete_marker` -- partial bhi hai, toh noncurrent versions aur delete markers index mein hi nahi; listing sirf visible objects scan karti hai.\n\nEscaping: object keys mein `%` aur `_` legal characters hain. Agar user prefix `100%_` de aur hum seedha `'100%_' || '%'` banayein, toh `%` 'kuch bhi' aur `_` 'koi ek char' ban jayega -- `100xxdone.txt` bhi match ho jayega. `_escape_like` backslash, `%`, `_` ko escape karta hai aur query `ESCAPE '\\'` use karti hai. Test `test_listing_prefix_delimiter_pagination` exactly yahi check karta hai: `prefix=100%_` pe sirf `100%_done.txt`.\n\nObservation (O8): ORDER BY key aur `key > :a` default collation use karte hain, jo text_pattern_ops order se alag ho sakta hai -- EXPLAIN se verify karna chahiye ki sort step nahi aa raha.",
+  "why_needed": "Bade buckets mein listing har request pe full scan nahi kar sakti; aur user input ko pattern language mein inject hone dena correctness bug (aur kabhi kabhi DoS) hai.",
+  "real_world_analogy": "Dictionary mein 'pre' se shuru hone wale words dhoondhna: alphabetical order ho toh seedha page pe jao. Agar koi '%' ko wildcard samjhe toh 'pre%' ka matlab 'pre se shuru kuch bhi' ho jayega jab user literally '%' wala word chahta tha.",
+  "how_it_works": "Planner LIKE ke constant prefix ko range condition mein convert karta hai sirf jab index opclass pattern-compatible ho. Escaping ke baad pattern ka literal prefix wahi user prefix hai, toh index range sahi rehta hai.",
+  "in_this_project": "`objects.py::_escape_like` `list_objects` aur `list_versions` dono mein use hota hai; `maintenance.py::run_lifecycle` bhi rule prefix ke liye same escaping inline karta hai. Index definition `0001_initial.py` mein hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_escape_like",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::ix_objects_list",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/tests/test_objects.py::test_listing_prefix_delimiter_pagination"
+  ],
+  "code_example": "# real: objstore/services/objects.py\ndef _escape_like(s: str) -> str:\n    return s.replace(\"\\\\\", \"\\\\\\\\\").replace(\"%\", \"\\\\%\").replace(\"_\", \"\\\\_\")\n\n# query uses:  key LIKE :p ESCAPE '\\'   with :p = _escape_like(prefix) + '%'\n\n-- real: migration\nCREATE INDEX ix_objects_list ON objects (bucket, key text_pattern_ops)\n  WHERE is_latest AND NOT is_delete_marker;",
+  "code_language": "python",
+  "advantages": [
+   "Prefix listing index range scan ban sakti hai locale DB mein bhi",
+   "Partial index chhota -- sirf visible objects",
+   "Escaping se exact prefix semantics"
+  ],
+  "disadvantages": [
+   "text_pattern_ops index ORDER BY/`>` collation queries ke liye kaam na aaye -- do alag orderings ka risk",
+   "Extra index write cost har PUT pe"
+  ],
+  "common_mistakes": [
+   "Backslash ko pehle escape na karna (order matters)",
+   "ESCAPE clause bhool jana",
+   "Prefix ko f-string mein SQL mein daalna (SQL injection)"
+  ],
+  "follow_up_questions": [
+   "How would you verify with EXPLAIN that the index is used?",
+   "What is the difference between text_pattern_ops and COLLATE \"C\"?",
+   "Why is the index partial, and what queries can't use it?"
+  ],
+  "concepts": [
+   "text_pattern_ops",
+   "LIKE escaping",
+   "partial index",
+   "collation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pattern opclass prefix scan deta hai lekin ordering locale se mismatch kar sakti hai; poore column ko COLLATE \"C\" dena cleaner hota (ek hi ordering har jagah).",
+   "failure_scenarios": "Escaping bhoolne pe galat objects listing mein aate (data leak within bucket nahi, par correctness bug); collation mismatch pe pagination keys skip/duplicate kar sakti hai.",
+   "alternatives": "`key COLLATE \"C\"` column; ya `key >= :p AND key < :p_next` explicit range; ya separate search/listing index.",
+   "scale_10x_100x": "100x par ek bucket ke billions keys -- B-tree theek hai, lekin listing ko dedicated store pe le jana (SYSTEM_DESIGN.md) aur bucket-based partitioning.",
+   "production_improvements": "Column/index ko C collation pe fix karna, EXPLAIN-based regression test, aur slow listing queries pe pg_stat_statements alert."
+  }
+ },
+ {
+  "id": "OBJS-031",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why is the version_id of an unversioned object the literal string 'null', and what does UNIQUE(bucket, key, version_id) give you?",
+  "answer_hinglish": "S3 mein jo objects versioning enable hone se pehle (ya suspended state mein) likhe jaate hain, unka version id literally string `\"null\"` hota hai. Hum wahi semantics copy karte hain: `commit_version` disabled/suspended bucket mein `version_id = 'null'` set karta hai.\n\nSQL NULL kyun nahi? Do reasons. Pehla, SQL mein `UNIQUE` constraint NULLs ko distinct maanta hai -- `(b, k, NULL)` ke do rows allowed ho jaate, toh 'ek null version per key' DB enforce nahi kar pata. String `'null'` ek normal value hai, toh `UNIQUE (bucket, key, version_id)` guarantee deta hai ki ek key ka sirf ek null version ho. Doosra, API mein `versionId=null` se client us specific version ko address kar sakta hai, bilkul real versions jaisa -- koi special case nahi, column `NOT NULL` hai.\n\nYeh unique constraint har version ko uniquely identify bhi karta hai: `GET ?versionId=...` aur `DELETE ?versionId=...` dono `WHERE bucket AND key AND version_id` pe kaam karte hain aur yeh index unhe fast banata hai. Real version ids `uuid4().hex` hain, toh collision practically impossible, lekin constraint phir bhi safety net hai.\n\nSuspended bucket ka example: v1, v2 real versions hain; suspend ke baad PUT -> 'null' version banega; doosra PUT -> wahi 'null' row replace hogi (purana blob queue), v1/v2 safe.",
+  "why_needed": "Unversioned aur versioned objects ko ek hi table aur ek hi API se handle karna hai, aur 'max ek null version' invariant DB se enforce karna hai.",
+  "real_world_analogy": "Hotel rooms mein ek 'walk-in' room number hamesha 'W' hota hai -- har baar naya guest usi 'W' room mein, purana guest bahar. Baaki rooms ke unique numbers.",
+  "how_it_works": "Constraint index (bucket, key, version_id) composite B-tree hai. Null row lookup `WHERE version_id = 'null'` isi index se.",
+  "in_this_project": "Migration: `version_id text NOT NULL, -- 'null' when versioning was never enabled (S3 semantics)` aur `UNIQUE (bucket, key, version_id)`. `commit_version` mein `null_row` lookup aur replace. `PUT /buckets/{b}/versioning` sirf `enabled|suspended` accept karta hai (`VersioningIn` pattern) -- S3 jaisa, enable ke baad wapas disabled nahi.",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/objstore/api/routes.py::VersioningIn",
+   "projects/07-object-storage/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (disabled / suspended branch)\nversion_id = \"null\"\nnull_row = (await s.execute(text(\"SELECT id, blob_key, is_latest FROM objects WHERE bucket = :b AND key = :k \"\n                                 \"AND version_id = 'null'\"), {\"b\": bucket[\"name\"], \"k\": key})).first()\nif null_row:\n    await s.execute(text(\"DELETE FROM objects WHERE id = :i\"), {\"i\": null_row.id})\n    await _queue_blob_deletion(s, null_row.blob_key)",
+  "code_language": "python",
+  "advantages": [
+   "UNIQUE NULL-semantics trap se bachav",
+   "S3-compatible version addressing",
+   "Ek column, koi special case nahi"
+  ],
+  "disadvantages": [
+   "'null' magic string -- kisi ko pata na ho toh confusing",
+   "User-supplied version ids kabhi allow kiye toh 'null' reserve karna padega"
+  ],
+  "common_mistakes": [
+   "version_id NULL rakh ke unique expect karna",
+   "Suspended bucket mein real versions bhi overwrite kar dena",
+   "Versioning ko enabled se disabled karne dena"
+  ],
+  "follow_up_questions": [
+   "What does Postgres 15's NULLS NOT DISTINCT change here?",
+   "How does a suspended bucket treat a DELETE without versionId?",
+   "Why can't a bucket go back from enabled to disabled in S3?"
+  ],
+  "concepts": [
+   "null version",
+   "unique constraints",
+   "NULL semantics",
+   "versioning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-032",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How does the lifecycle noncurrent-expiration query use the lag() window function, and why is age measured from the successor?",
+  "answer_hinglish": "Rule 'noncurrent versions ko 7 din baad delete karo' ka sahi matlab hai: version ko noncurrent BANE hue 7 din. Version kab noncurrent bana? Jab uske baad naya version aaya. Toh age apne `created_at` se nahi, balki agle (newer) version ke `created_at` se ginni chahiye.\n\nExample: v1 Jan 1 ko bana, 1 saal tak current raha, v2 Jan 1 next year aaya. Agar v1 ki age apne created_at se ginein, toh v2 aate hi v1 turant (365 > 7 din) delete ho jayega -- user ko 7 din ka recovery window milna tha, mila zero. Isliye successor timestamp.\n\nSQL mein yeh window function `lag(created_at) OVER (PARTITION BY key ORDER BY created_at DESC, id DESC)` se hota hai. Descending order mein 'previous row' matlab next newer version. Toh har row ko `noncurrent_since` mil jata hai. Phir outer filter `NOT is_latest AND noncurrent_since < cutoff`. Latest version ka lag NULL hai (koi newer nahi), aur woh `NOT is_latest` se bhi excluded hai.\n\nPura kaam ek `DELETE FROM objects WHERE id IN (subquery) RETURNING blob_key` statement mein, aur returned blobs `blob_deletions` mein queue. Iske baad 'lone delete markers' (marker jiske neeche koi version nahi) bhi delete hote hain.\n\nObservation (O10): yeh bulk SQL per-key advisory lock nahi leta, unlike user deletes.",
+  "why_needed": "Lifecycle rules storage cost control karte hain, lekin galat age calculation user ka recovery window chhupke se khatam kar dega.",
+  "real_world_analogy": "Purana phone: aapne naya phone liya, uske baad 7 din purana phone 'backup' rakhte ho. 7 din naye phone ke aane se gine jaate hain, purane phone ki kharid date se nahi.",
+  "how_it_works": "Window function rows ko partition (key) mein order karta hai aur har row pe pichli row ka value deta hai, bina self-join ke. Ek scan mein saare versions ka successor time mil jata hai.",
+  "in_this_project": "`maintenance.py::run_lifecycle` ka noncurrent block; DATABASE_DESIGN.md mein same query explained hai. Test `test_lifecycle_expiration_noncurrent_and_markers` simulated `now=FUTURE(10)` pe `expired_noncurrent == 1` (v1 gaya, v2 current raha), aur `FUTURE(31)` pe expired_current, expired_noncurrent aur removed_delete_markers teeno 1.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/DATABASE_DESIGN.md",
+   "projects/07-object-storage/tests/test_maintenance.py::test_lifecycle_expiration_noncurrent_and_markers"
+  ],
+  "code_example": "-- real, trimmed: objstore/services/maintenance.py\nDELETE FROM objects WHERE id IN (\n  SELECT id FROM (\n    SELECT id, is_latest,\n           lag(created_at) OVER (PARTITION BY key ORDER BY created_at DESC, id DESC) AS noncurrent_since\n    FROM objects WHERE bucket = :b AND key LIKE :p ESCAPE '\\') v\n  WHERE NOT is_latest AND noncurrent_since < :c)\nRETURNING blob_key;",
+  "code_language": "sql",
+  "advantages": [
+   "Sahi semantics (S3 jaisa NoncurrentDays)",
+   "Ek statement, ek scan, no self-join",
+   "Idempotent -- dobara chalao toh kuch extra nahi"
+  ],
+  "disadvantages": [
+   "Prefix ke saare versions scan -- bade buckets pe bhaari",
+   "Bulk delete bina per-key lock (observation O10)",
+   "Ek rule = ek bada transaction"
+  ],
+  "common_mistakes": [
+   "Age apne created_at se ginna",
+   "lag aur lead ka direction ulta samajhna",
+   "Delete ke baad blobs queue karna bhool jana -> orphans"
+  ],
+  "follow_up_questions": [
+   "How would you batch this delete for a bucket with 100M versions?",
+   "What is an 'expired object delete marker' and why remove it?",
+   "How would you add 'keep at most N noncurrent versions'?"
+  ],
+  "concepts": [
+   "window functions",
+   "lag",
+   "lifecycle",
+   "noncurrent versions"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Ek SQL statement simple aur atomic hai; lekin bade buckets pe lambi transaction, locks aur WAL spike. Batching complexity add karti.",
+   "failure_scenarios": "Concurrent PUT is query ke beech aaye toh snapshot purana dekhta hai; worst case ek version jo abhi abhi noncurrent hua woh ignore hota hai -- next run pakdega. Delete idempotent hai.",
+   "alternatives": "Har version pe `noncurrent_since` column store karna jab flip hota hai (write time pe), phir simple indexed delete; ya per-key procedural loop.",
+   "scale_10x_100x": "100x pe chunked deletes (LIMIT + loop), partition per bucket, aur lifecycle ko off-peak schedule; index on (bucket, is_latest, created_at).",
+   "production_improvements": "Rule wise metrics (kitne versions expire hue), batching, aur advisory lock ya `SKIP LOCKED` style coordination agar multiple workers parallel chalein."
+  }
+ },
+ {
+  "id": "OBJS-033",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "What are ix_objects_blob and ix_objects_versions for, and how does GC check whether a blob is still referenced?",
+  "answer_hinglish": "Do supporting indexes hain jo specific queries ke liye bane hain:\n\n**ix_objects_versions (bucket, key, created_at DESC)**: version listing (`list_versions` jo `ORDER BY key, created_at DESC` karta hai) aur permanent delete ke baad promotion (`ORDER BY created_at DESC, id DESC LIMIT 1`). Is index se 'is key ka sabse naya bacha version' ek index lookup ban jata hai.\n\n**ix_objects_blob (blob_key)**: GC ka reference check. Jab `run_gc` queued blob uthata hai, woh pehle poochta hai: 'kya koi objects row ya multipart_parts row abhi bhi is blob_key ko point kar raha hai?' (`SELECT 1 FROM objects WHERE blob_key = :b UNION ALL SELECT 1 FROM multipart_parts WHERE blob_key = :b LIMIT 1`). Bina index ke yeh har queued blob pe full table scan hota.\n\nYeh re-check kyun? Normal flow mein queued blob pe koi reference nahi hona chahiye, kyunki blob keys random hain aur reuse nahi hote. Lekin re-check sasta safety net hai: agar kabhi koi bug ek still-referenced blob queue kar de, GC usse delete nahi karega -- bas queue entry hata dega. Data loss ke against belt-and-braces.\n\nNote: `multipart_parts.blob_key` pe alag index nahi hai; parts table normally chhoti hoti hai. Orphan scan ek alag path hai jo saare referenced keys ek set mein load karta hai (observation O6: scale nahi karta).",
+  "why_needed": "GC aur version operations hot paths nahi lagte, lekin bina index ke yeh table size ke saath linearly slow hote hain aur worker ko DB pe heavy bana dete hain.",
+  "real_world_analogy": "Godown mein box phenkne se pehle register check karna ki 'koi order is box number ko refer toh nahi kar raha' -- register box number se sorted ho toh check turant.",
+  "how_it_works": "B-tree on blob_key -> point lookup O(log n). Composite (bucket, key, created_at DESC) -> 'top 1 by created_at' index scan without sort.",
+  "in_this_project": "Indexes `0001_initial.py` mein. `maintenance.py::run_gc` loop mein har queued blob ke liye reference query + delete + queue row removal karta hai (`ORDER BY queued_at LIMIT 10000` per run). Test `test_gc_deletes_queued_and_orphan_blobs_but_keeps_live_ones` verify karta hai ki live aur 'overwritten' ka naya blob safe rehte hain aur `blob_deletions` khaali hota hai.",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py::ix_objects_blob",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::ix_objects_versions",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/services/objects.py::list_versions"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_gc, queued part)\nfor b in queued:\n    async with sm() as s:\n        still_used = await s.scalar(text(\"SELECT 1 FROM objects WHERE blob_key = :b UNION ALL \"\n                                         \"SELECT 1 FROM multipart_parts WHERE blob_key = :b LIMIT 1\"), {\"b\": b})\n    if not still_used:\n        await storage.delete(b)\n        deleted_queued += 1\n    async with sm() as s, s.begin():\n        await s.execute(text(\"DELETE FROM blob_deletions WHERE blob_key = :b\"), {\"b\": b})",
+  "code_language": "python",
+  "advantages": [
+   "GC reference check O(log n)",
+   "Promotion aur version listing bina sort",
+   "Re-check se accidental data loss se bachav"
+  ],
+  "disadvantages": [
+   "Har index write amplification badhata hai",
+   "Per-blob 2-3 round trips -- GC throughput limited"
+  ],
+  "common_mistakes": [
+   "Queued blob ko bina re-check delete karna",
+   "Storage delete se pehle queue row hata dena (crash pe blob leak; yahan order sahi hai: delete phir row hatao)",
+   "multipart_parts ko reference check mein bhool jana"
+  ],
+  "follow_up_questions": [
+   "Why is the queue row removed only after the storage delete?",
+   "How would you batch GC reference checks?",
+   "Should multipart_parts.blob_key also be indexed?"
+  ],
+  "concepts": [
+   "indexes",
+   "garbage collection",
+   "reference checking",
+   "query planning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-034",
+  "project_slug": "p07-object-storage",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Which rules are enforced by CHECK constraints and foreign keys, and how does the API turn constraint violations into 422/409?",
+  "answer_hinglish": "Kai validation rules seedha schema mein hain:\n\n- Bucket name: `CHECK (name ~ '^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$')` -- DNS-compatible, 3-63 chars, lowercase.\n- `versioning IN ('disabled','enabled','suspended')`.\n- `bucket_grants.permission IN ('read','write')`.\n- `multipart_parts.part_number BETWEEN 1 AND 10000` (S3 limit).\n- Foreign keys: buckets -> access_keys (owner), objects/multipart_uploads/grants/lifecycle_rules -> buckets `ON DELETE CASCADE`, parts -> uploads `ON DELETE CASCADE`.\n\n`create_bucket` route ek simple INSERT karta hai aur `IntegrityError` catch karta hai: error message mein 'check' ho toh 422 `invalid bucket name`, warna (PK violation) 409 `BucketAlreadyExists`. Matlab bucket name validation ka 'source of truth' DB hai, Python regex duplicate nahi kiya. Test `test_bucket_rules`: `Bad_Name` -> 422, duplicate `photos` -> 409.\n\nCASCADE ka role: `delete_bucket` pehle check karta hai ki koi object version ya multipart upload na bacha ho (409 `BucketNotEmpty`), phir bucket delete -> grants aur lifecycle rules cascade se saaf. Objects ka cascade practically tab chalega jab bucket khaali hai.\n\nCode level pe bhi double check hai: `upload_part` part_number 1..10000 pehle hi check karta hai taaki blob likhne se pehle fail ho.",
+  "why_needed": "Constraints har writer pe lagu hote hain -- API, migrations, manual SQL. Validation ek jagah (DB) rakhne se drift nahi hota.",
+  "real_world_analogy": "Bank form ka format: account number field mein sirf 11 digits fit hote hain -- clerk check kare na kare, form hi galat input accept nahi karta.",
+  "how_it_works": "Postgres INSERT ke time CHECK evaluate karta hai; violation pe transaction abort aur asyncpg `CheckViolationError` / `UniqueViolationError` jo SQLAlchemy `IntegrityError` mein wrap hota hai (`exc.orig`).",
+  "in_this_project": "`routes.py::create_bucket` mein `'check' in str(exc.orig).lower()` string match. `upload_part` mein `if not 1 <= part_number <= 10000: raise InvalidPart`. `delete_bucket` mein do `SELECT 1 ... LIMIT 1` checks.",
+  "implementation_files": [
+   "projects/07-object-storage/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/07-object-storage/objstore/api/routes.py::create_bucket",
+   "projects/07-object-storage/objstore/api/routes.py::delete_bucket",
+   "projects/07-object-storage/tests/test_objects.py::test_bucket_rules"
+  ],
+  "code_example": "# real, trimmed: objstore/api/routes.py\ntry:\n    async with request.app.state.sm() as s, s.begin():\n        await s.execute(text(\"INSERT INTO buckets (name, owner_key) VALUES (:b, :o)\"), {\"b\": bucket, \"o\": akid})\nexcept IntegrityError as exc:\n    if \"check\" in str(exc.orig).lower():\n        raise Unprocessable(\"invalid bucket name (3-63 chars: a-z 0-9 . -)\") from None\n    raise Conflict(\"bucket already exists\", details={\"code\": \"BucketAlreadyExists\"}) from None",
+  "code_language": "python",
+  "advantages": [
+   "Single source of truth for rules",
+   "Race-free uniqueness (check-then-insert race nahi)",
+   "CASCADE se config cleanup automatic"
+  ],
+  "disadvantages": [
+   "Error mapping string match pe -- fragile",
+   "DB error messages se user-friendly message banana mushkil"
+  ],
+  "common_mistakes": [
+   "Pehle SELECT karke exist check karna phir INSERT -- race condition",
+   "CASCADE pe bharosa karke bucket ke saath objects bhi delete kar dena bina blob queue ke (blobs orphan)",
+   "Python aur DB mein alag regex rakhna"
+  ],
+  "follow_up_questions": [
+   "Why is matching 'check' in the error string fragile, and what is better?",
+   "What would happen to blobs if a non-empty bucket were deleted via CASCADE?",
+   "Why do S3 bucket names have to be DNS compatible?"
+  ],
+  "concepts": [
+   "CHECK constraints",
+   "foreign keys",
+   "ON DELETE CASCADE",
+   "error mapping"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-035",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How does pg_advisory_xact_lock with hashtextextended serialise writers of the same key?",
+  "answer_hinglish": "Har metadata write (PUT commit, delete, multipart complete) transaction ke shuru mein `SELECT pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0))` chalata hai. Advisory lock Postgres ka 'application-defined' lock hai: kisi table row pe nahi, ek 64-bit number pe. `hashtextextended` 'bucket/key' string ko 64-bit integer mein hash karta hai, toh har key ka apna lock number.\n\n`_xact_` version transaction-scoped hai: COMMIT ya ROLLBACK pe automatically release -- unlock bhoolne ka risk nahi, crash pe bhi connection ke saath chala jata hai. Do writers same key pe: pehla lock leta hai, doosra wait karta hai jab tak pehla commit na kare. Phir doosra fresh state dekhta hai (READ COMMITTED mein naya statement naya snapshot), toh woh pehle ka naya version 'current' maan ke flip karta hai.\n\nRow lock (`SELECT ... FOR UPDATE`) kyun nahi? Kyunki pehli baar PUT pe koi row exist hi nahi karti -- jo row nahi hai usko lock nahi kar sakte. Do concurrent 'first writes' dono 'current = None' dekhte aur dono insert karte. Advisory lock ek 'naam' ko lock karta hai, row ke existence se independent.\n\nAur yeh lock sirf metadata transaction ke dauraan hai (milliseconds), bytes upload ke dauraan nahi. Different keys ke writers parallel chalte hain.",
+  "why_needed": "Versioned flip (read current -> update -> insert) ek read-modify-write hai; bina serialisation ke concurrent writers do latest ya lost update bana sakte hain.",
+  "real_world_analogy": "Bank locker room: har locker number ka ek token; jo token le woh hi us locker ke saath kaam kare. Locker abhi bana bhi na ho, token phir bhi hai.",
+  "how_it_works": "Postgres shared memory lock table mein (locktype advisory, objid) entry; waiters lock queue mein block hote hain. `pg_locks` view mein dikhte hain.",
+  "in_this_project": "`objects.py::key_lock_sql` returns the SQL; `put_object`, `delete_object`, `complete_multipart` usse `s.begin()` ke andar pehli statement ki tarah chalate hain. `commit_version` ka docstring kehta hai 'Caller must hold the key advisory lock in the same transaction'. Test `test_concurrent_writes_to_same_key` 20 parallel PUTs pe verify karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::delete_object",
+   "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key"
+  ],
+  "code_example": "# real: objstore/services/objects.py\ndef key_lock_sql() -> str:\n    # Transaction-scoped advisory lock: serialises concurrent writers of the SAME key only.\n    return \"SELECT pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0))\"\n\n# usage (put_object)\nasync with sm() as s, s.begin():\n    await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n    ...\n    vid = await commit_version(s, bucket, key, ...)",
+  "code_language": "python",
+  "advantages": [
+   "Non-existent rows bhi lock ho jaate hain",
+   "Auto-release on commit/rollback",
+   "Sirf same key contend karti hai"
+  ],
+  "disadvantages": [
+   "Lock ek Postgres instance tak limited -- sharded metadata pe per-shard",
+   "Hash collisions do alag keys ko serialise kar sakte hain (harmless)",
+   "Caller discipline -- function khud enforce nahi karta"
+  ],
+  "common_mistakes": [
+   "Session-level `pg_advisory_lock` use karke unlock bhoolna (connection pool mein leak)",
+   "Lock upload stream ke dauraan pakad ke rakhna",
+   "SELECT FOR UPDATE ko first-insert case ke liye kaafi samajhna"
+  ],
+  "follow_up_questions": [
+   "Why not SERIALIZABLE isolation instead of an advisory lock?",
+   "What happens to the lock if the API process crashes mid-transaction?",
+   "How would you see who is waiting on these locks in production?"
+  ],
+  "concepts": [
+   "advisory locks",
+   "pg_advisory_xact_lock",
+   "read-modify-write",
+   "serialisation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pessimistic per-key lock: hot key pe writers queue banate hain lekin koi failed retry nahi. Optimistic (unique violation pe retry) hot keys pe thrash karta.",
+   "failure_scenarios": "Lock holder ka transaction slow ho (DB stall) toh same key ke saare writers wait; connection pool (pool_size 10 + 20 overflow) exhaust ho sakta hai agar ek hot key pe bahut log likhein.",
+   "alternatives": "SERIALIZABLE isolation + retry; `INSERT ... ON CONFLICT` based latest pointer table; external lock service (Redis/etcd) -- extra failure modes.",
+   "scale_10x_100x": "10x pe bhi lock per key hai toh theek; 100x pe metadata shard hoga aur lock shard-local -- shard key mein (bucket, key) hona chahiye.",
+   "production_improvements": "`lock_timeout` set karna taaki hot key pe infinite wait na ho, pg_locks/wait events pe dashboard, aur hot-key detection metric."
+  }
+ },
+ {
+  "id": "OBJS-036",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What exactly does test_concurrent_writes_to_same_key prove, and what would fail without the advisory lock?",
+  "answer_hinglish": "Test do buckets banata hai: `ver` (versioning enabled) aur `plain` (disabled). Phir `asyncio.gather` se 20 PUTs ek hi key `hot` pe ek saath dono buckets mein bhejta hai, aur DB state assert karta hai:\n\n- `ver` mein exactly 20 rows (har PUT ek version) aur `is_latest` exactly 1.\n- `plain` mein exactly 1 row (sab overwrite).\n- `blob_deletions` mein exactly 19 entries -- `plain` ke 19 overwritten blobs queue hue, koi leak nahi, koi double nahi.\n- GET ka content kisi ek valid version ka hai.\n\nYeh prove karta hai ki (1) koi version lost nahi hua, (2) latest invariant hold karta hai, (3) unversioned overwrite pe har purana blob exactly ek baar GC ke liye queue hua.\n\nLock ke bina kya hota? Versioned case: do writers ek saath `current = v5` padhte, dono v5 ko false karte, dono apna row `is_latest = true` insert karte -> doosra insert `uq_objects_latest` pe IntegrityError -> 500. Unversioned case: do writers dono `null_row` dekhte, dono DELETE karte (doosre ka 0 rows), dono INSERT 'null' -> UNIQUE (bucket,key,version_id) violation, ya ek ka blob queue nahi hota aur orphan ban jata. Toh index data corrupt hone nahi deta, lekin users ko random 500s milte; lock unhe clean serialise karta hai.\n\nNote: yeh in-process ASGI test hai, lekin coordination Postgres mein hai, toh multiple API processes pe bhi same guarantee.",
+  "why_needed": "Concurrency bugs normal unit tests mein nahi dikhte; deliberate contention test hi invariants ko real interleavings mein verify karta hai.",
+  "real_world_analogy": "Ek hi ATM pe 20 log ek saath withdraw karein -- end mein balance aur transaction log dono exactly match hone chahiye.",
+  "how_it_works": "`asyncio.gather` 20 coroutines ek event loop pe chalata hai; har request ka bytes upload alag, commit transactions Postgres connection pool pe parallel aate hain aur advisory lock pe line lagate hain.",
+  "in_this_project": "`tests/test_objects.py::test_concurrent_writes_to_same_key` -- direct SQL counts `db()` session se: `count(*) WHERE bucket = 'ver'` == 20, latest == 1, `plain` == 1, `blob_deletions` == 19. FAILURE_SCENARIOS.md row 7 isko reference karta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/tests/test_objects.py::test_concurrent_writes_to_same_key",
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/objstore/services/objects.py::commit_version",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::uq_objects_latest"
+  ],
+  "code_example": "# real, trimmed: tests/test_objects.py\nawait asyncio.gather(*[a.put(\"ver\", \"hot\", f\"v{i}\".encode()) for i in range(20)])\nawait asyncio.gather(*[a.put(\"plain\", \"hot\", f\"v{i}\".encode()) for i in range(20)])\nasync with db() as s:\n    assert await s.scalar(text(\"SELECT count(*) FROM objects WHERE bucket = 'ver'\")) == 20\n    assert await s.scalar(text(\"SELECT count(*) FROM objects WHERE bucket = 'ver' AND is_latest\")) == 1\n    assert await s.scalar(text(\"SELECT count(*) FROM objects WHERE bucket = 'plain'\")) == 1\n    assert await s.scalar(text(\"SELECT count(*) FROM blob_deletions\")) == 19",
+  "code_language": "python",
+  "advantages": [
+   "Real Postgres, real contention",
+   "Invariants DB counts se verify, sirf API response se nahi",
+   "Blob accounting bhi check (19 queued)"
+  ],
+  "disadvantages": [
+   "Single process/event loop -- true multi-host timing nahi",
+   "Probabilistic: interleaving har run pe alag, rare races miss ho sakte hain"
+  ],
+  "common_mistakes": [
+   "Concurrency test sirf status codes check kare, DB invariants nahi",
+   "Sequential loop ko concurrency test samajhna",
+   "Mock DB ke saath concurrency test likhna"
+  ],
+  "follow_up_questions": [
+   "How would you make this test more likely to expose a race?",
+   "How would you test the same invariant across multiple API processes?",
+   "What other invariants deserve a concurrency test here?"
+  ],
+  "concepts": [
+   "concurrency testing",
+   "invariants",
+   "race conditions",
+   "advisory locks"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Integration test real DB pe slow hai lekin wahi race pakadta hai jo mocks nahi pakad sakte. 20 writers sasta compromise hai.",
+   "failure_scenarios": "Lock hata do toh test 500s ya count mismatch se fail hoga -- yahi regression protection hai. Flaky nahi hona chahiye kyunki invariants deterministic hain.",
+   "alternatives": "Property-based/stateful testing (Hypothesis) jo random op sequences generate kare; Jepsen-style multi-node tests.",
+   "scale_10x_100x": "Multi-process load test (bench + several uvicorn workers) jo invariants post-check kare; 100x pe chaos testing with DB failover.",
+   "production_improvements": "CI mein yeh test repeat N times; periodic production invariant check query: `SELECT bucket, key FROM objects WHERE is_latest GROUP BY 1,2 HAVING count(*) > 1` (index ki wajah se hamesha khaali hona chahiye)."
+  }
+ },
+ {
+  "id": "OBJS-037",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why is the bucket row lock (SELECT ... FOR UPDATE) taken only when the bucket has a quota?",
+  "answer_hinglish": "Quota check ek classic check-then-act race hai: 'used + adding <= quota?' padho, phir insert karo. Do concurrent uploads dono `used = 600` dekhein, quota 1000 ho, dono 300 add karein -> dono pass, total 1200. Isliye check aur insert ek bucket-wide lock ke andar hone chahiye: `SELECT 1 FROM buckets WHERE name = :b FOR UPDATE`. Ab us bucket ke saare quota'd writes commit time pe ek line mein.\n\nLekin pehle code yeh lock HAR PUT pe leta tha, quota ho ya na ho. Result: ek bucket ke saare writes (alag alag keys bhi) serialise ho gaye. TESTING.md mein measured: 1KB PUT, 16 concurrent, local adapter 53 ops/s. Fix: lock sirf `if bucket['quota_bytes'] is not None`. After: 72 ops/s (S3 adapter 44 -> 57). Comment code mein hai: 'Locking unconditionally serialised EVERY write in the bucket (measured: 53 PUT/s)'.\n\nDesign principle: lock ka scope utna hi ho jitna invariant demand karta hai. Per-key invariant (one latest) -> per-key advisory lock. Per-bucket invariant (quota) -> per-bucket lock, sirf jab woh invariant exist kare.\n\nReview mein multipart paths mein do gaps mile aur fix hue: `upload_part` quota check bina bucket lock ke tha (O2) -- ab quota'd bucket pe same `FOR UPDATE` lock; aur `complete_multipart` ka quota check cascade delete ke BAAD chalta tha aur parts do baar subtract karta tha, toh kabhi fail hi nahi hota tha (O3) -- ab delete se pehle check, net = final size - parts. Test: `test_multipart_parts_respect_quota_and_completion_check_is_real`.",
+  "why_needed": "Correctness ke liye lock chahiye, lekin galat granularity ka lock throughput maar deta hai -- quota-less buckets ko woh cost nahi deni chahiye.",
+  "real_world_analogy": "Parking lot mein limited spots ho toh gate pe ek guard ginta hai (lock); jis lot mein unlimited parking hai wahan guard bithana bas line lagwata hai.",
+  "how_it_works": "FOR UPDATE bucket row pe row-level lock leta hai jo transaction end tak hold hota hai. Advisory key lock pehle, bucket lock baad mein -- consistent order se deadlock risk kam (complete_multipart bhi same order follow karta hai).",
+  "in_this_project": "`objects.py::put_object` mein `if bucket[\"quota_bytes\"] is not None:` block, phir `_check_quota` jo `sum(size)` saare versions + multipart parts ka nikalta hai. Test `test_quota_counts_all_versions`: quota 1000, 600 bytes v1 ok, 600 bytes v2 -> 403 QuotaExceeded, stats `stored_bytes == 600`, `quota_used_pct == 60.0`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+   "projects/07-object-storage/objstore/services/objects.py::upload_part",
+   "projects/07-object-storage/tests/test_objects.py::test_quota_counts_all_versions",
+   "projects/07-object-storage/TESTING.md",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_multipart_parts_respect_quota_and_completion_check_is_real"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (put_object)\nasync with sm() as s, s.begin():\n    await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n    if bucket[\"quota_bytes\"] is not None:\n        # Only quota'd buckets need bucket-wide serialisation (check-then-insert must not race).\n        # Locking unconditionally serialised EVERY write in the bucket (measured: 53 PUT/s).\n        await s.execute(text(\"SELECT 1 FROM buckets WHERE name = :b FOR UPDATE\"), {\"b\": bucket[\"name\"]})\n        await _check_quota(s, bucket, info.size)\n    vid = await commit_version(s, bucket, key, ...)",
+  "code_language": "python",
+  "advantages": [
+   "Quota race-free",
+   "Quota-less buckets full parallel",
+   "Measured improvement 53 -> 72 PUT/s"
+  ],
+  "disadvantages": [
+   "Quota'd buckets abhi bhi bucket-wide serialised",
+   "_check_quota har write pe sum(size) scan karta hai -- bade buckets pe slow",
+   "Quota'd buckets pe part uploads bhi bucket lock pe serialize hote hain"
+  ],
+  "common_mistakes": [
+   "Lock har jagah 'safe side' ke liye le lena",
+   "Check lock ke bahar karna aur insert andar",
+   "Quota check bytes upload se pehle karna -- size tab pata hi nahi (streaming)"
+  ],
+  "follow_up_questions": [
+   "How would you make quota checks O(1) instead of summing every version?",
+   "How would you fix the upload_part quota race?",
+   "Would a soft quota (eventually enforced) be acceptable for billing?"
+  ],
+  "concepts": [
+   "lock granularity",
+   "check-then-act race",
+   "SELECT FOR UPDATE",
+   "quotas"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bucket lock correctness deta hai lekin quota'd hot bucket pe throughput ek line jitna. Running counter (`used_bytes` column) se lock chhota hota lekin counter drift/maintenance ka kaam.",
+   "failure_scenarios": "Lock ke bina concurrent uploads quota cross kar jaate. Review se pehle upload_part race (O2) se multipart parts quota cross kar sakte the; ab woh bhi locked hai.",
+   "alternatives": "Atomic counter: `UPDATE buckets SET used = used + :n WHERE name = :b AND used + :n <= quota RETURNING` -- ek statement, short lock; ya async/soft quota with periodic reconciliation (cloud billing jaisa).",
+   "scale_10x_100x": "Bade quota'd buckets pe sum scan aur bucket lock dono bottleneck -> counter column + periodic reconciliation, ya sharded counters.",
+   "production_improvements": "upload_part mein bhi bucket lock lena, used_bytes counter, quota metrics (used pct alerts), aur reconciliation job jo counter ko sum se compare kare."
+  }
+ },
+ {
+  "id": "OBJS-038",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Why does put_object hold no lock while the client is streaming the upload?",
+  "answer_hinglish": "`put_object` do phases mein hai. Phase 1: bytes ek NAYE random blob key pe stream hote hain -- koi DB transaction nahi, koi lock nahi. Phase 2: short transaction jisme advisory lock, optional quota, version flip aur commit.\n\nReason: upload ka time client ke network pe depend karta hai. 5 GiB file slow mobile connection pe minutes ya ghanton le sakti hai. Agar lock (ya open transaction) upload ke dauraan hold hota, toh: (1) same key ke baaki writers -- aur quota'd bucket mein poore bucket ke writers -- itni der block rehte; (2) ek DB connection minutes tak busy, pool (10 + 20 overflow) jaldi khatam; (3) Postgres mein long-running transaction vacuum ko rokta hai aur bloat badhata hai; (4) ek slow ya malicious client (slowloris style) poore key ko freeze kar sakta.\n\nPhase 1 safe hai bina lock ke kyunki har upload apne unique blob key pe likhta hai -- do uploads kabhi same file/object pe nahi likhte, toh conflict possible hi nahi. Conflict sirf metadata 'kaun latest hai' pe hai, aur woh milliseconds ka kaam hai.\n\nSide effect: last-writer-wins commit order se decide hota hai, upload start order se nahi -- jo upload pehle KHATAM hua uska commit pehle. Yeh S3 ke semantics se match karta hai.",
+  "why_needed": "Network-bound kaam ko lock ke andar rakhna system ki concurrency ko sabse slow client ki speed pe le aata hai.",
+  "real_world_analogy": "Restaurant mein khana banane (upload) ke liye table reserve nahi karte; sirf serve karte waqt (commit) table pe 1 minute ke liye jagah chahiye.",
+  "how_it_works": "Unique blob key = no shared mutable state in phase 1. Phase 2 ek transaction mein sirf metadata SQL. Agar phase 2 fail ho toh except block naya blob delete karta hai.",
+  "in_this_project": "`services/objects.py` module docstring: '1. stream bytes into a NEW random blob (no lock held while the client uploads) 2. short transaction: advisory lock ... -> commit'. Route `put_object` authorize ke liye ek session kholke turant band karta hai (`async with sm() as s:` block) phir upload start karta hai -- auth ka connection bhi upload ke dauraan hold nahi hota.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::new_blob_key",
+   "projects/07-object-storage/objstore/api/routes.py::put_object",
+   "projects/07-object-storage/ARCHITECTURE.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py\nblob_key = new_blob_key()\nstream = HashingStream(body, max_bytes)\ninfo = await storage.put(blob_key, stream)          # minutes, no lock, no transaction\n_verify_digests(info, content_md5, sha256_header, signed_sha256)\nasync with sm() as s, s.begin():                  # milliseconds\n    await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n    vid = await commit_version(s, bucket, key, blob_key=blob_key, ...)",
+  "code_language": "python",
+  "advantages": [
+   "Lock hold time milliseconds, upload size se independent",
+   "DB connections upload ke dauraan free",
+   "Slow clients baaki writers ko block nahi karte"
+  ],
+  "disadvantages": [
+   "Commit fail hone pe already-written bytes waste (delete karne padte hain)",
+   "Quota violation upload ke BAAD pata chalta hai -- poora upload waste"
+  ],
+  "common_mistakes": [
+   "Transaction upload se pehle open karke end pe commit karna",
+   "Object key se blob path banana -- tab concurrent uploads same file pe likhenge",
+   "Last-writer-wins ko start-time based samajhna"
+  ],
+  "follow_up_questions": [
+   "How would you reject an over-quota upload early using Content-Length?",
+   "What happens if two uploads finish at exactly the same time?",
+   "Why is a long-running transaction bad for Postgres vacuum?"
+  ],
+  "concepts": [
+   "lock scope",
+   "long transactions",
+   "streaming",
+   "last-writer-wins"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-039",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "How does this system provide strong read-after-write consistency across many stateless API instances?",
+  "answer_hinglish": "Guarantee: jab PUT 200 return karta hai, uske baad koi bhi GET -- kisi bhi API instance pe -- naya version dekhega. Yeh isliye hota hai kyunki: (1) bytes pehle durable likhe jaate hain (local adapter fsync + rename, S3 adapter upload complete); (2) metadata ka COMMIT 200 se pehle hota hai; (3) har GET ek hi Postgres primary se `WHERE is_latest` padhta hai. Postgres commit ke baad har naya statement committed data dekhta hai, toh 'ek source of truth' + 'commit-before-ack' = strong read-after-write.\n\nAPI instances stateless hain -- koi local metadata cache nahi. Sirf access-key secret cache 60s ka hai, jo auth ko affect karta hai, objects ko nahi. Isliye load balancer kisi bhi instance pe bheje, answer same.\n\nBlob layer pe bhi consistency chahiye: GET ko woh blob milna chahiye jo metadata point kar raha hai. Random, never-reused blob keys ki wajah se 'overwrite visibility' ka sawaal hi nahi -- har version naya key hai. Isliye S3 backend ka koi bhi read-after-write subtlety (pehle overwrite PUT pe eventual tha) humein nahi lagta; hum sirf new-key reads karte hain.\n\nKya toot sakta hai: agar read replicas listing/GET ke liye laga dein (SYSTEM_DESIGN.md 10x mein listing ke liye suggest), toh replica lag se stale reads aayenge -- us waqt GET primary pe hi rakhna padega. Aur O4 (review fix): overwrite ke baad purana blob ab `deletion_grace_seconds` tak GC se bachta hai, taaki purana GET stream complete kar sake.",
+  "why_needed": "Users expect karte hain ki upload ke turant baad download naya content de; eventual consistency cache invalidation aur pipeline bugs ka source hai (isliye AWS S3 Dec 2020 mein strong consistency pe gaya).",
+  "real_world_analogy": "Ek hi master register (Postgres) jisme entry likhne ke baad hi receipt (200) milti hai; koi bhi counter pe jao, wahi register dekha jata hai.",
+  "how_it_works": "Commit -> WAL flush -> visible to new snapshots. GET: authorize + head_object (ek session) -> blob stream. Immutable blob keys = content-addressable jaisa behaviour, visibility issue nahi.",
+  "in_this_project": "SYSTEM_DESIGN.md 'Consistency' section: 'metadata commits before the 200, so the next GET (any instance) sees the new version'. `put_object` route `obj.put_object` return hone (commit) ke baad hi `Response(200)` banata hai. DEPLOYMENT.md: 'The API is stateless: run as many replicas as needed'.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/api/routes.py::get_object",
+   "projects/07-object-storage/objstore/services/objects.py::head_object",
+   "projects/07-object-storage/SYSTEM_DESIGN.md",
+   "projects/07-object-storage/objstore/services/auth.py::_secret"
+  ],
+  "code_example": "# illustrative: the ordering that gives read-after-write\n# 1. bytes durable under a NEW key\ninfo = await storage.put(blob_key, stream)\n# 2. metadata commit (single Postgres primary)\nasync with sm() as s, s.begin():\n    ...commit_version(...)\n# 3. only now ack\nreturn Response(200, headers={\"x-obj-version-id\": vid})\n# any instance: SELECT * FROM objects WHERE bucket=:b AND key=:k AND is_latest",
+  "code_language": "python",
+  "advantages": [
+   "Simple mental model -- jo 200 hua woh visible",
+   "Instances stateless -- horizontal scale easy",
+   "Immutable blob keys blob-layer consistency issues hata dete hain"
+  ],
+  "disadvantages": [
+   "Single Postgres primary = metadata write/read throughput limit",
+   "Read replicas add karte hi guarantee weak hoti hai",
+   "Cross-region strong consistency costly"
+  ],
+  "common_mistakes": [
+   "Metadata cache per instance add karna bina invalidation ke",
+   "Listing ke liye replica laga dena aur 'strong' claim karna",
+   "200 pehle bhejna aur commit async karna"
+  ],
+  "follow_up_questions": [
+   "How would you keep read-after-write if GETs moved to read replicas?",
+   "What consistency does listing give during concurrent writes?",
+   "How did AWS make S3 strongly consistent at its scale?"
+  ],
+  "concepts": [
+   "read-after-write",
+   "strong consistency",
+   "stateless services",
+   "single source of truth"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strong consistency single primary ki wajah se cheap hai; scale pe yahi primary bottleneck. Eventual model zyada scalable lekin clients ko complex banata.",
+   "failure_scenarios": "Primary failover ke dauraan async replica promote hui toh last committed writes lose ho sakte hain (agar synchronous replication nahi) -> 200 mila lekin object gayab. Blob orphan ban jayega, GC saaf karega.",
+   "alternatives": "Read replicas + session stickiness / LSN-based read-your-writes (client last commit LSN bheje, replica wait kare); quorum-based metadata store (S3 internally witness/cache coherence protocol use karta hai).",
+   "scale_10x_100x": "10x: zyada API processes, primary same. 100x: metadata sharded by bucket -- har shard ka apna primary, consistency per-key shard-local rehti hai (key kabhi do shards mein nahi).",
+   "production_improvements": "Synchronous replication (synchronous_commit remote_apply) for zero-loss failover, LSN-aware replica routing, consistency regression tests across instances."
+  }
+ },
+ {
+  "id": "OBJS-040",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What happens if complete_multipart races with an abort or with a second complete of the same upload?",
+  "answer_hinglish": "`complete_multipart` lambi operation hai: pehle parts padhta hai (bina lock), validate karta hai, phir saare parts ko re-stream karke ek naya `final_blob` likhta hai -- yeh seconds/minutes le sakta hai. Is dauraan koi abort kar sakta hai (ya lifecycle `abort_multipart_days` chala de) ya client retry mein doosra complete bhej de.\n\nRace ka resolution commit transaction mein hai: key advisory lock lene ke baad `DELETE FROM multipart_uploads WHERE upload_id = :u RETURNING upload_id`. Jo pehle yeh DELETE kar paata hai woh jeetta hai. Agar row already gayab hai (doosre complete ne ya abort ne hata di), `deleted.first() is None` -> `Conflict('upload was completed or aborted concurrently')` 409. Except block apna `final_blob` delete kar deta hai, toh koi orphan nahi (aur delete fail ho toh GC grace ke baad pakdega).\n\nDELETE ... RETURNING ek atomic 'claim' hai -- read-then-delete se better kyunki row lock milta hai aur doosra concurrent DELETE commit ka wait karke 0 rows paata hai.\n\nEk aur subtle case: abort ne parts ke blobs queue kar diye aur GC ne unhe delete kar diya JAB complete abhi unhe re-stream kar raha tha -> `storage.get` fail, complete 500, aur upload row abort se already gayab. Result consistent hai (object bana hi nahi), bas error message less friendly.\n\nCascade: multipart_parts `ON DELETE CASCADE` se upload ke saath hat jaate hain; complete stored parts ke saare blobs (unused bhi) queue karta hai.",
+  "why_needed": "Distributed clients retry karte hain aur background jobs bhi same resources chhoote hain; long operation ke end pe atomic claim ke bina do objects ban sakte ya aborted upload complete ho sakta.",
+  "real_world_analogy": "Do log ek hi coupon redeem karne aayein: counter pe coupon phaadna (DELETE RETURNING) jiska pehle hua, wahi redeem; doosre ko 'already used' milta hai.",
+  "how_it_works": "Postgres row lock DELETE pe: doosra transaction same row ko DELETE karne pe pehle ka commit wait karta hai, phir re-check karke 0 rows. Isliye no double-complete.",
+  "in_this_project": "`objects.py::complete_multipart` commit block; `abort_multipart` parts ke blob keys select karke upload delete aur blobs queue karta hai; `maintenance.py::run_lifecycle` stale uploads pe `abort_multipart` call karta hai. Note: race-specific test repo mein nahi hai -- behaviour code se derive kiya hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::complete_multipart",
+   "projects/07-object-storage/objstore/services/objects.py::abort_multipart",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::STATEMENTS"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (complete_multipart commit)\ntry:\n    async with sm() as s, s.begin():\n        await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": up[\"key\"]})\n        deleted = await s.execute(text(\"DELETE FROM multipart_uploads WHERE upload_id = :u RETURNING upload_id\"),\n                                  {\"u\": upload_id})\n        if deleted.first() is None:\n            raise Conflict(\"upload was completed or aborted concurrently\")\n        ...\nexcept BaseException:\n    await storage.delete(final_blob)\n    raise",
+  "code_language": "python",
+  "advantages": [
+   "Atomic claim -- exactly one winner",
+   "Loser apna blob cleanup karta hai",
+   "Lifecycle abort aur user complete same mechanism se safe"
+  ],
+  "disadvantages": [
+   "Loser ka re-stream I/O waste (bada object = bada waste)",
+   "Retry of a successful complete 409 deta hai, idempotent success nahi"
+  ],
+  "common_mistakes": [
+   "Upload row ko pehle SELECT karke 'exists' check, phir alag DELETE",
+   "Complete ke shuru mein parts ke blobs delete kar dena",
+   "Conflict pe final blob chhod dena"
+  ],
+  "follow_up_questions": [
+   "How would you make a retried complete return the original result idempotently?",
+   "Why not lock the upload row at the start of complete?",
+   "What does S3 return for a duplicate CompleteMultipartUpload?"
+  ],
+  "concepts": [
+   "race conditions",
+   "atomic claim",
+   "DELETE RETURNING",
+   "multipart upload"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Optimistic: kaam pehle, claim end pe. Long operation ke dauraan lock nahi -> concurrency achhi, lekin loser ka kaam waste. Pessimistic lock start pe lena abort ko minutes block karta.",
+   "failure_scenarios": "Abort + GC complete ke beech parts delete kar de -> complete ka re-stream fail (500). Consistent but unfriendly. Client retry pe 404 NoSuchUpload.",
+   "alternatives": "Upload row pe `state` column (in_progress -> completing) claim at start with UPDATE ... WHERE state='in_progress'; abort completing state ko reject kare. Ya server-side composition jisme re-stream hi nahi.",
+   "scale_10x_100x": "Bade objects (100GB) ke re-stream pe race window lambi; server-side composition (SYSTEM_DESIGN.md) window ko milliseconds kar deta.",
+   "production_improvements": "Completed upload ka result short TTL ke liye store karke retried complete ko same response; 'completing' state; metrics for 409 conflicts."
+  }
+ },
+ {
+  "id": "OBJS-041",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Is it safe to run several maintenance workers (lifecycle + GC) at the same time?",
+  "answer_hinglish": "Worker docstring claim karta hai: 'Safe to run on several instances: lifecycle deletes are idempotent and GC re-checks references.' Dekhte hain kyun -- aur kahan cost hai.\n\n**Lifecycle**: expiration `delete_object(..., None)` call karta hai jo key lock leta hai; do workers same key expire karein toh versioned bucket mein worst case do delete markers ban sakte hain (harmless, next noncurrent pass saaf karega), unversioned mein doosra delete 0 rows. Noncurrent aur lone-marker deletes plain SQL DELETE hain -- doosra worker already-deleted rows ko bas 0 rows paata hai. Abort multipart: doosre worker ka `_get_upload` NoSuchUpload raise karega -- yeh us rule ke us run ko exception se tod deta hai (worker loop `maintenance_failed` log karke next interval pe chalega). Toh correctness safe, lekin noisy.\n\n**GC**: queued blob delete idempotent hai (`unlink(missing_ok)` / S3 delete idempotent), aur reference re-check se live blob nahi jata. Orphan scan: dono workers same orphan delete karein toh second no-op.\n\nToh correct hai, lekin efficient nahi: dono same kaam duplicate karte hain aur DB load double. Production mein better: ek leader (Postgres advisory lock `pg_try_advisory_lock('maintenance')` jaisa) ya work partitioning (`FOR UPDATE SKIP LOCKED` on blob_deletions). Yeh project mein implement nahi hai.",
+  "why_needed": "HA ke liye worker ke multiple replicas chalana natural hai; agar jobs idempotent na hon toh double-processing data loss ya errors deta hai.",
+  "real_world_analogy": "Do safai karmachari ek hi corridor saaf karein: kachra double nahi hota, bas mehnat double hoti hai aur kabhi dono ek hi dustbin pe takra jaate hain.",
+  "how_it_works": "Idempotency yahan state-based hai: 'delete if exists' operations, aur reference checks before destructive blob deletes. Koi distributed lock nahi.",
+  "in_this_project": "`objstore/worker.py::main` har `interval=300` sec pe `run_lifecycle` + `run_gc` chalata hai, exceptions log karke continue. Test `test_lifecycle_expiration_noncurrent_and_markers` teesri run (`FUTURE(40)`) pe sab counters 0 assert karta hai -- idempotency proof. Docker compose ek `worker` service chalata hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/worker.py::main",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/tests/test_maintenance.py::test_lifecycle_expiration_noncurrent_and_markers"
+  ],
+  "code_example": "# illustrative (not in repo): single-leader guard for the worker loop\nasync with sm() as s:\n    got = await s.scalar(text(\"SELECT pg_try_advisory_lock(hashtext('objstore-maintenance'))\"))\n    if got:\n        await run_lifecycle(sm, storage)\n        await run_gc(sm, storage, settings.orphan_grace_seconds)\n        await s.execute(text(\"SELECT pg_advisory_unlock(hashtext('objstore-maintenance'))\"))",
+  "code_language": "python",
+  "advantages": [
+   "HA without coordination infra",
+   "Idempotent operations -- crash mid-run safe, next run continues",
+   "Simple worker loop"
+  ],
+  "disadvantages": [
+   "Duplicate work aur DB load",
+   "Concurrent abort pe exception noise",
+   "Versioned expiration pe duplicate delete markers possible"
+  ],
+  "common_mistakes": [
+   "Non-idempotent 'count and decrement' style jobs ko multi-instance chalana",
+   "Worker loop ko ek exception pe crash hone dena",
+   "GC ko re-check ke bina chalana"
+  ],
+  "follow_up_questions": [
+   "How would you elect a single active worker using Postgres?",
+   "How would you shard GC work across workers with SKIP LOCKED?",
+   "Which lifecycle step is least idempotent and why?"
+  ],
+  "concepts": [
+   "idempotency",
+   "background workers",
+   "leader election",
+   "at-least-once processing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-042",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "The key lock hashes bucket/key into 64 bits. What happens on a hash collision, and are there other subtleties with the lock key?",
+  "answer_hinglish": "Do alag keys ka `hashtextextended(bucket || '/' || key, 0)` same 64-bit value de sakta hai. Effect sirf performance ka hai, correctness ka nahi: dono keys ke writers ek doosre ka wait karenge (false serialisation). Koi data mix nahi hota, kyunki lock sirf 'kaun pehle commit kare' decide karta hai; SQL queries actual (bucket, key) pe chalti hain. 64-bit space mein random collision probability birthday bound se bahut kam hai jab tak billions active keys ek saath contend na karein -- practically ignore.\n\nDoosri subtlety: string concatenation `b || '/' || k`. Bucket names mein '/' allowed nahi (CHECK regex), toh 'a' + '/' + 'b/c' aur 'a/b' + '/' + 'c' ambiguity nahi ban sakti -- bucket part hamesha pehle '/' tak hai. Agar bucket names mein '/' allowed hota toh do alag (bucket, key) pairs same string bana sakte the -- again sirf false serialisation.\n\nTeesri: advisory lock space poore database mein shared hai. Agar koi aur subsystem same DB mein advisory locks use kare (jaise worker leader lock), unke numbers collide kar sakte hain. Two-int form `pg_advisory_xact_lock(classid, objid)` se namespacing hoti hai.\n\nChauthi: hashtextextended Postgres ka internal function hai; major versions ke beech iska output stable rehna guaranteed nahi -- lekin yeh sirf in-flight locks ke liye use hota hai, persist nahi, toh upgrade safe hai.",
+  "why_needed": "Lock keys design karte waqt samajhna zaroori hai ki collision correctness todta hai ya sirf throughput -- yahan sirf throughput.",
+  "real_world_analogy": "Do logon ke locker ka token number galti se same nikal aaye: dono ko ek ke baad ek jaana padega, lekin dono apne apne locker hi kholenge.",
+  "how_it_works": "Lock identity = 64-bit int. Waiters lock manager queue mein. Collision -> same queue -> serialise. Release at transaction end.",
+  "in_this_project": "`objects.py::key_lock_sql` -- `hashtextextended(:b || '/' || :k, 0)`, seed 0. Bucket name CHECK `^[a-z0-9][a-z0-9.-]{1,61}[a-z0-9]$` migration mein, jo '/' exclude karta hai. Is repo mein koi aur advisory lock user nahi hai, toh namespace clash abhi nahi.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/07-object-storage/objstore/services/objects.py::complete_multipart"
+  ],
+  "code_example": "-- illustrative: namespaced two-key form to avoid clashes with other advisory-lock users\nSELECT pg_advisory_xact_lock(7, hashtext(:b || '/' || :k));   -- classid 7 = 'object key locks'\n\n-- real form used by the project\nSELECT pg_advisory_xact_lock(hashtextextended(:b || '/' || :k, 0));",
+  "code_language": "sql",
+  "advantages": [
+   "Collision sirf performance issue",
+   "64-bit space -- collisions rare",
+   "Bucket name rules ambiguity hata dete hain"
+  ],
+  "disadvantages": [
+   "Lock namespace shared across DB",
+   "Hash function internal -- debugging mein pg_locks se key wapas nahi milti"
+  ],
+  "common_mistakes": [
+   "32-bit `hashtext` use karna -- collisions zyada likely",
+   "Lock key ko correctness ka source maan lena",
+   "Separator ke bina concat karna (`'ab' || 'c'` vs `'a' || 'bc'`)"
+  ],
+  "follow_up_questions": [
+   "How would you find which object key a waiting advisory lock in pg_locks belongs to?",
+   "Would a collision ever cause a deadlock here?",
+   "What changes if the same database hosts several services using advisory locks?"
+  ],
+  "concepts": [
+   "hash collisions",
+   "advisory locks",
+   "lock namespaces",
+   "birthday bound"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hash-based lock keys row-free locking dete hain; cost collisions aur observability (pg_locks mein sirf number). Row-based locks readable hain par first-insert case handle nahi karte.",
+   "failure_scenarios": "Collision: false serialisation, latency spike on two unrelated hot keys. Deadlock tab possible agar ek transaction do key locks alag order mein le -- yahan har transaction ek hi key lock leta hai (plus bucket row lock fixed order mein), toh nahi.",
+   "alternatives": "Two-int namespaced form; ya lock table `object_locks(bucket, key)` with INSERT ON CONFLICT + FOR UPDATE; ya external lock service.",
+   "scale_10x_100x": "100x pe zyada keys -> collision probability phir bhi negligible (64-bit). Sharded metadata pe lock shard-local, collisions bhi shard-local.",
+   "production_improvements": "Lock wait time ko log karna with bucket/key (app side) taaki pg_locks number ko map kar sakein; classid namespacing agar aur subsystems advisory locks use karein."
+  }
+ }
+]

@@ -1,0 +1,1023 @@
+[
+ {
+  "id": "OBJS-043",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Could the garbage collector delete a blob that a GET request is still streaming? How was that fixed?",
+  "answer_hinglish": "Review se pehle haan -- code review mein yeh window mili (O4), ab fix aur regression-tested hai.\n\nFlow dekho: `get_object` route pehle Postgres se row padhta hai (`head_object`), session band karta hai, phir `StreamingResponse(storage.get(row[\"blob_key\"]))` return karta hai. Bytes ka streaming DB transaction ke bahar, baad mein hota hai. Ab maan lo unversioned bucket mein usi key pe koi naya PUT aa gaya. `commit_version` purani 'null' row delete karta hai aur purana blob `blob_deletions` mein queue kar deta hai. Agla `run_gc` us queued blob ko uthata hai, check karta hai ki `objects` ya `multipart_parts` mein koi reference hai ya nahi -- reference nahi hai -- aur (pehle) turant `storage.delete` kar deta tha.\n\nO4: queued deletions pe koi grace period nahi tha; grace sirf orphan scan (`orphan_grace_seconds`) pe lagta tha. Toh agar ek client 5GB file dheere network pe download kar raha hai aur beech mein object overwrite + GC run ho gaya, toh local adapter pe Linux par open file handle chal jayega (unlink ke baad bhi inode zinda rehta hai), lekin Windows pe ya S3 adapter pe (`get_object` range ke saath ek hi response stream) behaviour backend pe depend karta hai -- S3 pe already-open response aksar complete ho jata hai, par naye range retries 404 denge.\n\nFix (shipped, schema change ke bina): `blob_deletions.queued_at` already tha; `run_gc` ab `WHERE queued_at < now() - make_interval(secs => :g)` se filter karta hai, `deletion_grace_seconds` default 300 (config + worker wiring). Regression test `test_gc_keeps_recently_queued_blobs_for_in_flight_downloads`: fresh queued blob GC ke baad bhi readable. Grace >= sabse lamba expected download hona chahiye.",
+  "why_needed": "Metadata aur bytes alag systems mein hain; read path metadata commit ke baad bytes stream karta hai, toh delete path ko readers ka dhyan rakhna padta hai.",
+  "real_world_analogy": "Library ne book ko 'discard' list mein daal diya, aur kabadiwala usi waqt utha le gaya jab ek student abhi table pe padh raha tha.",
+  "how_it_works": "GET: row read -> session close -> blob stream. PUT overwrite: old row delete + blob_deletions insert. GC: queued blob -> reference check -> storage.delete. Reference check sirf metadata dekhta hai, active readers nahi.",
+  "in_this_project": "`objstore/api/routes.py::get_object` row padh ke `StreamingResponse` deta hai. `services/maintenance.py::run_gc` queued blobs ko sirf `deletion_grace_seconds` ke baad delete karta hai; `config.py::deletion_grace_seconds = 300`; `worker.py` passes it. Test `tests/test_review_fixes.py::test_gc_keeps_recently_queued_blobs_for_in_flight_downloads`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/api/routes.py::get_object",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/objstore/config.py::deletion_grace_seconds",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_gc_keeps_recently_queued_blobs_for_in_flight_downloads"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_gc)\nqueued = (await s.execute(text(\"SELECT blob_key FROM blob_deletions WHERE queued_at < now() - make_interval(secs => :g) \"\n                               \"ORDER BY queued_at LIMIT 10000\"), {\"g\": deletion_grace_seconds})).scalars().all()\nfor b in queued:\n    try:\n        ...  # re-check still_used, storage.delete(b), DELETE FROM blob_deletions\n    except Exception:\n        failed += 1\n        log.exception(\"gc_delete_failed\", extra={\"blob_key\": b})   # stays queued, retried next run",
+  "code_language": "python",
+  "advantages": [
+   "Read path lock-free hai, GET kabhi writer ko block nahi karta",
+   "Storage jaldi reclaim hota hai"
+  ],
+  "disadvantages": [
+   "Storage is freed deletion_grace_seconds later",
+   "A download longer than the grace can still break (grace must be tuned)",
+   "Behaviour beyond the grace is backend-dependent (POSIX unlink vs S3)"
+  ],
+  "common_mistakes": [
+   "Maan lena ki reference check = koi use nahi kar raha",
+   "Orphan grace aur queued-deletion grace ko same samajhna"
+  ],
+  "follow_up_questions": [
+   "Queued deletions pe grace bina schema change ke kaise add kiya?",
+   "How does S3 itself avoid this for overwritten objects?",
+   "Would versioning remove this risk?"
+  ],
+  "concepts": [
+   "garbage collection",
+   "read-delete race",
+   "grace period",
+   "streaming"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Grace period dene se storage thoda der se free hota hai, lekin readers safe rehte hain. Reference counting ya read leases zyada exact hain par har GET pe write cost lagata hai.",
+   "failure_scenarios": "Before the fix: slow client + unversioned overwrite + GC run = truncated download, retry range 404. Now only downloads longer than deletion_grace_seconds are at risk.",
+   "alternatives": "queued_at based grace; reader leases table; versioned buckets jahan old version noncurrent rehta hai; S3 jaisa backend-level delayed deletion.",
+   "scale_10x_100x": "10x-100x pe GC zyada frequently chalega aur downloads bade honge, toh window badhti hai -- grace mandatory ho jata hai. Queue partitioned processing chahiye.",
+   "production_improvements": "Done: queued_at grace (300s). Next: grace >= max expected download time per deployment, metric for blobs deleted that were read recently."
+  }
+ },
+ {
+  "id": "OBJS-044",
+  "project_slug": "p07-object-storage",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Why does the storage layer use asyncio.to_thread, and what does each thread hop cost?",
+  "answer_hinglish": "Seedha jawab: file system calls (`open`, `write`, `fsync`, `os.replace`) aur boto3 dono blocking/synchronous hain. FastAPI ek asyncio event loop pe chalta hai; agar hum event loop ke andar `f.write` ya `client.get_object` call karte, toh poora process us call tak ruk jata -- baaki saare requests bhi. Isliye `asyncio.to_thread` se blocking call default thread pool mein bhejte hain aur event loop free rehta hai.\n\nLekin har hop free nahi hai: function thread pool mein submit hota hai, thread wake hota hai, result future ke through wapas loop pe aata hai. Yeh context switch + GIL handoff hai. Chhote objects pe (1KB PUT) yeh overhead real work se zyada ho jata hai. Isliye `storage/local.py` mein comment hai ki file system calls ko kam se kam hops mein group kiya -- `_open` (mkdir + open ek hop), har chunk ka ek write, aur `_finish` (flush + fsync + close + rename ek hop). TESTING.md mein 'fewer thread hops in the local adapter' un teen changes mein se ek hai jisne 1KB PUT 53 se 72 ops/s kiya.\n\nS3 adapter mein to_thread aur bhi zaroori hai kyunki boto3 ka `upload_fileobj` poore upload tak block karta hai -- woh ek background thread mein chalta hai aur event loop `_QueueReader.feed` ke through chunks deta hai. Thread pool ka default size limited hai (Python mein typically min(32, cpu+4)), toh bahut saare parallel S3 uploads pool ko saturate kar sakte hain -- yeh ek generic ballpark consideration hai, project mein measure nahi kiya.",
+  "why_needed": "Async server mein ek bhi blocking call sab requests ki latency bigaad deta hai.",
+  "real_world_analogy": "Restaurant ka waiter (event loop) khud khana nahi pakata; order kitchen (thread pool) ko de deta hai aur doosre tables sambhalta hai. Lekin har baar kitchen jaane-aane mein time lagta hai, isliye ek trip mein zyada kaam lao.",
+  "how_it_works": "asyncio.to_thread(func, *args) -> loop.run_in_executor(default ThreadPoolExecutor). Await karne wala coroutine suspend hota hai, thread mein func chalta hai, result future resolve karta hai.",
+  "in_this_project": "`storage/local.py::put` mein `_open` aur `_finish` closures; `get` mein `open`, `seek`, `read` har ek to_thread. `storage/s3.py::put` mein `asyncio.to_thread(self.client.upload_fileobj, ...)` ek task ban ke chalta hai aur har chunk `asyncio.to_thread(reader.feed, chunk)` se feed hota hai (feed backpressure pe block kar sakta hai, isliye woh bhi thread mein).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+   "projects/07-object-storage/objstore/storage/s3.py::S3Adapter",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: objstore/storage/local.py (LocalAdapter.put)\ndef _finish(fh):\n    fh.flush()\n    os.fsync(fh.fileno())\n    fh.close()\n    os.replace(tmp, final)\n\n# group FS calls into as few hops as possible\nf = await asyncio.to_thread(_open)\nasync for chunk in stream:\n    await asyncio.to_thread(f.write, chunk)\nawait asyncio.to_thread(_finish, f)",
+  "code_language": "python",
+  "advantages": [
+   "Event loop responsive rehta hai",
+   "Sync libraries (boto3) bina rewrite ke use ho jati hain"
+  ],
+  "disadvantages": [
+   "Har hop ka overhead chhote objects pe dominate karta hai",
+   "Shared thread pool saturate ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Async function ke andar seedha blocking I/O call karna",
+   "Har chhote syscall ke liye alag to_thread hop"
+  ],
+  "follow_up_questions": [
+   "Why is fsync especially bad to run on the event loop?",
+   "Would aiofiles or an async S3 client (aioboto3) change anything?",
+   "How would you size the thread pool?"
+  ],
+  "concepts": [
+   "asyncio",
+   "thread pool",
+   "blocking I/O",
+   "event loop"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-045",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How does the simplified SigV4 request signing work in this project?",
+  "answer_hinglish": "Short mein: client apna secret kabhi network pe nahi bhejta. Woh request ke important parts se ek 'string to sign' banata hai, usko apne secret se HMAC-SHA256 karta hai, aur sirf signature bhejta hai. Server DB se usi access key ka secret nikal ke same string banata hai, same HMAC compute karta hai, aur compare karta hai.\n\nString to sign = `METHOD \\n RAW_PATH \\n CANONICAL_QUERY \\n DATE \\n CONTENT_SHA256`. Headers: `Authorization: OBJ-HMAC-SHA256 Credential=<akid>, Signature=<hex>`, `x-obj-date: <unix seconds>`, `x-obj-content-sha256: <hex> | UNSIGNED-PAYLOAD`.\n\nHar field ka reason hai: method sign hai toh GET ka signature DELETE pe kaam nahi karega; raw path sign hai toh `/objects/a` ka signature `/objects/b` pe fail (test_auth_failures yahi check karta hai); canonical query (sorted, encoded) sign hai toh `versionId` badal nahi sakte; date sign hai toh replay window bound hota hai; body hash sign hai toh proxy body swap nahi kar sakta (test_signed_body_cannot_be_swapped -> 400 BadDigest).\n\nYeh 'simplified' kyun hai: real AWS SigV4 mein secret se date/region/service ke through derived signing key banti hai, canonical headers list hoti hai, aur credential scope hota hai. Yahan seedha secret se HMAC hai. Security property (secret never sent, request bound, replay window) same hai, lekin key scoping nahi hai -- README ke known limitations mein likha hai.",
+  "why_needed": "Bearer tokens/passwords har request mein bhejna risky hai; signing se ek captured request sirf wahi ek request reh jati hai.",
+  "real_world_analogy": "Cheque pe signature: bank aapka signature verify karta hai, lekin aapka 'pen' (secret) kabhi bank ko nahi dete. Aur amount + payee cheque pe likha hai, toh koi badal nahi sakta.",
+  "how_it_works": "Client: sha = sha256(body) ya UNSIGNED; sig = hex(HMAC(secret, string_to_sign)). Server: parse header -> skew check -> secret lookup (cached) -> recompute -> hmac.compare_digest.",
+  "in_this_project": "`services/signing.py::string_to_sign` aur `sign`; client side `sign_headers` (aur `objstore/client.py::ObjClient.request` jo raw path aur query nikalta hai). Server side `services/auth.py::authenticate` header parse karta hai (`parse_auth_header`), `x-obj-date` ko `clock_skew_seconds=900` se check karta hai, `_secret` se secret laata hai aur `hmac.compare_digest` karta hai. Body hash `Caller.signed_sha256` ban ke `put_object` tak jata hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/signing.py::string_to_sign",
+   "projects/07-object-storage/objstore/services/signing.py::sign_headers",
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/tests/test_objects.py::test_auth_failures"
+  ],
+  "code_example": "# real, trimmed: objstore/services/signing.py\ndef string_to_sign(method, raw_path, query, date, content_sha256):\n    return \"\\n\".join([method.upper(), raw_path, canonical_query(query), date, content_sha256])\n\ndef sign(secret, msg):\n    return hmac.new(secret.encode(), msg.encode(), hashlib.sha256).hexdigest()",
+  "code_language": "python",
+  "advantages": [
+   "Secret wire pe kabhi nahi jata",
+   "Har request individually bound aur tamper-evident",
+   "Stateless verification (sirf secret lookup)"
+  ],
+  "disadvantages": [
+   "Server ko plaintext secret chahiye (hash store nahi kar sakte)",
+   "Derived keys / scope nahi, toh blast radius bada",
+   "Headers (content-type, meta) sign nahi hote"
+  ],
+  "common_mistakes": [
+   "Decoded path sign karna jabki server raw path verify karta hai",
+   "Query ko bina sort/encode kiye sign karna",
+   "Signature ko `==` se compare karna"
+  ],
+  "follow_up_questions": [
+   "Why can't the server store only a hash of the secret?",
+   "Which headers are NOT covered by the signature and does it matter?",
+   "How does AWS SigV4 derive its signing key?"
+  ],
+  "concepts": [
+   "HMAC",
+   "request signing",
+   "SigV4",
+   "authentication"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-046",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "How does the clock-skew window protect against replay, and what can still be replayed?",
+  "answer_hinglish": "Signed request mein `x-obj-date` (unix seconds) string-to-sign ka part hai. `authenticate` check karta hai `abs(time.time() - int(date)) > skew` toh 401 'request date outside allowed clock skew (possible replay)'. Default `clock_skew_seconds = 900`, yaani +-15 minute. Attacker date badal nahi sakta kyunki woh signed hai, toh ek captured request sirf 15 minute tak hi valid hai.\n\nLekin window ke andar replay possible hai -- server nonce ya seen-signature cache nahi rakhta. FAILURE_SCENARIOS #13 honestly kehta hai: inside the window, the same request is idempotent for PUT/GET/DELETE. Same PUT dobara = same bytes ka naya version (versioned bucket mein ek extra version aur extra storage/quota!), same DELETE dobara = ek aur delete marker, same GET = data dobara padh lena. Toh 'idempotent' ka matlab state-wise mostly same, lekin versioned bucket mein side effects (extra versions) aate hain. Multipart `complete` replay pe `NoSuchUpload`/Conflict milega kyunki upload delete ho chuka.\n\nWindow kyun 15 min: client aur server ki clocks perfectly synced nahi hoti; bahut chhota window = legit clients fail. AWS bhi 15 minute use karta hai. Real defence TLS hai -- attacker request capture hi na kar paye; signing+skew defence-in-depth hai.\n\nAgar strict replay protection chahiye: signature (ya nonce header) ko Redis/Postgres mein window duration ke TTL ke saath store karo aur duplicate reject karo -- cost har request pe ek write.",
+  "why_needed": "Bina date ke ek captured signed request hamesha ke liye valid rehta.",
+  "real_world_analogy": "Movie ticket pe show time chhapa hota hai: ticket sirf usi show ke aas-paas valid hai, lekin us window mein agar kisi ne photocopy kar li toh gatekeeper ke paas 'already used' list nahi hai.",
+  "how_it_works": "date signed -> attacker change nahi kar sakta. Server: if |now - date| > 900 -> 401. Window ke andar koi dedupe nahi.",
+  "in_this_project": "`services/auth.py::authenticate` mein skew check, `config.py` mein `clock_skew_seconds: int = 900`. Test `test_auth_failures` ek request `now=int(time.time()) - 3600` ke saath sign karta hai aur 401 expect karta hai. Presigned URLs alag mechanism use karte hain: date ki jagah `X-Obj-Expires`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/objstore/config.py::Settings",
+   "projects/07-object-storage/tests/test_objects.py::test_auth_failures",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py (authenticate)\ndate = request.headers.get(\"x-obj-date\", \"\")\ntry:\n    if abs(time.time() - int(date)) > skew:\n        raise Unauthorized(\"request date outside allowed clock skew (possible replay)\")\nexcept ValueError:\n    raise Unauthorized(\"missing or invalid x-obj-date\") from None",
+  "code_language": "python",
+  "advantages": [
+   "Stateless -- koi nonce store nahi",
+   "Captured requests ki life 15 min tak bounded",
+   "Clock drift tolerate karta hai"
+  ],
+  "disadvantages": [
+   "Window ke andar exact replay possible",
+   "Versioned bucket mein replayed PUT extra version banata hai",
+   "Server clock galat ho toh sab clients fail"
+  ],
+  "common_mistakes": [
+   "Date ko sign na karna (tab skew check bekaar)",
+   "Window ko itna chhota karna ki NTP drift wale clients toot jaye",
+   "Maan lena ki skew check full replay protection hai"
+  ],
+  "follow_up_questions": [
+   "How would you add strict once-only semantics?",
+   "What happens if the server clock drifts by 20 minutes?",
+   "Why does a presigned URL use an expiry instead of a date?"
+  ],
+  "concepts": [
+   "replay attack",
+   "clock skew",
+   "idempotency",
+   "nonce"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Stateless skew window cheap hai; nonce cache exact hai lekin har request pe write aur shared store chahiye (multi-instance).",
+   "failure_scenarios": "Server clock drift -> legit requests 401; NTP fail monitoring chahiye. Window ke andar replayed PUT versioned bucket mein quota kha sakta hai.",
+   "alternatives": "Nonce/signature cache with TTL = window; short-lived tokens; mTLS; idempotency keys for writes.",
+   "scale_10x_100x": "100x request rate pe nonce cache ka write load bahut bada hoga -- sharded Redis with TTL, ya sirf mutating requests ke liye dedupe.",
+   "production_improvements": "TLS mandatory, NTP monitoring + alert on 'clock skew' 401 rate, optional dedupe on mutating requests, window ko config se tune karna."
+  }
+ },
+ {
+  "id": "OBJS-047",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "What is the UNSIGNED-PAYLOAD option and what is the trade-off of allowing it?",
+  "answer_hinglish": "UNSIGNED-PAYLOAD ka matlab hai client `x-obj-content-sha256: UNSIGNED-PAYLOAD` bhejta hai aur body ka hash signature mein include nahi hota. Signature ab bhi method, path, query aur date ko bind karta hai, lekin body ko nahi.\n\nKyun allow kiya: body ka SHA-256 signature mein daalne ke liye client ko poori body PEHLE hash karni padti hai, phir bhejni padti hai -- yaani 5GB file do baar padhni padegi, ya memory mein buffer karni padegi. Streaming upload (generator se aa raha data) ke liye yeh possible hi nahi. Isliye `ObjClient.request` mein agar content async iterator hai toh `body=None` -> UNSIGNED. Bench script bhi `md5=False` use karta hai.\n\nTrade-off: ab ek man-in-the-middle jo request intercept kar sake, woh headers rakh ke body badal sakta hai aur signature valid rahega. Mitigations: (1) TLS -- MITM mushkil; (2) Content-MD5 ya `x-obj-checksum-sha256` header -- lekin dhyan do, yeh headers signature mein covered NAHI hain, toh active attacker unhe bhi badal sakta hai; yeh sirf accidental corruption pakadte hain; (3) server response mein `x-obj-checksum-sha256` wapas aata hai, client verify kar sakta hai ki jo store hua wahi bheja tha. TRADEOFFS.md #11 yahi kehta hai: body integrity then relies on Content-MD5 / checksum headers and TLS.\n\nSigned payload ke case mein `Caller.signed_sha256` set hota hai aur `_verify_digests` usko stream ke actual SHA-256 se compare karta hai -- body swap -> 400 BadDigest (test_signed_body_cannot_be_swapped). Note: verification upload ke BAAD hota hai (bytes pehle blob mein jaate hain, mismatch pe blob delete).",
+  "why_needed": "Large/streaming uploads ko double read ya full buffering ke bina sign karna.",
+  "real_world_analogy": "Sealed envelope pe sign karna vs sirf address label pe sign karna: label pe sign karne se address toh fix hai, lekin andar ka letter koi badal sakta hai -- isliye envelope ko armoured truck (TLS) mein bhejte ho.",
+  "how_it_works": "sha header == UNSIGNED -> Caller.signed_sha256 = None -> put_object ko signed hash nahi milta -> sirf optional Content-MD5 / checksum header check. Otherwise signed hash compare hota hai HashingStream ke sha256 se.",
+  "in_this_project": "`services/signing.py` mein `UNSIGNED = \"UNSIGNED-PAYLOAD\"` aur `sign_headers(..., body=None)`; `services/auth.py::authenticate` return karta hai `Caller(akid, is_admin, signed_sha256=None if sha == signing.UNSIGNED else sha)`; `services/objects.py::_verify_digests` 'signed payload' label ke saath compare karta hai. Presigned PUT bhi body sign nahi karta (Caller.signed_sha256 None).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/signing.py::sign_headers",
+   "projects/07-object-storage/objstore/services/auth.py::Caller",
+   "projects/07-object-storage/objstore/services/objects.py::_verify_digests",
+   "projects/07-object-storage/objstore/client.py::ObjClient",
+   "projects/07-object-storage/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/client.py (ObjClient.request)\nbody = req.content if (sign_body and not hasattr(content, \"__aiter__\")) else None\nreq.headers.update(sign_headers(self.ak, self.sk, method, raw_path, req.url.query.decode(), body))\n\n# objstore/services/signing.py\nsha = hashlib.sha256(body).hexdigest() if body is not None else UNSIGNED",
+  "code_language": "python",
+  "advantages": [
+   "Constant-memory streaming uploads possible",
+   "Client ko file do baar nahi padhni padti"
+  ],
+  "disadvantages": [
+   "Body tampering signature se detect nahi hoti",
+   "Content-MD5 / checksum headers khud signed nahi hain",
+   "Presigned PUT bhi body ko bind nahi karta"
+  ],
+  "common_mistakes": [
+   "Sochna ki Content-MD5 active attacker se bachata hai (woh bhi badla ja sakta hai)",
+   "TLS ke bina UNSIGNED-PAYLOAD allow karna",
+   "Server pe signed hash verify karna bhool jana"
+  ],
+  "follow_up_questions": [
+   "How does AWS solve this with streaming chunked signatures (aws-chunked)?",
+   "Should UNSIGNED-PAYLOAD be disallowed over plain HTTP?",
+   "Can the client verify integrity after upload?"
+  ],
+  "concepts": [
+   "UNSIGNED-PAYLOAD",
+   "payload signing",
+   "streaming",
+   "integrity"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Security (full body binding) vs usability (streaming). Yahan streaming ko prefer kiya, TLS + checksum headers pe bharosa.",
+   "failure_scenarios": "MITM without TLS: body replace, signature valid; agar attacker Content-MD5 bhi recompute kar de toh server ko pata nahi chalega.",
+   "alternatives": "AWS streaming SigV4 (har chunk ka chained signature); upload ke baad client-side checksum verification; trailer checksums.",
+   "scale_10x_100x": "Bade objects aur zyada uploads pe UNSIGNED hi default ban jata hai, toh TLS everywhere aur chunk signing zaroori ho jata hai.",
+   "production_improvements": "Plain HTTP pe UNSIGNED reject karo, chunk-signed streaming implement karo, ya presigned PUT mein expected sha256 ko signed query param banao."
+  }
+ },
+ {
+  "id": "OBJS-048",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "Why does the code compare signatures with hmac.compare_digest instead of ==?",
+  "answer_hinglish": "Kyunki `==` string comparison pehle mismatch pe ruk jata hai -- agar pehla character galat hai toh jaldi return, agar 30 characters sahi hain toh thoda der se. Yeh time difference bahut chhota hai (nanoseconds), lekin bahut saari requests aur statistics se attacker measure kar sakta hai ki uska guess kitna prefix sahi hai, aur character by character sahi signature bana sakta hai. Isse timing attack kehte hain.\n\n`hmac.compare_digest(a, b)` constant-time comparison hai: poori string compare karta hai chahe mismatch kahin bhi ho, toh time se kuch leak nahi hota.\n\nIs project mein teen jagah use hota hai: `authenticate` mein header signature compare, `_presigned` mein presigned URL signature compare, aur `routes.py::create_access_key` mein `x-admin-token` compare. Admin token wala important hai kyunki woh ek static shared secret hai -- usko `==` se compare karte toh woh timing se guess ho sakta tha.\n\nInterview mein honestly bolo: network jitter ki wajah se remote timing attacks practically mushkil hain, lekin constant-time compare free hai, toh koi reason nahi ki risk lo. Security reviewers yeh pehli cheez dekhte hain. Aur yeh bhi dhyan rakho ki compare_digest ko dono same type ke args chahiye (str-str ya bytes-bytes).",
+  "why_needed": "Secret-dependent comparisons ko timing side-channel se leak hone se rokna.",
+  "real_world_analogy": "Ek tala jo galat chaabi pe turant 'click' karke mana kar de, versus ek tala jo hamesha 5 second leta hai -- pehle wale mein chor sun sakta hai ki kitne pins sahi baithe.",
+  "how_it_works": "compare_digest har byte XOR karke result accumulate karta hai aur end mein check karta hai; loop length input length pe depend karta hai, content pe nahi.",
+  "in_this_project": "`services/auth.py::authenticate` -> `if not hmac.compare_digest(expected, sig): raise Unauthorized(\"signature does not match\")`; `_presigned` mein same; `api/routes.py::create_access_key` mein `hmac.compare_digest(x_admin_token, request.app.state.settings.admin_token)`. SECURITY.md table mein 'Timing attacks on signatures' row.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::authenticate",
+   "projects/07-object-storage/objstore/services/auth.py::_presigned",
+   "projects/07-object-storage/objstore/api/routes.py::create_access_key",
+   "projects/07-object-storage/SECURITY.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py\nexpected = signing.sign(secret, signing.string_to_sign(request.method, raw_path, q, date, sha))\nif not hmac.compare_digest(expected, sig):\n    raise Unauthorized(\"signature does not match\")",
+  "code_language": "python",
+  "advantages": [
+   "Timing side channel band",
+   "Zero extra complexity"
+  ],
+  "disadvantages": [
+   "Sirf comparison protect karta hai, baaki code paths (e.g. unknown key vs wrong sig) alag time le sakte hain"
+  ],
+  "common_mistakes": [
+   "Secrets/tokens/HMACs ko `==` se compare karna",
+   "str aur bytes mix karke compare_digest call karna (TypeError)"
+  ],
+  "follow_up_questions": [
+   "Does the 'unknown access key' error path leak which keys exist?",
+   "Are remote timing attacks practical?",
+   "Where else in a web app do you need constant-time comparison?"
+  ],
+  "concepts": [
+   "timing attack",
+   "constant-time comparison",
+   "HMAC"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-049",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How does authorize() decide whether a caller may read, write or administer a bucket?",
+  "answer_hinglish": "`services/auth.py::authorize` ek simple ACL model implement karta hai, order mein:\n\n1. Bucket row load karo; nahi mili toh 404 NoSuchBucket.\n2. Caller admin hai ya bucket ka owner (`owner_key`) -> sab allowed, bucket row return.\n3. Action ADMIN hai (versioning, acl, quota, lifecycle, delete bucket) aur caller owner nahi -> 403. Grants se admin nahi milta.\n4. Action READ hai, `object_read=True` hai aur bucket `public_read` hai -> allowed, chahe anonymous ho. Dhyan do: sirf object GET/HEAD routes `object_read=True` pass karte hain; listing aur stats nahi -- isliye public bucket ki listing anonymous ko 401 deti hai (enumeration se bachne ke liye).\n5. Anonymous hai -> 401 authentication required.\n6. `bucket_grants` se permissions; `read` grant read deta hai, `write` grant write aur read dono deta hai.\n7. Warna 403.\n\ntest_access_control yeh sab cover karta hai: bob 403 jab tak grant nahi, anon 401, public_read ke baad anon object GET karta hai lekin listing 401, bob read grant ke saath PUT pe 403, bob ACL change nahi kar sakta, admin sab padh sakta hai.\n\nYeh real S3 bucket policies (JSON policy language, conditions, deny) nahi hai -- SECURITY.md gaps mein 'no bucket policies language (only ACL grants)' likha hai. Ek detail: `authorize` bucket row return karta hai jisme `versioning` aur `quota_bytes` hai, toh routes usi ko put/delete service ko pass karte hain -- ek query mein auth + config.",
+  "why_needed": "Multi-tenant storage mein har request ko owner/grantee/public ke hisaab se allow/deny karna.",
+  "real_world_analogy": "Office building: owner ke paas master key, kuch employees ko specific floor ka access card (grant), aur lobby (public_read objects) sabke liye khuli -- lekin lobby se directory list (listing) public nahi.",
+  "how_it_works": "Caller (access_key, is_admin) + bucket row + action -> allow/raise. Grants table `(bucket, access_key_id, permission)` PK ke saath.",
+  "in_this_project": "`objstore/services/auth.py::authorize` aur `Action` enum (READ, WRITE, ADMIN). Routes: `get_object`/`head` `object_read=True` ke saath; `list_objects` aur `stats` bina; `set_acl` grants ko delete+insert karta hai ek transaction mein. Test: `tests/test_objects.py::test_access_control`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::authorize",
+   "projects/07-object-storage/objstore/services/auth.py::Action",
+   "projects/07-object-storage/objstore/api/routes.py::set_acl",
+   "projects/07-object-storage/tests/test_objects.py::test_access_control"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py (authorize)\nif caller.is_admin or (caller.access_key and caller.access_key == b[\"owner_key\"]):\n    return dict(b)\nif action is Action.ADMIN:\n    raise Forbidden(\"only the bucket owner can change bucket configuration\")\nif action is Action.READ and object_read and b[\"public_read\"]:\n    return dict(b)\nif caller.access_key is None:\n    raise Unauthorized(\"authentication required\")\ngrants = set(...)  # SELECT permission FROM bucket_grants ...\nif action.value in grants or (action is Action.READ and \"write\" in grants):\n    return dict(b)\nraise Forbidden(...)",
+  "code_language": "python",
+  "advantages": [
+   "Simple, readable, testable",
+   "Public read sirf objects tak -- no anonymous enumeration",
+   "Ek query mein auth + bucket config"
+  ],
+  "disadvantages": [
+   "No deny rules, no prefix-level permissions, no conditions",
+   "Har non-owner request pe extra grants query",
+   "Bucket existence 404 se leak hota hai unauthenticated callers ko"
+  ],
+  "common_mistakes": [
+   "Public bucket mein listing bhi public kar dena",
+   "write grant ko read imply na karna (clients confuse)",
+   "ADMIN actions ko write grant se allow kar dena"
+  ],
+  "follow_up_questions": [
+   "Should a non-existent bucket return 404 or 403 to strangers?",
+   "How would you add prefix-scoped grants?",
+   "How does S3 combine ACLs, bucket policies and IAM?"
+  ],
+  "concepts": [
+   "authorization",
+   "ACL",
+   "public read",
+   "least privilege"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-050",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "How are presigned URLs verified, and what is the blast radius if one leaks?",
+  "answer_hinglish": "Presigned URL mein query params hote hain: `X-Obj-Credential`, `X-Obj-Expires`, `X-Obj-Signature` (aur optional `versionId`). Signed message = `METHOD \\n RAW_PATH \\n CANONICAL_QUERY(without signature) \\n PRESIGNED \\n EXPIRES`. Verification `auth.py::_presigned` mein: expiry < now -> 401; signer ka secret lookup; message recompute; `hmac.compare_digest`. Match hone pe `Caller(akid, is_admin, via_presign=True)` -- yaani request SIGNER ki identity se authorize hoti hai.\n\nBlast radius: leaked URL sirf (1) wahi method (GET URL se DELETE -> 401), (2) wahi exact path/key (key badli -> 401), (3) wahi versionId agar diya tha, (4) expiry tak. test_presigned_urls yeh sab cover karta hai. `/presign` route expiry ko `max_presign_seconds = 7 days` tak cap karta hai, aur sirf wahi presign karne deta hai jo signer khud kar sakta hai (bob alice ka bucket presign kare -> 403).\n\nLeak ko jaldi kaise kill karein: signer ki access key revoke karo (`revoked_at`). Lekin dhyan: `_secret` 60s cache karta hai, toh har instance pe revoke ko 60 second tak lag sakta hai. Aur revoke us key ke SAARE presigned URLs aur SAARE signed requests ko maar deta hai -- per-URL revoke nahi hai.\n\nReview finding O1 (fixed): pehle 7-day cap sirf URL banate waqt `/presign` route mein enforce hota tha; `_presigned` sirf `expires >= now` dekhta tha, toh secret wala `signing.presign` se 10 saal ka URL khud bana sakta tha. Ab verification mein bhi `exp > time.time() + max_presign_seconds + 60` -> 401 (`test_presigned_url_with_excessive_expiry_is_rejected_at_use`). Revoke ke liye ab `DELETE /admin/access-keys/{id}` endpoint bhi hai. Ek aur subtlety: admin ka presigned URL admin authority carry karta hai (is_admin pass hota hai), lekin sirf us ek path/method ke liye.",
+  "why_needed": "Browser ya third party ko credentials diye bina ek specific operation allow karna, aur leak ka damage bound karna.",
+  "real_world_analogy": "Hotel ka temporary room key-card: sirf ek room, sirf checkout time tak; kho gaya toh reception poore guest account ko block kar sakta hai, ek card ko nahi.",
+  "how_it_works": "presign(): params sorted + urlencoded, msg sign. _presigned(): parse, expiry, secret, recompute over request.method + raw_path + query minus signature, compare. Authorization phir normal authorize() se signer ke naam pe.",
+  "in_this_project": "`services/signing.py::presign` aur `presigned_string`; `services/auth.py::_presigned`; `api/routes.py::presign` (`PresignIn`, cap check, `authorize` with READ/WRITE, `quote_key` path). Config `max_presign_seconds`. Test `test_presigned_urls` mein expired URL ko seedha `signing.presign(..., int(time.time()) - 1)` se banaya gaya hai -- wahi API jisse koi bhi secret-holder lambi expiry bhi bana sakta hai.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::_presigned",
+   "projects/07-object-storage/objstore/services/signing.py::presign",
+   "projects/07-object-storage/objstore/api/routes.py::presign",
+   "projects/07-object-storage/tests/test_objects.py::test_presigned_urls",
+   "projects/07-object-storage/objstore/config.py::Settings",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_presigned_url_with_excessive_expiry_is_rejected_at_use"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py (_presigned)\nakid, expires, sig = params.get(\"X-Obj-Credential\"), params.get(\"X-Obj-Expires\"), params[\"X-Obj-Signature\"]\nif int(expires) < time.time():\n    raise Unauthorized(\"presigned URL expired\")\nsecret, is_admin = await _secret(sm, akid or \"\")\nexpected = signing.sign(secret, signing.presigned_string(request.method, raw_path, q, expires))\nif not hmac.compare_digest(expected, sig):\n    raise Unauthorized(\"presigned signature does not match (wrong method, path, or tampered query)\")\nreturn Caller(akid, is_admin, via_presign=True)",
+  "code_language": "python",
+  "advantages": [
+   "Bina credentials ke scoped, time-bound access",
+   "Stateless -- koi URL table nahi",
+   "Signer apni authority se zyada delegate nahi kar sakta"
+  ],
+  "disadvantages": [
+   "Per-URL revocation nahi",
+   "Revocation per key hai, per URL nahi (aur doosre instances pe 60s cache delay)",
+   "Leaked GET URL expiry tak kisi ke bhi haath kaam karta hai"
+  ],
+  "common_mistakes": [
+   "Lambi expiry default rakhna",
+   "Admin key se presign karna",
+   "Revoke ke baad 60s cache lag bhool jana"
+  ],
+  "follow_up_questions": [
+   "How would you support revoking a single presigned URL?",
+   "Should presigned PUT URLs pin content-length or sha256?",
+   "Why sign 'PRESIGNED' as a literal in the message?"
+  ],
+  "concepts": [
+   "presigned URL",
+   "delegation",
+   "expiry",
+   "revocation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Stateless URLs scale aur simple hain, lekin individually revoke nahi hote. Stateful token table revocation deti hai par har GET pe lookup.",
+   "failure_scenarios": "URL logs/Referer headers/chat mein leak ho jata hai; 7 din tak object public jaisa. Secret-holder O1 ki wajah se unbounded-expiry URL bana sakta hai.",
+   "alternatives": "Short expiry + refresh; per-URL id in a revocation list; dedicated low-privilege signing keys; CDN signed cookies.",
+   "scale_10x_100x": "Bahut saare presigned downloads pe API hi bottleneck -- presign directly against blob store/CDN (SYSTEM_DESIGN 100x row).",
+   "production_improvements": "(Verification-time max expiry check: done.) dedicated presign-only keys per app, audit log of presign calls, Referrer-Policy guidance, shorter default expiry."
+  }
+ },
+ {
+  "id": "OBJS-051",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How does this system prevent path traversal through object keys like ../../etc/passwd?",
+  "answer_hinglish": "Main defence architectural hai: object key kabhi file path nahi banta. Object key sirf ek string hai jo Postgres ke `objects.key` column mein store hoti hai. Bytes ek random blob key ke naam se store hote hain (`new_blob_key()` = uuid4 hex + 8 hex chars), aur `objects.blob_key` usko point karta hai. Toh `../../etc/passwd` naam ka object bhi disk pe `root/ab/cd/<random hex>` jaisi file hi banega.\n\nDefence in depth: `LocalAdapter._path` check karta hai `blob_key.isalnum()` -- agar kabhi bug se koi non-hex key aa jaye (jaise `../x`) toh ValueError. Blob keys server-generated hain, client control nahi karta.\n\nTeesri layer client side ki thi, jo ek real bug se aayi (TESTING.md bug 2): HTTP clients RFC 3986 dot-segment removal karte hain, toh `/buckets/photos/objects/../../etc/passwd` bhejte waqt URL `/buckets/etc/passwd` jaisa normalise ho jata aur request galat resource pe jaati. Fix: `signing.quote_key` `.` aur `..` segments ko `%2E` / `%2E%2E` encode karta hai. Server pe FastAPI `{key:path}` route decode karke original key wapas deta hai.\n\ntest_hostile_keys_never_touch_filesystem_paths `../../etc/passwd`, `a/../../b`, emoji, `%25`, `?q=1`, backslashes sab PUT/GET karta hai aur assert karta hai ki har file `tmp_path/blobs` ke andar hai aur naam alnum hai. Yahi random-key design renames ko metadata-only bhi banata hai.",
+  "why_needed": "Object stores user-controlled names accept karte hain; agar naam se path bane toh attacker server ki files padh/likh sakta hai.",
+  "real_world_analogy": "Cloakroom: aap coat dete ho aur token number milta hai. Coat kis rack pe kahan latka hai yeh staff decide karta hai -- aap 'mera coat manager ke cabin mein rakho' nahi bol sakte.",
+  "how_it_works": "Key -> metadata row -> random blob_key -> sharded path. Path computation input sirf server-generated hex.",
+  "in_this_project": "`services/objects.py::new_blob_key`, `storage/local.py::LocalAdapter._path` (isalnum + `root/blob_key[:2]/blob_key[2:4]/blob_key`), `services/signing.py::quote_key`. Route `_check_key` sirf length (1..1024 bytes) validate karta hai -- content nahi, kyunki key data hai. Test: `tests/test_objects.py::test_hostile_keys_never_touch_filesystem_paths`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/local.py::_path",
+   "projects/07-object-storage/objstore/services/objects.py::new_blob_key",
+   "projects/07-object-storage/objstore/services/signing.py::quote_key",
+   "projects/07-object-storage/tests/test_objects.py::test_hostile_keys_never_touch_filesystem_paths"
+  ],
+  "code_example": "# real, trimmed: objstore/storage/local.py\ndef _path(self, blob_key: str) -> Path:\n    if not blob_key.isalnum():          # defence in depth: keys are server-generated hex\n        raise ValueError(\"invalid blob key\")\n    return self.root / blob_key[:2] / blob_key[2:4] / blob_key",
+  "code_language": "python",
+  "advantages": [
+   "Traversal design se impossible, sanitisation pe depend nahi",
+   "Kisi bhi Unicode/special key ko support",
+   "Rename metadata-only"
+  ],
+  "disadvantages": [
+   "Blob store bina DB ke unreadable",
+   "Ek extra indirection (key -> blob)"
+  ],
+  "common_mistakes": [
+   "Key ko sanitize karke path banana (blacklist hamesha miss karti hai)",
+   "Client side dot-segment normalisation ignore karna",
+   "Blob key client se accept karna"
+  ],
+  "follow_up_questions": [
+   "Why is sanitising keys (removing ..) weaker than random blob keys?",
+   "What did the dot-segment client bug look like?",
+   "How does S3 itself handle keys with ..?"
+  ],
+  "concepts": [
+   "path traversal",
+   "indirection",
+   "defence in depth",
+   "URL encoding"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-052",
+  "project_slug": "p07-object-storage",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "What security gaps remain in this design, and how would you close them for production?",
+  "answer_hinglish": "Honestly bolunga -- SECURITY.md mein documented gaps hain:\n\n1. Access key secrets plaintext mein (`access_keys.secret`). HMAC verify karne ke liye server ko original secret chahiye, toh bcrypt jaisa one-way hash kaam nahi karega. Fix: secrets ko KMS key se encrypt karke store karo (envelope encryption), decrypt sirf memory mein; ya AWS jaisa derived signing keys taaki leak hone pe scope limited ho.\n2. Server-side encryption nahi: blobs disk/SeaweedFS pe as-is. Fix: per-object data key se AES-GCM, data key KMS se wrapped, metadata row mein store.\n3. Object lock / WORM nahi: ransomware ya rogue admin versions permanently delete kar sakta hai (`DELETE ?versionId=`). Fix: retention-until column + legal hold, delete path mein enforce.\n4. Bucket policy language nahi -- sirf owner/grants/public_read.\n5. Compose demo mein TLS nahi -- aur UNSIGNED-PAYLOAD + presigned URLs TLS pe bharosa karte hain.\n\nCode review mein jo mile aur fix hue: `max_presign_seconds` ab verification pe bhi enforce hota hai (O1); `list_parts` pehle upload_id se bina bucket filter query karta tha (O7) -- bucket A pe write access wala bucket B ke upload ke parts dekh sakta tha agar upload_id pata ho; ab bucket se scoped (`test_list_parts_is_scoped_to_the_bucket`); revoke endpoint add hua (`test_revoked_access_key_stops_working`). Abhi bhi baaki: secret cache 60s -- doosre instances pe revoke turant effective nahi; admin token static shared secret hai `x-admin-token` header mein, default `change-me-obj-admin`.\n\nPriority order main yeh rakhunga: TLS + secret encryption pehle (credential compromise sabse bada blast radius), phir SSE, phir object lock compliance needs ke hisaab se.",
+  "why_needed": "Interviewer dekhna chahta hai ki aap apne system ki limits jaante ho aur unka risk-ranked plan hai.",
+  "real_world_analogy": "Ghar mein achha lock (signing) laga diya, lekin spare chaabi (plaintext secret) ek drawer mein padi hai aur almirah (blobs) mein tala nahi.",
+  "how_it_works": "Existing controls: HMAC signing, skew window, compare_digest, scoped presign, ACLs, random blob keys, size limits, quotas. Gaps: secrets at rest, data at rest, immutability, policy language, transport.",
+  "in_this_project": "`migrations/versions/0001_initial.py` mein `secret text NOT NULL -- needed to verify HMACs (like AWS); encrypt at rest in production`; `services/auth.py::_secret` (60s `SecretCache`); `api/routes.py::list_parts` (now checks the upload belongs to the bucket via `_get_upload`); `api/routes.py::revoke_access_key`; `config.py` `admin_token` default. DEPLOYMENT.md checklist item 6: encrypt access key secrets and blobs at rest.",
+  "implementation_files": [
+   "projects/07-object-storage/SECURITY.md",
+   "projects/07-object-storage/migrations/versions/0001_initial.py",
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/objstore/api/routes.py::list_parts",
+   "projects/07-object-storage/DEPLOYMENT.md",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_list_parts_is_scoped_to_the_bucket"
+  ],
+  "code_example": "# real, trimmed: objstore/api/routes.py (list_parts) -- O7 fixed in review\nawait authorize(s, c, bucket, Action.WRITE)\n# Filter by bucket too: write access to bucket A must not reveal parts of an upload in bucket B.\nawait obj._get_upload(s, bucket, upload_id)      # 404 unless this upload belongs to THIS bucket\nrows = (await s.execute(text(\"SELECT part_number, size, etag, uploaded_at FROM multipart_parts WHERE upload_id = :u \"\n                             \"ORDER BY part_number\"), {\"u\": upload_id})).mappings().all()",
+  "code_language": "python",
+  "advantages": [
+   "Gaps documented hain, hidden nahi",
+   "Core request auth already strong (HMAC, replay window)"
+  ],
+  "disadvantages": [
+   "DB dump = saare credentials",
+   "Disk/backup leak = saara data",
+   "No immutability against insider/ransomware"
+  ],
+  "common_mistakes": [
+   "Secrets ko bcrypt karne ki koshish (HMAC verify impossible ho jayega)",
+   "TLS ko 'infra ka kaam' bol ke ignore karna",
+   "SSE ko sirf disk encryption samajhna"
+  ],
+  "follow_up_questions": [
+   "How would you encrypt access key secrets while still verifying HMACs?",
+   "Design SSE-KMS for this system.",
+   "How would you implement object lock retention?"
+  ],
+  "concepts": [
+   "threat model",
+   "encryption at rest",
+   "KMS",
+   "WORM"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har mitigation ka cost: KMS decrypt latency (cache se kam), SSE pe CPU, object lock pe storage jo delete nahi ho sakta.",
+   "failure_scenarios": "DB backup leak -> sab secrets -> attacker kisi ka bhi data padh/delete. Rogue admin -> permanent version deletes. Plain HTTP -> MITM body swap with UNSIGNED-PAYLOAD.",
+   "alternatives": "Derived/scoped signing keys (AWS SigV4 style), HSM-backed signing, external IdP with short-lived STS tokens instead of long-lived keys.",
+   "scale_10x_100x": "Zyada tenants = zyada keys aur zyada blast radius; short-lived credentials aur per-tenant KMS keys standard ban jate hain.",
+   "production_improvements": "TLS everywhere, KMS-encrypted secrets, SSE per object, object lock, (presign expiry check at verify and list_parts bucket filter: done), admin token -> admin access key only, audit logging."
+  }
+ },
+ {
+  "id": "OBJS-053",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What performance numbers did you measure, and how were they measured?",
+  "answer_hinglish": "Numbers TESTING.md se, real runs 2026-11-17, in-process ASGI (httpx ASGITransport -- client aur server ek hi Python process mein), Postgres Docker Desktop on Windows mein:\n\n- 1KB PUT, 16 concurrent: local adapter 53 -> 72 ops/s (fix ke baad), S3 adapter (SeaweedFS in Docker) 44 -> 57 ops/s.\n- 1KB GET, 16 concurrent: local 85 -> 112 ops/s, S3 55 -> 91 ops/s.\n- 64MB PUT sequential: local 153 MB/s, S3 45 MB/s.\n- 64MB GET sequential: local 371 MB/s, S3 63 MB/s.\n\nConcurrency sweep (PUT 1KB, local): c=1 31/s (CPU 44% of wall), c=4 76/s (CPU 122%), c=16 55/s (CPU 110%).\n\nBenchmark `bench/throughput.py` hai: tables truncate, ek BENCH key, bucket banao, 300 small PUTs semaphore(16) ke saath, phir 300 GETs, phir 3x64MB PUT aur GET. Real API path chalta hai -- signing, auth, Postgres transaction, storage adapter -- sirf network nahi.\n\nInterview mein main clear bolta hoon: yeh absolute numbers laptop + Docker Desktop ke hain, production capacity nahi. Inka value relative hai: before/after fix ka comparison aur bottleneck ka type (lock contention vs CPU). Small-object numbers latency-bound/CPU-bound hain; large-object numbers bandwidth/backend-bound hain.",
+  "why_needed": "Claims ko real measurement se back karna, aur bottleneck dhundhna.",
+  "real_world_analogy": "Car ki mileage company ke test track pe vs city traffic mein: number useful hai comparison ke liye, lekin aapki daily commute ka exact number nahi.",
+  "how_it_works": "asyncio.gather + Semaphore(16) se concurrency; time.perf_counter se rate; same process mein ASGI transport toh client CPU bhi server ke saath share hota hai.",
+  "in_this_project": "`bench/throughput.py::run` (`python bench/throughput.py both`), `md5=False` ke saath PUTs, `ObjClient` with `httpx.ASGITransport`. Results `TESTING.md` Benchmarks table mein.",
+  "implementation_files": [
+   "projects/07-object-storage/bench/throughput.py::run",
+   "projects/07-object-storage/TESTING.md",
+   "projects/07-object-storage/objstore/client.py::ObjClient"
+  ],
+  "code_example": "# real, trimmed: bench/throughput.py\nn, small = 300, os.urandom(1024)\nsem = asyncio.Semaphore(16)\n\nasync def put(i):\n    async with sem:\n        assert (await c.put(\"bench\", f\"small/{i}\", small, md5=False)).status_code == 200\n\nt = time.perf_counter()\nawait asyncio.gather(*[put(i) for i in range(n)])\nput_rate = n / (time.perf_counter() - t)",
+  "code_language": "python",
+  "advantages": [
+   "Full stack measured (auth + DB + storage)",
+   "Before/after comparison reproducible"
+  ],
+  "disadvantages": [
+   "Client aur server same process -- CPU share",
+   "Docker Desktop on Windows I/O representative nahi",
+   "Sirf 300 ops -- noisy"
+  ],
+  "common_mistakes": [
+   "Laptop numbers ko production capacity bolna",
+   "Sirf throughput dekhna, latency percentiles nahi",
+   "Warmup ke bina measure karna"
+  ],
+  "follow_up_questions": [
+   "Why is the in-process setup both useful and misleading?",
+   "What would you add: p99 latency, separate load generator?",
+   "Why are GETs faster than PUTs here?"
+  ],
+  "concepts": [
+   "benchmarking",
+   "throughput",
+   "methodology"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-054",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Explain the bucket-lock bottleneck you found and how fixing it changed PUT throughput.",
+  "answer_hinglish": "Pehle `put_object` ka commit transaction HAR PUT pe `SELECT 1 FROM buckets WHERE name = :b FOR UPDATE` leta tha. Iska matlab ek bucket ke saare writes -- chahe alag-alag keys pe hon -- ek line mein serialize ho rahe the. Har transaction ko bucket row lock ke liye wait karna padta, aur lock commit tak hold hota. 16 concurrent clients the lekin effectively commit section single-threaded tha. Measured: 53 PUT/s (local), 44 (S3).\n\nSocha ki lock kis liye tha: quota check. `_check_quota` ek check-then-insert hai -- 'used + adding <= quota?' padho, phir insert. Do concurrent PUTs dono ek saath check pass kar sakte the aur dono insert karke quota cross. Bucket row lock un dono ko serialize karta hai. Lekin jis bucket pe quota hi nahi, wahan yeh lock bekaar tha. Fix: lock sirf `if bucket[\"quota_bytes\"] is not None`. Per-key correctness ke liye advisory lock (`key_lock_sql`) already tha, toh different keys ab parallel commit karte hain.\n\nIs fix + secret cache + kam thread hops ke saath local 53 -> 72 PUT/s, S3 44 -> 57 (TESTING.md, in-process ASGI, Docker Desktop on Windows). Teeno changes ek saath measure hue, toh honest answer: lock fix main structural fix tha, lekin individual contribution separately measure nahi kiya.\n\nLesson: lock ka scope uske invariant jitna hi hona chahiye. Invariant 'one latest per key' -> key lock. Invariant 'bucket total <= quota' -> bucket lock, sirf jab quota ho.",
+  "why_needed": "Unnecessary coarse locks parallelism maar dete hain; scaling ke liye lock granularity sahi chahiye.",
+  "real_world_analogy": "Building mein har flat ka apna darwaza hai, lekin kisi ne main gate pe ek hi chaabi rakh di aur har resident ko line mein lagna padta hai -- jabki main gate sirf tab chahiye jab building ki total capacity count karni ho.",
+  "how_it_works": "Row lock (FOR UPDATE) transaction end tak hold. Contention = transactions jo same row maangte hain. Quota'd bucket mein ab bhi serialize, baaki mein sirf same-key writers.",
+  "in_this_project": "`services/objects.py::put_object` mein comment: 'Locking unconditionally serialised EVERY write in the bucket (measured: 53 PUT/s)'. Same conditional lock `complete_multipart` mein bhi. `_check_quota` quota None pe turant return. TESTING.md 'What changed' section.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/objects.py::_check_quota",
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (put_object)\nasync with sm() as s, s.begin():\n    await s.execute(text(key_lock_sql()), {\"b\": bucket[\"name\"], \"k\": key})\n    if bucket[\"quota_bytes\"] is not None:\n        # Only quota'd buckets need bucket-wide serialisation (check-then-insert must not race).\n        # Locking unconditionally serialised EVERY write in the bucket (measured: 53 PUT/s).\n        await s.execute(text(\"SELECT 1 FROM buckets WHERE name = :b FOR UPDATE\"), {\"b\": bucket[\"name\"]})\n        await _check_quota(s, bucket, info.size)",
+  "code_language": "python",
+  "advantages": [
+   "Non-quota buckets mein different keys parallel commit",
+   "Quota correctness quota'd buckets mein intact"
+  ],
+  "disadvantages": [
+   "Quota'd buckets abhi bhi per-bucket serialised",
+   "Quota bucket ke andar hot bucket = bottleneck"
+  ],
+  "common_mistakes": [
+   "Ek global/bucket lock 'safe side' ke liye lena",
+   "Lock ke andar slow kaam (yahan upload lock ke bahar hai -- good)",
+   "Multiple changes ek saath measure karke kisi ek ko credit dena"
+  ],
+  "follow_up_questions": [
+   "How would you make quota checks scale without a bucket-wide lock?",
+   "How would you have detected this contention in production (pg_locks, wait events)?",
+   "Why is the advisory lock still needed?"
+  ],
+  "concepts": [
+   "lock contention",
+   "lock granularity",
+   "quota",
+   "SELECT FOR UPDATE"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fine-grained locks parallelism dete hain lekin har invariant ke liye sahi lock chahiye. Quota ke liye bucket lock simple aur correct hai par hot quota buckets ko serialise karta hai.",
+   "failure_scenarios": "Quota bucket pe heavy write load -> sab ek row lock pe queue; lock wait timeouts. Upload_part ab bhi bucket lock leta hai (O2 review fix), toh multipart-heavy quota buckets pe contention aur badhta hai.",
+   "alternatives": "Usage counter row with atomic `UPDATE ... SET used = used + :n WHERE used + :n <= quota` (single-row, short lock); reservation/lease model; eventually-consistent soft quotas checked async (S3 style billing).",
+   "scale_10x_100x": "100x pe per-bucket counter row bhi hot ho jayegi -- sharded counters (N sub-rows, sum on read) ya soft quotas.",
+   "production_improvements": "pg_stat_activity wait_event monitoring, lock wait histograms, `lock_timeout`, maintained usage counter instead of SUM over all versions on every PUT."
+  }
+ },
+ {
+  "id": "OBJS-055",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "After the lock fix, why didn't more concurrency help, and what does the CPU-bound finding tell you?",
+  "answer_hinglish": "Lock fix ke baad maine concurrency vary karke PUT 1KB measure kiya (TESTING.md, in-process ASGI, Postgres in Docker Desktop on Windows): c=1 -> 31/s with CPU 44% of wall; c=4 -> 76/s with CPU 122%; c=16 -> 55/s with CPU 110%.\n\nInterpretation: c=1 pe CPU sirf 44% busy hai -- baaki time process DB round trips aur file I/O ka wait kar raha hai, toh concurrency badhane se throughput badhta hai (latency overlap hoti hai). c=4 pe CPU 122% of wall -- matlab ek core se zyada (GIL ke bahar threads jaise fsync/hashing kuch parallel chalte hain) -- process practically CPU-saturated hai. Is point ke baad aur concurrency sirf contention, context switching aur event loop scheduling overhead badhati hai, isliye c=16 pe throughput 55 pe gir gaya.\n\nCPU kahan ja raha hai: ek hi Python process mein client (signing, httpx), server (FastAPI routing, pydantic), SQLAlchemy + asyncpg, HMAC, MD5+SHA-256, aur thread pool hops. Python ek core pe effectively GIL-bound hai.\n\nProduction answer: API stateless hai -- saari coordination (advisory locks, unique index, quota lock) Postgres mein hai, process memory mein sirf 60s secret cache. Toh horizontally scale karo: zyada uvicorn workers/processes/pods load balancer ke peeche. Yeh honest finding hai ki 76/s Python per-process limit hai, system design limit nahi. Agla bottleneck tab Postgres hoga.",
+  "why_needed": "Bottleneck ka type (lock vs CPU vs I/O) decide karta hai ki fix code mein hai ya more machines mein.",
+  "real_world_analogy": "Ek cashier ke counter pe line: 4 customers tak woh fast hai kyunki beech mein printer ka wait hota tha; 16 customers pe woh bas zyada confuse hota hai. Solution: aur counters kholo.",
+  "how_it_works": "CPU% of wall = process CPU time / wall time. <100% -> waiting dominant; >=100% single process saturated. Throughput peak ke baad gire toh overhead > benefit.",
+  "in_this_project": "`bench/throughput.py` same harness; finding TESTING.md 'Further investigation' paragraph aur README known limitations ('CPU-bound in Python (~76 PUT/s small objects at best); scale API processes horizontally'). DEPLOYMENT.md: 'The API is stateless: run as many replicas as needed'.",
+  "implementation_files": [
+   "projects/07-object-storage/TESTING.md",
+   "projects/07-object-storage/bench/throughput.py",
+   "projects/07-object-storage/README.md",
+   "projects/07-object-storage/DEPLOYMENT.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Bottleneck clearly identified with evidence",
+   "Stateless API -> linear-ish horizontal scaling possible"
+  ],
+  "disadvantages": [
+   "Single-process Python ceiling low hai",
+   "Benchmark mein client CPU bhi shamil -- server-only number thoda better hoga"
+  ],
+  "common_mistakes": [
+   "Concurrency badhate rehna jab CPU already saturated",
+   "Optimise karna bina profile kiye",
+   "Client+server same process ka effect ignore karna"
+  ],
+  "follow_up_questions": [
+   "What would you profile next (py-spy, cProfile)?",
+   "How many uvicorn workers per core would you run?",
+   "When does Postgres become the next bottleneck?"
+  ],
+  "concepts": [
+   "CPU-bound",
+   "GIL",
+   "horizontal scaling",
+   "profiling"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Python developer speed vs per-core throughput. Stateless design is trade-off ko theek karta hai -- processes add karo.",
+   "failure_scenarios": "Overload pe ek process ka event loop latency badhti hai, timeouts; health checks bhi slow. Autoscaling CPU metric pe karna chahiye.",
+   "alternatives": "Hot paths ko native code mein (hashlib already C hai), PyPy, Go/Rust data plane with Python control plane, ya bytes ko API se bypass (presign direct to blob store).",
+   "scale_10x_100x": "10x: zyada processes + PgBouncer. 100x: Postgres write throughput limit -> metadata sharding; bytes direct blob store/CDN.",
+   "production_improvements": "Separate load generator, py-spy flame graphs, per-route latency histograms (bpcommon already exports http_request_duration_seconds), uvicorn --workers, connection pool tuning."
+  }
+ },
+ {
+  "id": "OBJS-056",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "Why is the S3 adapter so much slower than the local adapter in the benchmarks?",
+  "answer_hinglish": "Numbers (TESTING.md, 2026-11-17, in-process ASGI, Docker Desktop on Windows): 64MB PUT local 153 MB/s vs S3 45 MB/s; 64MB GET local 371 MB/s vs S3 63 MB/s; 1KB PUT 72 vs 57 ops/s; 1KB GET 112 vs 91 ops/s.\n\nReasons:\n1. Extra network hop + HTTP: local adapter seedha file write karta hai; S3 adapter har chunk ko boto3 ke through HTTP pe SeaweedFS ko bhejta hai, jo Docker Desktop ke network virtualisation se guzarta hai (Windows pe yeh notoriously slow hai).\n2. SeaweedFS khud bhi data apne volume pe likhta hai -- do storage layers.\n3. Thread handoffs: `_QueueReader` mein event loop chunk `feed` karta hai (to_thread), boto3 thread `readinto` se padhta hai -- condition variable wake-ups, 8-chunk bounded buffer. Har chunk ka copy aur synchronisation.\n4. boto3 managed transfer 8MB threshold ke upar multipart karta hai (64MB = ~8 parts) aur har part ka HTTP request + upload complete call.\n5. GET pe `body.read(256KB)` har chunk ek to_thread hop.\n\nMain yeh nahi bolunga ki S3 adapter 'slow design' hai -- numbers environment-heavy hain. Asli point: storage backend network ke peeche ho toh API process bytes ka proxy ban jata hai, aur do baar network cross hota hai (client -> API -> blob store). Isliye scaling path mein presigned URLs directly blob store/CDN pe point karte hain taaki bytes API ko bypass karein.",
+  "why_needed": "Backend choice ka cost samajhna aur data path design karna.",
+  "real_world_analogy": "Ghar ki almari se kapde nikalna vs godown se courier mangwana: godown zyada bada aur safe hai, lekin har cheez ka trip lagta hai.",
+  "how_it_works": "Local: stream -> file write. S3: stream -> HashingStream -> feed queue -> boto3 thread -> HTTP multipart -> SeaweedFS -> its disk. GET reverse with ranged GetObject.",
+  "in_this_project": "`storage/s3.py::_QueueReader` (backpressure `while len(self._chunks) > 8`), `S3Adapter.put` (`upload_fileobj` in a thread), `S3Adapter.get` (`Range=bytes=start-end`, 256KB reads). Local: `storage/local.py` CHUNK = 256KB. Bench: `bench/throughput.py both`.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/s3.py::_QueueReader",
+   "projects/07-object-storage/objstore/storage/s3.py::S3Adapter",
+   "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: objstore/storage/s3.py (S3Adapter.put)\nreader = _QueueReader()\nupload = asyncio.to_thread(self.client.upload_fileobj, io.BufferedReader(reader), self.bucket, blob_key)\ntask = asyncio.ensure_future(upload)\nasync for chunk in stream:\n    await asyncio.to_thread(reader.feed, chunk)\nreader.finish()\nawait task",
+  "code_language": "python",
+  "advantages": [
+   "S3 backend durability/replication delegate ho jata hai",
+   "Same API code dono backends pe"
+  ],
+  "disadvantages": [
+   "Extra hop aur copies",
+   "API process bytes ka proxy -- CPU aur bandwidth dono"
+  ],
+  "common_mistakes": [
+   "Docker Desktop on Windows ke numbers ko S3 ki inherent speed samajhna",
+   "Bytes ko hamesha API se route karna"
+  ],
+  "follow_up_questions": [
+   "How would presigning directly against the blob store change this?",
+   "Would a bigger queue or chunk size help?",
+   "How would you tune boto3 TransferConfig?"
+  ],
+  "concepts": [
+   "storage backend",
+   "data path",
+   "throughput",
+   "proxying"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-057",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "What does the access-key secret cache buy you, and what does it cost?",
+  "answer_hinglish": "`auth.py::SecretCache` (ek instance `app.state.secret_cache` pe) ek dict rakhta hai: akid -> (expiry monotonic time, (secret, is_admin) ya None). TTL 60s. Fayda: har signed request pe ek Postgres round trip bachta hai (`SELECT secret, is_admin FROM access_keys WHERE access_key_id = :a AND revoked_at IS NULL`). Small-object workloads mein request ka bada hissa round trips hi hai, toh yeh TESTING.md ke teen improvements mein se ek hai (53 -> 72 PUT/s combined).\n\nUnknown keys bhi cache hote hain (`found = None`) -- isse bogus access key ids ki flood DB ko hammer nahi karti (negative caching).\n\nCost (TRADEOFFS #10): revoked key DOOSRE instances pe 60s tak kaam karti rahegi -- har process apna cache rakhta hai, koi pub/sub nahi. Jis instance pe `DELETE /admin/access-keys/{id}` aaya, woh `secret_cache.forget(akid)` se turant evict karta hai. Review story: pehle cache module-global `_SECRET_CACHE` tha; revoke fix ke baad test suite ne pakda ki ek process ke andar alag app instances ek doosre ki revocation 'leak' kar rahe the -- isliye cache `app.state` pe instance-scoped bana. Naya key bhi max 60s tak 'unknown' dikh sakta hai agar kisi ne pehle us id ke saath request bheji ho (negative cache). Memory bound crude hai: 10,000 entries ke baad poora cache clear -- simple, lekin attacker random ids bhej ke cache baar baar clear kara sakta hai, toh negative-cache protection weak hai aur legit keys bhi evict hote hain.\n\nEk subtle point: `time.monotonic()` use kiya hai, wall clock nahi, toh NTP jumps cache expiry nahi bigaadte. Alag se: `/presign` route secret direct DB se padhta hai, cache se nahi.",
+  "why_needed": "Hot path se repeated DB lookups hatana; lekin security-sensitive data cache karne ka staleness cost samajhna.",
+  "real_world_analogy": "Security guard ke paas employees ki photo list jo woh har ghante update karta hai: fast checking, lekin aaj subah nikale gaye employee ko ek ghante tak andar aane mil sakta hai.",
+  "how_it_works": "Lookup: hit and not expired -> cached; else DB query, store with TTL. Size > 10000 -> clear(). None result -> 401.",
+  "in_this_project": "`objstore/services/auth.py::SecretCache` (TTL 60s, `forget`), `_secret`; `app.state.secret_cache`; revoke route `api/routes.py::revoke_access_key`; revocation column `access_keys.revoked_at`; test `tests/test_review_fixes.py::test_revoked_access_key_stops_working`. TRADEOFFS.md #10.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/auth.py::SecretCache",
+   "projects/07-object-storage/objstore/services/auth.py::_secret",
+   "projects/07-object-storage/objstore/api/routes.py::revoke_access_key",
+   "projects/07-object-storage/tests/test_review_fixes.py::test_revoked_access_key_stops_working",
+   "projects/07-object-storage/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/auth.py\nclass SecretCache:\n    TTL = 60.0\n    def __init__(self):\n        self._d: dict[str, tuple[float, tuple[str, bool] | None]] = {}\n    def get(self, akid):\n        hit = self._d.get(akid)\n        return hit[1] if hit and hit[0] > time.monotonic() else ...\n    def put(self, akid, value) -> None:\n        if len(self._d) > 10_000:\n            self._d.clear()\n        self._d[akid] = (time.monotonic() + self.TTL, value)\n    def forget(self, akid) -> None:\n        self._d.pop(akid, None)",
+  "code_language": "python",
+  "advantages": [
+   "Ek DB round trip per request kam",
+   "Negative caching bogus-id floods ko sasta karta hai",
+   "Monotonic clock -- wall clock jumps se safe"
+  ],
+  "disadvantages": [
+   "Revocation doosre instances pe 60s tak delayed (local instance turant forget karta hai)",
+   "Crude eviction (clear all) attacker trigger kar sakta hai",
+   "Secrets process memory mein plaintext"
+  ],
+  "common_mistakes": [
+   "Security data cache karke revocation semantics bhool jana",
+   "Cache size unbounded chhod dena",
+   "Wall clock se TTL nikalna"
+  ],
+  "follow_up_questions": [
+   "How would you make revocation immediate across instances?",
+   "Would an LRU be better than clear-all?",
+   "Should negative results have a shorter TTL?"
+  ],
+  "concepts": [
+   "caching",
+   "negative caching",
+   "revocation",
+   "TTL"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Latency/DB load vs revocation freshness. 60s ek reasonable middle ground hai, lekin compliance-heavy setups mein kam chahiye.",
+   "failure_scenarios": "Key compromise: revoke ke baad 60s window. Cache-clear flood: attacker random ids se cache thrash karke DB load wapas la sakta hai.",
+   "alternatives": "Postgres LISTEN/NOTIFY ya Redis pub/sub se invalidation; LRU (functools / cachetools) with separate small TTL for negatives; short-lived tokens jahan revocation ki zaroorat kam.",
+   "scale_10x_100x": "Zyada instances = zyada independent caches = revocation inconsistency; central invalidation channel zaroori. DB load per instance cache se bounded rehta hai.",
+   "production_improvements": "LRU with max size, negative TTL 5s, NOTIFY on revoke, metric for cache hit ratio, encrypt secrets at rest aur memory mein minimum time."
+  }
+ },
+ {
+  "id": "OBJS-058",
+  "project_slug": "p07-object-storage",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would you scale this object store to 10x and 100x the load?",
+  "answer_hinglish": "SYSTEM_DESIGN.md ka scaling path follow karunga, aur har step ko bottleneck se justify karunga.\n\n10x: Pehla bottleneck single Python process CPU hai (76 PUT/s small objects at best, TESTING.md). API stateless hai -- locks Postgres mein, koi sticky state nahi -- toh zyada processes/pods load balancer ke peeche. Backend S3-compatible (SeaweedFS/MinIO/AWS) taaki durability aur capacity delegate ho. Listing heavy ho toh read replicas -- lekin dhyan: listing replica pe stale ho sakti hai, aur hamara strong read-after-write promise sirf primary pe hai. PgBouncer connection pooling kyunki har process 10+20 connections ka pool rakhta hai.\n\n100x: Ab Postgres metadata single writer limit hai. Metadata shard karo bucket se (ya hash(bucket,key) agar ek bucket hi bahut bada hai). Bucket se shard karne pe ek bucket ki listing ek shard pe rehti hai aur advisory lock bhi local; hash se shard karne pe listing scatter-gather ban jati hai, toh dedicated listing index chahiye. Bytes ko API se hatao: presigned URLs directly blob store pe point karein, public reads CDN se serve hon -- API sirf control plane. GC ka orphan scan (observation O6: poora store list karke saare referenced keys memory set mein) is scale pe kaam nahi karega -- prefix/time-partitioned incremental scan chahiye.\n\nHuge objects: multipart completion abhi parts ko re-stream karke naya blob banata hai -- double I/O. Server-side composition (manifest of part blobs, ya backend ka native multipart) chahiye. Blob layer mein erasure coding. Quota ke liye SUM over all versions har PUT pe mehenga -- maintained usage counters.",
+  "why_needed": "Senior interview mein dekha jata hai ki aap bottlenecks ka order jaante ho aur har step ka cost.",
+  "real_world_analogy": "Ek dukaan se chain banana: pehle aur cashiers (API processes), phir alag godown (blob store), phir har sheher ka apna inventory system (sharded metadata), aur ghar tak delivery seedha godown se (presign/CDN).",
+  "how_it_works": "Control plane (auth, metadata, locks) vs data plane (bytes). Data plane ko API se alag karna sabse bada multiplier hai; control plane ko shard karna doosra.",
+  "in_this_project": "Stateless: `main.py::create_app` mein sirf engine pool + storage adapter; per-instance state sirf `app.state.secret_cache` (`SecretCache`). Coordination: `key_lock_sql`, `uq_objects_latest`, bucket FOR UPDATE. Bytes path: `get_object` -> `StreamingResponse(storage.get(...))`. GC: `run_gc` + `list_older_than`. Scaling table SYSTEM_DESIGN.md.",
+  "implementation_files": [
+   "projects/07-object-storage/SYSTEM_DESIGN.md",
+   "projects/07-object-storage/objstore/main.py::create_app",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/services/objects.py::key_lock_sql",
+   "projects/07-object-storage/TESTING.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Stateless API se 10x almost free",
+   "Clear data/control plane split ka path"
+  ],
+  "disadvantages": [
+   "Sharding listing aur cross-bucket admin stats ko complex banata hai",
+   "Presign-to-blob-store ke baad API checksums/quota enforce nahi kar sakta"
+  ],
+  "common_mistakes": [
+   "Pehle hi sharding karna bina measure kiye",
+   "Read replicas pe listing aur read-after-write promise mix karna",
+   "Bytes ko hamesha API se proxy karna"
+  ],
+  "follow_up_questions": [
+   "How would you shard metadata and still list a bucket?",
+   "What do you lose when clients upload directly to the blob store?",
+   "How would GC work at billions of blobs?"
+  ],
+  "concepts": [
+   "horizontal scaling",
+   "sharding",
+   "CDN",
+   "control plane vs data plane"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bucket-sharding listing simple rakhta hai lekin hot bucket ek shard pe; hash-sharding load balance karta hai lekin listing scatter-gather. Direct-to-blob-store bandwidth bachata hai par enforcement (checksums, quotas) blob store/callbacks pe shift hota hai.",
+   "failure_scenarios": "Shard failure = us shard ke buckets unavailable; replica lag = stale listing; CDN cache = deleted object kuch der tak served (purge chahiye).",
+   "alternatives": "FoundationDB/Spanner/TiKV jaisa distributed metadata store; Ceph RGW/MinIO jaisa ready system; Cassandra for metadata with LWT.",
+   "scale_10x_100x": "10x: processes + S3 backend + replicas + PgBouncer. 100x: metadata shards, CDN, presign direct, incremental GC, usage counters, server-side multipart.",
+   "production_improvements": "Capacity tests per stage with a separate load generator, per-shard metrics, CDN purge on delete, admission control/rate limits per tenant."
+  }
+ },
+ {
+  "id": "OBJS-059",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens if an upload's body is corrupted in transit?",
+  "answer_hinglish": "Seedha: server 400 BadDigest return karta hai, jo blob likha gaya tha woh delete ho jata hai, aur koi metadata row nahi banti -- toh object kabhi visible hi nahi hota.\n\nKaise: client upload ke saath `Content-MD5` (base64 MD5) aur/ya `x-obj-checksum-sha256` header bhejta hai (ya signed request mein `x-obj-content-sha256`). Server stream karte waqt `HashingStream` MD5 aur SHA-256 dono calculate karta hai. Upload complete hone par `_verify_digests` compare karta hai. Mismatch -> `BadDigest` exception. `put_object` mein `except BaseException: await storage.delete(blob_key); raise` -- blob cleanup aur error propagate.\n\nDhyan do order pe: bytes PEHLE blob mein likhe gaye (hash poore stream ke baad hi pata chalta hai), phir verify, phir hi metadata. Isliye corrupt data kabhi 'latest version' nahi banta -- purana version (agar tha) as-is rehta hai.\n\ntest_integrity_checks_reject_corrupted_uploads: galat MD5 -> 400 BadDigest; galat SHA-256 -> 400; GET -> 404; aur `(tmp_path / \"blobs\").glob(\"*/*/*\")` empty -- rejected blobs disk pe nahi bache. Agar delete bhi fail ho jaye toh blob orphan ban jayega aur GC grace period ke baad hata dega.\n\nClient ki zimmedari: checksum bhejna. Agar client koi checksum nahi bhejta aur UNSIGNED-PAYLOAD use karta hai, toh server ke paas compare karne ko kuch nahi -- TCP checksum aur TLS hi bachate hain.",
+  "why_needed": "Silent data corruption storage system ka sabse bura failure hai; detect karke reject karna zaroori.",
+  "real_world_analogy": "Courier ke saath packet ka weight likha hai; delivery pe weight match nahi hua toh packet accept nahi, wapas.",
+  "how_it_works": "stream -> blob + md5/sha256 -> compare with headers -> mismatch: delete blob, 400; match: metadata commit.",
+  "in_this_project": "`services/objects.py::_verify_digests` aur `put_object`; `BadDigest(AppError)` with status 400 code 'BadDigest'; `storage/base.py::HashingStream`. Test `tests/test_objects.py::test_integrity_checks_reject_corrupted_uploads`. FAILURE_SCENARIOS #1.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::_verify_digests",
+   "projects/07-object-storage/objstore/services/objects.py::BadDigest",
+   "projects/07-object-storage/tests/test_objects.py::test_integrity_checks_reject_corrupted_uploads",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/objects.py (_verify_digests)\nif content_md5:\n    expected = base64.b64decode(content_md5, validate=True).hex()\n    if expected != info.md5:\n        raise BadDigest(\"Content-MD5 does not match the received body (corrupted in transit?)\")\nfor label, value in ((\"x-obj-checksum-sha256\", sha256_header), (\"signed payload\", signed_sha256)):\n    if value and value.lower() != info.sha256:\n        raise BadDigest(f\"{label} does not match the received body\")",
+  "code_language": "python",
+  "advantages": [
+   "Corrupt data kabhi visible nahi",
+   "Purana version safe rehta hai",
+   "Cleanup automatic"
+  ],
+  "disadvantages": [
+   "Checksum optional hai -- client na bheje toh detection nahi",
+   "Mismatch tab pata chalta hai jab poora upload ho chuka (bandwidth waste)"
+  ],
+  "common_mistakes": [
+   "Content-MD5 ko hex bhejna (base64 chahiye)",
+   "Verify se pehle metadata commit karna",
+   "Rejected blob ko delete na karna"
+  ],
+  "follow_up_questions": [
+   "Why can't you verify before writing the bytes?",
+   "What if storage.delete fails after BadDigest?",
+   "Does TLS make Content-MD5 unnecessary?"
+  ],
+  "concepts": [
+   "data integrity",
+   "checksums",
+   "BadDigest"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-060",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens if the API process crashes after writing the blob but before committing metadata?",
+  "answer_hinglish": "Result: ek orphan blob -- bytes storage mein hain lekin koi `objects` ya `multipart_parts` row usko reference nahi karti. Client ko 200 kabhi nahi mila (crash ho gaya), toh client ke liye upload fail hua aur woh retry karega -- retry naya random blob key banayega. Object ka purana state (agar tha) bilkul intact hai, kyunki metadata transaction commit hi nahi hua.\n\nYeh deliberately design kiya gaya hai -- 'bytes first, metadata second'. Ulta order (metadata pehle) mein crash ke baad ek row hoti jo aise blob ko point karti jo exist nahi karta -- GET 500 dega, data loss jaisa dikhega. Orphan blob sirf garbage hai: storage waste, correctness issue nahi.\n\nCleanup: `run_gc` ka doosra phase -- `storage.list_older_than(orphan_grace_seconds)` (default 3600s) se purane blobs list karo, `objects` + `multipart_parts` ke saare blob_keys ka set banao, aur jo set mein nahi hai unhe `delete_any` karo. Grace period isliye ki abhi in-flight upload ka blob (jo commit hone wala hai) bhi 'unreferenced' dikhta hai -- usse delete nahi karna.\n\nTest: test_gc_deletes_queued_and_orphan_blobs_but_keeps_live_ones crash simulate karta hai -- `st.put(\"deadbeef\" * 5, ...)` bina metadata ke, phir `os.utime` se mtime 2 ghante purana, phir GC -> `deleted_orphans == 1` aur live objects safe. Local adapter pe `.tmp-*` files (crash mid-write) bhi isi scan mein aati hain.",
+  "why_needed": "Do systems (Postgres + blob store) ke beech distributed transaction nahi hai; crash-safe ordering hi consistency deta hai.",
+  "real_world_analogy": "Pehle saaman godown mein rakho, phir register mein entry karo. Entry se pehle bijli gayi toh godown mein ek unregistered dibba padha hai -- monthly audit mein hata do. Ulta karte toh register mein entry hoti par saaman nahi -- customer ko 'stock hai' bol ke dhoka.",
+  "how_it_works": "Write: blob put -> verify -> txn commit. Crash between = unreferenced blob. GC: list blobs older than grace, subtract referenced set, delete rest.",
+  "in_this_project": "`services/objects.py` module docstring (write path ordering), `put_object`; `services/maintenance.py::run_gc`; `config.py` `orphan_grace_seconds = 3600`. Test `tests/test_maintenance.py::test_gc_deletes_queued_and_orphan_blobs_but_keeps_live_ones`. FAILURE_SCENARIOS #3.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/objects.py::put_object",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/tests/test_maintenance.py::test_gc_deletes_queued_and_orphan_blobs_but_keeps_live_ones",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_gc, orphan phase)\ncandidates = await storage.list_older_than(orphan_grace_seconds)\nasync with sm() as s:\n    referenced = set((await s.execute(text(\"SELECT blob_key FROM objects WHERE blob_key IS NOT NULL UNION \"\n                                           \"SELECT blob_key FROM multipart_parts\"))).scalars().all())\nfor name in candidates:\n    if name not in referenced:\n        await storage.delete_any(name)\n        orphans += 1",
+  "code_language": "python",
+  "advantages": [
+   "Dangling metadata kabhi nahi",
+   "Koi 2PC / distributed transaction nahi chahiye",
+   "Self-healing via GC"
+  ],
+  "disadvantages": [
+   "Orphans tab tak storage khate hain jab tak GC na chale",
+   "GC orphan scan full-store hai (observation O6)"
+  ],
+  "common_mistakes": [
+   "Metadata pehle likhna",
+   "Grace period ke bina orphan GC (in-flight uploads mar jayenge)",
+   "Orphan blobs ko monitor na karna"
+  ],
+  "follow_up_questions": [
+   "Why not a two-phase commit between Postgres and S3?",
+   "How would you make the orphan scan incremental?",
+   "Could you record an 'intent' row before writing bytes?"
+  ],
+  "concepts": [
+   "crash consistency",
+   "orphan blobs",
+   "write ordering",
+   "garbage collection"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bytes-first + GC simple hai aur correctness deta hai; cost hai temporary garbage aur ek GC process. Intent-log approach orphans ko directly track karta hai lekin har PUT pe ek extra write.",
+   "failure_scenarios": "GC lamba nahi chala toh orphans jama hote hain (storage cost). Grace period upload duration se chhota ho toh live upload ka blob delete ho sakta hai.",
+   "alternatives": "Pending-uploads table (intent row before bytes, delete after commit; GC sirf expired intents ko dekhe); 2PC (bahut complex, blob stores support nahi karte); S3 jaisa backend jahan multipart incomplete parts lifecycle se expire hote hain.",
+   "scale_10x_100x": "Billions of blobs pe full listing + in-memory referenced set impossible; intent table ya time-partitioned blob prefixes (e.g. date/hex) se incremental GC.",
+   "production_improvements": "Orphan count metric (abhi sirf warning log `gc_removed_orphan_blobs`), alert on spike (crash loop ka signal), intent table, GC batch/paginated."
+  }
+ },
+ {
+  "id": "OBJS-061",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens if the process crashes while the local adapter is halfway through writing a blob?",
+  "answer_hinglish": "Koi half-written blob kabhi visible nahi hota. Local adapter final path pe seedha nahi likhta: pehle same directory mein `.tmp-<uuid>` file mein likhta hai, phir `flush` + `os.fsync`, phir `os.replace(tmp, final)`. `os.replace` same filesystem pe atomic rename hai -- reader ya toh poori final file dekhega ya kuch nahi.\n\nCrash mid-write ke baad disk pe bas ek `.tmp-...` file bachti hai. Metadata row kabhi bani hi nahi (bytes first), toh kuch use reference nahi karta. Normal error path mein (exception, client disconnect, TooLarge) `except BaseException: f.close(); tmp.unlink(missing_ok=True)` temp file turant hata deta hai. Hard crash (kill -9, power loss) mein cleanup code nahi chalta -- tab `list_older_than` jo `root.glob(\"*/*/*\")` scan karta hai, `.tmp-*` files ko bhi candidates mein include karta hai (comment: 'includes .tmp-* leftovers from crashed writes'), aur kyunki woh kisi referenced set mein nahi hain, `delete_any` grace period ke baad unhe hata deta hai.\n\nfsync kyun rename se PEHLE: agar rename pehle disk pe persist ho jaye aur data nahi, toh power loss ke baad final naam wali file zero/garbage bytes ki ho sakti hai. Pehle data durable, phir visible.\n\nO5 (review mein mila, fixed): pehle parent directory ka fsync rename ke baad nahi hota tha. POSIX pe rename khud durable hone ke liye directory fsync chahiye -- power loss pe rename kho sakta tha (aur metadata, jo rename ke baad commit hota hai, missing blob ko point karta). Ab `LocalAdapter` rename ke baad `os.open(final.parent, O_RDONLY | O_DIRECTORY)` + `os.fsync(dfd)` karta hai jahan supported ho; Windows directories fsync nahi kar sakta (NTFS rename journal karta hai), isliye `hasattr(os, 'O_DIRECTORY')` guard.",
+  "why_needed": "Readers ko partial files dikhana aur crash ke baad corrupt blobs chhodna dono unacceptable hain.",
+  "real_world_analogy": "Painting ko pehle backroom mein poora banao aur sukhao, phir gallery wall pe ek jhatke mein lagao -- visitor kabhi adhoori painting nahi dekhega.",
+  "how_it_works": "write tmp -> flush -> fsync(file) -> replace(tmp, final). Error -> unlink tmp. Hard crash -> tmp leftover -> GC after grace.",
+  "in_this_project": "`objstore/storage/local.py::LocalAdapter.put` (`_open`, `_finish`), `list_older_than` aur `delete_any` (glob by name, so tmp files bhi match). FAILURE_SCENARIOS #5.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/local.py::LocalAdapter",
+   "projects/07-object-storage/objstore/storage/local.py::list_older_than",
+   "projects/07-object-storage/objstore/storage/local.py::delete_any",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/storage/local.py (LocalAdapter.put)\ntmp = final.with_name(f\".tmp-{uuid.uuid4().hex}\")\n...\nf = await asyncio.to_thread(_open)\ntry:\n    async for chunk in stream:\n        await asyncio.to_thread(f.write, chunk)\n    await asyncio.to_thread(_finish, f)     # flush + fsync + close + os.replace\nexcept BaseException:\n    f.close()\n    tmp.unlink(missing_ok=True)\n    raise",
+  "code_language": "python",
+  "advantages": [
+   "Atomic visibility",
+   "Data durable before visible",
+   "Leftovers GC se clean"
+  ],
+  "disadvantages": [
+   "Directory fsync sirf POSIX pe (Windows pe skip); har PUT pe ek extra fsync",
+   "fsync har PUT pe latency add karta hai"
+  ],
+  "common_mistakes": [
+   "Final path pe seedha likhna",
+   "Rename ke baad fsync karna",
+   "Temp file ko different filesystem pe rakhna (rename atomic nahi rahega)"
+  ],
+  "follow_up_questions": [
+   "Why must the temp file be in the same directory?",
+   "Why is fsync of the directory needed for rename durability?",
+   "How does S3 provide the same atomicity?"
+  ],
+  "concepts": [
+   "atomic rename",
+   "fsync",
+   "crash safety",
+   "temp files"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-062",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens when the S3 backend is unreachable, or when deleting a blob from it fails?",
+  "answer_hinglish": "Do alag cases hain, aur dono mein design ka 'bytes first, deletes async' rule kaam aata hai.\n\n1. Backend unreachable during PUT: `storage.put` exception raise karta hai (boto3 retries `max_attempts: 3` ke baad). Yeh metadata transaction se PEHLE hota hai, toh koi row nahi badli -- object ka purana state intact. Client ko 500 milta hai (bpcommon ka unhandled handler generic 'internal_error' deta hai, stack trace log hota hai). FAILURE_SCENARIOS #15: 'request fails with 500 before metadata changes'. Shayad kuch partial multipart data SeaweedFS mein bacha ho -- woh orphan GC ya backend ka apna cleanup sambhalega. GET pe backend down -> 500 bhi; metadata row padhne ke baad stream fail hoti hai.\n\n2. Delete fail ya slow: user DELETE ya overwrite request blob ko inline delete nahi karta -- sirf `blob_deletions` mein row insert karta hai same transaction mein. Request already succeed ho chuka. Worker ka `run_gc` baad mein `storage.delete` karta hai. Agar woh fail ho, toh (review fix ke baad) `run_gc` us blob ke liye `gc_delete_failed` log karta hai aur baaki queue process karta rehta hai -- pehle exception poora run abort kar deta tha. Kyunki `DELETE FROM blob_deletions` storage.delete ke BAAD hota hai, failed delete ki queue row bachi rehti hai -- natural retry.\n\nEdge: `put_object` ke error path mein `await storage.delete(blob_key)` best-effort hai -- agar backend hi down hai toh woh bhi fail hoga aur original exception ki jagah naya exception propagate ho sakta hai; blob orphan banega aur GC sambhalega.",
+  "why_needed": "External dependency fail hone pe metadata consistent rehna chahiye aur user-facing operations jitna ho sake succeed karne chahiye.",
+  "real_world_analogy": "Kabadiwala nahi aaya toh bhi aap kamre se purana saaman 'discard' list mein daal dete ho -- kamra (metadata) saaf dikhta hai, kabadiwala jab aayega tab utha lega.",
+  "how_it_works": "PUT: storage first -> fail -> no metadata. DELETE: metadata change + queue in one txn -> GC later -> on failure row stays -> retry next run.",
+  "in_this_project": "`storage/s3.py::S3Adapter` (`Config(retries={\"max_attempts\": 3})`), `services/objects.py::_queue_blob_deletion`, `services/maintenance.py::run_gc`, `objstore/worker.py::main` (try/except + `asyncio.sleep(interval)`).",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/storage/s3.py::S3Adapter",
+   "projects/07-object-storage/objstore/services/objects.py::_queue_blob_deletion",
+   "projects/07-object-storage/objstore/services/maintenance.py::run_gc",
+   "projects/07-object-storage/objstore/worker.py::main",
+   "projects/07-object-storage/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: objstore/worker.py (main)\nwhile True:\n    try:\n        log.info(\"lifecycle_run\", extra=await run_lifecycle(sm, storage))\n        log.info(\"gc_run\", extra=await run_gc(sm, storage, s.orphan_grace_seconds))\n    except Exception:\n        log.exception(\"maintenance_failed\")\n    await asyncio.sleep(interval)",
+  "code_language": "python",
+  "advantages": [
+   "Backend outage metadata corrupt nahi karta",
+   "Deletes user latency/availability se decoupled",
+   "Failed deletes naturally retry"
+  ],
+  "disadvantages": [
+   "Permanently failing blob har run retry hota hai (logged, lekin alert khud lagana padega)",
+   "Backend down = reads bhi down (no replica)"
+  ],
+  "common_mistakes": [
+   "Inline delete jo blob store fail pe user DELETE fail kar de",
+   "Queue row ko delete attempt se pehle hata dena"
+  ],
+  "follow_up_questions": [
+   "How would you stop one poison blob from blocking the whole GC run?",
+   "Should GET fall back to a replica?",
+   "How would you alert on a growing blob_deletions queue?"
+  ],
+  "concepts": [
+   "external dependency failure",
+   "async deletion",
+   "retries"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "OBJS-063",
+  "project_slug": "p07-object-storage",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens when a client starts a multipart upload and never completes or aborts it?",
+  "answer_hinglish": "Parts storage mein pade rehte hain aur paisa/quota khate hain, lekin listing mein dikhte nahi -- yeh classic 'invisible cost' hai. Har part ek blob hai aur `multipart_parts` mein row; upload `multipart_uploads` mein. Object kabhi bana hi nahi, toh `list_objects` mein kuch nahi.\n\nIs project mein teen cheezein isko handle karti hain:\n1. Quota: `_check_quota` sirf objects nahi, `multipart_parts` ka sum bhi count karta hai -- adhoore uploads quota mein shamil hain.\n2. Visibility: `bucket_stats` `incomplete_multipart_uploads` aur `incomplete_multipart_bytes` report karta hai, aur bucket delete `BucketNotEmpty` (409) deta hai jab tak in-progress uploads hain.\n3. Cleanup: lifecycle rule `abort_multipart_days`. `run_lifecycle` purane uploads (`initiated_at < cutoff`) dhundh ke `abort_multipart` call karta hai, jo parts ke blob keys `blob_deletions` mein queue karta hai aur upload row delete (parts CASCADE se). GC phir bytes hatata hai.\n\nTest test_lifecycle_aborts_stale_multipart: rule `abort_multipart_days: 1`, upload + ek 50-byte part, `run_lifecycle(now=FUTURE(2))` -> `aborted_uploads == 1`, stats mein incomplete 0.\n\nProduction advice: har bucket pe default abort rule (S3 best practice bhi yahi hai, e.g. 7 days). Bina rule ke yeh garbage hamesha rehta hai -- koi automatic expiry nahi hai.",
+  "why_needed": "Abandoned uploads silent storage leak hain; lifecycle ke bina kabhi clean nahi hote.",
+  "real_world_analogy": "Gym locker book kiya aur saaman rakh ke bhool gaye -- jab tak management 'unclaimed after N days' rule nahi lagata, locker bhara rehta hai aur aap uska bill bharte ho.",
+  "how_it_works": "Lifecycle: SELECT upload_id WHERE bucket AND key LIKE prefix AND initiated_at < cutoff -> abort_multipart (queue part blobs, DELETE upload) -> GC deletes blobs.",
+  "in_this_project": "`services/maintenance.py::run_lifecycle` (abort_multipart_days branch), `services/objects.py::abort_multipart`, `_check_quota` (parts join), `bucket_stats`, `api/routes.py::delete_bucket`. Test `tests/test_maintenance.py::test_lifecycle_aborts_stale_multipart`. FAILURE_SCENARIOS #11.",
+  "implementation_files": [
+   "projects/07-object-storage/objstore/services/maintenance.py::run_lifecycle",
+   "projects/07-object-storage/objstore/services/objects.py::abort_multipart",
+   "projects/07-object-storage/objstore/services/maintenance.py::bucket_stats",
+   "projects/07-object-storage/tests/test_maintenance.py::test_lifecycle_aborts_stale_multipart"
+  ],
+  "code_example": "# real, trimmed: objstore/services/maintenance.py (run_lifecycle)\nif r[\"abort_multipart_days\"] is not None:\n    cutoff = now - timedelta(days=r[\"abort_multipart_days\"])\n    async with sm() as s, s.begin():\n        ids = (await s.execute(text(\"SELECT upload_id FROM multipart_uploads WHERE bucket = :b AND key LIKE :p \"\n                                    \"ESCAPE '\\\\' AND initiated_at < :c\"), {...})).scalars().all()\n        for uid in ids:\n            await abort_multipart(s, r[\"bucket\"], uid)",
+  "code_language": "python",
+  "advantages": [
+   "Abandoned parts quota mein count -- abuse bounded",
+   "Stats mein visible",
+   "Lifecycle se automatic cleanup"
+  ],
+  "disadvantages": [
+   "Rule optional hai -- default koi expiry nahi",
+   "Abort sabhi uploads ek transaction mein (bahut saare ho toh lamba txn)"
+  ],
+  "common_mistakes": [
+   "Lifecycle abort rule set na karna",
+   "Sochna ki listing khaali hai toh storage bhi khaali hai",
+   "Parts ko inline delete karna (yahan queue hota hai)"
+  ],
+  "follow_up_questions": [
+   "Why are incomplete uploads invisible in listings?",
+   "Should incomplete parts count toward quota?",
+   "What if a client is still uploading parts when the abort rule fires?"
+  ],
+  "concepts": [
+   "multipart upload",
+   "lifecycle",
+   "storage leak"
+  ],
+  "advanced": null
+ }
+]

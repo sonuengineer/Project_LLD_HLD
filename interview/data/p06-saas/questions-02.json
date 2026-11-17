@@ -1,0 +1,1004 @@
+[
+ {
+  "id": "SAAS-022",
+  "project_slug": "p06-saas",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "How does audit.record guarantee that every action has an audit row and no audit row exists for a rolled-back action?",
+  "answer_hinglish": "Simple trick: audit row usi database transaction mein insert hoti hai jisme action hai. `audit.record(s, principal, action, target_type, target_id, **metadata)` ko caller ka session `s` milta hai -- naya connection ya naya transaction nahi. Toh `create_project` mein project INSERT aur `project.created` audit INSERT dono ek transaction mein hain. Transaction commit hua -> dono rows. Kuch bhi fail hua (unique violation, plan limit, exception) -> ROLLBACK -> dono gayab. 'Action hua par audit nahi' ya 'audit hai par action rollback hua' -- dono impossible.\n\nAgar audit alag transaction ya async queue se likhte toh window hoti: action commit, process crash, audit lost. Ya ulta: audit likha, action fail. Compliance ke liye yeh dono bure hain.\n\nRow mein kya jaata hai: `tenant_id`, `actor_user_id` ya `actor_api_key_id` (Principal se), `action`, `target_type`, `target_id` (text, kyunki targets alag types ke hain), `metadata` jsonb (`json.dumps(metadata, default=str)` -- uuid/datetime safe), `ip`, `request_id`. request_id se audit row ko logs aur traces se correlate kar sakte ho.\n\nKuch jagah `audit.record` ki jagah direct INSERT hai (create_tenant, accept_invitation, admin set_status, billing apply_event) kyunki wahan Principal object nahi hai -- lekin pattern same: same transaction. `test_audit_log_records_actions_with_actor` check karta hai ki order `project.deleted, project.created, tenant.created` hai. Trade-off: denied ya failed attempts audit nahi hote, kyunki unka transaction rollback hota hai.",
+  "why_needed": "Audit logs compliance (SOC 2, ISO 27001) ka basic requirement hain; consistency guarantee ke bina audit ka koi bharosa nahi.",
+  "real_world_analogy": "Bank mein cash jama karna aur passbook entry ek hi counter pe, ek hi stamp ke saath -- ya toh dono hote hain ya koi nahi.",
+  "how_it_works": "Route -> tenant_tx -> business write -> audit.record(s, ...) -> COMMIT (dono) ya ROLLBACK (dono).",
+  "in_this_project": "`saas/services/audit.py::record`; callers `tenancy.create_project`, `delete_project`, `invite`, `change_role`, `remove_member`, `create_api_key`, `revoke_api_key`, routes `run_report`, `checkout`, `audit_export`. Table `audit_logs` with `ix_audit_tenant_created`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/audit.py::record",
+   "projects/06-saas/saas/services/tenancy.py::create_project",
+   "projects/06-saas/tests/test_api.py::test_audit_log_records_actions_with_actor"
+  ],
+  "code_example": "# real services/audit.py (trimmed)\nasync def record(s, principal, action, target_type=None, target_id=None, **metadata) -> None:\n    await s.execute(text(\n        \"INSERT INTO audit_logs (tenant_id, actor_user_id, actor_api_key_id, action, target_type, target_id, \"\n        \"metadata, ip, request_id) VALUES (:t, :u, :k, :a, :tt, :ti, CAST(:m AS jsonb), :ip, :rid)\"), {...})",
+  "code_language": "python",
+  "advantages": [
+   "Atomic consistency action <-> audit",
+   "Koi extra infra (queue) nahi",
+   "request_id se correlation"
+  ],
+  "disadvantages": [
+   "Failed/denied attempts audit nahi hote",
+   "Audit insert action ki latency mein add hota hai",
+   "Hot tenant pe audit table bada hota hai"
+  ],
+  "common_mistakes": [
+   "Audit ko fire-and-forget background task mein likhna",
+   "Audit mein secrets (tokens) daalna",
+   "Commit ke baad audit likhna"
+  ],
+  "follow_up_questions": [
+   "Denied access attempts ko kaise audit karoge?",
+   "Audit ko external SIEM tak kaise stream karoge?",
+   "Audit table ki retention policy?"
+  ],
+  "concepts": [
+   "audit log",
+   "transactional consistency",
+   "compliance"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-023",
+  "project_slug": "p06-saas",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "How does TenantCache build keys, and why can't RLS protect you from a cache leak?",
+  "answer_hinglish": "`TenantCache.key(tenant_id, name)` hamesha `saas:cache:{tenant_id}:{name}` return karta hai. Tenant id key ka hissa hai, optional nahi -- `get_or_load` aur `invalidate` dono ka pehla argument `tenant_id` hai. Toh `projects:list` Acme ke liye `saas:cache:<acme-uuid>:projects:list` aur Globex ke liye alag key hai.\n\nRLS kyun nahi bachata? Kyunki RLS database mein chalta hai. Cache hit pe database poocha hi nahi jaata. Agar key sirf `projects:list` hoti: Acme ki request ne list load karke cache ki, Globex ki agli request ko cache hit mila aur Acme ki list mil gayi -- RLS ko pata bhi nahi chala. Yeh 'tenant-awareness beyond SQL' ka sabse common example hai. Module docstring yahi likhta hai.\n\n`get_or_load` flow: GET key -> hit toh JSON decode; miss toh `loader()` (jo `tenant_tx` mein query karta hai), result `SET ex=ttl` (60s default). Redis error pe loader direct call -- cache sirf optimisation hai. Global cheezein (tenant by slug) `_global` namespace use karti hain explicitly.\n\n`test_tenant_aware_cache_never_crosses_tenants`: Acme ki list cache hui, Globex ki list empty aayi, Redis keys exactly do tenant-namespaced keys hain, aur Acme mein naya project create karne ke baad list 2 items dikhati hai (invalidation kaam kar raha).",
+  "why_needed": "Cache leaks real incidents ka source rahe hain; interviewer check karta hai ki aap isolation ko sirf DB tak limited nahi samajhte.",
+  "real_world_analogy": "Apartment ke common letterbox mein sirf 'Flat ka letter' likha ho toh koi bhi utha lega; har letter pe flat number (tenant id) likhna padta hai.",
+  "how_it_works": "key = prefix + tenant_id + name; get -> hit/miss -> loader in tenant_tx -> set with TTL; writes -> invalidate(tenant_id, names).",
+  "in_this_project": "`saas/services/cache.py::TenantCache` (`key`, `get_or_load`, `invalidate`, hits/misses counters). Usage: `routes.list_projects` (`projects:list`), `deps._tenant_by_slug` (`_global`, `tenant-slug:{slug}`), `deps.tenant_principal` (`member-role:{user_id}`).",
+  "implementation_files": [
+   "projects/06-saas/saas/services/cache.py::TenantCache",
+   "projects/06-saas/saas/api/routes.py::list_projects",
+   "projects/06-saas/tests/test_api.py::test_tenant_aware_cache_never_crosses_tenants"
+  ],
+  "code_example": "# real services/cache.py\n@staticmethod\ndef key(tenant_id, name: str) -> str:\n    return f\"saas:cache:{tenant_id}:{name}\"",
+  "code_language": "python",
+  "advantages": [
+   "Structural guarantee -- tenant id bina key nahi banti",
+   "Redis failure pe graceful",
+   "Per-tenant invalidation easy"
+  ],
+  "disadvantages": [
+   "Developer `_global` namespace mein tenant data daal de toh leak",
+   "TTL tak stale data (out-of-band changes)"
+  ],
+  "common_mistakes": [
+   "Cache key user input (slug) se banana bina normalise kiye",
+   "Response ko URL path se cache karna jab auth header alag ho",
+   "CDN pe tenant-specific responses cache karna"
+  ],
+  "follow_up_questions": [
+   "HTTP/CDN layer pe tenant leak kaise hota hai (Vary header)?",
+   "Per-tenant cache flush kaise karoge?",
+   "Cache hit ratio kaise monitor karoge?"
+  ],
+  "concepts": [
+   "tenant-aware caching",
+   "cache key design",
+   "data leakage"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-024",
+  "project_slug": "p06-saas",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How do tenant-aware background jobs work in jobs.py and worker.py?",
+  "answer_hinglish": "Job enqueue karte waqt tenant id message ka hissa hota hai: `enqueue(redis, tenant_id, kind, payload)` -> `LPUSH saas:jobs {tenant_id, kind, payload}`. `run_report` route pehle `reports` row 'queued' status ke saath insert karta hai (tenant_tx mein, audit ke saath), phir job enqueue karta hai aur 202 return.\n\nWorker (`python -m saas.worker`) loop mein `process_one(redis, sm, timeout=1.0)` chalata hai: `BRPOP` (blocking pop, 1s timeout), message parse, `HANDLERS[kind]` lookup (decorator `@handler('project_report')` se registered), aur sabse important: handler ko `async with tenant_tx(sm, msg['tenant_id']) as s` ke andar call karta hai. Handler ko session milta hai jiska RLS context already job ke tenant pe set hai.\n\n`project_report` handler mein jaan-boojh kar koi `WHERE tenant_id` nahi hai -- `SELECT count(*) FROM projects`, `SELECT count(*) FROM memberships`. RLS scope karta hai. `test_tenant_aware_background_job` Globex ka 'globex-secret' project banata hai, Acme ka report run karta hai, aur assert karta hai ki `project_names == ['acme-1']`.\n\nFailure handling: handler exception pe `log.exception` aur alag `tenant_tx` mein report ko 'failed' mark. Unknown kind log hota hai aur drop. Worker har 60s `flush_usage_to_db` bhi chalata hai. Limitation: BRPOP ke baad crash = job lost (no ack/visibility timeout), aur koi retry nahi -- Project 3 jaisa reliable queue production mein chahiye.",
+  "why_needed": "Nightly jobs aur async workers classic leak vector hain -- woh request context ke bahar chalte hain aur aksar 'saare tenants' wali queries likhte hain.",
+  "real_world_analogy": "Kitchen ka order slip: har slip pe table number (tenant) likha hai, aur chef sirf usi table ki plate banata hai -- slip pe number nahi toh plate kahin bhi chali jaye.",
+  "how_it_works": "API: insert report row + LPUSH. Worker: BRPOP -> tenant_tx(tenant) -> handler(s) -> commit; error -> mark failed.",
+  "in_this_project": "`saas/services/jobs.py` (`QUEUE = 'saas:jobs'`, `HANDLERS`, `handler`, `enqueue`, `project_report`, `process_one`), `saas/worker.py::main`, route `api/routes.py::run_report`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/jobs.py::process_one",
+   "projects/06-saas/saas/services/jobs.py::project_report",
+   "projects/06-saas/saas/worker.py::main",
+   "projects/06-saas/tests/test_api.py::test_tenant_aware_background_job"
+  ],
+  "code_example": "# real (trimmed) services/jobs.py\nmsg = json.loads(item[1])\nfn = HANDLERS.get(msg[\"kind\"])\ntry:\n    async with tenant_tx(sm, msg[\"tenant_id\"]) as s:\n        await fn(s, msg[\"tenant_id\"], msg[\"payload\"])\nexcept Exception:\n    log.exception(\"job_failed\", extra={\"kind\": msg[\"kind\"], \"tenant_id\": msg[\"tenant_id\"]})",
+  "code_language": "python",
+  "advantages": [
+   "Handler bug se bhi cross-tenant leak nahi",
+   "Simple Redis list queue",
+   "Report status DB mein trackable"
+  ],
+  "disadvantages": [
+   "At-most-once: crash pe job lost",
+   "No retries/backoff",
+   "Ek queue saare tenants -- noisy tenant doosron ko delay kare"
+  ],
+  "common_mistakes": [
+   "Job mein tenant id na daalna aur handler mein 'sab tenants' query",
+   "Worker ko superuser/owner se chalana",
+   "Worker mein global_tx use karke tenant data expect karna"
+  ],
+  "follow_up_questions": [
+   "Ek tenant 10,000 reports enqueue kare toh fairness kaise?",
+   "Job ko reliable kaise banaoge?",
+   "Cross-tenant maintenance job (sab tenants) kaise likhoge safely?"
+  ],
+  "concepts": [
+   "background jobs",
+   "tenant context propagation",
+   "worker"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-025",
+  "project_slug": "p06-saas",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Why does migration 0001 have a custom run() helper that splits SQL on ';\\n'?",
+  "answer_hinglish": "Yeh ek real bug ka fix hai jo TESTING.md mein 'Bugs found by tests' #3 hai: 'Migration with multiple statements per execute failed under asyncpg's extended protocol: split.'\n\nBackground: Postgres ke do query protocols hain. Simple query protocol ek string mein multiple statements `;` se separated chala sakta hai, lekin parameters support nahi karta. Extended protocol (Parse/Bind/Execute) parameters aur prepared statements support karta hai lekin ek message mein EK hi statement. asyncpg by default extended protocol use karta hai, toh `op.execute(\"CREATE TABLE a ...; CREATE TABLE b ...;\")` fail hota hai -- 'cannot insert multiple commands into a prepared statement'.\n\n`run(sql)` helper `sql.split(';\\n')` karta hai, har piece strip karta hai, aur khaali ya sirf comment wale pieces skip karta hai, baaki har statement ko alag `op.execute` deta hai. Docstring honestly limitation likhta hai: 'Safe here because no statement body contains that sequence internally.' Matlab agar kisi function body ya string literal mein `;` ke baad newline ho toh split use tod dega. Isliye role creation wala `DO $$ ... $$` block aur 0002/0003 ki functions seedha `op.execute` se ek-ek karke chalaye gaye hain; `resolve_api_key` ki body ek line ki hai isliye `run()` mein safe hai.\n\nLesson: driver ka protocol behaviour migrations ko affect karta hai; ek naive split parser nahi hai, toh assumptions comment mein likho.",
+  "why_needed": "Real debugging story -- dikhata hai ki aap driver internals (asyncpg extended protocol) samajhte ho, sirf ORM nahi.",
+  "real_world_analogy": "Courier service jo ek parcel mein ek hi item leta hai -- tumhe saamaan alag-alag parcel mein pack karna padega; aur agar ek item ke andar hi kat-ne ka nishaan ho toh galat jagah se kat jayega.",
+  "how_it_works": "split(';\\n') -> strip -> skip comment-only -> op.execute(each). Function bodies with internal ';\\n' must be executed whole.",
+  "in_this_project": "`migrations/versions/0001_initial.py::run`; 0002 aur 0003 multiple `op.execute` calls use karte hain. `migrations/env.py` `create_async_engine` (asyncpg) se migrations chalata hai.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py::run",
+   "projects/06-saas/migrations/env.py",
+   "projects/06-saas/TESTING.md"
+  ],
+  "code_example": "# real 0001_initial.py\ndef run(sql: str) -> None:\n    \"\"\"asyncpg executes one statement per call (extended protocol), so split on ';' + newline.\n    Safe here because no statement body contains that sequence internally.\"\"\"\n    for stmt in (x.strip() for x in sql.split(\";\\n\")):\n        if stmt and not all(line.strip().startswith(\"--\") or not line.strip() for line in stmt.splitlines()):\n            op.execute(stmt)",
+  "code_language": "python",
+  "advantages": [
+   "Big SQL blocks readable rehte hain",
+   "asyncpg ke saath kaam karta hai"
+  ],
+  "disadvantages": [
+   "Naive split -- plpgsql bodies ya literals tod sakta hai",
+   "Hidden assumption future authors ko pata hona chahiye"
+  ],
+  "common_mistakes": [
+   "Sync psycopg pe test karke asyncpg pe deploy karna",
+   "Function bodies ko split helper se chalana",
+   "Comment-only chunks execute karna (empty statement error)"
+  ],
+  "follow_up_questions": [
+   "Simple vs extended protocol ka performance fark?",
+   "Migrations ke liye sync driver kyun nahi use kiya?",
+   "PgBouncer transaction mode mein prepared statements ka issue?"
+  ],
+  "concepts": [
+   "asyncpg",
+   "extended query protocol",
+   "migrations"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-026",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Give an architecture overview of the SaaS backend: components and how a request flows through them.",
+  "answer_hinglish": "Teen runtime components: FastAPI API (`saas.main:app`), worker (`python -m saas.worker`), aur do datastores -- Postgres (source of truth, RLS) aur Redis (cache, rate limit buckets, usage counters, job queue). Migrations ek alag step hai jo owner role se chalta hai.\n\nCode layers: `api/` (HTTP edge -- `deps.py` authentication/authorization, `routes.py` paanch routers: auth, me, t, billing, admin), `core/` (pure logic, koi IO nahi -- security, rbac, plans, principal), `db/session.py` (tenant_tx/global_tx), `services/` (business logic -- tenancy, auth, audit, limits, cache, billing, jobs). `main.py` app factory lifespan mein engine, Redis pool (BlockingConnectionPool max 50), cache, limits aur billing provider `app.state` pe rakhta hai -- tests `create_app(Settings(...))` se override karte hain.\n\nRequest flow (GET /t/acme/projects): middleware request id + metrics -> `tenant_principal` (tenant from cache/DB, token -> user/key, membership/scopes, suspension, rate limit, quota) -> route `p.require(PROJECT_READ)` -> `cache.get_or_load(tenant, 'projects:list')` -> miss pe `tenant_tx` (BEGIN, set_config, SELECT, COMMIT) -> JSON. Write paths invalidate cache after commit. Async kaam (`/reports`) Redis queue pe jaata hai aur worker `tenant_tx` mein chalata hai. Billing provider webhooks `/billing/webhook` pe HMAC se authenticate hote hain. Shared `bpcommon` error envelope, JSON logging aur Prometheus metrics deta hai.",
+  "why_needed": "Interview mein architecture 2 minute mein clearly batana zaroori hai; layering aur data stores ki responsibilities clear honi chahiye.",
+  "real_world_analogy": "Restaurant: reception (deps -- kaun ho, reservation hai?), waiter (routes), kitchen (services), store room (Postgres) aur order board (Redis), aur back kitchen staff (worker) jo lambe orders banata hai.",
+  "how_it_works": "Client -> middleware -> deps (Principal) -> route -> service -> tenant_tx -> Postgres; Redis for cache/limits/queue; worker consumes queue.",
+  "in_this_project": "ARCHITECTURE.md mein file map aur mermaid sequence/flowchart. `saas/main.py::create_app`, `shared/bpcommon/http.py::setup_app` (request id, access log, `/metrics`, `/healthz`). docker-compose services: postgres, redis, migrate, api, worker.",
+  "implementation_files": [
+   "projects/06-saas/ARCHITECTURE.md",
+   "projects/06-saas/saas/main.py::create_app",
+   "shared/bpcommon/http.py::setup_app",
+   "projects/06-saas/docker-compose.yml"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear layering; core pure aur testable",
+   "App factory se tests mein config override",
+   "Shared infra code reuse"
+  ],
+  "disadvantages": [
+   "Single Postgres = single point of failure aur scaling limit",
+   "Redis pe kai responsibilities (cache, queue, limits) -- ek failure kai features ko affect"
+  ],
+  "common_mistakes": [
+   "Business logic routes mein likhna",
+   "Global module-level engine (tests mein override mushkil)",
+   "Redis ko source of truth banana"
+  ],
+  "follow_up_questions": [
+   "Redis ki responsibilities alag instances mein split karoge?",
+   "API aur worker independently scale kaise?",
+   "Read replicas kahan fit hongi?"
+  ],
+  "concepts": [
+   "layered architecture",
+   "app factory",
+   "request lifecycle"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-027",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Describe the defence-in-depth isolation layers. Why not rely on just one?",
+  "answer_hinglish": "Mere design mein tenant isolation paanch-chhe layers mein hai, aur har layer ek alag class ki galti pakadti hai. (1) Routing: tenant data sirf `/t/{slug}` routes pe, jo `tenant_principal` require karte hain. (2) Membership: non-member ko 404 -- tenant exist karta hai yeh bhi nahi pata chalta. (3) Permission: `Principal.require(...)` har action pe; API key scopes AND creator role. (4) Explicit filters: sensitive lookups (membership role) mein `WHERE tenant_id = :t AND user_id = :u` RLS ke upar bhi. (5) Postgres RLS: bhooli hui WHERE clause, galat job query -- sab current tenant tak limited. (6) Role setup: app non-owner, NOSUPERUSER, NOBYPASSRLS -- toh RLS bypass nahi ho sakta. Aur SQL ke bahar: cache keys mein tenant id, jobs mein tenant id + worker tenant_tx.\n\nEk pe kyun nahi? Kyunki har layer ka apna blind spot hai. App checks developer discipline pe depend karte hain -- ek route mein require() bhool gaye. RLS sirf DB queries dekhta hai -- cache, files, logs nahi. RLS policies khud buggy ho sakti hain -- mere project mein yahi hua: memberships policy ka OR. Tab layer 4 (explicit filter) wahi galti pakadti, aur fix ke baad dono hain. Interesting point: bug ke time explicit filter nahi tha, isliye escalation hua -- yeh exactly dikhata hai ki kyun dono chahiye.\n\nCost: thoda duplicated logic aur 'zero rows kyun?' type debugging. Lekin cross-tenant leak SaaS company ke liye existential risk hai, toh yeh cost justified hai.",
+  "why_needed": "Senior interviewers 'defence in depth' sunna chahte hain with concrete examples, aur yeh ki aap kis layer se kya fail ho sakta hai samajhte ho.",
+  "real_world_analogy": "Bank vault: gate guard, ID check, locker room key, individual locker key, aur CCTV. Ek guard so jaye toh baaki khade hain.",
+  "how_it_works": "Each request passes all layers; a bug in one layer is caught by the next; failure mode is 404/403/zero rows, never data from another tenant.",
+  "in_this_project": "ARCHITECTURE.md 'Isolation layers (defence in depth)' flowchart. Code: `deps.tenant_principal` (layers 1-3), `deps.load_role` explicit filter comment 'belt and braces', `0001`/`0003` RLS, role creation, `cache.py`, `jobs.py`.",
+  "implementation_files": [
+   "projects/06-saas/ARCHITECTURE.md",
+   "projects/06-saas/saas/api/deps.py::tenant_principal",
+   "projects/06-saas/migrations/versions/0003_strict_memberships_policy.py",
+   "projects/06-saas/saas/services/cache.py::TenantCache"
+  ],
+  "code_example": "# real api/deps.py\nasync def load_role():\n    async with tenant_tx(app.state.sm, tid, user_id) as s:\n        # Explicit tenant filter as well as RLS: belt and braces on the most sensitive lookup.\n        return await s.scalar(text(\"SELECT role FROM memberships WHERE tenant_id = :t AND user_id = :u\"),\n                              {\"t\": tid, \"u\": user_id})",
+  "code_language": "python",
+  "advantages": [
+   "Ek layer ka bug data breach nahi banta",
+   "Har layer independently testable",
+   "Audit/compliance story strong"
+  ],
+  "disadvantages": [
+   "Duplicated logic",
+   "Debugging mein kai layers check karni padti hain",
+   "Thoda per-request overhead"
+  ],
+  "common_mistakes": [
+   "RLS ko akela authorization maan lena",
+   "App checks ko 'RLS hai na' sochke skip karna",
+   "SQL ke bahar ke leak vectors (cache, exports, logs) bhool jana"
+  ],
+  "follow_up_questions": [
+   "Kaunsi layer sabse zaroori hai agar ek hi rakh sako?",
+   "Logs aur error messages se tenant data leak kaise ho sakta hai?",
+   "Layers ko continuously verify kaise karoge?"
+  ],
+  "concepts": [
+   "defence in depth",
+   "tenant isolation",
+   "security layers"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har extra layer complexity aur latency add karti hai; lekin leak ki cost (customer trust, legal) bahut zyada hai. Explicit filters aur RLS ka overlap intentional hai.",
+   "failure_scenarios": "Policy bug (OR) + missing explicit filter = escalation (real). Cache key bug = leak jo RLS nahi pakdega. Owner URL misconfig = RLS off silently.",
+   "alternatives": "Physical isolation (DB per tenant) jo kai layers ko redundant banata hai; service mesh level tenant routing; ORM-level automatic tenant scoping (jaise Django tenant middlewares).",
+   "scale_10x_100x": "Scale pe zyada services aur data stores (search index, object storage, analytics) -- har ek ko tenant-aware banana padega: index per tenant ya tenant filter, S3 prefixes with IAM conditions.",
+   "production_improvements": "Continuous cross-tenant tests in CI (har naye endpoint ke liye automatic 'Bob can't see Acme' test), runtime assertion ki result rows ka tenant_id == context, aur periodic pen tests."
+  }
+ },
+ {
+  "id": "SAAS-028",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "How is the billing provider abstracted, and what does the mock provider simulate?",
+  "answer_hinglish": "App kabhi Stripe/Razorpay SDK directly call nahi karta. `services/billing.py` mein `BillingProvider` ek `typing.Protocol` hai -- structural interface: `name`, `async create_checkout(tenant_id, plan) -> CheckoutSession`, aur `verify_and_parse(body, signature) -> BillingEvent`. Routes sirf `request.app.state.billing` ke through baat karte hain. Provider-neutral data classes: `CheckoutSession(id, url)` aur `BillingEvent(id, type, tenant_id, plan, status, customer_id, subscription_id)`.\n\n`MockBillingProvider` real provider jaisa behave karta hai: `create_checkout` `cs_...` session id banata hai aur in-memory dict mein tenant aur plan yaad rakhta hai; `complete(session_id)` customer payment simulate karta hai aur ek `subscription.updated` event body + Stripe-style signature `t=<ts>,v1=<hmac>` return karta hai; `sign` HMAC-SHA256 over `\"{ts}.\" + body`; `verify_and_parse` signature aur 300s tolerance verify karke `BillingEvent` banata hai. Demo route `/billing/mock/checkout/{session}/complete` complete() call karke apne hi `/billing/webhook` ko ASGI transport se POST karta hai -- poora real flow.\n\nBusiness logic `apply_event` provider-independent hai: plan validate (`PLANS` mein hona chahiye), idempotency insert, tenant plan update, subscriptions upsert, audit. Naya provider = naya class jo protocol implement kare; `main.py` mein ek line badlegi. Limitations honest: proration, dunning, failed renewals, disputes exercise nahi hote (TRADEOFFS #10).",
+  "why_needed": "Vendor lock-in se bachna aur offline testability -- dono architecture questions mein aate hain.",
+  "real_world_analogy": "Mobile charger ka universal adapter: phone (app) ko sirf USB-C (protocol) chahiye; deewar ka socket Indian ho ya UK (Stripe ya Razorpay), adapter badlo.",
+  "how_it_works": "Route -> provider.create_checkout -> user pays -> provider POSTs signed event -> provider.verify_and_parse -> apply_event (provider-neutral).",
+  "in_this_project": "`saas/services/billing.py::BillingProvider`, `MockBillingProvider`, `apply_event`; `saas/main.py` mein `app.state.billing = MockBillingProvider(settings.billing_webhook_secret)`; routes `checkout`, `billing_webhook`, `mock_complete`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/billing.py::BillingProvider",
+   "projects/06-saas/saas/services/billing.py::MockBillingProvider",
+   "projects/06-saas/saas/api/routes.py::mock_complete",
+   "projects/06-saas/saas/main.py::create_app"
+  ],
+  "code_example": "# real services/billing.py\nclass BillingProvider(Protocol):\n    name: str\n\n    async def create_checkout(self, tenant_id: str, plan: str) -> CheckoutSession: ...\n\n    def verify_and_parse(self, body: bytes, signature: str | None) -> BillingEvent: ...",
+  "code_language": "python",
+  "advantages": [
+   "Offline tests, no network",
+   "Provider swap localised",
+   "Domain events provider-neutral"
+  ],
+  "disadvantages": [
+   "Mock real edge cases (proration, disputes) cover nahi karta",
+   "Mock sessions in-memory -- multi-replica pe kaam nahi karega",
+   "Mock complete endpoint unauthenticated -- production mein disable karna zaroori"
+  ],
+  "common_mistakes": [
+   "Provider SDK objects ko domain mein leak karna",
+   "Mock ko production config mein chhod dena",
+   "Protocol bahut chhota rakhna (refunds/cancel baad mein sab jagah hack)"
+  ],
+  "follow_up_questions": [
+   "Real Stripe adapter mein kya extra handle karna padega?",
+   "Do providers ek saath (India Razorpay, baaki Stripe) kaise?",
+   "Provider ki outage pe checkout ka kya?"
+  ],
+  "concepts": [
+   "adapter pattern",
+   "Protocol",
+   "billing abstraction",
+   "testability"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-029",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Design a hybrid 'silo for enterprise' model on top of this pooled architecture. What has to change?",
+  "answer_hinglish": "Hybrid matlab free/pro tenants pooled DB mein rehte hain, aur enterprise ya regulated tenants apne dedicated database (silo) mein. Is project mein yeh implement nahi hai; SYSTEM_DESIGN.md isko scaling path ke roop mein list karta hai. Main aise design karunga.\n\n(1) Tenant catalog: ek global control-plane table `tenants` mein `deployment` column (pool-1, silo-acme) aur connection info ka reference (secret manager path). (2) Routing: `tenant_principal` tenant resolve karne ke baad Principal mein shard/silo id rakhe, aur `tenant_tx` sessionmaker ko us shard se le -- `sm_for(tenant)` registry, har silo ka apna engine/pool. Accha point: humara code pehle se har tenant query ko `tenant_tx(sm, tenant_id)` se guzarta hai, toh routing ek jagah add hogi. (3) Schema same rakho -- silo mein bhi `tenant_id` column aur RLS; isse code paths same rahenge aur migration ek hi. (4) Migrations: runner jo saare databases pe chale, versions track kare, aur failures pe resume kare. (5) Global data -- users, memberships across tenants, billing_events -- control plane mein; `user_tenants()` control plane se. (6) Move tool: pool se silo tenant migrate karna -- logical replication ya dual-write + backfill, verify counts, cutover with brief write freeze.\n\nTrade-offs: silo ka cost (per-DB instance, connection pools -- N tenants x pool_size connections) aur operational load. Isliye sirf top tier ko silo. Fayda: noisy neighbour gaya, per-tenant backup/restore aur data residency (EU tenant EU region mein) possible.",
+  "why_needed": "Real SaaS companies (Salesforce, Atlassian) isi pattern pe evolve hui hain; senior design round mein yeh common hai.",
+  "real_world_analogy": "Hostel mein zyada students dorm mein, lekin VIP guest ko alag cottage; reception register batata hai kaun kahan hai, aur kitchen ka menu (schema) sabke liye same.",
+  "how_it_works": "Control plane (tenant -> deployment) + data planes (pool/silos) + per-request routing + fleet-wide migrations + tenant move tooling.",
+  "in_this_project": "Abhi: ek engine `app.state.sm`; `tenant_tx(sm, tenant_id)` har jagah. SYSTEM_DESIGN.md 'Isolation models' table mein Hybrid row aur 'Scaling path' mein 'move biggest tenants to silos'. Implementation is project mein nahi hai.",
+  "implementation_files": [
+   "projects/06-saas/SYSTEM_DESIGN.md",
+   "projects/06-saas/saas/db/session.py::tenant_tx",
+   "projects/06-saas/saas/api/deps.py::tenant_principal",
+   "projects/06-saas/saas/main.py::create_app"
+  ],
+  "code_example": "# illustrative (not in repo): routing tenant_tx by deployment\nENGINES: dict[str, async_sessionmaker] = {}\n\ndef sm_for(tenant: dict) -> async_sessionmaker:\n    return ENGINES[tenant[\"deployment\"]]      # 'pool-1' or 'silo-acme'\n\n# route: async with tenant_tx(sm_for(p.tenant), p.tenant_id, p.user_id) as s: ...",
+  "code_language": "python",
+  "advantages": [
+   "Pricing tier = isolation tier",
+   "Enterprise ke liye residency/compliance",
+   "Pool ka cost advantage baaki tenants ke liye"
+  ],
+  "disadvantages": [
+   "Routing + fleet migrations ki complexity",
+   "Cross-tenant queries (admin, analytics) ab kai DBs pe",
+   "Connection count explode"
+  ],
+  "common_mistakes": [
+   "Silo ke liye alag schema/code path banana",
+   "Global data (users) ko silo mein copy karna",
+   "Tenant move bina verification ke"
+  ],
+  "follow_up_questions": [
+   "Pool se silo zero-downtime move kaise?",
+   "Users table silo mein ho ya control plane mein?",
+   "Fleet migration mein ek silo fail ho jaye toh?"
+  ],
+  "concepts": [
+   "hybrid tenancy",
+   "control plane",
+   "tenant routing",
+   "data residency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Same schema + RLS silo mein bhi = ek codebase; cost yeh ki silo mein RLS redundant overhead. Control plane ek naya critical dependency.",
+   "failure_scenarios": "Routing table stale -> request galat DB pe (zero rows, fail closed theek hai); silo down -> sirf woh tenant down (blast radius chhota); fleet migration partial -> version skew.",
+   "alternatives": "Citus (distributed Postgres, tenant_id distribution column) jo routing khud karta hai; schema-per-tenant as middle tier; cell-based architecture (har cell full stack).",
+   "scale_10x_100x": "1000 silos pe per-silo pools impossible -- PgBouncer per silo, ya cells mein group karo; migrations orchestrator with canary waves.",
+   "production_improvements": "Tenant move tooling with logical replication, per-tenant restore drills, residency-aware routing, cost dashboards per silo."
+  }
+ },
+ {
+  "id": "SAAS-030",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "How does the platform admin feature work, and why are admin actions written into the tenant's audit log?",
+  "answer_hinglish": "Platform admin SaaS company ka operator hai (support/ops), tenant ka member nahi. `users.is_platform_admin` flag ek explicit operator command se set hota hai: `python -m saas.cli promote <email>`. Review se pehle yeh registration ke waqt email `platform_admin_emails` config mein match hone pe set hota tha -- bina email verification ke jo pehle woh email register kare woh platform admin! Woh path hata diya (`test_registration_does_not_grant_platform_admin`). `platform_admin` dependency JWT se user id leti hai (`current_user_id`, API keys reject) aur DB se flag check karti hai; nahi toh 403 'platform admin only'.\n\nAdmin routes: `GET /admin/tenants` (saari tenants -- `tenants` table pe RLS nahi hai, `global_tx` kaafi), `POST /admin/tenants/{id}/status` (active/suspended + reason), `GET /admin/tenants/{id}/usage` (pehle Redis counters flush, phir `tenant_tx(tenant_id)` mein usage_counters), `POST /admin/usage/flush`.\n\nSuspension do steps mein: `global_tx` mein `UPDATE tenants SET status`, phir `tenant_tx(tenant_id, admin_id)` mein audit row `platform.tenant_suspended` with `{reason}` metadata, phir tenant slug cache invalidate taaki agla request turant 403 dekhe.\n\nAudit tenant ke log mein kyun? Kyunki tenant ko jaanne ka haq hai ki unke account ke saath kya hua -- 'humara account kisne aur kyun suspend kiya?'. Platform admin power abuse ka risk hai (SECURITY.md: 'Platform admin abuse -> admin actions written into the tenant's audit log'). Aur saas_app audit_logs ko UPDATE/DELETE nahi kar sakta, toh admin bhi trail mita nahi sakta app ke through. Admin ko data padhne ke liye bhi `tenant_tx` lena padta hai -- RLS admin pe bhi lagta hai, koi magic bypass nahi.",
+  "why_needed": "Internal tools sabse common leak/abuse vector hain; interviewer dekhta hai ki admin access bhi controlled aur audited hai.",
+  "real_world_analogy": "Building ka facility manager kisi bhi office ki bijli kaat sakta hai, lekin us office ke register mein entry karni padti hai ki kab, kyun.",
+  "how_it_works": "platform_admin dep -> UPDATE tenants (global) -> audit INSERT in tenant_tx(tenant, admin) -> invalidate cache.",
+  "in_this_project": "`saas/api/deps.py::platform_admin`, `saas/api/routes.py::set_status`, `tenant_usage`, `all_tenants`. `saas/cli.py::promote` (operator grant); registration ab admin flag set nahi karta (`test_registration_does_not_grant_platform_admin`). Test `test_platform_admin_suspension`.",
+  "implementation_files": [
+   "projects/06-saas/saas/api/deps.py::platform_admin",
+   "projects/06-saas/saas/api/routes.py::set_status",
+   "projects/06-saas/saas/services/auth.py::AuthService",
+   "projects/06-saas/tests/test_api.py::test_platform_admin_suspension",
+   "projects/06-saas/saas/cli.py::promote"
+  ],
+  "code_example": "# real (trimmed) api/routes.py set_status\nasync with tenant_tx(request.app.state.sm, tenant_id, admin_id) as s:   # admin acts inside the tenant: audited\n    await s.execute(text(\"INSERT INTO audit_logs (tenant_id, actor_user_id, action, metadata) \"\n                         \"VALUES (:t, :u, :a, CAST(:m AS jsonb))\"),\n                    {\"t\": tenant_id, \"u\": admin_id, \"a\": f\"platform.tenant_{body.status}\", ...})",
+  "code_language": "python",
+  "advantages": [
+   "Admin actions transparent to tenant",
+   "Admin bhi RLS ke andar",
+   "Suspension turant effective (cache invalidation)"
+  ],
+  "disadvantages": [
+   "Status update aur audit do alag transactions -- beech mein crash = audit missing",
+   "Admin grant CLI/DB access pe depend karta hai (audit trail CLI ke bahar)",
+   "Admin ke liye MFA nahi"
+  ],
+  "common_mistakes": [
+   "Admin tools ko superuser DB connection dena",
+   "Admin actions ko sirf internal log mein rakhna",
+   "Support ko tenant impersonation bina audit ke"
+  ],
+  "follow_up_questions": [
+   "Support engineer ko customer data dekhna ho toh (break-glass) kaise?",
+   "Admin ke liye MFA/SSO kyun mandatory?",
+   "Status update + audit ko atomic kaise banaoge?"
+  ],
+  "concepts": [
+   "platform admin",
+   "internal tooling",
+   "audit",
+   "suspension"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-031",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Why does the project use two database identities (owner for migrations, saas_app for the app), and how is that wired in deployment?",
+  "answer_hinglish": "Do identities isliye ki do bilkul alag kaam hain aur unke privileges bhi alag hone chahiye. Owner role schema ka maalik hai: tables, indexes, policies, functions banata hai, role `saas_app` create karta hai, grants deta hai. Yeh sirf deploy time pe `alembic upgrade head` ke liye chahiye. App role `saas_app` runtime pe har request serve karta hai: sirf DML, audit_logs pe sirf SELECT/INSERT, NOSUPERUSER NOBYPASSRLS, kisi table ka owner nahi -- taaki RLS hamesha lage.\n\nWiring: `config.py` mein do settings: `database_url` (saas_app) aur `migration_database_url` (owner). `migrations/env.py` `-x url=...` ya `migration_database_url` use karta hai aur docstring kehta hai 'never as the app role'. docker-compose mein `x-env` dono URLs define karta hai; `migrate` service `alembic upgrade head` chalake exit karti hai, aur `api` aur `worker` `depends_on: migrate: service_completed_successfully` -- matlab migration pehle, app baad mein. saas_app ka password `SAAS_APP_DB_PASSWORD` env se migration mein inject hota hai (single quotes escape karke).\n\nDEPLOYMENT.md checklist: 'Run migrations as a separate step before rolling the API' aur secrets secret manager se. Tests bhi yahi mirror karte hain: `APP_URL` saas_app, `OWNER_URL` sirf TRUNCATE ke liye. Galti se app ko owner URL diya toh sab chalega lekin RLS gayab -- isliye yeh separation documentation aur config dono mein explicit hai.",
+  "why_needed": "Least privilege aur safe deployment pipeline -- dono production readiness ke signals hain.",
+  "real_world_analogy": "Construction company (owner) building banati hai aur chaabiyan deti hai; resident (app) sirf apne flat ki chaabi rakhta hai. Resident ko builder ki master key nahi dete.",
+  "how_it_works": "Deploy: migrate job (owner) -> success -> roll API/worker (saas_app). Runtime: only saas_app connections.",
+  "in_this_project": "`saas/config.py::Settings` (`database_url`, `migration_database_url`, `app_db_password`), `migrations/env.py`, `docker-compose.yml` (`migrate`, `api`, `worker`), `DEPLOYMENT.md` 'Two database identities' table.",
+  "implementation_files": [
+   "projects/06-saas/saas/config.py::Settings",
+   "projects/06-saas/migrations/env.py",
+   "projects/06-saas/docker-compose.yml",
+   "projects/06-saas/DEPLOYMENT.md"
+  ],
+  "code_example": "# real docker-compose.yml (trimmed)\nSAAS_DATABASE_URL: postgresql+asyncpg://saas_app:${SAAS_APP_DB_PASSWORD:-saas_app_dev}@postgres:5432/saas\nSAAS_MIGRATION_DATABASE_URL: postgresql+asyncpg://owner:${SAAS_OWNER_PASSWORD:-owner_dev}@postgres:5432/saas\n...\napi:\n  depends_on: {migrate: {condition: service_completed_successfully}, redis: {condition: service_healthy}}",
+  "code_language": "yaml",
+  "advantages": [
+   "RLS guaranteed at runtime",
+   "Compromised app DDL nahi chala sakta",
+   "Migrations explicit deploy step"
+  ],
+  "disadvantages": [
+   "Do secrets manage karne",
+   "Migration role password env mein (dev defaults)"
+  ],
+  "common_mistakes": [
+   "Same URL dono ke liye",
+   "App startup pe auto-migrate (app ko owner privileges chahiye honge)",
+   "Default dev passwords production mein"
+  ],
+  "follow_up_questions": [
+   "Backward-compatible migrations (expand/contract) kaise likhoge?",
+   "Migration fail ho toh rollout ka kya?",
+   "Owner credentials ko kaun access kar sakta hai?"
+  ],
+  "concepts": [
+   "least privilege",
+   "deployment pipeline",
+   "database migrations"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-032",
+  "project_slug": "p06-saas",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Walk through tenant creation. Why was create_tenant moved from two transactions to one, and what could go wrong before?",
+  "answer_hinglish": "`create_tenant(sm, user_id, body)` ab EK transaction hai: `INSERT INTO tenants (slug, name) RETURNING id` (tenants pe RLS nahi; slug UNIQUE + CHECK `^[a-z0-9-]{3,40}$`), phir usi transaction mein `SELECT set_config('app.tenant_id', :t, true), set_config('app.user_id', :u, true)` -- naye tenant ka RLS context -- phir memberships (owner), subscriptions (free, active, provider 'none') aur audit `tenant.created`. Duplicate slug -> IntegrityError -> 409 'slug already taken'.\n\nPehle do transactions kyun the? Memberships, subscriptions aur audit_logs RLS tables hain jinke WITH CHECK ko `app.tenant_id` = naya tenant id chahiye, aur woh id insert ke baad hi pata chalti hai. Code ne clarity ke liye pehla `global_tx` aur doosra `tenant_tx` rakha tha.\n\nKya galat ho sakta tha (code review mein mila): step 1 commit ke baad step 2 fail (DB blip, crash) -> orphan tenant bina owner ke, koi access nahi kar sakta, aur slug hamesha ke liye 'taken' (burnt). Fix: `set_config` transaction ke beech mein switch karna RLS ke saath bilkul valid hai (`is_local=true` transaction-scoped hai), toh sab ek COMMIT mein. Regression test `test_tenant_creation_is_atomic` beech ka insert fail karwata hai aur check karta hai ki tenant row bhi rollback hui aur slug reusable hai.\n\nEk aur detail: audit insert mein `:tt` alag param hai -- asyncpg one-type-per-param ka fix.",
+  "why_needed": "Multi-step writes ki atomicity samajhna -- aur RLS kaise transaction design ko affect karta hai -- senior signal hai.",
+  "real_world_analogy": "Naya flat registration: pehle society register mein flat number allot (step 1), phir owner ka naam aur maintenance account (step 2). Step 2 se pehle clerk chala gaya toh flat allotted hai par owner koi nahi.",
+  "how_it_works": "global_tx: INSERT tenant -> COMMIT. tenant_tx(new id): INSERT membership(owner), subscription(free), audit -> COMMIT.",
+  "in_this_project": "`saas/services/tenancy.py::create_tenant` (single transaction, mid-transaction set_config); route `api/routes.py::create_tenant` (`POST /tenants`, 201); test `tests/test_review_fixes.py::test_tenant_creation_is_atomic`.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/tenancy.py::create_tenant",
+   "projects/06-saas/saas/api/routes.py::create_tenant",
+   "projects/06-saas/tests/test_review_fixes.py::test_tenant_creation_is_atomic"
+  ],
+  "code_example": "# real (trimmed): saas/services/tenancy.py::create_tenant\ntry:\n    async with sm() as s, s.begin():\n        tid = await s.scalar(text(\"INSERT INTO tenants (slug, name) VALUES (:s, :n) RETURNING id\"),\n                             {\"s\": body.slug, \"n\": body.name})\n        # Enter the new tenant's RLS context inside the same transaction.\n        await s.execute(text(\"SELECT set_config('app.tenant_id', :t, true), set_config('app.user_id', :u, true)\"),\n                        {\"t\": str(tid), \"u\": str(user_id)})\n        await s.execute(text(\"INSERT INTO memberships (tenant_id, user_id, role) VALUES (:t, :u, 'owner')\"), ...)\n        # subscriptions + audit_logs ... one COMMIT\nexcept IntegrityError:\n    raise Conflict(\"slug already taken\") from None",
+  "code_language": "python",
+  "advantages": [
+   "Atomic: tenant, owner, subscription and audit commit together",
+   "Slug uniqueness DB-enforced",
+   "No orphan sweeper needed"
+  ],
+  "disadvantages": [
+   "Mid-transaction set_config is less obvious to readers",
+   "External provisioning (billing customer etc.) would still need a separate idempotent step"
+  ],
+  "common_mistakes": [
+   "RLS tables ko global_tx mein insert karne ki koshish (WITH CHECK fail)",
+   "Slug check app mein SELECT se karna (race)",
+   "Multi-step creation ko alag transactions mein karna (orphan rows, burnt unique keys)"
+  ],
+  "follow_up_questions": [
+   "Do transactions wala version kis failure pe toot-ta tha, aur test ne kaise prove kiya?",
+   "Slug rename support karoge toh kya tootega (cache keys, URLs)?",
+   "Tenant creation pe rate limit/abuse prevention?"
+  ],
+  "concepts": [
+   "atomicity",
+   "tenant onboarding",
+   "transactions",
+   "RLS WITH CHECK"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pehle do transactions readability dete the par atomicity khote the; ab ek transaction mein set_config switch -- atomic aur RLS ke saath compatible.",
+   "failure_scenarios": "Before the fix: step 2 fail -> orphan tenant, slug locked. Now: any failure rolls everything back; concurrent same-slug creates -> ek 409 (UNIQUE se safe).",
+   "alternatives": "Single tx with mid-transaction set_config; saga with compensation (delete tenant on failure); outbox-style provisioning job.",
+   "scale_10x_100x": "Bade onboarding (default data, billing customer create, search index) ke liye provisioning workflow chahiye -- state machine 'provisioning -> active'.",
+   "production_improvements": "Tenant status 'provisioning' add karo, ek tx mein core rows, external side effects (billing customer) idempotent job se, aur orphan sweeper metric."
+  }
+ },
+ {
+  "id": "SAAS-033",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Walk through the database schema. Which tables are tenant-scoped with RLS and which are global, and why?",
+  "answer_hinglish": "Schema 12 tables ka hai (0001_initial.py). Global (no RLS): `users` (identity ek se zyada tenants mein share hoti hai), `tenants` (slug se lookup tenant pata hone se pehle chahiye), `billing_events` (provider event aate waqt tenant pata nahi -- comment: 'Not tenant-scoped: provider events arrive before we know the tenant. Unique id = idempotency.'), `refresh_tokens` (user-level, tenant se independent).\n\nTenant-scoped with ENABLE + FORCE RLS (`TENANT_TABLES`): `memberships (tenant_id, user_id) PK`, `invitations`, `projects`, `api_keys`, `audit_logs`, `usage_counters`, `subscriptions` (tenant_id hi PK -- ek tenant ek subscription), `reports`. Sabme `tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE`.\n\nImportant constraints: `tenants.slug UNIQUE` + regex CHECK, `status IN ('active','suspended')`; memberships role CHECK (owner/admin/member/viewer); invitations role CHECK sirf admin/member/viewer -- owner invite se ban hi nahi sakta, DB level pe. `api_keys.key_hash UNIQUE`, `scopes text[]`. `audit_logs.id bigserial` (ordering ke liye), `metadata jsonb`. `usage_counters PK (tenant_id, metric, period)`. Global tables pe RLS nahi hai, toh unki protection queries aur grants pe hai -- jaise `users` ko app sirf apne id se padhta hai.\n\nDATABASE_DESIGN.md mein mermaid ER diagram aur index table hai.",
+  "why_needed": "Schema walk-through har project interview ka hissa hai; global vs tenant-scoped ka reasoning yahan sabse important hai.",
+  "real_world_analogy": "Society: residents ki directory (users) aur flats ki list (tenants) common notice board pe; har flat ka andar ka saamaan (projects, keys) sirf flat ke andar.",
+  "how_it_works": "Global tables: lookup before tenant known. Tenant tables: tenant_id NOT NULL + FK CASCADE + RLS policy.",
+  "in_this_project": "`migrations/versions/0001_initial.py` (CREATE TABLE block, `TENANT_TABLES` list), `DATABASE_DESIGN.md` ER diagram aur Row-level security section.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real 0001_initial.py\nTENANT_TABLES = [\"memberships\", \"invitations\", \"projects\", \"api_keys\", \"audit_logs\", \"usage_counters\",\n                 \"subscriptions\", \"reports\"]",
+  "code_language": "python",
+  "advantages": [
+   "Clear boundary global vs tenant",
+   "DB-level constraints (CHECKs) app bugs pakadte hain",
+   "CASCADE se tenant delete clean"
+  ],
+  "disadvantages": [
+   "Global tables pe RLS protection nahi",
+   "users table mein email global unique -- ek email ek identity"
+  ],
+  "common_mistakes": [
+   "Tenant table mein tenant_id nullable rakhna",
+   "Global table pe galti se tenant data rakhna",
+   "Role values sirf app mein validate karna"
+  ],
+  "follow_up_questions": [
+   "refresh_tokens ko tenant-scoped kyun nahi banaya?",
+   "tenants table pe RLS lagaoge toh slug lookup kaise?",
+   "Hard delete vs soft delete tenant?"
+  ],
+  "concepts": [
+   "schema design",
+   "tenant-scoped tables",
+   "constraints"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-034",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why should nearly every index in a pooled multi-tenant schema start with tenant_id?",
+  "answer_hinglish": "Kyunki pooled model mein practically har query -- RLS ki wajah se automatically -- `tenant_id = X` filter rakhti hai. Composite index ka leftmost column equality filter hona chahiye taaki B-tree seedha us tenant ke range pe jump kare, aur baaki columns (sort order, secondary filter) us range ke andar sorted milein.\n\nExample: list query `SELECT ... FROM projects ORDER BY created_at DESC LIMIT 20` + RLS predicate `tenant_id = :t`. Index `ix_projects_tenant_created (tenant_id, created_at DESC)`: Postgres tenant ke entries pe jump karta hai, already sorted order mein padhta hai, aur 20 rows ke baad ruk jaata hai -- no sort, no full scan. Benchmark (TESTING.md, 100 tenants x 1,000 projects): 0.148 ms server execution, plan 'Index Scan, RLS predicate as Index Cond'. Index drop karne pe 2.938 ms (~20x) -- bitmap scan on `(tenant_id, name)` unique index + top-N sort.\n\nAgar index `(created_at)` hota (tenant ke bina) toh Postgres ko globally newest rows padhni padti aur doosre tenants ki rows filter karni padti -- bade tenants ke beech chhota tenant bahut slow. Yeh rule DATABASE_DESIGN.md mein likha hai: 'in a pooled multi-tenant schema, nearly every index should start with tenant_id.' Project ke indexes: `ix_audit_tenant_created`, `ix_reports_tenant (tenant_id, created_at DESC)`, `ix_api_keys_tenant`, `UNIQUE (tenant_id, name)`. Exceptions: global lookups jaise `key_hash UNIQUE`, `token_hash UNIQUE`, `ix_memberships_user` -- yeh tenant pata hone se pehle chalte hain.",
+  "why_needed": "Index design pooled schema mein performance ka 80% hai; interviewer leftmost-prefix rule aur RLS interaction samajhna chahta hai.",
+  "real_world_analogy": "Phone directory pehle city se, phir naam se sorted: 'Pune ke Sharma' turant milte hain. Agar sirf naam se sorted ho toh saare Sharma padh ke Pune wale chhantne padenge.",
+  "how_it_works": "B-tree composite: (tenant_id, created_at DESC) -> equality seek on tenant_id -> ordered scan on created_at -> LIMIT stops early.",
+  "in_this_project": "`0001_initial.py` comment: 'Every hot query filters by tenant first: lead composite indexes with tenant_id.' `bench/rls_bench.py` index drop karke compare karta hai. DATABASE_DESIGN.md 'Indexes' table.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/bench/rls_bench.py",
+   "projects/06-saas/DATABASE_DESIGN.md",
+   "projects/06-saas/TESTING.md"
+  ],
+  "code_example": "-- real 0001_initial.py\n-- Every hot query filters by tenant first: lead composite indexes with tenant_id.\nCREATE INDEX ix_projects_tenant_created ON projects (tenant_id, created_at DESC);\nCREATE INDEX ix_audit_tenant_created ON audit_logs (tenant_id, created_at DESC);",
+  "code_language": "sql",
+  "advantages": [
+   "Index scan + early LIMIT",
+   "RLS predicate index condition ban jaata hai",
+   "Tenant size se independent latency"
+  ],
+  "disadvantages": [
+   "Har index thoda bada (uuid prefix)",
+   "Cross-tenant admin queries ko alag indexes chahiye"
+  ],
+  "common_mistakes": [
+   "Single-column tenant_id index + sort",
+   "Index tenant ke bina (created_at)",
+   "uuid v4 primary keys ki random insert locality ignore karna"
+  ],
+  "follow_up_questions": [
+   "Partial indexes kab use karoge?",
+   "Hash partitioning by tenant_id indexes ko kaise affect karta hai?",
+   "Index-only scan ke liye INCLUDE columns?"
+  ],
+  "concepts": [
+   "composite index",
+   "leftmost prefix",
+   "tenant-first index",
+   "query plan"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-035",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Why is project name unique per tenant (UNIQUE (tenant_id, name)) and email unique on lower(email)?",
+  "answer_hinglish": "Dono constraints business rules ko database level pe enforce karte hain, app ke race conditions ke bina.\n\n`projects UNIQUE (tenant_id, name)`: Acme ka 'website' project aur Globex ka 'website' project dono allowed hone chahiye -- naam tenant ke andar unique hai, globally nahi. Agar `UNIQUE (name)` hota toh ek tenant doosre tenant ka naam 'block' kar deta -- aur worse, 409 conflict se pata chal jaata ki kisi aur tenant ka 'secret-merger' naam ka project exist karta hai: cross-tenant information leak via error. Composite unique leak aur false conflict dono hatata hai. Bonus: yeh index tenant_id se start hota hai, toh tenant-scoped name lookup bhi fast. `create_project` IntegrityError ko 409 'a project with this name already exists' mein convert karta hai.\n\n`uq_users_email_lower ON users (lower(email))`: expression unique index. 'Alice@Acme.io' aur 'alice@acme.io' same user hain -- case-insensitive uniqueness. Login query `WHERE lower(email) = lower(:e)` isi index ko use karti hai. `test_registration_validation`: 'a@b.co' register, phir 'A@B.CO' -> 409.\n\nKyun DB level? 'SELECT then INSERT' check app mein race-prone hai -- do concurrent registrations dono pass kar sakti hain. Unique index atomic hai. `register` mein app-level `exists` check friendly error ke liye hai, lekin final guarantee index ka hai. (Review fix: pehle register ka concurrent duplicate IntegrityError 500 deta tha; ab woh bhi 409 'email already registered' mein map hota hai -- `test_concurrent_duplicate_registration_is_409`.)",
+  "why_needed": "Constraint design aur 'uniqueness ka scope' -- chhota lagta hai lekin multi-tenant leakage se juda hai.",
+  "real_world_analogy": "Har school mein 'Class 5A' ho sakti hai, lekin ek school mein do '5A' nahi -- uniqueness school ke scope mein hai.",
+  "how_it_works": "Composite UNIQUE btree (tenant_id, name). Expression index on lower(email); query must use same expression.",
+  "in_this_project": "`0001_initial.py`: `UNIQUE (tenant_id, name)` aur `CREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email))`. `tenancy.create_project` aur `auth.AuthService.register` / `login`.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/saas/services/tenancy.py::create_project",
+   "projects/06-saas/saas/services/auth.py::AuthService",
+   "projects/06-saas/tests/test_api.py::test_registration_validation",
+   "projects/06-saas/tests/test_review_fixes.py::test_concurrent_duplicate_registration_is_409"
+  ],
+  "code_example": "-- real 0001_initial.py\nCREATE UNIQUE INDEX uq_users_email_lower ON users (lower(email));\n...\n  UNIQUE (tenant_id, name)",
+  "code_language": "sql",
+  "advantages": [
+   "Race-free uniqueness",
+   "No cross-tenant name leaks via 409",
+   "Case-insensitive identity"
+  ],
+  "disadvantages": [
+   "lower() Unicode edge cases (citext ya normalisation chahiye ho sakta)",
+   "Expression index query mein same expression maangta hai"
+  ],
+  "common_mistakes": [
+   "Global UNIQUE(name) multi-tenant table mein",
+   "Email uniqueness case-sensitive",
+   "Sirf app-level uniqueness check"
+  ],
+  "follow_up_questions": [
+   "citext vs lower() index?",
+   "Soft-deleted rows ke saath uniqueness (partial unique index)?",
+   "Concurrent register pe IntegrityError handling?"
+  ],
+  "concepts": [
+   "unique constraint",
+   "expression index",
+   "scoped uniqueness"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-036",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Explain the usage_counters and subscriptions table designs.",
+  "answer_hinglish": "`usage_counters (tenant_id, metric, period, value bigint)` ka primary key `(tenant_id, metric, period)` hai. `period` text 'YYYY-MM' hai. Iska matlab ek tenant ka ek metric ek mahine mein exactly ek row -- yahi natural key hai aur `flush_usage_to_db` ka `ON CONFLICT (tenant_id, metric, period)` isi pe upsert karta hai. PK tenant_id se shuru hota hai, toh 'is tenant ka usage' query (admin usage route `ORDER BY period`) index pe chalti hai. `metric` column generic hai -- abhi sirf `api_calls`, lekin naya metric (storage_gb, reports_run) schema change ke bina add ho sakta hai. `bigint` kyunki enterprise pe counts int32 cross kar sakte hain. Period text (date nahi) Redis key format se seedha match karta hai -- simple, though `date` type range queries ke liye better hota.\n\n`subscriptions` mein `tenant_id` hi PRIMARY KEY hai -- ek tenant ka ek current subscription. Columns: plan, status, provider ('none' for free, 'mock'), provider_customer_id, provider_subscription_id, current_period_end, updated_at. `create_tenant` free/active/none row banata hai; `apply_event` `ON CONFLICT (tenant_id) DO UPDATE` se upsert karta hai.\n\nInteresting design point: plan do jagah hai -- `tenants.plan` (hot path pe padha jaata hai, slug cache mein) aur `subscriptions.plan` (billing record). `tenants.plan` effective entitlement hai; status non-active ho toh apply_event tenants.plan ko 'free' kar deta hai jabki subscriptions row event ka plan aur status rakhti hai. Yeh denormalisation read path fast rakhta hai lekin dono ko sync rakhna padta hai.",
+  "why_needed": "Billing/usage tables ka design interviewer ko dikhata hai ki aap natural keys, upserts aur denormalisation trade-offs samajhte ho.",
+  "real_world_analogy": "Bijli ka meter: har ghar (tenant), har meter type (metric), har mahine (period) ki ek reading. Aur connection ka contract (subscription) ghar pe ek hi.",
+  "how_it_works": "usage: PK upsert per flush. subscriptions: PK tenant_id upsert per billing event; tenants.plan = effective plan for authorization.",
+  "in_this_project": "`0001_initial.py` CREATE TABLE usage_counters / subscriptions; `services/limits.py::flush_usage_to_db`; `services/billing.py::apply_event`; `tenancy.create_tenant`.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/saas/services/limits.py::flush_usage_to_db",
+   "projects/06-saas/saas/services/billing.py::apply_event"
+  ],
+  "code_example": "-- real 0001_initial.py\nCREATE TABLE usage_counters (\n  tenant_id uuid NOT NULL REFERENCES tenants(id) ON DELETE CASCADE,\n  metric text NOT NULL,\n  period text NOT NULL,          -- 'YYYY-MM'\n  value bigint NOT NULL DEFAULT 0,\n  PRIMARY KEY (tenant_id, metric, period)\n);",
+  "code_language": "sql",
+  "advantages": [
+   "Natural key = cheap idempotent upsert",
+   "Generic metric column extensible",
+   "Effective plan hot path pe ek column"
+  ],
+  "disadvantages": [
+   "Plan do jagah -- drift possible",
+   "Period text, date arithmetic awkward",
+   "Subscription history nahi (sirf current)"
+  ],
+  "common_mistakes": [
+   "Har request pe usage_counters UPDATE (hot row)",
+   "Plan sirf subscriptions mein rakh ke har request pe join",
+   "History ke bina subscription overwrite karna aur audit na rakhna"
+  ],
+  "follow_up_questions": [
+   "Subscription history kaise rakhoge?",
+   "Plan drift detect kaise karoge?",
+   "Daily granularity chahiye toh schema?"
+  ],
+  "concepts": [
+   "natural key",
+   "upsert",
+   "denormalisation",
+   "usage metering"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-037",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How is the refresh_tokens table designed to support rotation, reuse detection and logout?",
+  "answer_hinglish": "`refresh_tokens` columns: `id uuid PK`, `user_id` (FK users ON DELETE CASCADE), `family_id uuid`, `token_hash text UNIQUE`, `expires_at`, `revoked_at`, `replaced_by uuid`, `created_at`. Plus `ix_refresh_family ON (family_id)`.\n\nHar column ka kaam: `token_hash UNIQUE` -- raw token kabhi store nahi hota, sha256 pe O(log n) lookup, aur unique index collision ka guard. `family_id` -- ek login session ki saari rotated tokens ko jodta hai; login pe naya `uuid4()`, refresh pe same family pass hoti hai. `revoked_at` -- NULL = active; rotation pe purana token revoke hota hai; reuse detection mein yahi signal hai ('revoked token dobara aaya'). `replaced_by` -- chain ka next token id; forensic trail (kaunsa token kisne replace kiya). `expires_at` -- 30 din (`refresh_token_ttl_seconds`). `ix_refresh_family` -- family-wide revoke (`UPDATE ... WHERE family_id = :f`) aur logout ke liye index.\n\nOperations: login -> insert (new family). Refresh -> `SELECT ... FOR UPDATE` by hash, phir naya insert + purane pe `revoked_at = now(), replaced_by = new_id`. Reuse -> `UPDATE ... SET revoked_at = coalesce(revoked_at, now()) WHERE family_id` (coalesce original revoke timestamps preserve karta hai). Logout -> subquery se family nikal ke saare active tokens revoke.\n\nTable tenant-scoped nahi hai -- session user ka hai, tenant ka nahi. Missing: expired/revoked rows ka cleanup job -- table time ke saath badhti rahegi; production mein periodic delete `WHERE expires_at < now() - interval '7 days'` chahiye.",
+  "why_needed": "Session storage design security interviews mein common hai; family/replaced_by jaise columns batate hain ki aapne reuse detection soch ke banaya.",
+  "real_world_analogy": "Cheque book: har cheque (token) ka number register mein, kaunsa cheque kis se replace hua, aur poori cheque book (family) ek saath cancel ho sakti hai.",
+  "how_it_works": "Unique hash lookup -> row lock -> insert successor -> mark predecessor revoked/replaced. Family index for bulk revoke.",
+  "in_this_project": "`0001_initial.py` CREATE TABLE refresh_tokens + `ix_refresh_family`; `saas/services/auth.py::AuthService` (`_issue`, `refresh`, `logout`).",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/saas/services/auth.py::AuthService"
+  ],
+  "code_example": "-- real 0001_initial.py\nCREATE TABLE refresh_tokens (\n  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  user_id uuid NOT NULL REFERENCES users(id) ON DELETE CASCADE,\n  family_id uuid NOT NULL,\n  token_hash text NOT NULL UNIQUE,\n  expires_at timestamptz NOT NULL,\n  revoked_at timestamptz,\n  replaced_by uuid,\n  created_at timestamptz NOT NULL DEFAULT now()\n);\nCREATE INDEX ix_refresh_family ON refresh_tokens (family_id);",
+  "code_language": "sql",
+  "advantages": [
+   "Reuse detection data-driven",
+   "Forensics via replaced_by",
+   "Family-wide revoke indexed"
+  ],
+  "disadvantages": [
+   "Table unbounded growth (no cleanup)",
+   "Har refresh 1 insert + 1 update",
+   "No device/user-agent info for session management UI"
+  ],
+  "common_mistakes": [
+   "Raw token store karna",
+   "Rotation pe purana row delete karna (reuse detect nahi hoga)",
+   "Family index na banana"
+  ],
+  "follow_up_questions": [
+   "'Logout from all devices' kaise implement karoge?",
+   "Cleanup job ka design?",
+   "Session list UI ke liye kya columns add karoge?"
+  ],
+  "concepts": [
+   "session storage",
+   "token family",
+   "schema design"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Revoked rows rakhna reuse detection ke liye zaroori hai, lekin storage badhta hai; delete karoge toh reuse 'invalid token' ban jayega (detection lost).",
+   "failure_scenarios": "Cleanup job galti se active family delete kare -> users logout; FOR UPDATE contention ek hi token pe concurrent refreshes (mobile app multiple tabs).",
+   "alternatives": "Redis mein sessions with TTL; stateless refresh JWT with server-side denylist; OAuth server (Keycloak/Auth0).",
+   "scale_10x_100x": "Millions of users pe table bada -- partition by created_at (monthly) aur purani partitions drop; ya Redis session store.",
+   "production_improvements": "Device metadata (user agent, ip, last_used) add karo, 'logout all devices' (`UPDATE ... WHERE user_id`), reuse detection pe security alert email."
+  }
+ },
+ {
+  "id": "SAAS-038",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How do you make the audit log append-only at the database level, and why not just in application code?",
+  "answer_hinglish": "Grants se. Migration 0001 saas_app ko baaki tables pe `SELECT, INSERT, UPDATE, DELETE` deta hai, lekin `audit_logs` pe sirf `GRANT SELECT, INSERT ON audit_logs TO saas_app`. Comment: 'Audit log is append-only for the application: no UPDATE / DELETE, even for a compromised app.' Toh app role agar `UPDATE audit_logs` ya `DELETE FROM audit_logs` chalaye toh Postgres 'permission denied for table audit_logs' deta hai.\n\n`test_audit_log_is_append_only_for_the_app` yahi prove karta hai: tenant_tx mein INSERT chalta hai, lekin `UPDATE audit_logs SET action = 'covered-up'` aur `DELETE FROM audit_logs` dono `DBAPIError` match 'permission denied' raise karte hain.\n\nApp code mein kyun nahi? Kyunki audit log ka threat model hi yeh hai ki attacker app ko compromise kar chuka hai (SQL injection, stolen credentials, malicious insider with app access) aur apne nishaan mitana chahta hai. App-level check ('hum UPDATE function expose nahi karte') compromised app pe kuch nahi karta -- attacker raw SQL chala sakta hai. Database grant app ke credentials ki capability hi seemit karta hai. Upar se RLS: app sirf current tenant ke audit rows padh/likh sakta hai.\n\nLimits: owner/superuser abhi bhi edit kar sakta hai -- isliye production mein audit ko external immutable store (WORM S3, SIEM) mein stream karna chahiye, ya hash chain banana. Retention (purane logs delete) ke liye ek alag privileged job chahiye.",
+  "why_needed": "Tamper-resistant audit compliance ki requirement hai; DB-level enforcement 'assume breach' thinking dikhata hai.",
+  "real_world_analogy": "Bank ki CCTV recording: cashier dekh sakta hai, lekin delete button sirf security head ke paas -- cashier ka computer hack ho jaye tab bhi recording safe.",
+  "how_it_works": "GRANT SELECT, INSERT only -> UPDATE/DELETE permission denied at execution, regardless of SQL source.",
+  "in_this_project": "`0001_initial.py` grants block; `tests/test_rls.py::test_audit_log_is_append_only_for_the_app`; SECURITY.md 'Audit tampering' row.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/tests/test_rls.py::test_audit_log_is_append_only_for_the_app",
+   "projects/06-saas/SECURITY.md"
+  ],
+  "code_example": "# real (trimmed) tests/test_rls.py\nwith pytest.raises(DBAPIError, match=\"permission denied\"):\n    async with tenant_tx(sm, a) as s:\n        await s.execute(text(\"UPDATE audit_logs SET action = 'covered-up'\"))\nwith pytest.raises(DBAPIError, match=\"permission denied\"):\n    async with tenant_tx(sm, a) as s:\n        await s.execute(text(\"DELETE FROM audit_logs\"))",
+  "code_language": "python",
+  "advantages": [
+   "Compromised app bhi history nahi badal sakta",
+   "Zero runtime cost",
+   "Test se proven"
+  ],
+  "disadvantages": [
+   "Owner/superuser bypass",
+   "Retention ke liye alag privileged path",
+   "TRUNCATE privilege bhi grant nahi hona chahiye (abhi nahi hai -- theek)"
+  ],
+  "common_mistakes": [
+   "Soft-delete column add karke 'append-only' kehna",
+   "App ko owner se chalana (grants bekaar)",
+   "Audit table pe ON DELETE CASCADE aur app role ko tenants pe DELETE dena (yahan review ke baad `REVOKE DELETE ON tenants` hua)"
+  ],
+  "follow_up_questions": [
+   "Hash-chained audit log kaise banaoge?",
+   "Tenant delete pe audit logs ka kya hona chahiye (app role ab tenants delete nahi kar sakta)?",
+   "Audit ko SIEM mein stream kaise?"
+  ],
+  "concepts": [
+   "append-only",
+   "GRANT",
+   "tamper resistance",
+   "audit log"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "SAAS-039",
+  "project_slug": "p06-saas",
+  "category": "Database Design",
+  "difficulty": "Senior/System Design",
+  "question": "How would you handle per-tenant backup, restore, export and deletion in this pooled schema?",
+  "answer_hinglish": "Pooled model ka yeh sabse weak point hai -- SYSTEM_DESIGN.md table 'Per-tenant restore: hard (row-level export)' kehta hai aur DEPLOYMENT.md: 'per-tenant export means filtered dumps (pooled model) -- document RPO/RTO per tier.' Is project mein tenant export/restore implement nahi hai; main aise design karunga.\n\nBackup: full database backups (pg_basebackup + WAL archiving, PITR) poore cluster ke liye -- yeh disaster recovery hai, per-tenant nahi. Per-tenant export: har tenant table ke liye `COPY (SELECT ... WHERE tenant_id = :t) TO ...` -- convenient baat yeh ki tenant_tx context ke saath app role se `SELECT * FROM projects` chalao aur RLS khud filter kar dega; global tables (users jo members hain) ko memberships join se nikaalo. Output JSON/CSV/parquet, encrypted, signed URL se deliver.\n\nPer-tenant restore ('Acme ne galti se 500 projects delete kar diye, kal ki state chahiye'): PITR se ek temporary DB restore karo kal ke time pe, us DB se sirf Acme ki rows export karo, aur production mein carefully merge -- conflicts (naye rows, ids) handle karke. Yeh slow aur manual hai -- silo model mein yeh 'restore that DB' hota.\n\nDeletion (GDPR right to erasure / contract end): schema mein `ON DELETE CASCADE` hai, lekin review ke baad app role (`saas_app`) ke paas `tenants` pe DELETE hi nahi hai (migration 0004 `REVOKE DELETE ON tenants`) -- kyunki cascade append-only audit_logs bhi uda deta. Toh deletion ek privileged/operator process hai (owner role ya admin job), aur usme decide karna padega: audit_logs retention requirement ke liye pehle archive karo, Redis keys (cache, usage, rl) alag se delete, backups mein data retention window tak rahega, aur users jo sirf is tenant mein the unka decision alag.",
+  "why_needed": "Enterprise customers aur compliance (GDPR) yeh poochte hain; interviewer dekhta hai ki aap pooled model ki operational kamzori jaante ho.",
+  "real_world_analogy": "Shared godown mein sab companies ka saamaan: poore godown ka insurance (full backup) hai, lekin ek company ka kal ka stock wapas laana matlab poora godown ki copy banake usme se sirf unka saamaan nikalna.",
+  "how_it_works": "Export: RLS-scoped SELECT per table. Restore: PITR to side DB -> extract tenant rows -> merge. Delete: CASCADE + Redis + backup retention.",
+  "in_this_project": "Schema mein har tenant table `ON DELETE CASCADE` hai (0001). SYSTEM_DESIGN.md aur DEPLOYMENT.md item 7. Export/restore tooling repo mein nahi hai.",
+  "implementation_files": [
+   "projects/06-saas/migrations/versions/0001_initial.py",
+   "projects/06-saas/SYSTEM_DESIGN.md",
+   "projects/06-saas/DEPLOYMENT.md",
+   "projects/06-saas/saas/db/session.py::tenant_tx"
+  ],
+  "code_example": "# illustrative (not in repo): RLS-scoped tenant export\nasync def export_tenant(sm, tenant_id):\n    out = {}\n    async with tenant_tx(sm, tenant_id) as s:\n        for t in (\"projects\", \"memberships\", \"api_keys\", \"audit_logs\", \"reports\"):\n            out[t] = [dict(r) for r in (await s.execute(text(f\"SELECT * FROM {t}\"))).mappings()]\n    return out   # RLS guarantees only this tenant's rows",
+  "code_language": "python",
+  "advantages": [
+   "Export RLS se naturally scoped",
+   "CASCADE deletion simple",
+   "Full PITR DR ke liye strong"
+  ],
+  "disadvantages": [
+   "Per-tenant restore manual aur slow",
+   "CASCADE audit logs bhi uda deta hai",
+   "Backups mein deleted tenant data retention window tak"
+  ],
+  "common_mistakes": [
+   "Per-tenant restore ko 'full restore' se karna (doosre tenants ka data overwrite)",
+   "Redis aur object storage ko deletion mein bhool jana",
+   "Export mein api key hashes/secrets dena"
+  ],
+  "follow_up_questions": [
+   "Restore merge mein id conflicts kaise handle karoge?",
+   "Crypto-shredding (per-tenant key delete) kya hai?",
+   "RPO/RTO per tier kaise define karoge?"
+  ],
+  "concepts": [
+   "backup and restore",
+   "data export",
+   "GDPR deletion",
+   "pooled model limitations"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pooled model cheap hai par per-tenant ops mehenge; silo mein ulta. Hybrid -- enterprise jinhe per-tenant restore SLA chahiye unko silo.",
+   "failure_scenarios": "Restore merge galat hua toh doosre tenant ka data corrupt (agar tenant filter miss); CASCADE ke saath accidental tenant delete = sab gaya (soft delete + grace period chahiye).",
+   "alternatives": "Schema/DB per tenant (pg_dump per schema/db); per-tenant logical replication; event-sourced data jahan replay se restore.",
+   "scale_10x_100x": "Hazaron tenants mein export jobs queue mein, rate limited; bade tenants ka export streaming (COPY) to object storage.",
+   "production_improvements": "Tenant soft-delete with 30-day grace, export-before-delete, audit logs ko alag retention store mein, per-tenant encryption keys for crypto-shredding."
+  }
+ },
+ {
+  "id": "SAAS-040",
+  "project_slug": "p06-saas",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do you make the plan limit (max_projects) race-safe? Explain the FOR UPDATE on the tenant row.",
+  "answer_hinglish": "Problem classic check-then-act race hai. Free plan pe max 3 projects. Naive code: `count = SELECT count(*) FROM projects; if count < 3: INSERT`. Ab 10 requests ek saath aayein -- Read Committed isolation mein sab apne-apne transaction mein count = 0, 1 ya 2 dekhenge (kisi ne commit nahi kiya), sab pass, aur 10 projects ban gaye. Unique constraint yahan help nahi karta kyunki naam alag hain.\n\nFix: `create_project` limit check se pehle `SELECT 1 FROM tenants WHERE id = :t FOR UPDATE` chalata hai. Yeh tenant ki row pe exclusive row lock leta hai. Doosri concurrent transaction same statement pe block ho jaati hai jab tak pehli COMMIT/ROLLBACK na kare. Pehli count karti hai (0), insert, commit -> lock release. Doosri ab aage badhti hai, aur Read Committed mein har statement naya snapshot leta hai, toh uska count ab 1 dikhata hai (committed row). Isi tarah teesri 2, chauthi 3 -> `PlanLimitReached` 403. Matlab per-tenant serialization sirf is critical section ke liye.\n\nTenant row kyun? Kyunki woh natural 'mutex' hai jo saare tenant ke creates share karte hain, aur projects table pe lock nahi kar sakte (nayi row exist nahi karti -- phantom). Lock sirf `max_projects is not None` pe -- enterprise (unlimited) ko serialize karne ki zaroorat nahi.\n\n`test_concurrent_creates_cannot_exceed_plan_limit`: `asyncio.gather` se 10 parallel POST, assert exactly 3 x 201. Cost: ek tenant ke concurrent creates line mein -- typical rates pe negligible.",
+  "why_needed": "Concurrency ka sabse common interview question -- 'check-then-act race' -- aur yahan real test se proven fix hai.",
+  "real_world_analogy": "Ek hi bathroom ki chaabi: jo chaabi le, wahi andar jaa ke dekhega 'jagah hai?' aur kaam karke chaabi wapas karega. Chaabi ke bina sab ek saath ghus jaate.",
+  "how_it_works": "BEGIN -> SELECT tenant FOR UPDATE (blocks others) -> count -> check -> INSERT -> COMMIT (release) -> next waiter re-counts with fresh snapshot.",
+  "in_this_project": "`saas/services/tenancy.py::create_project`; test `tests/test_api.py::test_concurrent_creates_cannot_exceed_plan_limit`; FAILURE_SCENARIOS #8. Lock `tenants` row pe hai jo RLS table nahi -- app role ke paas UPDATE grant hai, toh FOR UPDATE allowed.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/tenancy.py::create_project",
+   "projects/06-saas/tests/test_api.py::test_concurrent_creates_cannot_exceed_plan_limit",
+   "projects/06-saas/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real services/tenancy.py\nif p.plan.max_projects is not None:\n    # Lock the tenant's row so two concurrent creates can't both pass the count check (race).\n    await s.execute(text(\"SELECT 1 FROM tenants WHERE id = :t FOR UPDATE\"), {\"t\": p.tenant_id})\n    count = await s.scalar(text(\"SELECT count(*) FROM projects\"))\n    if count >= p.plan.max_projects:\n        raise PlanLimitReached(...)",
+  "code_language": "python",
+  "advantages": [
+   "Simple, correct, test se proven",
+   "Lock sirf ek tenant ko serialize karta hai",
+   "Unlimited plans skip"
+  ],
+  "disadvantages": [
+   "Same tenant ke creates serialize",
+   "Billing webhook jo tenants row UPDATE kare woh bhi wait karega",
+   "count(*) bade tenant pe mehenga ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Count ko Redis mein rakhna bina atomic reservation ke",
+   "SERIALIZABLE bina retry loop ke",
+   "Lock projects table ki rows pe lena (phantoms)"
+  ],
+  "follow_up_questions": [
+   "SERIALIZABLE isolation se kaise karoge, kya trade-off?",
+   "Advisory lock vs row lock?",
+   "Counter column (tenants.project_count) approach?"
+  ],
+  "concepts": [
+   "race condition",
+   "SELECT FOR UPDATE",
+   "check-then-act",
+   "row lock"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Row lock pessimistic aur simple; SERIALIZABLE optimistic hai par retries chahiye; counter column fast hai par drift risk.",
+   "failure_scenarios": "Lock holder slow (long transaction) -> doosre creates wait; deadlock agar koi aur code path tenants row aur projects ko ulte order mein lock kare; lock timeout set nahi hai.",
+   "alternatives": "pg_advisory_xact_lock(hashtext(tenant_id)); denormalised count with CHECK constraint; SERIALIZABLE + retry; Redis reservation tokens.",
+   "scale_10x_100x": "Ek tenant ke bahut high write rate pe yeh hot row bottleneck -- tab counter sharding ya advisory lock per resource type (projects vs members alag) better.",
+   "production_improvements": "Same pattern ab member limit (invite + accept) aur last-owner checks pe bhi laga hai (`_lock_tenant`, review fix); `lock_timeout` set karo; lock wait time ka metric."
+  }
+ },
+ {
+  "id": "SAAS-041",
+  "project_slug": "p06-saas",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How does test_concurrent_creates_cannot_exceed_plan_limit actually produce concurrency, and is it a trustworthy test?",
+  "answer_hinglish": "Test `asyncio.gather` se 10 `c.post('/t/acme/projects', ...)` coroutines ek saath launch karta hai aur assert karta hai `sum(r.status_code == 201) == 3`. Client `httpx.AsyncClient` with `ASGITransport` hai -- requests in-process FastAPI app pe jaati hain, network nahi. Concurrency kahan se aati hai? Har request ka handler async hai aur DB pe `await` karta hai. Jab request 1 asyncpg pe query bhej ke await karti hai, event loop request 2 ko chalata hai, wagairah. SQLAlchemy engine ka pool `pool_size=10, max_overflow=10` hai, toh 10 requests ko 10 alag Postgres connections milte hain -- matlab Postgres mein 10 genuinely concurrent transactions. Isliye race real hai, Python-level fake nahi.\n\nTrustworthy kyun? (1) Lock hata do toh (mentally) saare 10 tenant_tx count 0-2 dekh sakte hain aur 3 se zyada succeed karenge -- assertion fail. (2) Assertion exact 3 hai, '<= 3' nahi -- toh deadlock ya over-serialization (jahan sab fail) bhi pakda jaata hai. (3) Real app role aur real Postgres.\n\nLimitations: interleaving nondeterministic hai -- lock ke bina bhi kabhi-kabhi sab sequential chal sakte hain (flaky false pass), lekin 10 concurrent requests ke saath probability kam hai. Rate limiter bhi beech mein hai: free plan burst 10 hai -- 10 requests + pehle wali calls (`tenant` create GET nahi karta) ke saath limit ke andar rehta hai; burst 10 se zyada requests bhejoge toh 429 test ko confuse karega. TESTING.md kehta hai suite 'stable across repeated runs'.",
+  "why_needed": "Concurrency tests likhna mushkil hai; interviewer poochta hai 'kaise pata ki test sach mein race create karta hai?'",
+  "real_world_analogy": "Ek saath das log ek counter pe -- lekin sach mein das counters (connections) khule hain, ek counter pe line nahi lagi; tabhi pata chalega ki ticket limit enforce hoti hai ya nahi.",
+  "how_it_works": "asyncio.gather -> 10 coroutines -> each awaits DB -> 10 pooled connections -> 10 concurrent Postgres transactions -> row lock serialises.",
+  "in_this_project": "`tests/test_api.py::test_concurrent_creates_cannot_exceed_plan_limit`; `tests/helpers.py::client` (ASGITransport, bcrypt_rounds=4); `saas/db/session.py::make_engine` pool settings.",
+  "implementation_files": [
+   "projects/06-saas/tests/test_api.py::test_concurrent_creates_cannot_exceed_plan_limit",
+   "projects/06-saas/tests/helpers.py::client",
+   "projects/06-saas/saas/db/session.py::make_engine"
+  ],
+  "code_example": "# real tests/test_api.py\nrs = await asyncio.gather(*[c.post(\"/t/acme/projects\", json={\"name\": f\"p{i}\"}, headers=oh) for i in range(10)])\nassert sum(r.status_code == 201 for r in rs) == 3        # FOR UPDATE on the tenant row serialises the check",
+  "code_language": "python",
+  "advantages": [
+   "Real DB concurrency",
+   "Exact assertion pakadta hai over/under-serialization",
+   "Fast (in-process)"
+  ],
+  "disadvantages": [
+   "Nondeterministic interleaving",
+   "Rate limit burst se interaction",
+   "Pool size se zyada requests pe queueing alag behaviour"
+  ],
+  "common_mistakes": [
+   "Sync client se sequential requests bhej ke 'concurrency test' kehna",
+   "'<= limit' assert karna",
+   "Ek hi DB connection share karna (serialised by driver)"
+  ],
+  "follow_up_questions": [
+   "Is test ko deterministic kaise banaoge (barrier/pg_sleep)?",
+   "Lock hata ke test fail hota hai -- kaise verify karoge?",
+   "Multi-process concurrency test kaise?"
+  ],
+  "concepts": [
+   "concurrency testing",
+   "asyncio.gather",
+   "connection pool"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "In-process ASGI concurrency fast aur realistic DB-side hai, lekin multi-process/multi-host interleavings nahi dikhata.",
+   "failure_scenarios": "Flaky pass (race na bane) ya flaky fail (rate limiter 429). Pool exhaustion pe requests queue -> race window chhoti.",
+   "alternatives": "Deterministic: transaction A lock leke `pg_sleep` kare jab B try kare; ya do explicit connections manually orchestrate karo; mutation testing (lock hatao, test fail hona chahiye).",
+   "scale_10x_100x": "Load tests (k6/locust) multiple API replicas ke against with invariant checker post-run (count <= limit).",
+   "production_improvements": "CI mein test ko N baar repeat karo; 'mutation' check ki lock hatane pe fail; similar tests member limit aur last-owner ke liye."
+  }
+ },
+ {
+  "id": "SAAS-042",
+  "project_slug": "p06-saas",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What race conditions exist around refresh-token rotation, and how does the FOR UPDATE in AuthService.refresh handle them?",
+  "answer_hinglish": "Scenario: ek client do tabs se (ya retry logic se) same refresh token ek saath bhejta hai. Bina lock ke: dono transactions `SELECT ... WHERE token_hash = :h` mein `revoked_at IS NULL` dekhte hain, dono naya token issue karte hain, dono purane ko revoke karte hain -- result: ek token se do valid families/branches. Rotation ka 'single use' guarantee toot gaya, aur attacker + victim dono valid tokens ke saath chal sakte the bina reuse detection ke.\n\n`refresh` mein lookup `... FOR UPDATE` ke saath hai. Pehla transaction row lock leta hai, naya token issue karta hai, purane ko `revoked_at = now()` set karta hai, commit. Doosra lock pe wait kar raha tha; lock milne pe Read Committed mein Postgres updated row version re-check karke deta hai -- ab `revoked_at` set hai. Toh doosra reuse detection branch mein jaata hai aur poori family revoke kar deta hai, commit, 401.\n\nYeh security-wise correct hai (single use strictly enforced), lekin UX trade-off hai: legit client ke concurrent refresh (do tabs) ko bhi 'chori' maana jaayega aur user logout. Real systems short grace period rakhte hain -- jaise 'agar purana token pichhle 10 seconds mein rotate hua aur replaced_by ka token abhi tak use nahi hua, toh wahi successor return karo'. Is project mein grace period nahi hai -- strict mode.\n\nEk aur detail: reuse branch `await s.commit()` karke raise karta hai, warna exception rollback se family revocation undo ho jaati.",
+  "why_needed": "Token rotation ke concurrency edge cases senior auth interviews mein aate hain -- strict vs grace period trade-off.",
+  "real_world_analogy": "Ek hi coupon do counters pe ek saath dikhaya: register pe lock na ho toh dono counters pe redeem ho jayega. Lock ke saath doosra counter dekhta hai 'already used' -- aur shak hone pe poori coupon book cancel.",
+  "how_it_works": "T1: lock row -> issue -> revoke old -> commit. T2: waits -> sees revoked -> family revoke -> commit -> 401.",
+  "in_this_project": "`saas/services/auth.py::AuthService.refresh` (`FOR UPDATE`, reuse branch with commit). Test `test_auth_flow_and_refresh_rotation_with_reuse_detection` sequential replay cover karta hai; concurrent case test nahi hai.",
+  "implementation_files": [
+   "projects/06-saas/saas/services/auth.py::AuthService",
+   "projects/06-saas/tests/test_api.py::test_auth_flow_and_refresh_rotation_with_reuse_detection"
+  ],
+  "code_example": "-- illustrative timeline\n-- T1: SELECT ... WHERE token_hash = h FOR UPDATE   (gets lock, revoked_at NULL)\n-- T2: SELECT ... WHERE token_hash = h FOR UPDATE   (blocks)\n-- T1: INSERT new token; UPDATE old SET revoked_at = now(); COMMIT\n-- T2: (unblocks, re-reads row: revoked_at NOT NULL) -> revoke family; COMMIT; 401",
+  "code_language": "sql",
+  "advantages": [
+   "Strict single-use",
+   "Race se do branches nahi bante",
+   "Simple implementation"
+  ],
+  "disadvantages": [
+   "Legit concurrent refresh = logout (false positive)",
+   "Lock contention per token (negligible)"
+  ],
+  "common_mistakes": [
+   "Lock ke bina rotation",
+   "Reuse branch mein commit bhoolna",
+   "Grace period ko bina successor binding ke implement karna (attacker ko bhi naya token mil jaye)"
+  ],
+  "follow_up_questions": [
+   "Grace period safely kaise implement karoge?",
+   "Mobile app mein refresh ko single-flight kaise banaoge?",
+   "Redis-based sessions mein yahi race kaise handle?"
+  ],
+  "concepts": [
+   "race condition",
+   "row locking",
+   "token rotation",
+   "Read Committed"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict rotation max security deta hai par multi-tab apps mein false logouts; grace period UX deta hai par chhota window attacker ke liye.",
+   "failure_scenarios": "Client network retry (response lost) -> family revoke -> user logged out unexpectedly; DB lock wait agar transaction slow.",
+   "alternatives": "Grace window returning same successor; client-side single-flight refresh (ek hi in-flight refresh); sliding sessions in Redis.",
+   "scale_10x_100x": "High auth traffic pe refresh_tokens hot table -- partition ya Redis; FOR UPDATE per-token hai toh contention low.",
+   "production_improvements": "Reuse events ka metric aur security alert; grace window (5-10s) with replaced_by-based idempotent response; client SDK mein refresh mutex."
+  }
+ }
+]

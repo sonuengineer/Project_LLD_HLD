@@ -1,0 +1,1061 @@
+[
+ {
+  "id": "COLB-042",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Beginner",
+  "question": "Why does OT need a central sequencer, and what is the sequencer in your system?",
+  "answer_hinglish": "OT ka simple (TP1-only) version tabhi correct hai jab sab participants ops ko EK hi order mein dekhein. Agar Alice ke server pe order 'A phir B' ho aur Bob ke server pe 'B phir A', toh dono alag sequence mein transform karenge -- aur kyunki transform compose pe distribute nahi karta aur TP2 hold nahi karta, docs diverge ho sakte hain. Sequencer woh component hai jo har op ko ek unique position (revision) deta hai -- ek total order per document.\n\nMere system mein sequencer koi alag service nahi hai -- Postgres hi hai. `service.submit` document row pe `SELECT ... FOR UPDATE` leta hai, current `rev` padhta hai, op ko `rev + 1` deta hai, aur commit karta hai. Kyunki row lock ek waqt pe ek hi transaction ko milta hai, do servers ek hi document ke liye kabhi same rev assign nahi kar sakte. `operations` ka `PRIMARY KEY (document_id, rev)` backstop hai.\n\nIsliye koi bhi server kisi bhi document ka edit accept kar sakta hai -- 'leader election' ya 'document ownership' ki zarurat nahi. Failover trivial: server mare toh client kisi aur server pe connect kare, sequencer (Postgres) wahi hai.\n\nCost: sequencer per-document serial hai aur har op ek DB transaction hai -- measured 45-66 committed ops/s per document (`TESTING.md`). Different documents parallel chalte hain.",
+  "why_needed": "Interviewer jaanna chahta hai ki tum 'ordering' ko first-class problem samajhte ho, sirf transform functions nahi.",
+  "real_world_analogy": "Bank mein token machine: kitne bhi counters hon, token number ek hi machine se nikalta hai, toh order pe kabhi jhagda nahi hota.",
+  "how_it_works": "Per-document mutual exclusion (row lock) -> monotonic rev counter -> persisted order.",
+  "in_this_project": "`collab/service.py::submit`, migration `rev bigint ... -- the sequencer's counter; row lock = per-document total order`, `SYSTEM_DESIGN.md` scaling table row 'Which server sequences a doc? Postgres row lock: any server can'.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/SYSTEM_DESIGN.md",
+   "projects/08-collab/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# real, collab/service.py\ndoc = (await s.execute(text(\"SELECT content, rev FROM documents WHERE id = :d FOR UPDATE\"), {\"d\": doc_id})).first()\n...\nrev = doc.rev + 1",
+  "code_language": "python",
+  "advantages": [
+   "No leader election, any server can sequence",
+   "Durable order before anyone sees it",
+   "Failover trivial"
+  ],
+  "disadvantages": [
+   "Per-doc throughput bounded by DB round trips",
+   "DB becomes critical path for every keystroke batch"
+  ],
+  "common_mistakes": [
+   "Server-local counters per server (do servers same rev de denge)",
+   "Timestamps se order (clock skew)"
+  ],
+  "follow_up_questions": [
+   "Sequencer ko DB ke bahar kaise le jaoge?",
+   "Agar Postgres slow ho toh users ko kya dikhega?",
+   "Do docs ek saath edit karne pe lock contention?"
+  ],
+  "concepts": [
+   "sequencer",
+   "total order",
+   "row lock"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-043",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How does SELECT ... FOR UPDATE give a total order across servers, and what alternatives did you consider?",
+  "answer_hinglish": "Do servers S1 aur S2 ek hi doc ke liye ek saath `submit` chalate hain. Dono transaction `SELECT content, rev FROM documents WHERE id = :d FOR UPDATE` karte hain. Postgres row pe exclusive-ish lock (FOR UPDATE) pehle wale ko deta hai; doosra BLOCK hota hai. Pehla rev 10 likhta hai, `documents.rev = 10` update, commit. Ab doosre ka SELECT return hota hai -- READ COMMITTED mein Postgres locked row ka LATEST committed version re-read karta hai, toh usko `rev = 10` aur naya content dikhta hai. Woh history mein rev 10 dekhta hai, transform karta hai, rev 11 likhta hai. Serial order guaranteed, servers ke beech koi coordination protocol nahi.\n\nAlternatives:\n1. Optimistic concurrency: bina lock, `UPDATE documents SET rev = rev+1 ... WHERE id = :d AND rev = :expected`; 0 rows -> retry. Contention pe retries badhte hain; ek hot doc pe livelock-ish. Lock queue fairer hai.\n2. SERIALIZABLE isolation: Postgres serialization failures throw karega, app ko retry karna padega -- same as optimistic but costlier.\n3. Advisory locks (`pg_advisory_xact_lock(hash(doc_id))`): kaam karega, par row lock natural hai kyunki wahi row update bhi hoti hai.\n4. Sequence per doc: Postgres sequences transactional nahi -- gaps aur rollback pe holes; rev mein gaps ordered forwarder ko 'gap' samjha denge.\n5. In-memory sequencer with sticky routing: sabse fast, par ownership, failover, fencing chahiye.\n\nMujhe row lock isliye pasand aaya: correctness obvious, failover free, aur lock waiters FIFO-ish queue mein chalte hain. Cost: lock hold time = poore transaction ka time (dedupe SELECT, history SELECT, INSERT, UPDATE, maybe snapshot, COMMIT) -- ~5 round trips.",
+  "why_needed": "Distributed ordering ke liye DB lock use karna -- uski semantics aur alternatives dono pata hone chahiye.",
+  "real_world_analogy": "Ek hi bathroom ki ek chaabi: jo andar hai uske nikalne tak baaki line mein; nikalne ke baad agla insaan current state dekh ke jaata hai.",
+  "how_it_works": "Row-level lock queue; READ COMMITTED re-reads latest row version after lock acquired; monotonic increment within txn.",
+  "in_this_project": "`collab/service.py::submit`. `TESTING.md`: 'Per-document throughput is bounded by the sequencer (row lock + ~5 statements per op at ~3ms per round trip through Docker Desktop)'.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/TESTING.md",
+   "projects/08-collab/TRADEOFFS.md"
+  ],
+  "code_example": "-- illustrative: optimistic alternative (NOT used)\nUPDATE documents SET rev = rev + 1, content = :new\nWHERE id = :d AND rev = :expected;   -- 0 rows => someone else won; reload + retransform + retry",
+  "code_language": "sql",
+  "advantages": [
+   "Simple, obviously correct",
+   "Fair queueing under contention",
+   "No extra infra"
+  ],
+  "disadvantages": [
+   "Lock held across multiple round trips",
+   "Waiters hold DB connections (pool pressure)",
+   "Deadlock risk if future code locks multiple docs"
+  ],
+  "common_mistakes": [
+   "Lock ke bahar content padhna aur andar sirf rev check karna",
+   "Assume karna ki FOR UPDATE ke baad purana snapshot dikhega (READ COMMITTED re-check)"
+  ],
+  "follow_up_questions": [
+   "READ COMMITTED vs REPEATABLE READ mein yeh query kaise behave karti?",
+   "Lock timeout set karoge?",
+   "Lock time kaise kam karoge?"
+  ],
+  "concepts": [
+   "SELECT FOR UPDATE",
+   "pessimistic locking",
+   "optimistic concurrency",
+   "READ COMMITTED"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pessimistic lock = no retries, simple; optimistic = no blocking but retry storms on hot docs.",
+   "failure_scenarios": "Slow transaction (network blip to DB) holding lock -> sab editors ka submit queue mein; lock_timeout na ho toh connections pile up aur pool exhaust.",
+   "alternatives": "Optimistic CAS on rev; advisory lock; in-memory per-doc actor with persisted batches; single-writer Kafka partition per doc.",
+   "scale_10x_100x": "Lock round trips ko ek stored procedure / single CTE mein karke 1 round trip; ya in-memory sequencer for hot docs. 100x docs pe DB writes total ka issue, lock ka nahi.",
+   "production_improvements": "`SET LOCAL lock_timeout`, metric for lock wait time (pg_stat_activity wait_event), submit ko ek SQL function mein collapse karna."
+  }
+ },
+ {
+  "id": "COLB-044",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Redis pub/sub is at-most-once and can reorder messages across publishers. Why does that happen, and how do you compensate?",
+  "answer_hinglish": "At-most-once: Redis pub/sub fire-and-forget hai. PUBLISH ke waqt jo subscribers connected hain unke output buffers mein message jaata hai; koi persistence nahi, koi ack nahi. Subscriber disconnected tha (network blip, Redis restart, subscriber ka output buffer limit cross hua aur Redis ne client kill kiya) -> message us subscriber ke liye hamesha ke liye gaya.\n\nReordering across publishers: server A rev 5 commit karta hai, server B rev 6 (A ke commit ke baad lock milne pe). Ab A ka PUBLISH aur B ka PUBLISH do alag TCP connections se Redis tak jaate hain. Agar A ka event loop busy tha ya network thoda slow, toh B ka PUBLISH Redis pe pehle pahunch sakta hai -- subscribers rev 6 pehle dekhenge. Ek publisher ke messages ordered hain (same connection), alag publishers ke beech koi guarantee nahi. Commit order != publish arrival order.\n\nCompensation -- per-room ordered forwarder (`realtime.py`):\n1. Reorder: `room.buffer[rev] = m`; `_flush` sirf `next_rev` se consecutive deliver karta hai. Rev 6 pehle aaya toh buffer mein wait.\n2. Loss: buffer non-empty raha toh `_fill_gap_later` 300ms baad Postgres se `ops_between(next_rev-1, min(buffer)-1)` padhta hai. Postgres source of truth hai, toh missing rev wahan zaroor hai (commit publish se pehle hua).\n3. Duplicates (gap fill ke baad late pub/sub message): `rev < next_rev` -> ignore.\n\n4. Tail loss (review mein mila tha): agar last op lost aur koi naya op na aaye toh gap detect hi nahi hota. Fix kiya: `check_tails` har `tail_check_ms` (1s) active rooms ke DB heads ek query mein padhta hai aur missing revs deliver karta hai (`test_lost_last_message_is_recovered_by_tail_check`).",
+  "why_needed": "Messaging guarantees ko samajhna aur unke upar correct layer banana distributed systems ka core skill hai.",
+  "real_world_analogy": "Do alag couriers se bheje letters: pehle bheja letter baad mein pahunch sakta hai, ya kho bhi sakta hai. Receiver numbered letters ko order mein lagata hai aur missing number ke liye head office se photocopy mangata hai.",
+  "how_it_works": "Unreliable unordered transport + sequence numbers + reorder buffer + repair from durable store = reliable ordered delivery.",
+  "in_this_project": "`collab/realtime.py` module docstring ('Two properties of Redis pub/sub we must handle (both bite real systems)'), `_deliver_ordered`, `_fill_gap_later`, `check_tails`. `FAILURE_SCENARIOS.md` #6, #7, #7b.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_deliver_ordered",
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/collab/realtime.py::check_tails"
+  ],
+  "code_example": "# real, collab/realtime.py docstring\n# 1. Ordering across publishers is not guaranteed: server A commits rev 5, server B commits rev 6, B's\n#    message can arrive first.\n# 2. Delivery is at-most-once: a subscriber that blips can miss a message entirely.",
+  "code_language": "python",
+  "advantages": [
+   "Low latency happy path (pub/sub)",
+   "Correctness from Postgres, not Redis"
+  ],
+  "disadvantages": [
+   "Gap -> 300ms+ extra latency",
+   "Tail loss ~1s (tail_check_ms) tak stale rehta hai",
+   "Complexity in every server"
+  ],
+  "common_mistakes": [
+   "Pub/sub ko ordered reliable queue samajhna",
+   "Single-publisher ordering ko multi-publisher pe assume karna"
+  ],
+  "follow_up_questions": [
+   "Redis Streams yeh problems kaise solve karte?",
+   "Commit ke andar publish karte toh?",
+   "Output buffer limit kya hai aur kab client kill hota?"
+  ],
+  "concepts": [
+   "at-most-once",
+   "message ordering",
+   "Redis pub/sub",
+   "reorder buffer"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fast-but-lossy bus + durable repair; alternative durable bus adds latency/ops but removes repair logic.",
+   "failure_scenarios": "Redis restart: saare subscribers ke messages lost; subscriber output buffer overflow (client-output-buffer-limit pubsub) pe Redis subscriber ko disconnect karta hai -- heavy traffic pe yeh real risk.",
+   "alternatives": "Redis Streams (XADD per doc, XREAD from last id), Kafka partition per doc, NATS JetStream.",
+   "scale_10x_100x": "100x traffic pe pubsub output buffers aur har server ka psubscribe * fan-in pehle tootega.",
+   "production_improvements": "Tail check already hai; aage gap_fills/tail_fills alerting, `client-output-buffer-limit pubsub` tuning, per-doc sequence check on client (rev jump detect -> resync)."
+  }
+ },
+ {
+  "id": "COLB-045",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why do acknowledgements travel through the ordered stream instead of being sent directly after the commit?",
+  "answer_hinglish": "Client state machine ki ek hidden assumption hai: jab ack (rev R) aata hai, client maan leta hai ki R se pehle ke saare revisions woh dekh chuka hai. `_ack(rev)` bas `outstanding = None; rev = R` karta hai.\n\nAb scenario: Bob ka op rev 9 (server 2 pe), Alice ka op rev 10 (server 1 pe, Bob ke baad lock mila). Alice ke server ko rev 9 pub/sub se thoda late milta hai. Agar server 1 commit ke turant baad Alice ko direct ack bhej de: Alice ko 'ack rev 10' pehle milega -> `rev = 10`, outstanding gone. Phir op rev 9 aata hai -> client usse apply karta hai, par ab koi outstanding nahi jiske against transform ho -- jabki Alice ka op server pe rev 9 ke against transform hua tha. Alice ke doc mein Bob ka edit galat position pe lagega -> divergence (ya length mismatch). Saath mein `rev` 10 se 9 pe peeche chala jayega.\n\nIsliye mere design mein author ko alag ack nahi milta. Commit ke baad sirf ek PUBLISH hota hai; author ka server bhi apne room ke ordered forwarder se woh message receive karta hai, aur `_for()` author ke connection ke liye usse `ack` bana deta hai -- rev order mein, rev 9 ke BAAD. `ARCHITECTURE.md` sequence: 'S1-->>A: ack rev 10 (in revision order)'.\n\nCost (`TRADEOFFS.md` #4): author ka ack ek extra pub/sub round trip ke baad aata hai, aur ack latency gap-fill delay se bhi affect ho sakti hai. Ack latency matlab buffer flush late -> author ke next op ka send late. Benefit: ek proof-friendly invariant -- client ko har cheez rev order mein milti hai.",
+  "why_needed": "Yeh subtle ordering bug hai jo bahut implementations mein hota hai; isse explain karna depth dikhata hai.",
+  "real_world_analogy": "Exam result: tumhe tumhara rank (ack) tab hi batao jab tumse upar wale sab ranks announce ho chuke hon -- warna tum galat samjhoge ki tumse aage koi nahi.",
+  "how_it_works": "Single publish -> per-server ordered forwarder -> projection to ack for author. Invariant: messages to a client are rev-ordered.",
+  "in_this_project": "`collab/realtime.py::_for`, `_flush`; `collab/api.py` op branch only publishes (no direct ack). `TRADEOFFS.md` #4, `ARCHITECTURE.md` edit lifecycle.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_for",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/TRADEOFFS.md",
+   "projects/08-collab/ARCHITECTURE.md"
+  ],
+  "code_example": "# real, collab/api.py (op branch) -- no direct ack, only publish\nif not applied.duplicate:\n    await hub.publish(doc_id, {\"type\": \"op\", \"rev\": applied.rev, \"op\": applied.op.to_json(),\n                               \"user_id\": conn.user_id, \"client_id\": conn.client_id,\n                               \"client_seq\": int(msg[\"client_seq\"])})",
+  "code_language": "python",
+  "advantages": [
+   "Client invariant simple: everything in rev order",
+   "No special code path for acks"
+  ],
+  "disadvantages": [
+   "Ack latency = pub/sub round trip (+ gap fill if any)",
+   "Redis down = acks delayed (author stuck in AwaitingConfirm)"
+  ],
+  "common_mistakes": [
+   "Direct ack after commit",
+   "Client ack handler mein rev ko max() se set karna ko fix samajhna (transform miss phir bhi)"
+  ],
+  "follow_up_questions": [
+   "Agar direct ack chahiye toh client ko kya badalna padega?",
+   "Ack lost ho toh?",
+   "Ack latency measure kiya?"
+  ],
+  "concepts": [
+   "ack ordering",
+   "invariant",
+   "ordered stream"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Correctness invariant vs ack latency; also couples author's progress to Redis health.",
+   "failure_scenarios": "Redis outage -> author ka ack nahi aata -> client buffer badhta rehta hai (edits lost nahi, bas sync ruk jaata hai) jab tak gap fill trigger ho ya reconnect.",
+   "alternatives": "Direct ack with 'ack includes all revs before it' (server sends missing ops before ack on same socket) -- ot.js server style single-node.",
+   "scale_10x_100x": "Scale se independent; par pub/sub latency badhne pe (cross-region) ack bhi utna late.",
+   "production_improvements": "Ack-latency metric; ack timeout on client -> reconnect with last_rev (catch-up delivers ack from DB)."
+  }
+ },
+ {
+  "id": "COLB-046",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How does (client_id, client_seq) deduplication give you an exactly-once effect for edits?",
+  "answer_hinglish": "Network pe 'exactly-once delivery' nahi hoti, par 'exactly-once EFFECT' ho sakta hai: at-least-once retry + idempotent receiver.\n\nClient side: har outstanding op ka ek `client_seq` hai (`next_seq` se, per client monotonically badhta). Agar connection toot gaya aur ack nahi aaya, client nahi jaanta ki op apply hua ya nahi. Reconnect pe `joined` ke baad woh outstanding op SAME client_seq ke saath dobara bhejta hai (`_send_op(*self.outstanding)`). Naya seq nahi -- warna server use naya op samjhega.\n\nServer side: `submit` lock ke andar pehla kaam: `SELECT rev FROM operations WHERE document_id AND client_id AND client_seq`. Mila -> `Applied(dup_rev, op, duplicate=True)`, kuch store nahi, kuch publish nahi. DB constraint `UNIQUE (document_id, client_id, client_seq)` backstop hai.\n\nDedupe lock ke ANDAR kyun? Agar bahar check karte, toh do resends parallel aa ke dono 'not found' dekh sakte the. Lock ke andar check serialized hai.\n\nDuplicate ka ack kaun bhejta hai? Normally zarurat hi nahi: reconnect pe `join(last_rev)` catch-up mein woh op `ops_between` se aata hai aur `_for` usse ack bana deta hai -- client ka outstanding wahin clear ho jaata hai, aur `joined` ke time resend hota hi nahi. Resend tab hota hai jab op server tak pahuncha hi nahi tha, ya catch-up ke baad commit hua. Test `test_lost_ack_resend_is_deduplicated`: reader cancel, insert, reconnect -> content 'abcXYZ', rev 1 -- exactly once.\n\nSecurity detail (review fix): client_id client-chosen hai aur broadcast hota hai, toh pehle doosra editor victim ke client_id + seq use karke uske ops 'duplicate' bana sakta tha. Ab `ws_endpoint` client_id ko `<user_id>:<client_id>` namespace karta hai, toh dedupe key effectively per user hai (`test_client_id_of_another_user_cannot_be_hijacked`).",
+  "why_needed": "Idempotency har distributed write path ka basic pattern hai; yahan iska concrete use case hai.",
+  "real_world_analogy": "Online payment: 'Pay' button do baar dabaya toh bhi ek hi baar paisa kate, kyunki har payment ka unique order ID hai.",
+  "how_it_works": "Retry with stable idempotency key; server checks key under the same lock that serialises writes; DB unique constraint as backstop.",
+  "in_this_project": "`collab/client.py::_handle` (joined -> resend outstanding with same seq), `collab/service.py::submit` dedupe, migration UNIQUE constraint. `FAILURE_SCENARIOS.md` #4.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/client.py::_handle",
+   "projects/08-collab/tests/test_realtime.py::test_lost_ack_resend_is_deduplicated"
+  ],
+  "code_example": "# real, collab/service.py\ndup = await s.scalar(text(\"SELECT rev FROM operations WHERE document_id = :d AND client_id = :c AND client_seq = :q\"),\n                     {\"d\": doc_id, \"c\": client_id, \"q\": client_seq})\nif dup is not None:\n    return Applied(dup, op, duplicate=True)",
+  "code_language": "python",
+  "advantages": [
+   "Safe blind retries",
+   "DB-enforced",
+   "No extra dedupe store"
+  ],
+  "disadvantages": [
+   "Dedupe key ka client_id client-chosen hai -- ab user_id prefix se namespaced (review fix), schema mein user_id column constraint ka hissa nahi",
+   "Duplicate op body compare nahi hota (same seq different op silently ignored)"
+  ],
+  "common_mistakes": [
+   "Retry pe naya client_seq generate karna",
+   "Dedupe lock ke bahar"
+  ],
+  "follow_up_questions": [
+   "client_id reuse across tabs/devices ka kya?",
+   "Dedupe table ka TTL/cleanup?",
+   "Same seq different op aaye toh kya karna chahiye?"
+  ],
+  "concepts": [
+   "idempotency",
+   "exactly-once effect",
+   "at-least-once",
+   "dedupe key"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-047",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Walk through reconnection: how does a client catch up with last_rev, and how is a lost ack handled?",
+  "answer_hinglish": "Disconnect ke waqt client ke paas: `doc` (local, pending edits included), `rev` (last server rev applied), `outstanding` (shayad), `buffer` (shayad).\n\nReconnect:\n1. Naya ticket (`ticket_factory`), naya WebSocket. Join message mein `last_rev = self.rev` (pehli baar ke baad).\n2. Server `Hub.join`: room lock, snapshot (head). `0 <= last_rev <= head` -> `ops_between(last_rev, head)` ke saare ops `_for()` se bhejo: doosron ke ops `op`, client ke APNE ops (matching client_id) `ack`. Phir `joined{catchup: True}`. Content nahi bhejte.\n3. Client har catch-up op pe `_server_op` -- outstanding aur buffer ke against transform, apply. Agar uska apna op server pe commit ho chuka tha (lost ack case), toh catch-up stream mein uski position pe `ack` aata hai -> outstanding clear, rev update. Pehle ke ops ke against outstanding transform ho chuka tha -- exactly server jaisa.\n4. `joined` -> agar outstanding ab bhi hai (op server tak pahuncha hi nahi), SAME client_seq se resend; warna buffer flush.\n\nLost ack ke teen sub-cases:\n- Op applied, ack lost -> catch-up mein ack. Resend nahi hota.\n- Op server tak nahi pahuncha -> catch-up mein nahi, resend after joined, normal submit.\n- Race: op catch-up snapshot ke BAAD commit hua (purane connection ka submit abhi chal raha tha) -> client resend karta hai, server dedupe karke `duplicate=True`; ack ordered stream se aata hai (live forwarder, kyunki naya conn room mein registered hai aur `rev > base_rev`).\n\nTest: `test_lost_ack_resend_is_deduplicated` -> 'abcXYZ', rev 1. Fuzz test mein 2 clients offline jaake reconnect karte hain.",
+  "why_needed": "Reconnect + lost ack real networks ka daily reality hai; yeh end-to-end bata pana senior-level clarity hai.",
+  "real_world_analogy": "Phone call kat gayi: wapas call karke bolo 'last baat mujhe point 7 tak yaad hai' -- doosra point 8 se repeat kare, aur agar tumhara sawaal pehle hi sun liya tha toh bolega 'haan woh mil gaya tha'.",
+  "how_it_works": "join(last_rev) -> replay missed ops (own as ack) -> joined -> resend unacked with same seq -> dedupe on server.",
+  "in_this_project": "`collab/client.py::connect` (`join['last_rev'] = self.rev`), `_handle`; `collab/realtime.py::join`; `service.submit` dedupe. `LEARNING_GUIDE.md` Step 5.",
+  "implementation_files": [
+   "projects/08-collab/collab/client.py::connect",
+   "projects/08-collab/collab/realtime.py::join",
+   "projects/08-collab/tests/test_realtime.py::test_lost_ack_resend_is_deduplicated",
+   "projects/08-collab/LEARNING_GUIDE.md"
+  ],
+  "code_example": "# real, tests/test_realtime.py\nc._reader.cancel()\nawait c.insert(3, \"XYZ\")\nawait asyncio.sleep(0.3)                     # server applied it (rev 1); ack never read\nawait c.disconnect()\nassert c.outstanding is not None             # client still thinks it is unacked\nawait c.connect()                            # catch-up delivers rev 1 as OUR ack; resend would be deduped\nassert await until(lambda: c.settled)\nfinal = await server_content(api, u, doc[\"id\"])\nassert final[\"content\"] == c.doc == \"abcXYZ\" and final[\"rev\"] == 1",
+  "code_language": "python",
+  "advantages": [
+   "Pending local edits survive reconnect",
+   "Cheap catch-up (only missed ops)",
+   "Exactly-once effect"
+  ],
+  "disadvantages": [
+   "Very stale last_rev = huge catch-up burst",
+   "Catch-up reads in room lock"
+  ],
+  "common_mistakes": [
+   "Reconnect pe full content le lena (pending edits ke saath conflict)",
+   "Resend with new seq"
+  ],
+  "follow_up_questions": [
+   "last_rev bahut purana ho toh limit lagaoge?",
+   "Reconnect storm (deploy) mein DB load?",
+   "Client ka rev catch-up ke dauraan kaise update hota hai?"
+  ],
+  "concepts": [
+   "reconnection",
+   "catch-up",
+   "lost ack",
+   "idempotent resend"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Catch-up via op replay keeps local edits valid; full-state resync is simpler but would discard/conflict with pending edits.",
+   "failure_scenarios": "Mass reconnect after deploy: har client ka catch-up ek `ops_between` query + room lock -> DB spike; last_rev older than archived ops (future retention) -> catch-up impossible.",
+   "alternatives": "Full resync + rebase pending edits via diff; or CRDT state-vector sync (Yjs) which sends only missing updates regardless of order.",
+   "scale_10x_100x": "10x clients reconnecting -> jittered backoff, catch-up rate limiting, catch-up from snapshot + ops when gap > N.",
+   "production_improvements": "Max catch-up size (fallback to full content + client-side rebase), reconnect backoff with jitter, metric for catch-up size."
+  }
+ },
+ {
+  "id": "COLB-048",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Describe the room join/leave race you found and how you fixed it.",
+  "answer_hinglish": "Bug (`FAILURE_SCENARIOS.md` #2, fuzz bug debug karte waqt mila): ek hi server pe ek doc ke liye ek connection leave kar raha hai (aakhri connection) aur usi waqt naya connection join kar raha hai.\n\nPehle code (simplified): `join` -> `room = rooms.setdefault(doc_id, Room())` ... kuch awaits (snapshot DB read) ... `room.conns[id] = conn`. `leave` -> `room.conns.pop(id)`; `if not room.conns: rooms.pop(doc_id)`.\n\nInterleaving: join ne `setdefault` se existing room object pakda, DB read pe await kiya. Us beech leave ne aakhri conn hataya, room khaali dekha, `rooms.pop(doc_id)` -- room dict se gaya. Join wapas aaya aur conn ko us PURANE room object mein register kiya jo ab `self.rooms` mein nahi hai. Ab `_on_message` `rooms.get(doc_id)` -> None -> sab ops drop. Connection orphan: open hai, par kabhi koi update nahi milega. Fuzz test mein yeh disconnect/reconnect pe flaky 'client never converges' ki tarah dikha.\n\nFix: dono same `room.lock` ke andar, aur identity check:\n- join: `room = setdefault(...)`; `await room.lock.acquire()`; `if self.rooms.get(doc_id) is room: break` warna release aur loop (naya room lo). Registration lock ke andar.\n- leave: `async with room.lock:` pop conn; `if not room.conns and self.rooms.get(doc_id) is room: rooms.pop(...)`, gap_task cancel.\n\nAb lock milne ke baad join verify karta hai ki room abhi bhi registered hai. asyncio single-threaded hai, par har `await` ek interleaving point hai -- 'no threads = no races' galat assumption hai.",
+  "why_needed": "asyncio mein race conditions ka real example -- interviewers yeh 'single-threaded so safe' myth todna pasand karte hain.",
+  "real_world_analogy": "Tum meeting room mein ghus rahe ho, darwaze pe ruke phone uthane; us beech aakhri banda nikla aur room ko 'band' karke booking cancel kar di. Tum andar baith gaye -- par ab us room mein koi meeting nahi hogi.",
+  "how_it_works": "Check-then-act across an await; fixed with per-room lock covering registration and removal plus identity re-check after acquiring.",
+  "in_this_project": "`collab/realtime.py::join` (`room.lock.release()   # a concurrent leave() removed this room meanwhile: use the new one`), `collab/realtime.py::leave` (`# same lock as join(): a joiner can't be registered into a room being dropped`). `FAILURE_SCENARIOS.md` #13 and bug #2.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::join",
+   "projects/08-collab/collab/realtime.py::leave",
+   "projects/08-collab/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, collab/realtime.py\nwhile True:\n    room = self.rooms.setdefault(doc_id, Room(doc_id))\n    await room.lock.acquire()\n    if self.rooms.get(doc_id) is room:\n        break\n    room.lock.release()   # a concurrent leave() removed this room meanwhile: use the new one\n...\nasync with room.lock:   # same lock as join(): a joiner can't be registered into a room being dropped\n    room.conns.pop(conn.conn_id, None)\n    if not room.conns and self.rooms.get(conn.doc_id) is room:\n        self.rooms.pop(conn.doc_id, None)",
+  "code_language": "python",
+  "advantages": [
+   "Simple per-room lock, no global lock",
+   "Identity check handles replaced rooms"
+  ],
+  "disadvantages": [
+   "DB read inside room lock delays forwarding for that doc",
+   "Lock ordering must be kept if more locks added"
+  ],
+  "common_mistakes": [
+   "asyncio code ko race-free maan lena",
+   "Room ko kabhi delete na karna (memory leak) ko 'fix' samajhna"
+  ],
+  "follow_up_questions": [
+   "Global lock kyun nahi liya?",
+   "Is bug ka test kaise likhoge (deterministic)?",
+   "Aur kaunse check-then-act points hain codebase mein?"
+  ],
+  "concepts": [
+   "race condition",
+   "asyncio",
+   "check-then-act",
+   "lock"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-room lock = fine-grained but join holds it during DB read; global lock simpler but serializes all rooms.",
+   "failure_scenarios": "Bina fix: silent orphaned connections -- user typing karta rahega, uske ops commit honge, par use doosron ke edits nahi dikhenge (one-way sync).",
+   "alternatives": "Never delete rooms (leak), reference counting with delayed GC, ya actor-per-room (single task owns room state, messages via queue).",
+   "scale_10x_100x": "Zyada churn (10x reconnects) pe lock contention badhega; actor model better scale karta hai.",
+   "production_improvements": "Deterministic race test with injected awaits (monkeypatch snapshot to pause), metric: connections in rooms vs open sockets."
+  }
+ },
+ {
+  "id": "COLB-049",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "How does offline editing synchronise when the client reconnects, and what are the limits of this approach?",
+  "answer_hinglish": "Offline flow (`client.py`, `test_offline_edits_sync_after_reconnect`):\n1. Disconnect: `connected = False`. User editing jaari: `edit()` local apply + `buffer = compose(buffer, op)`. `_flush_buffer` kuch nahi bhejta (not connected). Agar disconnect ke waqt ek op outstanding tha, woh bhi rehta hai.\n2. Meanwhile doosre users ke 5 ops commit hote hain.\n3. Reconnect with `last_rev`. Catch-up ops aate hain -> `_server_op` har op ke against outstanding (agar hai) aur buffer DONO ko transform karta hai, aur server op ko local doc pe apply. (Yahin fuzz bug tha: buffer sirf outstanding ke saath transform hota tha.)\n4. `joined` -> outstanding resend (same seq) ya buffer flush as ONE op with base_rev = latest rev.\nTest result: '[draft] shared (v2).....' ya '[draft] shared..... (v2)' -- dono valid (tie-break dependent), convergence assert hoti hai.\n\nLimits (honest):\n- Server-mandatory: offline edits tab tak 'tentative' hain jab tak server accept na kare. Do offline clients ek doosre se sync nahi kar sakte (no P2P).\n- Long offline: buffer ek bada composed op ban jaata hai; reconnect pe catch-up mein hazaaron ops; server pe incoming op ko unke against transform (lock ke andar, O(history)). Intention preservation weak: user ne 2 ghante pehle wala text edit kiya jo ab badal chuka hai -- OT merges mechanically, semantic conflict ka UI nahi.\n- Persistence: Python/JS client buffer memory mein hai -- tab band = offline edits gone. Real app mein IndexedDB/localStorage.\n- `max_op_components` (10k) -- bahut lambi offline session ka op reject ho sakta hai -> client ab stall nahi hota (review fix: `resync()`), par offline edits discard ho jaate hain.\n\nOffline-first products isliye CRDTs (Yjs/Automerge) prefer karte hain: P2P, persistence-friendly, order-independent merge.",
+  "why_needed": "Offline support claim karna easy hai; uski limits honestly batana senior signal hai.",
+  "real_world_analogy": "Plane mein laptop pe document edit karna aur land karke sync: chhote changes smoothly merge, par agar team ne poora chapter rewrite kar diya tha toh tumhare edits technically merge honge par shayad semantically ajeeb.",
+  "how_it_works": "Offline = buffer-only state; catch-up transforms buffer; then single op submit.",
+  "in_this_project": "`collab/client.py` docstring 'Offline: edits keep composing into the buffer...', `_server_op`, `_handle`; `ARCHITECTURE.md` `OfflineBuffer` state; `editor.html` 'go offline' toggle; test `test_offline_edits_sync_after_reconnect`.",
+  "implementation_files": [
+   "projects/08-collab/collab/client.py::_server_op",
+   "projects/08-collab/tests/test_realtime.py::test_offline_edits_sync_after_reconnect",
+   "projects/08-collab/ARCHITECTURE.md",
+   "projects/08-collab/collab/editor.html"
+  ],
+  "code_example": "# real, tests/test_realtime.py\nawait offline.disconnect()\nawait offline.insert(0, \"[draft] \")          # edited on a plane\nawait offline.insert(len(offline.doc), \" (v2)\")\nfor _ in range(5):\n    await online.insert(len(online.doc), \".\")  # meanwhile others keep editing\nawait offline.connect()\nassert await until(lambda: offline.settled and online.doc == offline.doc and online.settled)",
+  "code_language": "python",
+  "advantages": [
+   "Reuses same OT machinery -- no special merge path",
+   "Single op on reconnect"
+  ],
+  "disadvantages": [
+   "No P2P, no durable local storage",
+   "Long offline = big transforms + weak intention preservation",
+   "Op size limit can block sync"
+  ],
+  "common_mistakes": [
+   "Offline buffer ko outstanding ke bina transform na karna (real bug)",
+   "Reconnect pe local doc ko server content se overwrite karna"
+  ],
+  "follow_up_questions": [
+   "Do offline devices ek doosre se sync kaise karein?",
+   "Offline edits persist kaise karoge?",
+   "Bahut bada offline op split kaise karoge?"
+  ],
+  "concepts": [
+   "offline sync",
+   "buffer",
+   "local-first",
+   "CRDT"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "OT + server: authoritative, simple storage; offline is second-class. CRDT: offline/P2P first-class, metadata cost.",
+   "failure_scenarios": "Client crash while offline -> edits lost (memory-only). Huge offline op -> `operation too large` -> client resync karta hai (stall nahi) par offline edits discard; split-and-retry abhi nahi hai.",
+   "alternatives": "Yjs/Automerge with IndexedDB persistence and sync protocol; ya OT with persisted pending queue and chunked submission.",
+   "scale_10x_100x": "Bahut saare offline-heavy users (mobile) -> long catch-ups + long transforms under lock; shift transform out of lock or move to CRDT.",
+   "production_improvements": "Persist outstanding+buffer locally, split large buffers into multiple ops, show 'pending sync' UI, conflict highlight for edits in heavily changed regions."
+  }
+ },
+ {
+  "id": "COLB-050",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What happens if a server crashes after committing an operation but before publishing it to Redis?",
+  "answer_hinglish": "Sequence: `submit` commit (op rev 42 Postgres mein durable) -> `hub.publish(...)` -> crash beech mein. Rev 42 ka pub/sub message kabhi nahi gaya.\n\nEffects:\n1. Author: uska connection crashed server pe tha -> socket close. Client reconnect karega (kisi bhi server), `last_rev` (41 ya kam) se join -> catch-up mein rev 42 ka op `ack` ban ke aayega (matching client_id). Outstanding clear. Agar client ne resend kiya toh dedupe. Edit exactly once.\n2. Doosre servers ke rooms: unke forwarders ko 42 nahi mila. Jab agla op rev 43 publish hoga, forwarder `buffer[43]`, `next_rev = 42` -> gap -> 300ms baad `_fill_gap_later` Postgres se rev 42 padhega -> flush 42, 43. Doosre clients ko 42 thoda late milega, par order sahi.\n3. Tail case: agar 42 ke baad koi op nahi aata, toh gap fill trigger hi nahi hota. Review mein yeh gap (tail loss) mila tha; ab har server ka `check_tails` har `tail_check_ms` (1s) DB head compare karta hai aur rev 42 deliver kar deta hai -- staleness ~1s tak bounded (`test_lost_last_message_is_recovered_by_tail_check`).\n\nKey design principle: commit-then-publish. Ulta (publish then commit) hota toh crash pe doosre clients ek aisa op dekh lete jo DB mein hai hi nahi -- 'ghost op' -- jo kabhi recover nahi hota aur clients permanently diverge. Is order mein worst case 'late delivery' hai, kabhi 'phantom' nahi. Postgres source of truth, Redis sirf notification.\n\nTransactional outbox pattern se publish ko bhi guaranteed bana sakte the (outbox row commit ke saath, relay publish kare) -- yahan zarurat nahi kyunki consumers khud DB se repair karte hain.",
+  "why_needed": "'Dual write' problem (DB + message bus) har event-driven system mein aata hai; correct ordering ka reasoning chahiye.",
+  "real_world_analogy": "Pehle register mein entry likho, phir announcement karo. Announcement miss ho jaye toh log register dekh lenge; ulta kiya aur entry nahi likhi toh announcement jhooth ban gaya.",
+  "how_it_works": "Commit first (durable), notify second (best-effort); consumers repair from durable store on gap.",
+  "in_this_project": "`collab/api.py::ws_endpoint` (publish after `submit` returns), `collab/realtime.py::_fill_gap_later`, `collab/realtime.py::check_tails` (tail case), `collab/realtime.py::join` catch-up. `FAILURE_SCENARIOS.md` #8.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/collab/realtime.py::check_tails"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Never phantom ops",
+   "No outbox infra needed",
+   "Author recovers via catch-up"
+  ],
+  "disadvantages": [
+   "Delayed delivery: next op tak (gap fill) ya ~1s tak (tail check)",
+   "Har server pe 1s ka extra head query (tail check)"
+  ],
+  "common_mistakes": [
+   "Publish inside transaction",
+   "Assuming publish success = delivered"
+  ],
+  "follow_up_questions": [
+   "Transactional outbox kab zaroori hota?",
+   "Tail check ne tail loss kaise fix kiya?",
+   "Author ka client kaise jaanega ki op commit hua?"
+  ],
+  "concepts": [
+   "dual write",
+   "commit then publish",
+   "transactional outbox",
+   "crash recovery"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Commit-then-notify with consumer-side repair avoids outbox complexity, at the cost of repair latency; the tail-loss hole is closed by a 1s periodic head check.",
+   "failure_scenarios": "Crash ke baad koi naya op na aaye -> pehle other servers' clients indefinitely stale rehte, ab tail check se ~1s; presence entries of crashed server linger till 30s stale.",
+   "alternatives": "Transactional outbox + relay; Postgres LISTEN/NOTIFY (in-txn, delivered on commit) as the fan-out; CDC (Debezium) from WAL.",
+   "scale_10x_100x": "Scale pe crashes zyada common; tail check per server ek batched query hai (`service.heads`), toh rooms badhne pe bhi ek round trip per tick.",
+   "production_improvements": "Tail check already does the per-room head compare; add alerting on tail_fills/gap age and a check right after subscriber reconnect."
+  }
+ },
+ {
+  "id": "COLB-051",
+  "project_slug": "p08-collab",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Why must a client receive operations strictly in revision order? What breaks otherwise?",
+  "answer_hinglish": "Client ka OT state machine ek chain hai: `outstanding` aur `buffer` hamesha 'doc@self.rev + mere pending edits' ke relative hain. Har incoming server op S ka contract hai ki woh doc@(S.rev - 1) pe apply hota hai -- server ne use pichle saare revs ke against transform karke store kiya hai.\n\nAgar client ko rev 11 pehle mil jaye aur rev 10 baad mein:\n- Rev 11 doc@10 pe apply hone ke liye bana hai, client abhi doc@9 pe hai. Length mismatch -> `apply` OTError (agar 10 ne length badli), ya worse: lengths match ho gayi (e.g. rev 10 ne ek char replace kiya) aur op galat jagah silently apply -- divergence.\n- `self.rev` 11 set ho jaata, phir 10 aata aur rev peeche jaata -> next op ka base_rev galat.\n- Pending ops galat sequence ke against transform hote -- server ki sequence se alag -> non-distributivity ki wajah se tie pe alag result.\n\nIsliye server side ordered forwarder strict hai: `_flush` sirf `next_rev` consecutive deliver karta hai; har connection ka ek single queue + single writer task hai, toh queue order = socket order. TCP (WebSocket) ek connection ke andar order preserve karta hai.\n\nClient side extra defense nahi hai (observation): `CollabClient` incoming `rev` ko check nahi karta ki woh exactly `self.rev + 1` hai. Ek cheap safety net hota: rev jump detect ho toh reconnect with last_rev (catch-up). Production client mein main yeh add karunga.",
+  "why_needed": "Ordering requirement ko concrete failure se jodna -- interviewer yahi chahta hai.",
+  "real_world_analogy": "Recipe ke steps: 'atta goondho' se pehle 'roti belo' padh liya toh result galat; har step pichle step ke result pe based hai.",
+  "how_it_works": "Ops are relative to the previous revision; out-of-order apply violates base length or position semantics.",
+  "in_this_project": "`collab/realtime.py::_flush` (`while room.next_rev in room.buffer`), `Conn.queue` + `write_loop`; `collab/client.py::_server_op` (no rev continuity check).",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_flush",
+   "projects/08-collab/collab/client.py::_server_op",
+   "projects/08-collab/collab/api.py::ws_endpoint"
+  ],
+  "code_example": "# illustrative client-side guard (NOT in repo)\ndef _server_op(self, rev, op):\n    if rev != self.rev + 1:\n        raise ResyncNeeded(f\"expected rev {self.rev + 1}, got {rev}\")   # reconnect with last_rev\n    ...",
+  "code_language": "python",
+  "advantages": [
+   "Simple invariant to reason about",
+   "TCP preserves order inside one connection"
+  ],
+  "disadvantages": [
+   "Strict ordering = head-of-line blocking on gaps"
+  ],
+  "common_mistakes": [
+   "Assume Redis ordering",
+   "Multiple writer tasks per socket"
+  ],
+  "follow_up_questions": [
+   "Client rev check add karoge toh kya karega mismatch pe?",
+   "Head-of-line blocking kitna costly hai?",
+   "Cursor messages ko order kyun nahi chahiye?"
+  ],
+  "concepts": [
+   "ordering",
+   "revision continuity",
+   "head-of-line blocking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-052",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What latency did you measure for edit propagation, and how was it measured?",
+  "answer_hinglish": "`bench/latency.py` real setup pe chala: 2 uvicorn servers same process mein, Postgres + Redis Docker Desktop on Windows mein (`TESTING.md`, run date 2026-11-17).\n\nPropagation: client A ek char insert karta hai, timer start; client B ka `received_ops` badhne tak busy-wait; timer stop. 100 edits, har edit ke baad A ke settle hone ka wait (ek op at a time). p50 aur p95 sort karke.\n\nResults:\n- Same server (A, B dono server 1 pe): p50 21.0 ms, p95 29.1 ms.\n- Across servers (A server 1, B server 2, via Redis pub/sub): p50 19.4 ms, p95 27.4 ms.\n\nDono ~20ms. Cross-server costlier nahi hai kyunki SAME server pe bhi path wahi hai: A -> server -> Postgres transaction (lock, dedupe, history, insert, update, commit) -> Redis PUBLISH -> server ka subscriber (khud ka message bhi pub/sub se aata hai) -> forwarder -> B. Same-server pe koi 'local shortcut' nahi hai -- design choice, taaki ordering ek hi path se aaye. Difference noise hai.\n\n20ms ka bada hissa Postgres round trips hain -- `TESTING.md` ~3ms per round trip through Docker Desktop bolta hai, aur submit mein ~5 statements. Linux pe native Postgres ke saath yeh kaafi kam hota (generic expectation, measured nahi).\n\nHuman perception: ~100ms tak edits 'instant' lagte hain, toh 20ms comfortable hai.",
+  "why_needed": "Numbers bolne se pehle methodology aur conditions batana credibility deta hai.",
+  "real_world_analogy": "Pizza delivery ka time: chahe dukaan tumhari gali mein ho ya agli gali mein, agar har order central kitchen se hi jaata hai toh time same.",
+  "how_it_works": "Wall clock from A's local edit to B's receipt; includes DB commit and pub/sub hop in both cases.",
+  "in_this_project": "`bench/latency.py::propagation`, `TESTING.md` Benchmarks table.",
+  "implementation_files": [
+   "projects/08-collab/bench/latency.py::propagation",
+   "projects/08-collab/TESTING.md"
+  ],
+  "code_example": "# real, bench/latency.py (trimmed)\nfor i in range(n):\n    target = b.received_ops + 1\n    t = time.perf_counter()\n    await a.insert(len(a.doc), \"x\")\n    while b.received_ops < target:\n        await asyncio.sleep(0)\n    lat.append((time.perf_counter() - t) * 1000)",
+  "code_language": "python",
+  "advantages": [
+   "Real servers, real DB, real WebSockets",
+   "Same-process clients -> no clock skew"
+  ],
+  "disadvantages": [
+   "Docker Desktop on Windows inflates round trips",
+   "Single client pair, no load",
+   "Busy-wait polling adds tiny overhead"
+  ],
+  "common_mistakes": [
+   "Numbers ko production ke liye extrapolate karna",
+   "Same-server ko 'faster path' assume karna"
+  ],
+  "follow_up_questions": [
+   "Load ke under p99 kya hoga?",
+   "Postgres ko path se hata do toh latency kitni?",
+   "Bench mein kya missing hai?"
+  ],
+  "concepts": [
+   "latency",
+   "p50/p95",
+   "benchmark methodology"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-053",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why is per-document throughput bounded at about 45-66 ops/s, and why do 8 writers only reach 66?",
+  "answer_hinglish": "`TESTING.md`: ONE document pe committed ops/s -- 1 writer: 45, 8 concurrent writers: 66. Same machine conditions (Docker Desktop on Windows).\n\nKyun bounded: har op ek Postgres transaction hai jo document row lock hold karta hai: SELECT FOR UPDATE, dedupe SELECT, history SELECT, INSERT op, UPDATE documents, COMMIT -- ~5-6 round trips, ~3ms each through Docker Desktop. Lock hold ~15-20ms -> theoretical max ~50-65 commits/s per doc. Lock serial hai, toh zyada writers lock ke saamne queue banate hain, throughput nahi badhta.\n\n1 writer = 45 kyun? Bench ka writer ek op bhejta hai aur ACK ka wait karta hai (`while not c.settled`). Ack ka path: commit + publish + pub/sub + forwarder + socket. Toh 1 writer ka cycle = lock time + ack round trip; lock idle rehta hai ack ke dauraan. 8 writers mein jab ek ka ack travel kar raha hai, doosre ka submit lock le leta hai -- lock ~continuously busy -> 66, jo approximately lock-bound ceiling hai. Isse aage writers add karne se sirf queueing latency badhegi.\n\nMatter karta hai? Humans ke liye nahi: client keystrokes compose karta hai jab op in-flight hai, toh ek user typically few ops/s generate karta hai. 66 ops/s = ~20-30 tez typists ek doc pe comfortably. 'Machine-generated firehose' (bots, bulk import) ke liye nahi.\n\nBadhane ke tareeke: round trips kam (ek SQL function/CTE mein submit), Postgres latency kam (same host, no Docker Desktop), batching (ek lock mein multiple pending ops sequence karna), ya in-memory sequencer per hot doc.",
+  "why_needed": "Bottleneck ko numbers se explain karna (Little's law style) performance interviews ka core hai.",
+  "real_world_analogy": "Ek hi billing counter: chahe line mein 1 ho ya 8, counter ek bill per X seconds hi kar sakta hai; 1 customer ke saath counter idle bhi rehta hai jab woh change gin raha hota hai.",
+  "how_it_works": "Serial critical section; throughput = 1 / lock_hold_time; single closed-loop client also pays ack latency.",
+  "in_this_project": "`bench/latency.py::throughput` (writers=1, 8; per=50; insert at 0 and wait settled), `TESTING.md` explanation, `README.md` known limitation.",
+  "implementation_files": [
+   "projects/08-collab/bench/latency.py::throughput",
+   "projects/08-collab/TESTING.md",
+   "projects/08-collab/README.md"
+  ],
+  "code_example": "# real, bench/latency.py\nasync def go(c):\n    for _ in range(per):\n        await c.insert(0, \"y\")\n        while not c.settled:\n            await asyncio.sleep(0)",
+  "code_language": "python",
+  "advantages": [
+   "Docs are independent -> total throughput scales with docs/servers",
+   "Bound is predictable"
+  ],
+  "disadvantages": [
+   "Single hot doc capped by DB latency",
+   "Lock waiters hold DB connections"
+  ],
+  "common_mistakes": [
+   "More app servers se per-doc throughput badhane ki ummeed",
+   "Closed-loop benchmark ko open-loop capacity samajhna"
+  ],
+  "follow_up_questions": [
+   "Ek SQL round trip mein submit kaise karoge?",
+   "Open-loop load test kaise karte?",
+   "Hot doc ko detect kaise karoge?"
+  ],
+  "concepts": [
+   "throughput",
+   "critical section",
+   "lock contention",
+   "closed-loop benchmark"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Postgres sequencer = durable + simple + any-server, capped per doc; in-memory sequencer = 10-100x faster per doc but needs ownership.",
+   "failure_scenarios": "Hot doc pe queue badhta hai -> submit latency badhti -> acks late -> clients ke buffers bade -> bade ops -> longer transforms -> positive feedback loop.",
+   "alternatives": "Stored procedure submit (1 round trip), batch commit of multiple ops per lock, in-memory per-doc actor with async persistence (Kafka/WAL).",
+   "scale_10x_100x": "10x users per doc -> buffering absorbs (fewer, larger ops). 100x (thousands of editors) -> dedicated sequencer + read-only viewers fan-out tier.",
+   "production_improvements": "Lock wait time metric, per-doc op rate metric, alert on submit p99; move submit to `plpgsql` function."
+  }
+ },
+ {
+  "id": "COLB-054",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would you scale a 'hot' document with thousands of concurrent editors?",
+  "answer_hinglish": "Pehle clarify: is project mein hot docs ka special handling implement NAHI hai; `SYSTEM_DESIGN.md` bas direction deta hai: 'Hot documents (1000s of editors) need a dedicated in-memory sequencer per document (sticky routing) and batching.'\n\nProblems at 1000s editors on one doc:\n1. Sequencer: ~66 ops/s cap (row lock).\n2. Fan-out: har op 1000s sockets pe -- across servers, har server pe forwarder loop.\n3. Transform cost: clients ka base_rev purana -> server har op ko bahut saare history ops ke against transform karta hai.\n4. Client side: har client ko har op transform/apply karna.\n\nDesign:\n1. Doc ownership: consistent hashing / directory service se `doc_id -> owner server`. Sab edit traffic owner pe route (sticky by doc, user nahi). Owner in-memory: current text, rev, recent op log ring buffer. Transform + apply memory mein (microseconds).\n2. Persistence: owner batch mein persist kare -- har 50ms ya N ops ka ek transaction (ops insert + content update). Ya op log Kafka partition (doc_id key) pe likhe aur ack after log append.\n3. Failover: lease + fencing token (Postgres/etcd mein `owner, epoch`). Naya owner durable log se state rebuild kare; purana owner fenced (epoch mismatch pe writes reject).\n4. Batching: owner pending ops ko ek tick mein sequence kare aur broadcast ek batched message mein.\n5. Fan-out tier: viewers aur editors ko read-mostly 'edge' servers serve karein; owner se ek stream, edges local sockets pe fan-out.\n6. Coalescing for slow clients: queue full pe drop ke bajaye 'snapshot + resume'.\n7. Cursors/presence ko sample/throttle karo (har client ka cursor 1000 logon ko 10Hz pe = explosion).\n\nTrade-off: ownership + failover complexity vs current 'any server, zero coordination'. Isliye sirf hot docs ko promote karna (dynamic) sensible hai.",
+  "why_needed": "Hot key / hot partition problem har system design interview mein kisi form mein aata hai.",
+  "real_world_analogy": "Ek chhote mandir mein darshan line ek pujari sambhal leta hai; kumbh mela mein dedicated control room, alag gates, aur batch mein darshan -- sirf us ek event ke liye special arrangement.",
+  "how_it_works": "Single-owner in-memory sequencer per hot doc + batched durable log + fenced failover + tiered fan-out.",
+  "in_this_project": "Not implemented. Current: `collab/service.py::submit` (DB sequencer), `deploy/nginx.conf` round-robin. `SYSTEM_DESIGN.md` capacity paragraph and scaling table alternative column.",
+  "implementation_files": [
+   "projects/08-collab/SYSTEM_DESIGN.md",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/deploy/nginx.conf",
+   "projects/08-collab/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "10-100x per-doc throughput (in-memory)",
+   "Batching amortises DB cost",
+   "Fan-out tier isolates sequencer"
+  ],
+  "disadvantages": [
+   "Ownership, leases, fencing complexity",
+   "Sticky routing needs doc-aware LB",
+   "Failover window = brief edit pause"
+  ],
+  "common_mistakes": [
+   "Saare docs ke liye sticky ownership (complexity without need)",
+   "Lease without fencing token (split brain: two sequencers)"
+  ],
+  "follow_up_questions": [
+   "Fencing token kaise kaam karta hai?",
+   "Owner change ke dauraan clients ka kya?",
+   "Hot doc detect karke promote kaise karoge?"
+  ],
+  "concepts": [
+   "hot key",
+   "in-memory sequencer",
+   "sticky routing",
+   "fencing",
+   "batching"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Any-server DB sequencer (simple, slow per doc) vs owned in-memory sequencer (fast, complex). Hybrid: promote hot docs only.",
+   "failure_scenarios": "Owner crash: in-flight unpersisted ops lost unless log-before-ack; split brain without fencing -> two rev 100s -> permanent divergence.",
+   "alternatives": "CRDT (no sequencer; merge anywhere) -- Figma-style multiplayer uses server-authoritative per-property LWW; Google Docs uses OT with per-doc server.",
+   "scale_10x_100x": "1000s editors: sequencer in-memory ~10k+ ops/s typical order of magnitude; fan-out 1000 x ops = bandwidth dominant -> batch broadcasts per tick.",
+   "production_improvements": "Doc-aware routing (header/URL hash), lease table with epoch, ops log in Kafka, metrics per doc (ops/s, subscribers)."
+  }
+ },
+ {
+  "id": "COLB-055",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "Why is cross-server propagation not slower than same-server propagation in your benchmark?",
+  "answer_hinglish": "Measured (`TESTING.md`): same server p50 21.0ms / p95 29.1ms; across servers p50 19.4ms / p95 27.4ms. Basically same, difference noise.\n\nReason: dono cases mein path identical hai. `ws_endpoint` op receive karta hai -> `submit` (Postgres) -> `hub.publish` (Redis). Ab B chahe same server pe ho ya doosre pe, B ka server op Redis pub/sub se hi receive karta hai -- same server bhi apna khud ka message `psubscribe` se wapas paata hai, kyunki fan-out ka ek hi path hai: `_subscriber -> _on_message -> _deliver_ordered -> _flush -> conn.queue -> write_loop`. Koi 'agar B local hai toh seedha bhej do' shortcut nahi.\n\nShortcut kyun nahi diya? Ordering. Agar local clients ko direct deliver karte aur remote ops pub/sub se, toh local op 10 direct jaata aur remote op 9 pub/sub se late -- client ko 10 pehle, 9 baad. Ek single ordered stream (har server pe forwarder) ka invariant simple rakhta hai. Redis hop LAN pe sub-millisecond hai, toh cost negligible.\n\nIsliye latency ka dominant cost Postgres transaction hai (~5 round trips at ~3ms on Docker Desktop), na ki Redis ya cross-server. `TESTING.md`: 'Both propagation paths go through Postgres commit + Redis pub/sub, so cross-server costs nothing extra.'\n\nImplication: horizontal scaling (zyada servers) latency nahi badhata. Latency improve karni ho toh DB path optimise karo.",
+  "why_needed": "Benchmark results ko architecture se explain karna -- 'kyun' batana numbers se zyada important hai.",
+  "real_world_analogy": "Har courier pehle central hub jaata hai chahe address padosi ka ho; toh padosi aur doosre shahar ka delivery time (local hub ke andar) same.",
+  "how_it_works": "Uniform path: every delivery via DB commit + Redis + forwarder; no local fast path.",
+  "in_this_project": "`collab/api.py` (publish only), `collab/realtime.py::_subscriber`, `bench/latency.py` (`propagation(ws1, ws1, ...)` vs `propagation(ws1, ws2, ...)`), `TESTING.md`.",
+  "implementation_files": [
+   "projects/08-collab/bench/latency.py::propagation",
+   "projects/08-collab/collab/realtime.py::_subscriber",
+   "projects/08-collab/TESTING.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "One ordered path -> simple correctness",
+   "Adding servers doesn't hurt latency"
+  ],
+  "disadvantages": [
+   "Local clients pay a Redis hop they theoretically don't need"
+  ],
+  "common_mistakes": [
+   "Local fast path add karke ordering tod dena",
+   "Redis ko latency bottleneck maan lena bina measure kiye"
+  ],
+  "follow_up_questions": [
+   "Local fast path safely kaise add karoge?",
+   "Redis cross-AZ ho toh numbers?",
+   "Postgres latency kaise kam karoge?"
+  ],
+  "concepts": [
+   "latency analysis",
+   "uniform path",
+   "pub/sub"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-056",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "What are the scaling limits of using psubscribe 'collab:doc:*' on every server?",
+  "answer_hinglish": "Har server `psubscribe('collab:doc:*')` karta hai -- yani HAR document ka HAR message (ops, presence, cursors) HAR server ko milta hai. `_on_message` phir `rooms.get(doc_id)` karke ignore karta hai agar local room nahi.\n\nSimple hai (subscribe/unsubscribe ko room lifecycle ke saath sync nahi karna, koi race nahi), par cost:\n1. Fan-in: S servers, total message rate M -> Redis S x M messages bhejta hai, aur har server M messages parse (json.loads) karta hai. 2 servers pe irrelevant; 50 servers aur 100k msgs/s pe har server 100k msg/s JSON parse -- mostly wasted CPU.\n2. Redis egress: Redis single-threaded hai for command processing; pub/sub fan-out output buffers pe load S ke saath linear.\n3. Cursor traffic dominate karta hai: cursors ops se zyada frequent hain, aur woh bhi sabko jaate hain.\n4. Serial processing: subscriber ek-ek message await karta hai, toh irrelevant messages relevant messages ko delay karte hain.\n5. Pattern matching: Redis ko har PUBLISH pe patterns match karne padte hain (patterns kam hain toh cheap).\n\nAlternatives:\n- Per-room SUBSCRIBE/UNSUBSCRIBE in join/leave (careful with races -- subscribe before snapshot read, so no gap).\n- Redis 7 sharded pub/sub (SSUBSCRIBE) cluster mein -- channel slot ke node pe hi traffic.\n- Doc-affinity routing: doc ke saare clients ek server pe -> cross-server fan-out hi nahi chahiye (par sticky routing aa jaata).\n- Cursors ko throttle (e.g. 10Hz max) aur coalesce.",
+  "why_needed": "Ek simple choice ka scaling cost identify karna senior-level thinking hai.",
+  "real_world_analogy": "Society ka ek hi WhatsApp group jisme sab buildings ke announcements: har resident ko har building ki khabar padhni padti hai, chahe uske kaam ki ho ya nahi.",
+  "how_it_works": "Broadcast-to-all subscription; filtering at consumer; cost O(servers x messages).",
+  "in_this_project": "`collab/realtime.py::_subscriber` (`await pubsub.psubscribe(CHANNEL.format('*'))`), `_on_message` (`if room is None: return`). `/stats` `received` counter vs local rooms dikhata hai kitna waste hai.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_subscriber",
+   "projects/08-collab/collab/realtime.py::_on_message",
+   "projects/08-collab/collab/api.py::stats"
+  ],
+  "code_example": "# illustrative (NOT in repo): per-room subscription\nasync def join(self, conn, doc_id, last_rev):\n    if doc_id not in self.rooms:\n        await self.pubsub.subscribe(CHANNEL.format(doc_id))   # subscribe BEFORE reading snapshot -> no gap\n    ...",
+  "code_language": "python",
+  "advantages": [
+   "Zero subscription bookkeeping",
+   "No subscribe/unsubscribe races"
+  ],
+  "disadvantages": [
+   "O(servers x messages) fan-in",
+   "Wasted parse CPU",
+   "Serial head-of-line"
+  ],
+  "common_mistakes": [
+   "Unsubscribe before last conn truly gone (race)",
+   "Subscribe after snapshot (gap between)"
+  ],
+  "follow_up_questions": [
+   "Per-room subscribe mein race kaise avoid karoge?",
+   "Sharded pub/sub kya hai?",
+   "Cursor traffic kaise throttle karoge?"
+  ],
+  "concepts": [
+   "pub/sub fan-in",
+   "pattern subscribe",
+   "sharded pub/sub"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Wildcard = simplicity at small S; per-room = efficiency with lifecycle complexity; affinity routing = no cross-server fan-out but sticky.",
+   "failure_scenarios": "Large S: subscriber falls behind -> Redis output buffer limit -> Redis disconnects subscriber -> messages lost -> gap fills everywhere -> DB load spike.",
+   "alternatives": "Per-doc SUBSCRIBE, Redis Cluster SSUBSCRIBE, NATS subject-based routing, Kafka partitions with consumer per server only for owned docs.",
+   "scale_10x_100x": "10x servers: 10x redundant traffic; 100x: wildcard subscription untenable.",
+   "production_improvements": "Measure `received` vs delivered ratio in /stats; move cursors to a throttled channel; per-room subscribe with gap-safe ordering."
+  }
+ },
+ {
+  "id": "COLB-057",
+  "project_slug": "p08-collab",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "How would you benchmark or load test this system properly, and what are the caveats of bench/latency.py?",
+  "answer_hinglish": "`bench/latency.py` do cheezein measure karta hai: (a) propagation latency A->B (100 edits, same server aur cross-server), (b) per-document committed ops/s with 1 aur 8 closed-loop writers (50 ops each). Real uvicorn servers, real Postgres + Redis -- achha starting point.\n\nCaveats (interview mein khud bolna chahiye):\n1. Environment: Docker Desktop on Windows -- ~3ms per DB round trip, production Linux se zyada. Numbers relative samjho.\n2. Closed-loop: writers ack ka wait karte hain. Isse 'coordinated omission' hota hai -- jab system slow hota hai, load bhi kam ho jaata hai, toh tail latency under-report hoti hai. Real users ka arrival rate system pe depend nahi karta.\n3. Single document, no background load: doosre documents ka DB/Redis traffic, cursors, presence nahi.\n4. Same process: dono servers aur clients ek event loop/process mein -- client CPU aur server CPU compete karte hain; network nahi hai.\n5. Sample size: 100 edits -> p95 ok, p99 meaningless.\n\nProper load test:\n- Open-loop generator (fixed op rate per client, e.g. Poisson), separate machines.\n- Many documents (Zipf distribution: kuch hot, bahut cold), many connections per server (10k idle + few active) to measure memory per connection.\n- Mix: ops, cursors (10Hz), pings, reconnects, offline bursts.\n- Measure: end-to-end propagation (client timestamps with same clock, ya server-side spans), submit latency, lock wait, gap_fills, slow_disconnects, Redis CPU, Postgres WAL rate.\n- Tools: k6 (WebSocket support), Locust with websocket client, ya custom asyncio harness.\n- Ramp until SLO break (e.g. p99 propagation > 100ms) -> capacity number.",
+  "why_needed": "Benchmark ki limitations batana engineering maturity dikhata hai; interviewer numbers pe zaroor push karega.",
+  "real_world_analogy": "Ek gaadi ki mileage sirf khaali highway pe ek baar check karna vs city traffic mein, AC on, passengers ke saath -- dono alag numbers.",
+  "how_it_works": "Closed vs open loop, workload realism, isolation of load generator, statistically meaningful samples.",
+  "in_this_project": "`bench/latency.py` (`propagation`, `throughput`, `main` using `run_server` from `tests/conftest.py`), `TESTING.md` conditions line.",
+  "implementation_files": [
+   "projects/08-collab/bench/latency.py::throughput",
+   "projects/08-collab/tests/conftest.py::run_server",
+   "projects/08-collab/TESTING.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Real stack, reproducible script",
+   "Measures both latency and throughput"
+  ],
+  "disadvantages": [
+   "Closed-loop, single doc, same process, Windows Docker"
+  ],
+  "common_mistakes": [
+   "Coordinated omission ignore karna",
+   "Load generator ko server ke saath same box pe chalana"
+  ],
+  "follow_up_questions": [
+   "Coordinated omission kya hai?",
+   "10k idle WebSockets ka memory kaise measure karoge?",
+   "SLO kya set karoge?"
+  ],
+  "concepts": [
+   "load testing",
+   "coordinated omission",
+   "open-loop",
+   "benchmarking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-058",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Beginner",
+  "question": "Give a high-level walkthrough of the architecture and its components.",
+  "answer_hinglish": "System ke components (`ARCHITECTURE.md`):\n\n1. Clients: browser editor (`editor.html`, JS port of OT + state machine) aur Python reference client (`client.py`). Har client WebSocket se connect hota hai.\n2. nginx (`deploy/nginx.conf`): plain round-robin load balancer, WebSocket upgrade headers, 3600s read timeout. No sticky sessions.\n3. Collab servers (FastAPI, `collab1`, `collab2`): har server mein:\n   - HTTP API (`api.py`): users, ws-tickets, docs CRUD, share, history, revisions, restore, presence, stats.\n   - `/ws` endpoint: ticket validate, join, op/cursor/ping handling.\n   - `Hub` (`realtime.py`): local rooms, Redis subscriber, ordered forwarder + gap fill, presence.\n   - `service.py`: permissions, sequencer `submit`, history, `content_at`.\n   - `ot.py`: pure OT library.\n4. Postgres: source of truth -- `users`, `documents` (content + rev; row = lock), `document_permissions`, `operations` (transformed op log), `snapshots`.\n5. Redis: pub/sub channel per doc `collab:doc:{id}` (fan-out), presence hashes `collab:presence:{id}`, one-time tickets `collab:ticket:{t}`.\n\nEdit flow: client op -> any server -> Postgres submit (lock, transform, store) -> Redis publish -> har server ka forwarder -> local clients (author ko ack, baaki ko op).\n\nCore idea: stateless-ish servers (sirf in-memory rooms jo reconstructable hain), ordering Postgres mein, fan-out Redis mein. Isliye koi bhi server koi bhi doc serve kar sakta hai aur scale out = aur servers add karo. `docker-compose.yml` exactly yahi chalata hai: postgres, redis, migrate, collab1, collab2, nginx.",
+  "why_needed": "Har interview 'architecture samjhao' se shuru hota hai; crisp component walkthrough zaroori hai.",
+  "real_world_analogy": "Ek newspaper: reporters (clients) kisi bhi branch office (server) mein khabar dete hain, central desk (Postgres) har khabar ko number deta hai aur archive karta hai, aur ek PA system (Redis) sab branches tak announce karta hai.",
+  "how_it_works": "Clients <-> LB <-> N stateless collab servers <-> Postgres (order, truth) + Redis (fan-out, ephemeral).",
+  "in_this_project": "`ARCHITECTURE.md` (component list + mermaid), `docker-compose.yml`, `deploy/nginx.conf`, `collab/main.py`.",
+  "implementation_files": [
+   "projects/08-collab/ARCHITECTURE.md",
+   "projects/08-collab/docker-compose.yml",
+   "projects/08-collab/collab/main.py::create_app",
+   "projects/08-collab/collab/realtime.py::Hub"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Any server serves any doc",
+   "Clear separation: truth (PG) vs transport (Redis)",
+   "Easy local multi-server setup"
+  ],
+  "disadvantages": [
+   "Postgres on every keystroke-batch path",
+   "Two stateful dependencies"
+  ],
+  "common_mistakes": [
+   "Redis ko source of truth bana dena",
+   "Server memory mein authoritative doc state rakhna bina persistence"
+  ],
+  "follow_up_questions": [
+   "Server crash pe kya khota hai?",
+   "Redis hata do toh kya kaam karega?",
+   "Kaunsa component pehle bottleneck banega?"
+  ],
+  "concepts": [
+   "architecture",
+   "stateless servers",
+   "source of truth",
+   "fan-out"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-059",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "How do you horizontally scale WebSocket servers without sticky sessions?",
+  "answer_hinglish": "WebSocket servers stateful hote hain (open connections), toh log aksar sticky sessions (same user -> same server) ya doc-affinity lagate hain. Mere design mein koi bhi server koi bhi document ka edit accept kar sakta hai, isliye nginx plain round-robin hai (`deploy/nginx.conf` comment: 'no sticky sessions needed for WebSockets').\n\nTeen problems aur unke solutions:\n1. Kaun sequence kare? Postgres row lock -- koi bhi server `submit` chala sakta hai; lock total order deta hai. Koi doc ownership nahi.\n2. Fan-out across servers: Alice server 1, Bob server 2. Commit ke baad Redis PUBLISH `collab:doc:{id}`; har server subscribed hai aur apne local room ke conns ko forward karta hai.\n3. Pub/sub weaknesses (at-most-once, reorder): per-room ordered forwarder + gap fill from Postgres.\n\nPlus: presence Redis hash mein (cross-server visible), tickets Redis mein (koi bhi server validate kare -- ticket server 1 se issue, connect server 2 pe). Reconnect kisi bhi server pe -- catch-up Postgres se.\n\nTest proof: `test_horizontal_scaling_two_servers` (c1 on s1, c2 on s2, dono directions), fuzz test 6 clients alternate servers, `demo.py` LB ke through `/stats` ka server_id dikhata hai.\n\nScale-out = servers add karo; documents independent. Limits: per-doc sequencer throughput, psubscribe-* fan-in O(servers), Redis single instance.\n\nSticky kab chahiye? Jab sequencer in-memory ho (hot docs) -- tab doc-affinity routing (consistent hashing on doc_id), user-sticky nahi.",
+  "why_needed": "WebSocket horizontal scaling ek bahut common system design question hai, aur 'no sticky sessions' ek strong claim hai jise justify karna padta hai.",
+  "real_world_analogy": "Kisi bhi bank branch mein jao aur apne account mein paisa jama karo -- kyunki ledger central hai aur har branch ko updates broadcast hote hain; tumhe apni 'home branch' jaane ki zarurat nahi.",
+  "how_it_works": "Externalised ordering (DB) + externalised fan-out (Redis) + reconstructable local state => round-robin LB works.",
+  "in_this_project": "`deploy/nginx.conf`, `collab/service.py::submit`, `collab/realtime.py::Hub`, tests `test_horizontal_scaling_two_servers`, `test_fuzz_many_clients_two_servers_with_disconnects`, `demo.py`.",
+  "implementation_files": [
+   "projects/08-collab/deploy/nginx.conf",
+   "projects/08-collab/collab/realtime.py::Hub",
+   "projects/08-collab/tests/test_realtime.py::test_horizontal_scaling_two_servers",
+   "projects/08-collab/demo.py"
+  ],
+  "code_example": "# real, tests/test_realtime.py\nc1 = CollabClient(ws1, doc[\"id\"], api.ticket_factory(u))\nc2 = CollabClient(ws2, doc[\"id\"], api.ticket_factory(u))\nawait c1.connect(); await c2.connect()\nawait c1.insert(0, \"from server one. \")\nassert await until(lambda: c2.doc == \"from server one. \")\nawait c2.insert(len(c2.doc), \"from server two.\")\nassert await until(lambda: c1.doc == c2.doc == \"from server one. from server two.\")",
+  "code_language": "python",
+  "advantages": [
+   "Simple LB, trivial failover",
+   "Servers interchangeable",
+   "Proven with two real processes in tests"
+  ],
+  "disadvantages": [
+   "Every op hits DB + Redis",
+   "Wildcard fan-in",
+   "Per-doc throughput not improved by more servers"
+  ],
+  "common_mistakes": [
+   "Sticky sessions ko correctness ke liye zaroori maan lena",
+   "Fan-out sirf local room tak (cross-server users miss)"
+  ],
+  "follow_up_questions": [
+   "Sticky sessions kab phir bhi useful hain?",
+   "Redis single instance fail ho toh?",
+   "10x servers pe kya tootega pehle?"
+  ],
+  "concepts": [
+   "horizontal scaling",
+   "sticky sessions",
+   "WebSocket",
+   "fan-out"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Externalised state = easy scale-out + failover; cost = DB/Redis on hot path and cross-server fan-in.",
+   "failure_scenarios": "Redis down: edits commit but fan-out stops (acks too) until recovery + gap fill; Postgres down: no edits at all, reads fail.",
+   "alternatives": "Doc-affinity routing with in-memory sequencer; managed services (Ably/Pusher) for fan-out; Kafka per-doc partitions.",
+   "scale_10x_100x": "10x servers: wildcard pub/sub waste grows; 100x: need sharded pub/sub or affinity routing, Postgres sharding by doc_id.",
+   "production_improvements": "Connection draining on deploy, per-server connection limits, autoscaling on connections not CPU, Redis HA (Sentinel)."
+  }
+ },
+ {
+  "id": "COLB-060",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Why is Postgres the source of truth and Redis treated as disposable? What would break if you reversed that?",
+  "answer_hinglish": "Rule: jo cheez kho jaane pe user ka data galat ho jaye, woh Postgres mein; jo cheez kho jaane pe bas thodi der ki inconvenience ho, woh Redis mein.\n\nPostgres mein: documents content + rev, op log, snapshots, permissions, users. Har edit ka ack tabhi milta hai jab op Postgres mein committed hai (commit -> publish -> forwarder -> ack). Toh 'ack mila' = 'durable'.\n\nRedis mein: pub/sub (notification), presence hash, cursors, ws tickets. Redis restart pe:\n- Pub/sub messages lost -> forwarders gap fill from Postgres.\n- Presence gone -> agle ping (10s) pe touch wapas bana deta hai (touch hget nahi mila toh naya dict).\n- Tickets gone -> clients naya ticket le lete hain (30s TTL waise bhi).\n`DEPLOYMENT.md`: 'Postgres is the source of truth; Redis can be restarted (forwarders gap-fill from Postgres).'\n\nAgar ulta karte (Redis mein doc state + sequencer via INCR, Postgres async):\n- Redis failover (async replication) pe last few ops lost -- par clients unke ack le chuke the -> clients ke docs mein woh edits hain, server pe nahi -> permanent divergence.\n- History aur restore ke liye durable log chahiye; async write-behind mein gaps.\n- Faster zaroor hota (in-memory INCR + Lua transform impossible-ish though).\n\nMiddle ground jo log karte hain: Redis Streams as durable-ish op log with AOF fsync always -- par phir Redis ko database ki tarah operate karna padta hai.",
+  "why_needed": "Durability boundaries clearly define karna system design ka core hai.",
+  "real_world_analogy": "Bank ka ledger (Postgres) vs branch ka token display board (Redis). Board band ho jaye toh log thoda confuse honge, par paisa sahi rahega.",
+  "how_it_works": "Ack only after durable commit; ephemeral data in Redis; all Redis-derived state reconstructable from Postgres or clients.",
+  "in_this_project": "`DEPLOYMENT.md`, `collab/realtime.py` (`_subscriber` comment, `touch`), `collab/api.py::ws_ticket`, `collab/service.py::submit`.",
+  "implementation_files": [
+   "projects/08-collab/DEPLOYMENT.md",
+   "projects/08-collab/collab/realtime.py::touch",
+   "projects/08-collab/collab/service.py::submit"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Redis outages degrade, don't corrupt",
+   "Acks mean durable",
+   "Simple ops (Redis no persistence needed)"
+  ],
+  "disadvantages": [
+   "DB latency on hot path",
+   "Postgres availability = edit availability"
+  ],
+  "common_mistakes": [
+   "Redis INCR ko sequencer banana bina durability ke",
+   "Ack before commit"
+  ],
+  "follow_up_questions": [
+   "Postgres failover (sync vs async replica) ka edits pe kya asar?",
+   "Redis HA chahiye phir bhi?",
+   "Presence ko Postgres mein kab rakhoge?"
+  ],
+  "concepts": [
+   "source of truth",
+   "durability",
+   "ephemeral state"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Durability-first (ack after PG commit) vs latency-first (ack after in-memory); chosen correctness.",
+   "failure_scenarios": "Postgres async replica failover can still lose last committed ops -> clients diverge from new primary; needs sync replication or client resync on failover.",
+   "alternatives": "Kafka (acks=all) as durable log + materialised state elsewhere; Redis with AOF always + WAIT for replicas.",
+   "scale_10x_100x": "100x: Postgres write throughput is the ceiling; shard by doc_id.",
+   "production_improvements": "Sync replication (synchronous_commit=remote_apply) for critical tenants; client-side checksum resync after DB failover."
+  }
+ },
+ {
+  "id": "COLB-061",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Would you replace Redis pub/sub with Redis Streams or Kafka? Compare the options for fan-out.",
+  "answer_hinglish": "Current: Redis pub/sub + ordered forwarder + gap fill from Postgres. `SYSTEM_DESIGN.md` alternatives column: 'Redis Streams / Kafka (durable, replayable)', 'durable log with offsets'.\n\nRedis Streams: `XADD collab:doc:{id} * rev 42 op ...`; consumers `XREAD BLOCK 0 STREAMS key last_id`. Fayde: messages persist (MAXLEN se trim), har server apna last-read ID track karke reconnect pe resume -- loss nahi; ek stream ke andar order append order hai. Par: append order = PUBLISH order, commit order nahi -- do servers ke XADD race kar sakte hain (rev 6 pehle append). Toh reorder buffer phir bhi chahiye, ya XADD lock ke andar (lock time badhega). Per-doc streams = bahut saari keys; XREAD multiple keys ek call mein limited. Gap fill ka need kam ho jaata hai.\n\nKafka: topic partitioned by doc_id -> per-doc order within partition (agar producer key doc_id aur ek hi producer per doc... multiple servers producing same key: order = broker append order, same race). Durable, replayable, consumer groups. Par: latency (ms se tens of ms with acks=all), har server ko saari partitions consume karni padengi (broadcast semantics, not consumer group) -- ya doc-affinity. Ops heavy.\n\nInteresting option: Kafka/Streams ko hi sequencer bana do -- client op ko log mein append karo (log order = total order), aur ek consumer per doc transform karke materialise kare. Tab Postgres row lock hat jaata hai; throughput log-bound.\n\nMeri raay: current scale pe pub/sub + gap fill sabse sasta aur correct hai, kyunki Postgres already durable log hai -- dobara durable bus duplicate cost hai. Main Streams tab laata jab gap fills frequent hon (pub/sub drops under load) ya tail loss unacceptable ho. Kafka tab jab ops stream doosre consumers (search indexing, analytics, audit) ko bhi chahiye.",
+  "why_needed": "Messaging technology choice ke trade-offs senior design interviews mein standard hain.",
+  "real_world_analogy": "Pub/sub = loudspeaker announcement (sun liya toh sun liya). Streams = notice board (baad mein aake padh sakte ho, kuch din tak). Kafka = official gazette (sab kuch archived, koi bhi kabhi bhi padh sake, par chhapne mein time lagta hai).",
+  "how_it_works": "Durable logs give replay + offsets; but multi-producer order still equals append order, not commit order, unless append happens under the sequencer lock or the log is the sequencer.",
+  "in_this_project": "Not implemented; current fan-out `collab/realtime.py::publish` + `_subscriber`; `SYSTEM_DESIGN.md` scaling table; `TRADEOFFS.md` #3.",
+  "implementation_files": [
+   "projects/08-collab/SYSTEM_DESIGN.md",
+   "projects/08-collab/TRADEOFFS.md",
+   "projects/08-collab/collab/realtime.py::publish"
+  ],
+  "code_example": "# illustrative (NOT in repo): Redis Streams consumer resuming from last id\nlast_id = \"$\"\nwhile True:\n    resp = await redis.xread({f\"collab:stream:{doc_id}\": last_id}, block=5000, count=100)\n    for _key, entries in resp or []:\n        for entry_id, fields in entries:\n            last_id = entry_id\n            await deliver_ordered(room, json.loads(fields[b\"msg\"]))",
+  "code_language": "python",
+  "advantages": [
+   "Streams: replay, fewer gap fills",
+   "Kafka: durable, multi-consumer, analytics-friendly"
+  ],
+  "disadvantages": [
+   "Still need ordering logic unless log is sequencer",
+   "More infra/ops; Kafka adds latency"
+  ],
+  "common_mistakes": [
+   "Sochna ki Kafka per-key ordering commit order deta hai multiple producers ke saath",
+   "Durable bus add karke Postgres gap fill remove karna bina analysis"
+  ],
+  "follow_up_questions": [
+   "Log ko sequencer banane ka design?",
+   "Streams memory kaise bound karoge?",
+   "Consumer group vs broadcast consumption yahan?"
+  ],
+  "concepts": [
+   "Redis Streams",
+   "Kafka",
+   "pub/sub",
+   "durable log",
+   "replay"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pub/sub + DB repair (cheap, already-durable PG) vs durable bus (replay, extra infra, still ordering caveats).",
+   "failure_scenarios": "Streams: memory growth without MAXLEN, consumer lag; Kafka: broker outage stops fan-out, rebalances pause consumption.",
+   "alternatives": "NATS JetStream, Postgres LISTEN/NOTIFY (fires on commit, in commit order per session but payload limits), CDC from WAL via Debezium.",
+   "scale_10x_100x": "100x: Kafka partitions by doc hash scale horizontally; pub/sub needs sharding; Streams per-doc keys spread across Redis Cluster.",
+   "production_improvements": "Start by measuring gap_fills rate; if >0.1% of messages, move to Streams with XADD under lock or log-as-sequencer."
+  }
+ },
+ {
+  "id": "COLB-062",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Design a Google Docs-scale collaborative editing system for millions of users. What changes from this project?",
+  "answer_hinglish": "Is project ka core design (central per-doc sequencer + OT + durable op log + fan-out) wahi hai jo Google Docs-style systems use karte hain; scale pe har layer sharded aur specialised hoti hai.\n\nRequirements: millions of docs, mostly 1-5 editors per doc, kuch hot docs (1000s viewers), <100ms propagation, durable, version history, ACLs, offline.\n\nDesign:\n1. Edge/connection tier: WebSocket gateways (bahut saare, autoscale on connections). Stateless-ish; authenticate (tickets/short-lived tokens), route by doc_id.\n2. Document session tier: har active doc ka ek owner process (in-memory sequencer: text, rev, recent ops). Directory/lease service (etcd/Spanner/Postgres) `doc_id -> owner, epoch`. Gateways ops owner ko forward karti hain, owner sequence + transform karke broadcast karta hai gateways ko (doc-subscribed gateways only). Yeh mere Postgres row lock ko replace karta hai.\n3. Durable log: owner ops ko append-only log (Spanner/Bigtable/Kafka) mein likhta hai, ack after durable append. Batched. Fencing token har write ke saath.\n4. Storage: snapshots/checkpoints object storage/Bigtable mein; current doc materialised; history compaction (named versions).\n5. ACL service: cached permissions, revocation events push to sessions (my project's gap: role checked only at join).\n6. Presence/cursors: separate, lossy, throttled channel via gateways.\n7. Offline: client persists pending ops (IndexedDB); reconnect with last_rev; very stale -> server sends snapshot + client rebases via diff.\n8. Rich text: tree/attribute OT (ya CRDT) -- plain text OT kaafi nahi.\n9. Multi-region: doc owner ek region mein (home region near most editors), remote users higher latency; owner migration on usage shift.\n\nMere project se mapping: `submit` -> owner sequencer; Redis pub/sub -> owner-to-gateway streams; ordered forwarder -> gateway per-doc ordered buffer; Postgres -> durable log + snapshot store.",
+  "why_needed": "Classic system design prompt; project ko foundation ki tarah use karke scale-up dikhana best answer hai.",
+  "real_world_analogy": "Ek chhota cafe vs ek nationwide chain: recipe (OT) wahi, par central kitchen, regional warehouses, delivery fleet, aur har branch ka manager -- sab specialised.",
+  "how_it_works": "Gateways -> per-doc owner (lease+fencing) -> durable batched log -> snapshots; separate presence; ACL push.",
+  "in_this_project": "Current building blocks: `collab/service.py::submit`, `collab/realtime.py::Hub`, `collab/ot.py`, `SYSTEM_DESIGN.md`. Owner/lease/sharding NOT implemented.",
+  "implementation_files": [
+   "projects/08-collab/SYSTEM_DESIGN.md",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/realtime.py::Hub",
+   "projects/08-collab/collab/ot.py::transform"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Per-doc owner = in-memory speed",
+   "Sharded storage by doc_id",
+   "Gateways scale independently"
+  ],
+  "disadvantages": [
+   "Lease/fencing/failover complexity",
+   "Cross-region latency for remote editors",
+   "Many moving parts"
+  ],
+  "common_mistakes": [
+   "Single global sequencer",
+   "Ignoring ACL revocation for live sessions",
+   "Presence through the durable path"
+  ],
+  "follow_up_questions": [
+   "Owner failover ke dauraan users kya dekhenge?",
+   "Doc ka home region kaise choose karoge?",
+   "OT vs CRDT is scale pe?"
+  ],
+  "concepts": [
+   "system design",
+   "document owner",
+   "lease",
+   "gateway tier",
+   "sharding"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Owner-based sequencing (fast, complex) vs DB-lock sequencing (simple, slow); per-doc locality makes sharding natural.",
+   "failure_scenarios": "Owner crash: brief pause, rebuild from log; split brain prevented by fencing; gateway crash: clients reconnect elsewhere and catch up.",
+   "alternatives": "CRDT-based (no owner needed, any replica accepts writes) -- Figma/Linear-style local-first with server as relay+storage.",
+   "scale_10x_100x": "Millions of docs => millions of owners spread across a cluster; hot docs get dedicated hosts; gateways count scales with connections.",
+   "production_improvements": "SLOs per layer, tracing op lifecycle, divergence checksums, chaos testing of owner failover."
+  }
+ },
+ {
+  "id": "COLB-063",
+  "project_slug": "p08-collab",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "If you moved to an in-memory sequencer per document with sticky routing, how would you handle ownership and failover safely?",
+  "answer_hinglish": "Is project mein yeh NAHI hai (Postgres row lock har server ko sequencer banata hai); `TRADEOFFS.md` #2 kehta hai in-memory sequencer 'would be much faster but needs ownership/failover logic'. Design aise karunga:\n\n1. Ownership registry: table `doc_owner(doc_id, server_id, epoch, lease_expires_at)` (Postgres) ya etcd. Server doc ka owner banne ke liye CAS: `UPDATE ... SET server_id = me, epoch = epoch + 1, lease_expires_at = now() + 10s WHERE doc_id = :d AND lease_expires_at < now()`. Renew har 3s.\n2. Routing: gateways/LB doc_id ko owner tak bhejein (registry lookup + cache), ya consistent hashing on doc_id with registry as truth. Client ko 'redirect' message bhi de sakte ho.\n3. Owner state: content, rev, recent ops ring buffer memory mein; startup pe Postgres se (snapshot + ops) load.\n4. Writes with fencing: owner har batch persist karte waqt epoch check kare -- `INSERT ... WHERE (SELECT epoch FROM doc_owner WHERE doc_id=:d) = :my_epoch`, ya ops table mein `epoch` column aur constraint. Purana owner (GC pause ke baad jaaga, lease expire ho chuka) ka write reject -> woh khud ko demote kare.\n5. Ack after durable persist (batch every ~10-50ms) -- latency vs throughput knob. Ack before persist kabhi nahi (failover pe acked ops lost = divergence).\n6. Failover: lease expire -> naya server claim (epoch+1) -> log se state rebuild -> clients reconnect with last_rev -> catch-up. Pause = lease timeout + rebuild.\n7. Rebalancing: graceful handoff -- old owner stop accepting, flush, release lease, new owner claim.\n\nMere current design ka 'no ownership' advantage chala jaata hai, isliye sirf hot docs ke liye karna sensible hai.",
+  "why_needed": "Leases aur fencing tokens distributed systems ke classic topics hain; is project se natural extension hai.",
+  "real_world_analogy": "Shop ki chaabi ek manager ke paas: chaabi ka ek expiry hai aur har nayi chaabi ka number bada; purani number wali chaabi se locker nahi khulega, chahe purana manager wapas aa jaye.",
+  "how_it_works": "Lease-based ownership + monotonic epoch fencing on durable writes + rebuild from log on failover.",
+  "in_this_project": "Not implemented. Contrast with `collab/service.py::submit` (DB lock). `TRADEOFFS.md` #2, `SYSTEM_DESIGN.md` scaling table.",
+  "implementation_files": [
+   "projects/08-collab/TRADEOFFS.md",
+   "projects/08-collab/SYSTEM_DESIGN.md",
+   "projects/08-collab/collab/service.py::submit"
+  ],
+  "code_example": "-- illustrative (NOT in repo): lease claim with fencing epoch\nUPDATE doc_owner\nSET server_id = :me, epoch = epoch + 1, lease_expires_at = now() + interval '10 seconds'\nWHERE doc_id = :d AND (lease_expires_at < now() OR server_id = :me)\nRETURNING epoch;",
+  "code_language": "sql",
+  "advantages": [
+   "Microsecond sequencing",
+   "Batch persistence",
+   "Explicit ownership enables caching"
+  ],
+  "disadvantages": [
+   "Failover pause",
+   "Fencing must be on every durable write",
+   "Routing complexity"
+  ],
+  "common_mistakes": [
+   "Lease without fencing (GC pause split brain)",
+   "Ack before persistence"
+  ],
+  "follow_up_questions": [
+   "Fencing token Martin Kleppmann wala argument?",
+   "Lease duration kaise tune karoge?",
+   "Clients ko owner change kaise pata chalega?"
+  ],
+  "concepts": [
+   "lease",
+   "fencing token",
+   "ownership",
+   "failover",
+   "split brain"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Performance via ownership vs availability/complexity; hybrid (promote hot docs) limits blast radius.",
+   "failure_scenarios": "Clock skew affects lease expiry reasoning; network partition: owner can't renew but still serving -> must stop serving before lease end (safety margin).",
+   "alternatives": "Keep DB sequencer but batch: one transaction sequences all pending ops for a doc (group commit) -- 5-10x without ownership.",
+   "scale_10x_100x": "10x: lease renew traffic = docs/3s writes; registry must scale (etcd limits) -> shard registry.",
+   "production_improvements": "Chaos tests (kill owner, pause owner), epoch in every log record, metrics for failover pause duration."
+  }
+ }
+]

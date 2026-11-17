@@ -1,0 +1,1006 @@
+[
+ {
+  "id": "FLOW-044",
+  "project_slug": "p10-workflow-engine",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "Walk through the payment_and_refund example workflow. What does each line do and why is it durable?",
+  "answer_hinglish": "`payment_and_refund` ek simple lekin powerful pattern dikhata hai: \"abhi charge karo, aur agar delivery ka confirmation window ke andar nahi aaya toh automatically refund karo\". Code sirf teen steps ka hai.\n\nPehla, `ctx.execute_activity(\"charge_payment\", ...)` -- yeh ek command produce karta hai (seq 1, ActivityScheduled). Activity worker asli charge karta hai, result history mein `ActivityCompleted` ban ke aata hai, aur replay pe `charge` variable mein woh result wapas aa jata hai.\n\nDoosra, `await ctx.wait_signal(\"delivered\", timeout=inp[\"delivery_timeout\"])` -- yeh andar se ek durable timer (seq 2, TimerStarted) aur ek signal waiter banata hai. Ab workflow kuch bhi consume nahi kar raha -- koi thread, koi memory nahi. Agar `delivered` signal pehle aaya toh payload milta hai; agar timer pehle fire hua toh `None`.\n\nTeesra, agar `delivered` truthy hai toh `{\"status\": \"paid\"}` return; warna `refund_payment` activity chalti hai aur `refunded_not_delivered` return.\n\nDurable kyun hai? Kyunki delivery_timeout real life mein 7 din ho sakta hai. Is beech worker restart, deploy, crash -- kuch bhi ho, timer `timers` table mein hai aur signal history mein. Koi bhi worker baad mein replay karke exactly wahin pahunch jata hai. Refund ka \"bhool jaana\" possible hi nahi hai -- yahi iska business value hai.",
+  "why_needed": "Yeh \"timeout-driven compensation\" ka sabse chhota example hai; interview mein signal + timer + compensation teeno ek saath samjhane ke kaam aata hai.",
+  "real_world_analogy": "Online order ke liye escrow jaisa: paisa le liya, agar 7 din mein courier \"delivered\" nahi bolta toh bank khud paisa wapas kar deta hai -- kisi insaan ko yaad rakhne ki zaroorat nahi.",
+  "how_it_works": "wait_signal(timeout) andar `self.sleep(timeout)` (TimerStarted) aur signal future ke beech `asyncio.wait(FIRST_COMPLETED)` karta hai. Jo event history mein pehle record hua, wahi replay mein bhi pehle resolve hota hai, isliye result deterministic hai.",
+  "in_this_project": "`flowengine/examples/workflows.py::payment_and_refund`. Test `test_payment_and_refund_signal_vs_timer` do workflows chalata hai: `pay-delivered` (timeout 30s, test TimerStarted dikhne ke baad `delivered` signal bhejta hai -> result `{\"status\": \"paid\", \"delivered_at\": \"2026-11-17\"}`) aur `pay-lost` (timeout 0.3s -> `refunded_not_delivered`). Test assert karta hai `effects(sm, \"refund\") == {\"refund\": 1}` -- refund exactly ek baar.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::payment_and_refund",
+   "projects/10-workflow-engine/tests/test_engine.py::test_payment_and_refund_signal_vs_timer",
+   "projects/10-workflow-engine/flowengine/runtime.py::wait_signal"
+  ],
+  "code_example": "# real, flowengine/examples/workflows.py\n@workflow(\"payment_and_refund\")\nasync def payment_and_refund(ctx, inp):\n    charge = await ctx.execute_activity(\"charge_payment\", inp[\"amount\"], inp.get(\"card\", \"ok\"), retry=FAST)\n    delivered = await ctx.wait_signal(\"delivered\", timeout=inp[\"delivery_timeout\"])\n    if delivered:\n        return {\"status\": \"paid\", \"delivered_at\": delivered.get(\"at\")}\n    await ctx.execute_activity(\"refund_payment\", charge[\"charge_id\"], inp[\"amount\"], retry=FAST)\n    return {\"status\": \"refunded_not_delivered\"}",
+  "code_language": "python",
+  "advantages": [
+   "Business deadline code mein seedha likha hai, cron job nahi chahiye",
+   "Crash/restart ke baad bhi refund guaranteed",
+   "Signal aur timer ka race deterministic"
+  ],
+  "disadvantages": [
+   "Signal jeetne ke baad bhi timer row baaki rehti hai aur baad mein ek extra TimerFired + workflow task aata hai (observation)",
+   "delivered payload ka shape validate nahi hota"
+  ],
+  "common_mistakes": [
+   "`asyncio.sleep` ya `datetime.now()` se deadline banana -- replay pe toot jayega",
+   "Refund activity ko idempotency key ke bina provider ko call karna"
+  ],
+  "follow_up_questions": [
+   "Agar signal aur timer lagbhag saath aaye toh kaun jeetega?",
+   "Charge fail ho jaye toh yeh workflow kya karega?",
+   "Timeout 30 din ka ho toh kya badalna padega?"
+  ],
+  "concepts": [
+   "signal",
+   "durable timer",
+   "compensation",
+   "timeout"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-045",
+  "project_slug": "p10-workflow-engine",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "Walk through the customer_onboarding example workflow, including the early-signal case.",
+  "answer_hinglish": "`customer_onboarding` ek typical multi-day onboarding hai: account banao, welcome email bhejo, verification ka wait karo, nahi aaya toh reminder bhejo, kuch time baad tips email bhejo.\n\nSteps: `create_account` activity -> `send_email(..., \"welcome\")` -> `wait_signal(\"verified\", timeout=inp[\"verify_within\"])`. Agar `verified` None hai (timeout), toh `send_email(..., \"verify_reminder\")`. Phir `ctx.sleep(inp[\"tips_after\"])` -- durable timer, real life mein \"3 din baad\". Phir `send_email(..., \"tips\")` aur result `{\"account_id\", \"verified_in_time\"}`.\n\nSabse interesting case hai early signal: user ne link itni jaldi click kiya ki signal workflow ke wait karne se pehle hi aa gaya. Job queue mein yeh signal kho jaata. Yahan `store.signal` turant `SignalReceived` event history mein append kar deta hai. Replay mein `ctx._signal` dekhta hai ki koi waiter nahi hai, toh payload `_signal_queues[\"verified\"]` mein buffer ho jata hai. Jab code `wait_signal(\"verified\")` tak pahunchta hai, queue mein se pop karke turant return. Isliye reminder email nahi jaati.\n\nYeh workflow durable timer ka bhi demo hai -- worker crash test bhi isi workflow ko use karta hai, kyunki isme timer ke beech mein \"rukne\" ka natural point hai.",
+  "why_needed": "Signals ka buffering behaviour samjhane ke liye yeh best example hai, aur yeh real SaaS onboarding flow jaisa dikhta hai.",
+  "real_world_analogy": "Jaise aapne courier ko pehle hi \"ghar pe koi nahi, darwaze pe rakh dena\" note de diya -- jab woh pahunchega tab note padh lega, note khoega nahi.",
+  "how_it_works": "Signal history mein ek event hai. Replay events ko order mein feed karta hai; `_signal()` waiter na mile toh queue mein append karta hai; `wait_signal()` pehle queue check karta hai, phir hi future banata hai.",
+  "in_this_project": "`flowengine/examples/workflows.py::customer_onboarding`. Test `test_customer_onboarding_with_signal_and_durable_timer` worker start hone se PEHLE `store.signal(sm, \"onb-1\", \"verified\", {\"ok\": True})` bhejta hai, phir assert karta hai `verified_in_time is True` aur email templates exactly `[\"welcome\", \"tips\"]` (reminder nahi). `test_worker_crash_another_worker_resumes_from_history` isi workflow ko crash scenario mein chalata hai aur `{\"account\": 1, \"email\": 3}` assert karta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::customer_onboarding",
+   "projects/10-workflow-engine/tests/test_engine.py::test_customer_onboarding_with_signal_and_durable_timer",
+   "projects/10-workflow-engine/flowengine/runtime.py::_signal",
+   "projects/10-workflow-engine/tests/test_runtime.py::test_signal_before_waiting_is_buffered"
+  ],
+  "code_example": "# real, flowengine/examples/workflows.py\nacct = await ctx.execute_activity(\"create_account\", inp[\"email\"], retry=FAST)\nawait ctx.execute_activity(\"send_email\", inp[\"email\"], \"welcome\", retry=FAST)\nverified = await ctx.wait_signal(\"verified\", timeout=inp[\"verify_within\"])\nif not verified:\n    await ctx.execute_activity(\"send_email\", inp[\"email\"], \"verify_reminder\", retry=FAST)\nawait ctx.sleep(inp[\"tips_after\"])                       # durable timer: days in real life\nawait ctx.execute_activity(\"send_email\", inp[\"email\"], \"tips\", retry=FAST)",
+  "code_language": "python",
+  "advantages": [
+   "Early signals lose nahi hote",
+   "Multi-day flow ek readable function mein",
+   "Har email idempotency key se exactly-once"
+  ],
+  "disadvantages": [
+   "Signal ka koi schema/validation nahi",
+   "Agar same naam ke do signal aaye toh doosra queue mein pada rehta hai -- koi consume na kare toh silently ignore"
+  ],
+  "common_mistakes": [
+   "Signal ko sirf tab accept karna jab workflow wait kar raha ho (race condition)",
+   "Timer ki jagah polling loop likhna"
+  ],
+  "follow_up_questions": [
+   "Signal buffer kahan store hota hai -- memory ya DB?",
+   "Workflow complete hone ke baad signal bhejo toh kya hota hai?",
+   "Do signal same naam se aaye toh?"
+  ],
+  "concepts": [
+   "signal buffering",
+   "durable timer",
+   "onboarding workflow"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-046",
+  "project_slug": "p10-workflow-engine",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Walk through document_approval: escalation, the second wait, and how cancellation is handled.",
+  "answer_hinglish": "`document_approval` human-in-the-loop workflow hai -- approvers ko notify karo, decision ka wait karo, time pe nahi aaya toh escalate karo, aur cancel hone pe cleanup karo.\n\nFlow: `notify(approvers, \"please review ...\")` -> `wait_signal(\"decision\", timeout=escalate_after)`. Timeout hua (`None`) toh `notify(escalation_to, \"... waiting for approval\")` aur phir `wait_signal(\"decision\")` BINA timeout ke -- ab boss ke decision tak indefinitely wait. Decision aaya: `approved` true ho toh `archive_document` aur `{\"status\": \"approved\"}`, warna `rejected` with comment.\n\nPoora body `try/except WorkflowCancelled` mein hai. Jab koi `POST /workflows/{id}/cancel` karta hai, `store.cancel` history mein `CancelRequested` append karta hai aur abhi-tak-pick-na-hue activity tasks ko `cancelled` mark karta hai. Replay mein `ctx._cancel()` jo bhi future pending hai (timer, signal waiter) usme `WorkflowCancelled` set karta hai. Code except block mein jata hai, ek NAYI activity `notify(..., \"review ... cancelled\")` schedule karta hai -- yeh tabhi possible hai kyunki naye futures cancel se affect nahi hote (bug 1 ka fix). Phir `raise` karta hai, toh replay result `cancelled` aata hai aur history `WorkflowCancelled` pe khatam hoti hai.\n\n`raise` zaroori hai -- agar swallow kar diya toh workflow `completed` ban jayega, cancelled nahi.",
+  "why_needed": "Approval flows har company mein hain; is example se escalation timers, unbounded waits aur cancellation-with-cleanup teeno ek jagah dikh jaate hain.",
+  "real_world_analogy": "Leave application: manager 2 din mein jawab na de toh HR ko escalate; agar employee khud application wapas le le toh sabko \"cancelled\" mail jaata hai.",
+  "how_it_works": "CancelRequested event -> `_cancel()` pending futures ko WorkflowCancelled se fail karta hai -> code ka except chalta hai -> naya command (notify) -> next workflow task mein ActivityScheduled/Completed -> code `raise` -> ReplayResult status cancelled -> complete_workflow_task WorkflowCancelled append karta hai.",
+  "in_this_project": "`flowengine/examples/workflows.py::document_approval`. `test_document_approval_escalation_and_cancellation`: doc-1 ka `escalate_after` 0.2s hai, test 2 ActivityCompleted (notify + escalation notify) ka wait karke `decision` signal bhejta hai -> `{\"status\": \"approved\", \"by\": \"boss\"}`. doc-2 (60s) pe TimerStarted ke baad `store.cancel(sm, \"doc-2\", \"superseded\")` -> status `cancelled`, last event `WorkflowCancelled`, aur notify messages mein \"cancelled\" aur \"waiting for approval\" dono present.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/examples/workflows.py::document_approval",
+   "projects/10-workflow-engine/tests/test_engine.py::test_document_approval_escalation_and_cancellation",
+   "projects/10-workflow-engine/flowengine/store.py::cancel",
+   "projects/10-workflow-engine/flowengine/runtime.py::_cancel"
+  ],
+  "code_example": "# real (trimmed), flowengine/examples/workflows.py\ntry:\n    await ctx.execute_activity(\"notify\", inp[\"approvers\"], f\"please review {inp['doc_id']}\", retry=FAST)\n    decision = await ctx.wait_signal(\"decision\", timeout=inp[\"escalate_after\"])\n    if decision is None:\n        await ctx.execute_activity(\"notify\", inp[\"escalation_to\"], f\"{inp['doc_id']} waiting for approval\", retry=FAST)\n        decision = await ctx.wait_signal(\"decision\")\n    ...\nexcept WorkflowCancelled:\n    await ctx.execute_activity(\"notify\", inp[\"approvers\"], f\"review of {inp['doc_id']} cancelled\", retry=FAST)\n    raise",
+  "code_language": "python",
+  "advantages": [
+   "Escalation ek if-statement hai, scheduler config nahi",
+   "Cancellation pe guaranteed cleanup",
+   "Unbounded human wait ka koi resource cost nahi"
+  ],
+  "disadvantages": [
+   "`decision['approved']` missing key pe KeyError -> workflow failed (input validation nahi)",
+   "Cleanup activity ke dauraan dobara cancel ka koi special handling nahi"
+  ],
+  "common_mistakes": [
+   "except WorkflowCancelled mein `raise` bhool jaana -- status completed ho jayega",
+   "Cleanup ko plain Python I/O se karna instead of activity"
+  ],
+  "follow_up_questions": [
+   "Cancel ke time jo activity already chal rahi thi uska kya hota hai?",
+   "Agar cleanup activity hi fail ho jaye?",
+   "Multi-level escalation kaise likhoge?"
+  ],
+  "concepts": [
+   "human in the loop",
+   "escalation",
+   "cancellation",
+   "compensation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-047",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Beginner",
+  "question": "Walk through the flowengine database schema. Why does each table exist?",
+  "answer_hinglish": "Schema `migrations/versions/0001_initial.py` mein hai aur chhe tables hain -- saara engine state Postgres mein hai.\n\n1. `workflows` -- har workflow execution ki ek row. `workflow_id` PK (business id, jaise order-123), `run_id`, `workflow_type`, `task_queue`, `status` (running/completed/failed/cancelled), `input`, `result`, `error`. Plus engine-control columns: `needs_task` (naye events aaye, replay chahiye), `locked_by`/`lease_until` (workflow-task lease), `last_event_id` (optimistic commit ke liye).\n\n2. `history_events` -- append-only event log, single source of truth. PK `(workflow_id, event_id)`, `event_type`, `attrs jsonb`.\n\n3. `activity_tasks` -- activity ka queue. `status`, `attempt`, `retry` policy jsonb, `start_to_close_seconds`, `heartbeat_timeout_seconds`, `visible_at` (backoff), `lease_until`, `heartbeat_details`, `last_error`, aur `UNIQUE (workflow_id, seq)`.\n\n4. `timers` -- durable timers, PK `(workflow_id, seq)`, `fire_at`, `fired`.\n\n5. `workers` -- registration + heartbeat (`task_queues`, `workflow_types`, `activity_types`, `last_heartbeat`).\n\n6. `activity_effects` -- sirf examples ke liye: har side effect idempotency key pe record hota hai taaki tests exactly-once prove kar sakein.\n\nKey idea: `history_events` \"truth\" hai; `activity_tasks`, `timers`, `workflows.needs_task` sab derived \"work queues\" hain jo usi transaction mein update hote hain jisme event append hota hai.",
+  "why_needed": "Interviewer pehle data model poochta hai; agar tables clear hain toh replay, leases, retries sab easily explain hote hain.",
+  "real_world_analogy": "Hospital: patient file (history) asli record hai; ward ki \"aaj kya karna hai\" list (task queues, timers) us file se derive hoti hai aur file update ke saath hi update hoti hai.",
+  "how_it_works": "Har state change ek transaction: workflow row lock -> event append -> related queue row insert/update -> needs_task flag. Isliye history aur queues kabhi out of sync nahi hote.",
+  "in_this_project": "`migrations/versions/0001_initial.py::STATEMENTS` mein saare CREATE TABLE aur partial indexes hain; `DATABASE_DESIGN.md` mein ER diagram aur har design point ka \"why\" table. Saare FK `ON DELETE CASCADE` hain, aur tests `TRUNCATE ... CASCADE` se reset karte hain (`tests/conftest.py::sm`).",
+  "implementation_files": [
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/10-workflow-engine/DATABASE_DESIGN.md",
+   "projects/10-workflow-engine/tests/conftest.py::sm"
+  ],
+  "code_example": "-- real (trimmed), migrations/versions/0001_initial.py\nCREATE TABLE history_events (                  -- append-only, the single source of truth for workflow state\n  workflow_id text NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,\n  event_id bigint NOT NULL,\n  event_type text NOT NULL,\n  attrs jsonb NOT NULL DEFAULT '{}',\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (workflow_id, event_id))",
+  "code_language": "sql",
+  "advantages": [
+   "Ek hi transactional store -- history aur queues atomic",
+   "SQL se debug karna aasaan",
+   "jsonb attrs se naye event types bina migration"
+  ],
+  "disadvantages": [
+   "Postgres single bottleneck (~97 statements per 4-activity workflow, TESTING.md)",
+   "activity_effects production table nahi, sirf demo"
+  ],
+  "common_mistakes": [
+   "Workflow ka current state (variables) ek column mein store karne ki koshish -- replay ka point hi khatam",
+   "History ko update/delete karna"
+  ],
+  "follow_up_questions": [
+   "last_event_id column kyun chahiye agar event_id already hai?",
+   "activity_tasks ko alag table kyun, history se derive kyun nahi?",
+   "History table bahut bada ho jaye toh?"
+  ],
+  "concepts": [
+   "schema design",
+   "event log",
+   "derived queues",
+   "Postgres"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-048",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why is history_events keyed by (workflow_id, event_id) and treated as append-only?",
+  "answer_hinglish": "`history_events` ka PK `(workflow_id, event_id)` hai aur `event_id` per-workflow gap-free counter hai (1, 2, 3...), global sequence nahi. Iske teen fayde hain.\n\nPehla, total order per workflow. Replay ke liye events ka EXACT order chahiye -- signal pehle aaya ya timer, yeh order hi decide karta hai. `_append` workflow row ka `FOR UPDATE` lock pakad ke `last_event_id` padhta hai, +1 karke insert karta hai aur wapas `last_event_id` update karta hai. Do concurrent writers (signal API aur activity completion) row lock pe serialize ho jaate hain, toh duplicate ya out-of-order id possible nahi. Agar bug se dono same id likhne ki koshish karein toh PK violation transaction rollback kar deta.\n\nDoosra, efficient read: `WHERE workflow_id = :w ORDER BY event_id` seedha PK index se range scan hai -- replay ko poori history ek sorted scan mein milti hai.\n\nTeesra, append-only = audit + determinism. Pichhla event kabhi badla toh pichhle replays aur naye replays alag result denge -- determinism toot jayega. Isliye code kabhi UPDATE/DELETE nahi karta history pe; sirf workflow delete hone par `ON DELETE CASCADE`.\n\n`attrs` jsonb hai kyunki har event type ke attributes alag hain (seq, result, error, payload...). `created_at` DB `now()` se aata hai, aur replay mein `ctx.now()` isi se banta hai.",
+  "why_needed": "Event sourcing ka poora guarantee is table ki design pe tika hai; order ya immutability toota toh replay galat.",
+  "real_world_analogy": "Bank passbook: har entry ka serial number, koi entry mitai nahi jaati -- galti hui toh nayi reversal entry.",
+  "how_it_works": "Writer: lock workflow row -> read last_event_id -> insert events with last+1.. -> update last_event_id -> commit. Reader: ORDER BY event_id. Global sequence ki jagah per-workflow counter isliye ki workflows ke beech ordering ki zaroorat nahi.",
+  "in_this_project": "`store.py::_append` (\"Caller must hold the workflow row lock\"), `claim_workflow_task` history `event_id <= :n ORDER BY event_id` padhta hai. `DATABASE_DESIGN.md` ki pehli row: \"gap-free ids assigned under the workflow row lock -- total order of facts per workflow\".",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::_append",
+   "projects/10-workflow-engine/flowengine/store.py::claim_workflow_task",
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py",
+   "projects/10-workflow-engine/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real, flowengine/store.py\nasync def _append(s, workflow_id, events):\n    \"\"\"Caller must hold the workflow row lock. Returns the new last_event_id.\"\"\"\n    last = await s.scalar(text(\"SELECT last_event_id FROM workflows WHERE workflow_id = :w\"), {\"w\": workflow_id})\n    for et, attrs in events:\n        last += 1\n        await s.execute(text(\"INSERT INTO history_events (workflow_id, event_id, event_type, attrs) \"\n                             \"VALUES (:w, :e, :t, CAST(:a AS jsonb))\"), {...})\n    await s.execute(text(\"UPDATE workflows SET last_event_id = :l WHERE workflow_id = :w\"), {...})",
+  "code_language": "python",
+  "advantages": [
+   "Gap-free, totally ordered per workflow",
+   "PK index pe sequential replay read",
+   "Natural audit trail"
+  ],
+  "disadvantages": [
+   "Har append ek row lock -- hot workflow (bahut signals) pe contention",
+   "Ek event per INSERT (batch INSERT nahi) -- extra round trips"
+  ],
+  "common_mistakes": [
+   "bigserial global id use karke order maan lena (concurrent transactions commit order alag ho sakta hai)",
+   "History rows ko 'fix' karne ke liye UPDATE karna"
+  ],
+  "follow_up_questions": [
+   "bigserial se ordering kyun unreliable hai?",
+   "Event schema evolve karna ho toh?",
+   "History ko partition kaise karoge?"
+  ],
+  "concepts": [
+   "append-only log",
+   "gap-free ids",
+   "row lock",
+   "event sourcing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-049",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Explain the partial indexes in the schema and which query each one serves.",
+  "answer_hinglish": "Schema mein chaar partial indexes hain, aur har ek ek specific polling query ke liye hai. Partial index ka matlab: sirf woh rows index mein jinhe hum dhoondhte hain -- index chhota rehta hai aur completed rows (jo 99% hongi) scan nahi hoti.\n\n1. `ix_workflows_pending ON workflows (task_queue, needs_task) WHERE status = 'running'` -- `claim_workflow_task` ke liye. Closed workflows kabhi index mein nahi aate, toh lakhon completed workflows ke beech bhi poller sirf running wale dekhta hai.\n\n2. `ix_activity_ready ON activity_tasks (task_queue, visible_at) WHERE status = 'scheduled'` -- `claim_activity` ke liye: `status = 'scheduled' AND visible_at <= now() ... ORDER BY visible_at`. Backoff wale tasks `visible_at` future mein hone se naturally skip.\n\n3. `ix_activity_started ON activity_tasks (lease_until) WHERE status = 'started'` -- reaper `reap_expired_activities` ke liye: `status = 'started' AND lease_until < now()`.\n\n4. `ix_timers_due ON timers (fire_at) WHERE NOT fired` -- `fire_due_timers` ke liye: `NOT fired AND fire_at <= now() ORDER BY fire_at`.\n\nPattern yeh hai ki har \"queue\" ek status-filtered partial index hai -- yeh Postgres-as-a-queue ka standard trick hai. Ek nuance: `ix_workflows_pending` ka order `(task_queue, needs_task)` hai lekin claim query `workflow_type = ANY(...)` aur `lease_until` bhi filter karti hai aur `ORDER BY workflow_id` karti hai; bahut zyada running-but-idle workflows (lakhon timers pe wait karte) hon toh `needs_task` ko predicate mein daalna better hoga.",
+  "why_needed": "Postgres-as-queue mein table mein mostly finished rows hoti hain; bina partial index ke har poll full scan ya bada index scan karega, aur poll har 100ms hota hai.",
+  "real_world_analogy": "Library ka \"issued books\" register alag rakhna -- har baar poori library ka catalogue nahi dekhna padta.",
+  "how_it_works": "Partial index sirf WHERE predicate match karne wali rows ko store karta hai; planner use tab use karta hai jab query ka predicate index predicate ko imply kare (e.g. status = 'scheduled').",
+  "in_this_project": "Saare chaar `migrations/versions/0001_initial.py::STATEMENTS` mein hain. Queries: `store.py::claim_workflow_task`, `store.py::claim_activity`, `store.py::reap_expired_activities`, `store.py::fire_due_timers`. `DATABASE_DESIGN.md`: \"needs_task + partial index on running workflows -- pollers scan only workflows with work\".",
+  "implementation_files": [
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/10-workflow-engine/flowengine/store.py::claim_activity",
+   "projects/10-workflow-engine/flowengine/store.py::reap_expired_activities",
+   "projects/10-workflow-engine/flowengine/store.py::fire_due_timers"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE INDEX ix_workflows_pending ON workflows (task_queue, needs_task) WHERE status = 'running';\nCREATE INDEX ix_activity_ready   ON activity_tasks (task_queue, visible_at) WHERE status = 'scheduled';\nCREATE INDEX ix_activity_started ON activity_tasks (lease_until) WHERE status = 'started';\nCREATE INDEX ix_timers_due       ON timers (fire_at) WHERE NOT fired;",
+  "code_language": "sql",
+  "advantages": [
+   "Index size active work ke proportional, total history ke nahi",
+   "Poll queries fast aur predictable",
+   "Status change pe row index se automatically nikal jaati hai"
+  ],
+  "disadvantages": [
+   "Har status update index maintenance karta hai (write amplification)",
+   "Query predicate exactly match na kare toh planner index ignore kar sakta hai"
+  ],
+  "common_mistakes": [
+   "Full index on status -- low cardinality, planner use nahi karta",
+   "Index predicate mein now() jaisa volatile function daalna (allowed nahi)"
+  ],
+  "follow_up_questions": [
+   "EXPLAIN se kaise verify karoge ki index use ho raha hai?",
+   "Dead tuples aur autovacuum ka queue tables pe kya asar hai?",
+   "needs_task ko index predicate mein kyun daalna chahiye?"
+  ],
+  "concepts": [
+   "partial index",
+   "Postgres as queue",
+   "query planning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-050",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "What does UNIQUE (workflow_id, seq) on activity_tasks (and the timers primary key) guarantee, and why is it needed?",
+  "answer_hinglish": "`activity_tasks` pe `UNIQUE (workflow_id, seq)` aur `timers` pe `PRIMARY KEY (workflow_id, seq)` ek simple lekin important guarantee dete hain: ek workflow ka ek command (seq N) kabhi do baar schedule nahi ho sakta, chahe engine ke andar koi race ho jaye.\n\n`seq` workflow code ka deterministic command number hai -- `ctx._next()` har execute_activity/sleep pe +1. Replay ke baad jo commands history mein nahi hain woh \"new\" hain, aur `complete_workflow_task` unke liye `activity_tasks`/`timers` mein rows insert karta hai.\n\nNormal path mein duplicate optimistic check se hi ruk jaata hai: commit sirf tab hota hai jab `last_event_id` claim ke time wala hi ho. Lekin defence in depth: maan lo koi bug ya lease-expiry race se do workers same history pe same seq ka command commit karne ki koshish karein. Doosre insert pe UNIQUE violation -> poora transaction rollback -> duplicate ActivityScheduled event bhi nahi likha jaata. Database-level invariant code-level logic se zyada bharosemand hai.\n\nIska ek aur fayda hai: idempotency key `workflow_id:seq` bhi unique ban jaati hai, kyunki ek (workflow, seq) ka ek hi task hai, aur retries usi row pe `attempt` badhate hain, nayi row nahi banate. Isliye activity ke saare attempts same key dekhte hain -- exactly-once effect ki neev yahi hai.",
+  "why_needed": "At-least-once systems mein duplicate work ka sabse sasta guard DB constraint hai; activity charge_payment do baar schedule hua toh double charge risk.",
+  "real_world_analogy": "Cheque book: har cheque number ek hi baar issue ho sakta hai; bank do cheque same number ke accept nahi karta.",
+  "how_it_works": "INSERT INTO activity_tasks ... ke time Postgres unique index check karta hai; conflict pe IntegrityError aur outer `s.begin()` transaction rollback, jisme event append aur needs_task update bhi undo.",
+  "in_this_project": "`migrations/versions/0001_initial.py` mein `UNIQUE (workflow_id, seq)`; insert `store.py::complete_workflow_task` mein. Retry ke liye `fail_activity` usi row ko `status = 'scheduled'` aur naya `visible_at` deta hai. `DATABASE_DESIGN.md`: \"a command can never be scheduled twice\". Test `test_two_workers_process_many_workflows_without_duplicates` 2 workers x 20 workflows pe effects exactly 20 each assert karta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py::STATEMENTS",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/store.py::fail_activity",
+   "projects/10-workflow-engine/tests/test_engine.py::test_two_workers_process_many_workflows_without_duplicates"
+  ],
+  "code_example": "-- real (trimmed), migrations/versions/0001_initial.py\nCREATE TABLE activity_tasks (\n  id bigserial PRIMARY KEY,\n  workflow_id text NOT NULL REFERENCES workflows(workflow_id) ON DELETE CASCADE,\n  seq int NOT NULL,                             -- command sequence number inside the workflow\n  ...\n  UNIQUE (workflow_id, seq))",
+  "code_language": "sql",
+  "advantages": [
+   "DB-enforced invariant, code bug se bhi safe",
+   "Retries same row pe -> stable idempotency key",
+   "Debug mein (workflow_id, seq) se seedha history event se join"
+  ],
+  "disadvantages": [
+   "Violation pe poora workflow task fail hota hai -- error log ke alawa koi graceful handling nahi",
+   "seq code order pe depend karta hai, isliye code change (versioning) pe care chahiye"
+  ],
+  "common_mistakes": [
+   "Har retry pe nayi task row banana -- idempotency key badal jayegi",
+   "Uniqueness sirf application logic se maintain karna"
+  ],
+  "follow_up_questions": [
+   "Agar violation hua toh worker kya karega?",
+   "Continue-as-new mein seq reset hoga toh key unique kaise rahegi?",
+   "Child workflows aaye toh key format kya hona chahiye?"
+  ],
+  "concepts": [
+   "unique constraint",
+   "defence in depth",
+   "idempotency key",
+   "command seq"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "DB constraint ek safety net hai, primary mechanism optimistic last_event_id check hai. Dono milke \"no duplicate scheduling\" dete hain bina distributed lock ke. Cost: ek extra unique index per activity row.",
+   "failure_scenarios": "Bug ya race mein constraint violation -> IntegrityError -> `_workflow_loop` mein log.exception aur workflow lease expire hone tak ruk jaata hai, phir retry. Agar seq logic hi galat ho (e.g. non-deterministic), har retry fail karega -- monitoring chahiye.",
+   "alternatives": "Application-level dedupe (SELECT then INSERT -- racy), INSERT ... ON CONFLICT DO NOTHING (silent, bug chhupa sakta hai), advisory locks per workflow.",
+   "scale_10x_100x": "10x: same design. 100x with history sharding: (workflow_id, seq) shard key ke andar local rehta hai, toh constraint shard-local hi kaafi hai -- cross-shard uniqueness ki zaroorat nahi.",
+   "production_improvements": "Continue-as-new aaye toh key mein run_id add karo (workflow_id:run_id:seq) warna naye run ke seq 1 ki key purane run se takrayegi; violation ko specific metric bana ke alert karo."
+  }
+ },
+ {
+  "id": "FLOW-051",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How does the needs_task boolean act as the workflow-task queue?",
+  "answer_hinglish": "Temporal mein workflow tasks ek alag matching service ki task queue mein jaate hain. flowengine ne isko ek boolean column se simplify kiya hai: `workflows.needs_task`. Matlab \"is workflow ki history mein naye events aaye hain jinhe abhi tak kisi ne replay nahi kiya\".\n\nKaun true karta hai? Har woh operation jo workflow ke liye naya fact likhta hai: `start_workflow` (default true), `store.signal`, `store.cancel`, `complete_activity`, `fail_activity` (final failure), `fire_due_timers`. Sab usi transaction mein `needs_task = true` set karte hain jisme event append hota hai.\n\nKaun false karta hai? `complete_workflow_task` -- successful commit ke baad `needs_task = false`. Aur non-determinism case mein bhi false (taaki infinite loop na ho).\n\nIska elegant hissa: bahut saare events ek saath aa jaayein (5 activities parallel complete) toh bhi ek hi flag hai -- ek hi workflow task sab events ek replay mein process karega. Natural batching. Aur agar replay ke dauraan naya event aaya, toh optimistic commit fail hota hai, `needs_task` true hi rehta hai aur workflow dobara claim hoga.\n\nClaim query `status = 'running' AND needs_task AND (lease_until IS NULL OR lease_until < now())` pe `FOR UPDATE SKIP LOCKED` karti hai. Is design mein alag queue table ki zaroorat nahi, aur \"ek workflow pe ek time pe ek hi workflow task\" lease se aata hai.",
+  "why_needed": "Workflow task ko \"pending work\" signal karna hai bina duplicate tasks ke; boolean flag se coalescing free mein milti hai.",
+  "real_world_analogy": "Inbox ka \"unread\" badge -- 1 mail aaye ya 10, badge ek hi hai, aur aap ek baar khol ke sab padh lete ho.",
+  "how_it_works": "Writers: lock row, append event, SET needs_task = true. Poller: claim where needs_task and lease free. Committer: if last_event_id unchanged, SET needs_task = false. Signal meanwhile -> last_event_id changed -> discard, flag stays true.",
+  "in_this_project": "Column `migrations/versions/0001_initial.py` mein (`needs_task boolean NOT NULL DEFAULT true -- new events arrived -> a workflow task must replay it`). Set: `store.py::signal`, `cancel`, `complete_activity`, `fail_activity`, `fire_due_timers`. Clear: `complete_workflow_task`. `/stats` endpoint `workflow_task_backlog` = `count(*) WHERE status = 'running' AND needs_task`. NonDeterminismError ke baad flag false ho jaata hai; fix deploy karke `store.retry_workflow_task` / `POST /workflows/{id}/retry-task` isko wapas true karta hai (review se pehle yahan manual SQL UPDATE hi rasta tha).",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/store.py::signal",
+   "projects/10-workflow-engine/flowengine/api.py::stats",
+   "projects/10-workflow-engine/tests/test_engine.py::test_nondeterministic_deploy_is_detected_and_workflow_survives",
+   "projects/10-workflow-engine/flowengine/store.py::retry_workflow_task"
+  ],
+  "code_example": "# real, flowengine/store.py (signal)\nawait _append(s, workflow_id, [(\"SignalReceived\", {\"name\": name, \"payload\": payload})])\nawait s.execute(text(\"UPDATE workflows SET needs_task = true WHERE workflow_id = :w\"), {\"w\": workflow_id})",
+  "code_language": "python",
+  "advantages": [
+   "Multiple events automatically batch ho jaate hain",
+   "Alag queue table/service nahi",
+   "Backlog metric ek simple count"
+  ],
+  "disadvantages": [
+   "Task ka koi created_at/priority nahi -- FIFO fairness nahi (claim ORDER BY workflow_id)",
+   "Non-determinism ke baad operator ko retry-task call karna padta hai"
+  ],
+  "common_mistakes": [
+   "Har event pe ek alag workflow task row insert karna -- duplicate replays",
+   "needs_task ko event append se alag transaction mein set karna (lost wakeup)"
+  ],
+  "follow_up_questions": [
+   "needs_task ko alag transaction mein set kiya toh kya bug aayega?",
+   "Backlog badh raha ho toh kya karoge?",
+   "Temporal ka matching service yeh kaam kaise karta hai?"
+  ],
+  "concepts": [
+   "workflow task",
+   "coalescing",
+   "flag-based queue",
+   "backlog"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-052",
+  "project_slug": "p10-workflow-engine",
+  "category": "Database Design",
+  "difficulty": "Senior/System Design",
+  "question": "History tables grow forever. How would you handle retention, archival and partitioning for history_events?",
+  "answer_hinglish": "Seedha jawab: is project mein retention implement nahi hai -- `history_events` sirf badhti hai, aur workflow delete hone pe hi `ON DELETE CASCADE` se jaati hai. `DEPLOYMENT.md` mein operational rule likha hai: \"Retention: archive histories of closed workflows after N days\" -- yeh documented next step hai.\n\nProduction mein main aise karunga. Pehla, distinction: running workflows ki history HOT hai (replay ke liye zaroori), closed workflows ki history COLD hai (sirf audit/debug). Running ki history kabhi delete nahi kar sakte.\n\nDoosra, archival job: `closed_at < now() - interval 'N days'` wale workflows ki history ko object storage (S3, ya Project 7 jaisa store) mein JSON/Parquet export karo, phir DB se delete. Temporal bhi yahi karta hai -- namespace retention period ke baad history archival mein jaati hai.\n\nTeesra, partitioning: bade scale pe `history_events` ko `workflow_id` hash se partition karna (shard-friendly), ya time-based partitioning taaki purane partitions DROP ho sakein (DELETE se bahut sasta, vacuum bloat nahi). Lekin time partitioning tricky hai kyunki ek long-running workflow ke events kai partitions mein phaile honge.\n\nChautha, history size limits: ek workflow ki history bahut lambi ho (TESTING.md: 2,001 events ka replay 102-132 ms) toh continue-as-new force karo.",
+  "why_needed": "Workflow engines audit ke liye sab kuch record karte hain; bina retention ke table TB mein jaata hai, vacuum aur index bloat se performance girta hai.",
+  "real_world_analogy": "Office files: chalu cases desk pe, band cases 1 saal baad record room (archive) mein, 7 saal baad shred.",
+  "how_it_works": "Archiver batch: SELECT closed workflows past retention -> export history -> DELETE FROM workflows (cascade se history, tasks, timers). Partitioned tables pe DROP PARTITION.",
+  "in_this_project": "Abhi: `migrations/versions/0001_initial.py` mein saare child tables `ON DELETE CASCADE` hain (archival delete aasaan), `workflows.closed_at` column hai (retention filter ke liye ready). Koi archiver nahi hai. `DEPLOYMENT.md` rule 4 retention ko next step batata hai; `SYSTEM_DESIGN.md` \"Long histories\" ke liye continue-as-new aur history size limits suggest karta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/migrations/versions/0001_initial.py",
+   "projects/10-workflow-engine/DEPLOYMENT.md",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md",
+   "projects/10-workflow-engine/TESTING.md"
+  ],
+  "code_example": "-- illustrative archiver (not in repo)\nWITH old AS (\n  SELECT workflow_id FROM workflows\n  WHERE status <> 'running' AND closed_at < now() - interval '30 days'\n  ORDER BY closed_at LIMIT 500)\nDELETE FROM workflows w USING old WHERE w.workflow_id = old.workflow_id;   -- cascades to history_events\n-- (export history of `old` to object storage BEFORE this delete)",
+  "code_language": "sql",
+  "advantages": [
+   "Hot table chhota rehta hai, replay aur poll queries fast",
+   "Audit data object storage mein sasta"
+  ],
+  "disadvantages": [
+   "Archived workflows ka /history endpoint ab DB se nahi chalega -- archive reader chahiye",
+   "Bulk DELETE vacuum pressure badhata hai"
+  ],
+  "common_mistakes": [
+   "Running workflows ki history trim karna -- replay toot jayega",
+   "Bina export ke delete karna (audit/compliance loss)"
+  ],
+  "follow_up_questions": [
+   "Time partition vs hash partition -- workflow history ke liye kaun?",
+   "Archive se ek workflow ka debug kaise karoge?",
+   "GDPR delete request aaye toh history ka kya?"
+  ],
+  "concepts": [
+   "retention",
+   "archival",
+   "partitioning",
+   "history size"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Retention vs auditability: lambi retention = zyada storage aur slow DB; chhoti = debugging aur compliance loss. Time partitioning cheap drops deta hai lekin long-running workflows ke liye awkward; hash partitioning sharding ke saath align hota hai lekin drop nahi, delete karna padta hai.",
+   "failure_scenarios": "Archiver beech mein crash ho: export ho gaya, delete nahi -- dobara chalne pe duplicate export (idempotent object key workflow_id/run_id rakho). Delete batch bahut bada -> long locks aur replication lag.",
+   "alternatives": "Temporal-style archival to blob storage; Postgres partitioning + pg_partman; history ko Cassandra jaisi wide-column store mein rakhna (Temporal ka default); TTL-based stores.",
+   "scale_10x_100x": "10x: archiver batch job + partial indexes kaafi. 100x: history_events ko workflow_id hash se shard/partition karo (Temporal history shards), closed history turant blob storage mein, DB mein sirf running.",
+   "production_improvements": "Namespace-level retention config, archival with signed object keys, /history ko archive-aware banana, history size/event count limits with warning metrics, continue-as-new for unbounded workflows."
+  }
+ },
+ {
+  "id": "FLOW-053",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Beginner",
+  "question": "What is FOR UPDATE SKIP LOCKED and how does flowengine use it to claim tasks?",
+  "answer_hinglish": "`SELECT ... FOR UPDATE SKIP LOCKED` Postgres ka feature hai jo database table ko safely queue bana deta hai. `FOR UPDATE` selected row pe lock lagata hai; `SKIP LOCKED` bolta hai \"agar koi row kisi aur transaction ne already lock ki hai toh uska wait mat karo, use skip karke agli row lo\".\n\nProblem yeh hai: 4 workers ek saath \"next ready task do\" poochhte hain. Bina lock ke sab ko same row milegi -> duplicate kaam. Sirf `FOR UPDATE` se dusre workers pehle wale ka wait karenge -> serial, slow. `SKIP LOCKED` se har worker ko alag row milti hai, bina blocking ke.\n\nflowengine mein do jagah use hota hai, dono ek hi pattern mein: `UPDATE ... WHERE id = (SELECT id ... LIMIT 1 FOR UPDATE SKIP LOCKED) RETURNING *`. Ek statement mein select + claim (status/lease update) atomic.\n\n`claim_activity`: `status = 'scheduled' AND visible_at <= now()` wali row, `ORDER BY visible_at`, phir `status = 'started', attempt = attempt + 1, locked_by, lease_until` set.\n\n`claim_workflow_task`: running + `needs_task` + lease free wala workflow, phir `locked_by` aur `lease_until = now() + 10s`, aur usi transaction mein history `event_id <= last_event_id` padhna.\n\nLekin SKIP LOCKED sirf transaction ke dauraan protect karta hai. Transaction commit ke baad row lock chala jaata hai -- isliye lease (`lease_until`) aur status column asli ownership represent karte hain.",
+  "why_needed": "Multiple workers ko bina duplicate aur bina blocking ke kaam baantna -- har queue system ka core problem.",
+  "real_world_analogy": "Bank ke counters pe token: jo token ek clerk utha chuka, doosra clerk uska wait nahi karta, agla token utha leta hai.",
+  "how_it_works": "Subquery candidate row lock karti hai (locked rows skip), outer UPDATE usi row ko claim state mein daal deta hai, RETURNING data worker ko de deta hai; commit ke baad lease/status ownership batate hain.",
+  "in_this_project": "`store.py::claim_activity` aur `store.py::claim_workflow_task`. Test `test_two_workers_process_many_workflows_without_duplicates`: workers W1 aur W2, 20 order workflows, assert `{\"reserve\": 20, \"charge\": 20, \"ship\": 20, \"email\": 20}` -- koi duplicate effect nahi.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::claim_activity",
+   "projects/10-workflow-engine/flowengine/store.py::claim_workflow_task",
+   "projects/10-workflow-engine/tests/test_engine.py::test_two_workers_process_many_workflows_without_duplicates"
+  ],
+  "code_example": "-- real (trimmed), flowengine/store.py claim_activity\nUPDATE activity_tasks SET status = 'started', attempt = attempt + 1, locked_by = :wk, lease_until = ...\nWHERE id = (SELECT id FROM activity_tasks WHERE status = 'scheduled' AND visible_at <= now()\n            AND task_queue = ANY(:q) AND activity_type = ANY(:t)\n            ORDER BY visible_at LIMIT 1 FOR UPDATE SKIP LOCKED)\nRETURNING *",
+  "code_language": "sql",
+  "advantages": [
+   "Alag broker ke bina safe concurrent queue",
+   "Non-blocking: workers ek dusre ka wait nahi karte",
+   "Claim atomic, ek round trip"
+  ],
+  "disadvantages": [
+   "Har claim ek row (LIMIT 1) -- batch claim nahi, high throughput pe zyada round trips",
+   "Strict FIFO guarantee nahi"
+  ],
+  "common_mistakes": [
+   "SELECT aur UPDATE alag transactions mein -- race",
+   "Sirf SKIP LOCKED pe bharosa, lease ke bina -- crash ke baad task kabhi wapas nahi aata"
+  ],
+  "follow_up_questions": [
+   "Commit ke baad row lock nahi raha -- ab ownership kaise pata hai?",
+   "LIMIT 1 ki jagah batch claim kaise karoge?",
+   "SKIP LOCKED ka downside kya hai?"
+  ],
+  "concepts": [
+   "SKIP LOCKED",
+   "task claiming",
+   "Postgres queue"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-054",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do leases work for workflow tasks versus activity tasks, and why are their durations different?",
+  "answer_hinglish": "Lease ka matlab: \"yeh kaam X worker ke paas hai, `lease_until` tak\". Agar worker mar gaya toh lease expire hogi aur koi aur worker kaam utha lega. SKIP LOCKED sirf claim transaction ke andar protect karta hai; uske baad ownership lease hi hai.\n\nWorkflow-task lease: `claim_workflow_task` `lease_until = now() + workflow_task_lease_seconds` (default 10s, `config.py`) set karta hai. Replay pure CPU hai aur milliseconds leta hai (TESTING.md: 21 events ka 0.5-2.1 ms), toh 10s kaafi generous hai. Worker crash ho toh 10s baad koi doosra worker `lease_until < now()` dekh ke claim kar leta hai. Successful commit pe `locked_by` aur `lease_until` NULL ho jaate hain.\n\nActivity lease: `claim_activity` mein `lease_until = now() + coalesce(heartbeat_timeout_seconds, start_to_close_seconds) + 1`. Activities minutes chal sakti hain, isliye lease unke timeout se derive hoti hai. Heartbeat karne wali activity ki lease chhoti (heartbeat_timeout, e.g. 0.5s) hoti hai aur har `store.heartbeat` usse aage badhata hai; bina heartbeat wali ki lease poore start_to_close (default 30s) ki. +1 second buffer clock jitter aur DB round trip ke liye.\n\nExpiry handle karne wale alag hain: workflow lease bas claim query mein re-claimable ho jaati hai (koi side effect nahi, replay idempotent hai), jabki activity lease `reap_expired_activities` reaper dekhta hai aur use timed-out attempt count karke `fail_activity` se retry/fail karta hai.",
+  "why_needed": "Crash recovery ka poora mechanism lease pe hai; galat duration ya to slow recovery (lambi lease) ya duplicate execution (chhoti lease) deti hai.",
+  "real_world_analogy": "Hotel room checkout time: time tak room aapka; checkout ke baad aap nahi nikle toh bhi housekeeping room naye guest ko de deti hai. Lambi stay ho toh reception pe \"extend\" (heartbeat) karte raho.",
+  "how_it_works": "Workflow: lease set on claim, cleared on commit/release; expired lease = claimable again. Activity: lease set on claim, extended by heartbeat, reaper converts expired lease into ActivityTimeout failure (retry with backoff ya final ActivityFailed).",
+  "in_this_project": "`store.py::claim_workflow_task` (lease_seconds param, worker `self.lease` = `FLOW_WORKFLOW_TASK_LEASE_SECONDS`), `store.py::claim_activity`, `store.py::heartbeat`, `store.py::reap_expired_activities`, `store.py::release_workflow_lease` (graceful shutdown pe lease turant chhodna -- bug 3 fix). Test `test_activity_heartbeat_timeout_detects_dead_worker` 0.5s heartbeat lease prove karta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::claim_workflow_task",
+   "projects/10-workflow-engine/flowengine/store.py::claim_activity",
+   "projects/10-workflow-engine/flowengine/store.py::reap_expired_activities",
+   "projects/10-workflow-engine/flowengine/store.py::release_workflow_lease",
+   "projects/10-workflow-engine/flowengine/config.py::Settings"
+  ],
+  "code_example": "-- real, flowengine/store.py claim_activity\n-- Lease = heartbeat timeout when the activity heartbeats (fast dead-worker detection), else start_to_close.\nlease_until = now() + make_interval(secs => coalesce(heartbeat_timeout_seconds, start_to_close_seconds) + 1)",
+  "code_language": "sql",
+  "advantages": [
+   "Worker death ka detection bina coordinator ke",
+   "Heartbeat activities ka fast failover",
+   "Workflow lease expiry harmless kyunki replay deterministic"
+  ],
+  "disadvantages": [
+   "Non-heartbeat activity ka crash 31s baad hi detect hota hai",
+   "Leases DB clock (now()) pe hain lekin timer fire_at worker clock se -- mixed clocks (observation)"
+  ],
+  "common_mistakes": [
+   "Lease ko processing time se chhota rakhna -- healthy worker ka kaam chheen liya jaata hai",
+   "Lease extend karte waqt attempt check na karna (fencing)"
+  ],
+  "follow_up_questions": [
+   "Lease expire hua lekin purana worker zinda tha -- uska result kya hoga?",
+   "Workflow lease 10s hi kyun?",
+   "Reaper ek se zyada workers pe chale toh?"
+  ],
+  "concepts": [
+   "lease",
+   "heartbeat",
+   "crash recovery",
+   "reaper"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Chhoti lease = fast recovery lekin GC pause/slow DB pe false positives (duplicate execution). Lambi lease = safe lekin slow failover. Heartbeat dono ka balance: lease chhoti, healthy worker extend karta rehta hai -- cost: har heartbeat ek DB write.",
+   "failure_scenarios": "Network partition: worker zinda hai lekin DB tak heartbeat nahi pahuncha -> lease expire -> doosra attempt start -> do attempts parallel chal rahe. Fencing (attempt check) purane ka completion reject karta hai, lekin side effect dono ne kiya ho sakta hai -- isliye idempotency key zaroori.",
+   "alternatives": "Coordinator-based ownership (ZooKeeper/etcd sessions), push model jahan server connection drop pe task reassign kare (Temporal matching + sticky queues), visibility timeout (SQS).",
+   "scale_10x_100x": "10x: heartbeat writes DB load banenge -- heartbeat throttling (Temporal SDK heartbeats ko batch/throttle karta hai). 100x: lease state alag fast store ya matching service memory mein.",
+   "production_improvements": "Heartbeat throttling, lease expiry metrics (reaper count), schedule_to_start timeout, worker clock ki jagah DB time consistently use karna."
+  }
+ },
+ {
+  "id": "FLOW-055",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What is fencing by attempt, and how does flowengine reject stale activity completions?",
+  "answer_hinglish": "Fencing ka matlab: jab kisi kaam ki ownership badal jaaye, toh purane owner ke writes ko reject karna. flowengine mein fencing token `activity_tasks.attempt` hai.\n\nScenario: worker A ne activity claim ki (attempt 1). A ka GC pause/network hang hua, heartbeat nahi gaya, lease expire hui. Reaper ne use timeout count karke `status = 'scheduled'` kar diya, worker B ne claim kiya -- ab `attempt = 2`. Ab A jaag ke result report karta hai.\n\n`complete_activity` ka UPDATE hai: `SET status = 'completed' WHERE id = :i AND status = 'started' AND attempt = :a`. A apna attempt 1 bhejta hai, DB mein 2 hai -> `rowcount == 0` -> function `False` return karta hai, koi `ActivityCompleted` event append nahi hota. Worker stats mein `stale` badhta hai. Same pattern `fail_activity` (return \"stale\") aur `heartbeat` (return False) mein hai.\n\nHeartbeat ka False activity ko bata deta hai \"tumne task kho diya\" -- `long_task` example mein `if not await ctx.heartbeat(...): return None` se activity jaldi ruk jaati hai.\n\nImportant limitation: fencing sirf ENGINE ka state protect karta hai, bahar ki duniya ka nahi. A ka email shayad already chala gaya. Isliye fencing ke saath idempotency key (`workflow_id:seq`, attempts ke beech same) zaroori hai -- `activity_effects` ka `ON CONFLICT DO NOTHING` ensure karta hai ki A aur B dono effect karne ki koshish karein toh bhi ek hi record ho.",
+  "why_needed": "Leases ke saath \"zombie\" workers hamesha possible hain; bina fencing ke purana result naye attempt ka result overwrite kar sakta hai ya duplicate events bana sakta hai.",
+  "real_world_analogy": "Purana ID card deactivate: naye guard ko naya card mila, purana guard wapas aake gate kholne ki koshish kare toh card reject.",
+  "how_it_works": "claim: attempt = attempt + 1 (naya token). Har write (complete/fail/heartbeat): WHERE attempt = :my_attempt AND status = 'started'. Token mismatch -> 0 rows -> stale.",
+  "in_this_project": "`store.py::complete_activity` (\"fenced: our lease expired and another attempt owns it\"), `store.py::fail_activity` ('stale'), `store.py::heartbeat` (\"False = we lost the task (fenced)\"), `examples/activities.py::long_task`, `Worker._execute` mein `self.stats[\"stale\"]`. `test_activity_heartbeat_timeout_detects_dead_worker` assert karta hai `attempt == 2` aur `effects == {\"long_task\": 1}`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_activity",
+   "projects/10-workflow-engine/flowengine/store.py::heartbeat",
+   "projects/10-workflow-engine/flowengine/examples/activities.py::long_task",
+   "projects/10-workflow-engine/flowengine/worker.py::_execute",
+   "projects/10-workflow-engine/tests/test_engine.py::test_activity_heartbeat_timeout_detects_dead_worker"
+  ],
+  "code_example": "# real, flowengine/store.py complete_activity\nres = await s.execute(text(\"UPDATE activity_tasks SET status = 'completed', lease_until = NULL WHERE id = :i \"\n                           \"AND status = 'started' AND attempt = :a\"), {\"i\": task[\"id\"], \"a\": task[\"attempt\"]})\nif res.rowcount == 0:\n    return False          # fenced: our lease expired and another attempt owns it",
+  "code_language": "python",
+  "advantages": [
+   "Zombie worker engine state corrupt nahi kar sakta",
+   "Extra column nahi chahiye -- attempt hi token",
+   "Heartbeat se activity ko early abort signal"
+  ],
+  "disadvantages": [
+   "External side effects fence nahi hote -- idempotency key ki zimmedari activity author pe",
+   "Fenced completion ka result waste hota hai"
+  ],
+  "common_mistakes": [
+   "Sirf `id` pe UPDATE karna, attempt check ke bina",
+   "Fencing ko exactly-once guarantee samajh lena"
+  ],
+  "follow_up_questions": [
+   "Fencing token external system (e.g. payment provider) tak kaise pass karoge?",
+   "Heartbeat False aaye toh activity ko kya karna chahiye?",
+   "Workflow tasks ke liye fencing kya hai?"
+  ],
+  "concepts": [
+   "fencing token",
+   "zombie worker",
+   "stale completion",
+   "idempotency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fencing engine-side correctness deta hai, effect-side correctness idempotency key se aati hai -- dono ke bina exactly-once effect nahi. Monotonic attempt counter sasta token hai; alternative (random lease ids) bhi kaam karte lekin attempt retry policy ke liye bhi chahiye tha.",
+   "failure_scenarios": "Zombie A aur naya B dono external API call karte hain; agar provider idempotency key support nahi karta toh double effect. Workflow cancel ke baad started task reap hoke retry ho sakta tha (review mein mila; ab cancel 'started' bhi cancel karta hai aur `_closed()` guard hai).",
+   "alternatives": "Lease id UUID per claim, version column (optimistic locking), storage-level fencing (e.g. HDFS/ZooKeeper epoch numbers jo storage khud verify kare).",
+   "scale_10x_100x": "Scale se fencing nahi badalta -- yeh per-row check hai. 100x pe stale completions ka rate metric important hoga: badhna = leases bahut chhoti ya workers overloaded.",
+   "production_improvements": "`stats[\"stale\"]` ko Prometheus metric banao, fencing token (attempt) ko idempotency key ke saath downstream systems tak pass karo jahan possible, heartbeat False pe activity ko cooperative cancel karo."
+  }
+ },
+ {
+  "id": "FLOW-056",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why must an activity's lease equal its heartbeat timeout (not start_to_close) when it heartbeats?",
+  "answer_hinglish": "Heartbeat ka poora purpose hai fast dead-worker detection. Ek activity jo 10 minute chalti hai, uska start_to_close 15 min ho sakta hai. Agar worker 1 minute mein mar gaya, toh start_to_close-based lease se humein 14 minute baad pata chalega. Heartbeat timeout (say 30s) bolta hai: \"agar 30s tak heartbeat nahi aaya toh maan lo mar gaya\".\n\nIsko kaam karne ke liye lease ki length heartbeat timeout honi chahiye, aur har heartbeat lease ko `now() + heartbeat_timeout` tak aage badhaye. Healthy activity ki lease lagatar renew hoti rehti hai; dead worker ki lease heartbeat_timeout mein expire ho jaati hai aur reaper use retry kar deta hai.\n\nIs project mein yahi ek real bug tha (FAILURE_SCENARIOS bug 4): `store.heartbeat` lease ko start_to_close (30s) se extend karta tha. Matlab pehli heartbeat ke baad lease 30s ki ho jaati thi -- heartbeat_timeout bekaar. Fix: claim aur heartbeat dono mein `coalesce(heartbeat_timeout_seconds, start_to_close_seconds) + 1`.\n\nNote do alag timeouts hain: start_to_close poore attempt ki max duration hai (worker-side `asyncio.wait_for` enforce karta hai), heartbeat_timeout do heartbeats ke beech max gap hai (lease enforce karti hai). Test mein heartbeat_timeout 0.5s aur start_to_close 30s hai -- aur doosra worker 0.5s ke andar takeover karta hai.",
+  "why_needed": "Long-running activities ke liye fast failover tabhi milta hai jab lease heartbeat interval se tied ho; warna heartbeat sirf progress logging ban jaata hai.",
+  "real_world_analogy": "Pahad pe trekker ko har 30 min radio check-in karna hai; base camp 30 min silence pe rescue bhejta hai, poori trek ke 8 ghante wait nahi karta.",
+  "how_it_works": "claim: lease = now + hb_timeout + 1. heartbeat(): WHERE attempt matches -> lease = now + hb_timeout + 1, heartbeat_details save. No heartbeat -> lease_until < now -> reaper -> fail_activity(ActivityTimeout, timed_out=True) -> retry.",
+  "in_this_project": "`store.py::heartbeat` aur `store.py::claim_activity` dono mein same coalesce expression. Workflow `heartbeat_test` (tests/test_engine.py) `heartbeat_timeout=0.5, start_to_close=30` set karta hai; `test_activity_heartbeat_timeout_detects_dead_worker` worker A ko 3 chunks ke baad `kill()` karta hai aur worker B se `attempt == 2`, `\"lease expired\" in last_error`, `{\"long_task\": 1}` assert karta hai. LEARNING_GUIDE: \"worker mara toh 0.5s mein pata chal gaya, 30s nahi\".",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::heartbeat",
+   "projects/10-workflow-engine/flowengine/store.py::claim_activity",
+   "projects/10-workflow-engine/tests/test_engine.py::heartbeat_test",
+   "projects/10-workflow-engine/tests/test_engine.py::test_activity_heartbeat_timeout_detects_dead_worker",
+   "projects/10-workflow-engine/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, flowengine/store.py heartbeat (after the fix)\n\"UPDATE activity_tasks SET last_heartbeat_at = now(), heartbeat_details = CAST(:d AS jsonb), \"\n\"lease_until = now() + make_interval(secs => coalesce(heartbeat_timeout_seconds, start_to_close_seconds) + 1) \"\n\"WHERE id = :i AND status = 'started' AND attempt = :a\"",
+  "code_language": "python",
+  "advantages": [
+   "Dead worker detection heartbeat_timeout mein, poore activity timeout mein nahi",
+   "Same expression claim aur renew dono mein -- consistency"
+  ],
+  "disadvantages": [
+   "Har heartbeat ek DB write; frequent heartbeats DB load",
+   "Activity heartbeat karna bhool gayi toh heartbeat_timeout pe hi kill/retry ho jaayegi"
+  ],
+  "common_mistakes": [
+   "Lease ko heartbeat pe max timeout tak extend karna (yahi bug tha)",
+   "heartbeat_timeout ko heartbeat interval ke barabar rakhna -- thoda jitter aur false timeout"
+  ],
+  "follow_up_questions": [
+   "Heartbeat kitni frequency pe bhejna chahiye?",
+   "Heartbeat details se resume kaise karoge?",
+   "start_to_close aur heartbeat_timeout dono expire ho jaayein toh kaun pehle?"
+  ],
+  "concepts": [
+   "heartbeat timeout",
+   "start-to-close",
+   "lease renewal",
+   "failure detection"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Chhota heartbeat_timeout = fast detection lekin zyada writes aur false positives (event loop busy hone pe heartbeat late). Temporal SDK heartbeats ko throttle karta hai (heartbeat_timeout ka fraction) taaki server load kam ho.",
+   "failure_scenarios": "Activity CPU-bound loop mein event loop block kare toh heartbeat nahi jaata -> lease expire -> doosra attempt parallel start, pehla bhi chal raha -- double work; heartbeat False ko check karna zaroori.",
+   "alternatives": "Worker-level heartbeat (workers table) se saari activities ka liveness -- sasta lekin coarse; ya connection-based liveness (gRPC stream) jaise Temporal ke long-poll.",
+   "scale_10x_100x": "10x activities = 10x heartbeat writes; throttling aur batching (ek worker ki saari activities ka ek UPDATE) chahiye. 100x pe heartbeats DB se hata ke in-memory matching/history service mein.",
+   "production_improvements": "Client-side heartbeat throttling, heartbeat_details ko next attempt ko pass karna (resume), metric: reaper timeouts per activity type, alert jab timeout rate badhe."
+  }
+ },
+ {
+  "id": "FLOW-057",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "If a workflow-task lease expires mid-replay and a second worker replays the same workflow, why is it safe -- and why does the stale commit now check locked_by only when releasing the lease?",
+  "answer_hinglish": "Pehli nazar mein yeh bug lagta hai: `complete_workflow_task` commit ke liye `locked_by = me` check nahi karta. Lekin design jaan-boojh ke `last_event_id` pe optimistic concurrency use karta hai, aur deterministic replay ki wajah se yeh safe hai.\n\nScenario: worker A ne workflow claim kiya, history 1..N padhi. A 10s (lease) se zyada atak gaya. Worker B ne `lease_until < now()` dekh ke claim kiya, same history 1..N. Ab dono commit ke liye aate hain. Commit `_lock` (FOR UPDATE) pe serialize hota hai.\n\nCase 1: B pehle commit karta hai aur new commands append karta hai -> `last_event_id` N se aage. A lock leta hai, `current[\"last_event_id\"] != wf[\"last_event_id\"]` -> lease clear karke `False`. A ka result discard.\n\nCase 2: replay se koi naya event nahi bana (workflow blocked, no new commands). Dono `needs_task = false` set karte hain -- same idempotent write, koi nuksaan nahi.\n\nKyun safe? Kyunki same history pe deterministic code same commands produce karega -- A aur B ka result identical hai, toh \"kaun jeeta\" matter nahi karta, bas ek hi apply hona chahiye, aur last_event_id woh guarantee karta hai. UNIQUE (workflow_id, seq) last line of defence hai.\n\nEk subtle cheez jo code review mein mili: stale A pehle lease bhi NULL kar deta tha -- chahe ab woh B ki lease ho. Tab teesra worker C turant claim karke B ke saath SAME task concurrently chala sakta tha (wasted replay; correctness phir bhi last_event_id se bachti). Fix: release `... WHERE workflow_id = :w AND locked_by = :k` -- stale worker sirf apni lease chhodta hai. Regression test `test_stale_commit_does_not_clear_another_workers_lease`: w1 0.05s lease leke stall, w2 claim karta hai, signal se history move, w1 ka commit False aur `locked_by` abhi bhi 'w2'.",
+  "why_needed": "Distributed systems mein \"lease expire hua lekin owner zinda hai\" common hai; interviewer dekhna chahta hai ki aap correctness ko lease pe depend karte ho ya kisi stronger invariant pe.",
+  "real_world_analogy": "Do accountants ne same ledger ki copy se same calculation kiya; jo pehle register mein entry kar de, doosra dekhta hai \"page number badal gaya\" aur apni entry phenk deta hai.",
+  "how_it_works": "Correctness = determinism + compare-and-set on last_event_id under row lock. Lease sirf efficiency (duplicate replay kam karna) ke liye hai, correctness ke liye nahi.",
+  "in_this_project": "`store.py::complete_workflow_task` -- `if current[\"last_event_id\"] != wf[\"last_event_id\"] or current[\"status\"] != \"running\": ... return False`. Worker isko `self.stats[\"stale\"]` mein count karta hai (`worker.py::run_workflow_task_once`). Docstring at top of `store.py` poora protocol (claim -> replay outside tx -> commit) explain karta hai. Test `test_stale_workflow_task_is_discarded_when_history_moves` mismatch path ko directly test karta hai.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/flowengine/worker.py::run_workflow_task_once",
+   "projects/10-workflow-engine/tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/tests/test_review_fixes.py::test_stale_commit_does_not_clear_another_workers_lease"
+  ],
+  "code_example": "# real, flowengine/store.py complete_workflow_task\ncurrent = await _lock(s, wid)\nif current[\"last_event_id\"] != wf[\"last_event_id\"] or current[\"status\"] != \"running\":\n    # Only release the lease if it is still ours (another worker may have claimed it after expiry)\n    await s.execute(text(\"UPDATE workflows SET locked_by = NULL, lease_until = NULL WHERE workflow_id = :w \"\n                         \"AND locked_by = :k\"), {\"w\": wid, \"k\": wf[\"locked_by\"]})\n    return False",
+  "code_language": "python",
+  "advantages": [
+   "Correctness lease timing pe depend nahi karti",
+   "Lambe locks nahi, replay transaction ke bahar",
+   "Simple compare-and-set"
+  ],
+  "disadvantages": [
+   "Duplicate replays CPU waste karte hain",
+   "Lease release ab owner-checked hai, par commit khud locked_by pe nahi -- correctness poori tarah last_event_id + determinism pe",
+   "Non-deterministic code ke saath guarantee kamzor ho jaati hai"
+  ],
+  "common_mistakes": [
+   "Lease ko hi correctness mechanism maan lena",
+   "Commit check sirf locked_by pe -- lease expiry ke baad stale owner bhi pass ho sakta hai agar re-claim nahi hua"
+  ],
+  "follow_up_questions": [
+   "Agar workflow code non-deterministic ho (e.g. random) toh yeh guarantee kaise tootegi?",
+   "Commit pe bhi locked_by check karna chahiye ya sirf release pe? Kyun?",
+   "Temporal workflow task ke liye kya token use karta hai?"
+  ],
+  "concepts": [
+   "optimistic concurrency",
+   "compare-and-set",
+   "determinism",
+   "lease expiry"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Optimistic CAS vs pessimistic lock: CAS replay ke dauraan koi lock nahi rakhta (high concurrency, short tx) lekin contention pe wasted work. Lease ko efficiency hint banana aur correctness CAS pe rakhna -- yeh classic split hai.",
+   "failure_scenarios": "Fix se pehle: stale A ne B ki lease clear ki -> teesra worker jaldi claim karke duplicate replay. Ab release owner-checked hai. Bad deploy (non-deterministic code) mein A aur B different commands bana sakte hain -- pehla commit jeetega, doosra discard, toh bhi history consistent rahegi.",
+   "alternatives": "Temporal: workflow task ka started event id / task token se fencing aur history service ke andar per-shard range id (shard ownership fencing). Alternative: locked_by + attempt check jaise activity mein.",
+   "scale_10x_100x": "10x: stale commits ka rate badhega agar hot workflows pe signals zyada hain -- sticky execution aur signal batching help karte. 100x: history shards ki ownership range-id se fence hoti hai (Temporal), DB row lock nahi.",
+   "production_improvements": "Stale-commit rate metric (worker stats Prometheus pe export nahi hote abhi), workflow task 'attempt' counter for diagnosis. (`AND locked_by = :k` release review mein add ho chuka.)"
+  }
+ },
+ {
+  "id": "FLOW-058",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Why does flowengine run replay outside any database transaction?",
+  "answer_hinglish": "Workflow task ke teen phases hain aur sirf pehla aur teesra DB transaction mein hain: claim (short tx: lease lo, history padho) -> replay (NO transaction, pure CPU) -> commit (short tx: lock, CAS check, events + tasks insert).\n\nReplay ko transaction ke bahar rakhne ke reasons:\n\n1. Locks chhote rehte hain. Agar replay ke dauraan workflow row ka `FOR UPDATE` lock pakda rehta, toh usi workflow pe aane wala har signal, activity completion, timer fire us lock ka wait karta. Lambi history (TESTING.md: 2,001 events ka replay 102-132 ms) pe yeh har writer ko slow karta.\n\n2. Connection pool bachta hai. Open transaction = ek pooled connection busy. Pool size 10 + overflow 10 hai (`worker.py::main`); CPU-bound replay ke dauraan connection pakad ke rakhna waste hai.\n\n3. Idle-in-transaction problems nahi -- Postgres mein lambe open transactions vacuum ko rokte hain aur bloat badhate hain.\n\nCost: replay ke dauraan naya event aa sakta hai, toh result stale ho sakta hai. Isko optimistic commit handle karta hai -- `last_event_id` match nahi kiya toh result discard, `needs_task` true rehta hai, aur agla workflow task naye events ke saath replay karega. TRADEOFFS.md #5: \"No long locks during replay; occasionally wasted replays when signals race\".",
+  "why_needed": "Lock duration aur throughput ka seedha rishta hai; CPU kaam ko transaction ke andar rakhna classic anti-pattern hai.",
+  "real_world_analogy": "Bank locker room mein baith ke calculation mat karo -- papers bahar laao, calculate karo, phir wapas jaake jaldi se jama karo (agar beech mein kisi ne file badli toh dobara karo).",
+  "how_it_works": "claim_workflow_task: `async with sm() as s, s.begin()` khatam hote hi commit. replay(): sirf in-memory list of events. complete_workflow_task: naya tx, _lock, CAS, writes.",
+  "in_this_project": "`store.py` module docstring (\"replay -> outside any transaction (pure CPU)\"), `store.py::claim_workflow_task`, `worker.py::run_workflow_task_once` (claim, `await replay(...)`, `complete_workflow_task`), `TRADEOFFS.md` item 5. Test `test_stale_workflow_task_is_discarded_when_history_moves` exactly yahi race simulate karta hai: claim, replay, beech mein signal, commit -> False.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::claim_workflow_task",
+   "projects/10-workflow-engine/flowengine/worker.py::run_workflow_task_once",
+   "projects/10-workflow-engine/TRADEOFFS.md",
+   "projects/10-workflow-engine/tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves"
+  ],
+  "code_example": "# real, flowengine/worker.py run_workflow_task_once (trimmed)\nwf = await store.claim_workflow_task(self.sm, self.id, self.queues, self.lease, sorted(self.workflows))  # tx 1\noutcome = await replay(fn, wf[\"workflow_id\"], str(wf[\"run_id\"]), wf[\"history\"])                     # no tx\nok = await store.complete_workflow_task(self.sm, wf, outcome)                                        # tx 2",
+  "code_language": "python",
+  "advantages": [
+   "Short locks, signals aur completions block nahi hote",
+   "Connections CPU kaam ke dauraan free",
+   "Vacuum-friendly"
+  ],
+  "disadvantages": [
+   "Contention pe wasted replays",
+   "Do transactions = do round trips per task minimum"
+  ],
+  "common_mistakes": [
+   "Replay ko claim transaction ke andar karna",
+   "Stale result ko bina check ke commit karna"
+  ],
+  "follow_up_questions": [
+   "Wasted replay ka rate kaise measure karoge?",
+   "Agar workflow pe signals bahut tez aate hain toh livelock possible hai?",
+   "Sticky cache is cost ko kaise kam karega?"
+  ],
+  "concepts": [
+   "transaction scope",
+   "optimistic concurrency",
+   "lock contention"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-059",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "A signal arrives while a worker is replaying the workflow. Walk through exactly what happens, using the stale-task test.",
+  "answer_hinglish": "Yeh FAILURE_SCENARIOS #6 hai aur test `test_stale_workflow_task_is_discarded_when_history_moves` isko step by step karta hai.\n\n1. `start_workflow(\"payment_and_refund\", \"stale-1\", delivery_timeout=60)` -> history: [WorkflowStarted], last_event_id = 1, needs_task = true.\n\n2. Test manually `claim_workflow_task` karta hai -> lease liya, history 1..1 padhi.\n\n3. `replay(...)` -> code `charge_payment` schedule karna chahta hai -> outcome mein new command seq 1.\n\n4. Ab replay ke \"dauraan\" (commit se pehle) `store.signal(sm, \"stale-1\", \"delivered\", ...)` -> signal workflow row lock karta hai, `SignalReceived` event 2 append, last_event_id = 2, needs_task = true. Note: signal ko lease se koi farak nahi padta -- woh lease check nahi karta, sirf row lock.\n\n5. `complete_workflow_task(sm, t, outcome)` -> lock, `current last_event_id (2) != wf last_event_id (1)` -> lease clear, return False.\n\nTest assert: `False` return, `needs_task is True`, aur `activities == []` -- stale result ka kuch bhi apply nahi hua (charge activity schedule nahi hui).\n\nPhir kya hota? Agla workflow task history 1..2 padhega: WorkflowStarted + SignalReceived. Replay mein signal buffer ho jayega (koi waiter nahi), code charge schedule karega, aur baad mein `wait_signal(\"delivered\")` pe turant buffered payload milega. Signal kabhi nahi khota, aur koi decision purani history pe commit nahi hota.",
+  "why_needed": "Yeh dikhata hai ki engine concurrent external inputs ko kaise correct rakhta hai bina workflow ko lock kiye.",
+  "real_world_analogy": "Aapne meeting ke minutes draft kiye, submit karne gaye toh pata chala beech mein ek naya email aa gaya -- draft phenk ke naye info ke saath dobara likhte ho.",
+  "how_it_works": "Signal writer aur workflow-task committer dono workflow row lock lete hain; last_event_id CAS detects interleaving; needs_task true rehta hai toh poller dobara utha leta hai.",
+  "in_this_project": "`tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves`, `store.py::signal`, `store.py::complete_workflow_task`. Worker real run mein isko `self.stats[\"stale\"] += 1` se count karta hai (`worker.py::run_workflow_task_once`).",
+  "implementation_files": [
+   "projects/10-workflow-engine/tests/test_engine.py::test_stale_workflow_task_is_discarded_when_history_moves",
+   "projects/10-workflow-engine/flowengine/store.py::signal",
+   "projects/10-workflow-engine/flowengine/store.py::complete_workflow_task",
+   "projects/10-workflow-engine/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, tests/test_engine.py\nt = await store.claim_workflow_task(sm, \"w\", [\"default\"], 10, sorted(WORKFLOWS))\noutcome = await replay(WORKFLOWS[\"payment_and_refund\"], \"stale-1\", str(t[\"run_id\"]), t[\"history\"])\nawait store.signal(sm, \"stale-1\", \"delivered\", {\"at\": \"now\"})     # lands while we were replaying\nassert await store.complete_workflow_task(sm, t, outcome) is False\nd = await store.describe(sm, \"stale-1\")\nassert d[\"needs_task\"] is True and d[\"activities\"] == []          # nothing from the stale result was applied",
+  "code_language": "python",
+  "advantages": [
+   "Signals kabhi block ya lose nahi hote",
+   "Decisions hamesha latest history pe based",
+   "Deterministic test without timing tricks"
+  ],
+  "disadvantages": [
+   "Hot workflow pe baar-baar stale -> wasted replays",
+   "Lease clear hone se ek aur worker turant claim kar sakta hai"
+  ],
+  "common_mistakes": [
+   "Signal ko tab reject karna jab workflow locked/leased ho",
+   "Stale result partially apply karna (e.g. activities insert, events nahi)"
+  ],
+  "follow_up_questions": [
+   "Agar signals itni tezi se aayein ki har commit stale ho (livelock)?",
+   "Temporal is case ko kaise handle karta hai?",
+   "Kya stale result ka kuch reuse ho sakta hai?"
+  ],
+  "concepts": [
+   "optimistic concurrency",
+   "signal",
+   "stale task",
+   "race"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Discard-and-retry simple aur correct hai; alternative \"merge\" (stale commands + naye events) complex aur error-prone. Cost sirf CPU.",
+   "failure_scenarios": "Livelock: ek workflow pe continuous signal stream ho toh har replay stale -- practically signals ms mein aate nahi, lekin bulk signal flood (e.g. ek campaign workflow ko 1000 events) mein ho sakta hai.",
+   "alternatives": "Temporal: workflow task in-flight ho toh naye events buffer hote hain aur task complete hone pe turant naya workflow task schedule hota hai (\"buffered events\"), aur commit history service ke andar shard lock se hota hai.",
+   "scale_10x_100x": "10x signals per workflow: signal batching aur sticky cache (incremental replay sirf naye events) se wasted work kam. 100x: hot workflows ko shard karna ya design change (entity workflows pe signal rate limit).",
+   "production_improvements": "Stale rate per workflow metric, signal rate limiting per workflow, sticky execution, aur buffered-event model jahan commit naye events ke saath bhi accept ho aur turant follow-up task bane."
+  }
+ },
+ {
+  "id": "FLOW-060",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How does concurrency work inside one worker process (activity slots, the event loop, and CPU-bound replay)?",
+  "answer_hinglish": "Ek worker process ek asyncio event loop pe chaar coroutines chalata hai: `_workflow_loop`, `_activity_loop`, `_timer_loop`, `_heartbeat_loop` (`Worker.run`).\n\nActivities: `self.slots = asyncio.Semaphore(activity_concurrency)` (default 8, CLI `--activity-concurrency`, docker-compose mein 16). `_activity_loop` pehle `slots.acquire()` karta hai, phir claim. Task mila toh `asyncio.create_task(self._execute(task))` aur done callback slot release karta hai. Matlab max N activities concurrently -- I/O-bound activities (HTTP, DB) ke liye yeh achha hai. Running tasks `self._running` set mein track hote hain taaki graceful stop unka wait kar sake.\n\nWorkflow tasks: `_workflow_loop` ek time pe ek workflow task chalata hai, sequentially. Replay CPU-bound hai -- jab replay chal raha hota hai, event loop blocked hai: activities ke heartbeats, timer loop, sab ruk jaate hain. Chhoti histories pe yeh milliseconds hai, lekin 2,001 events pe 100+ ms (TESTING.md).\n\nIsliye TESTING.md ka result: same process mein 2 workers = 5.2-6.1 workflows/s (1 worker 5.2), kyunki process CPU-bound hai (80% wall). Alag processes (GIL ke bahar) scale karte hain: 4.9 -> 7.6 -> 8.3 for 1/2/4 processes.\n\nPractical rule: concurrency badhani ho toh `activity_concurrency` I/O ke liye, aur CPU (replay) ke liye zyada processes.",
+  "why_needed": "Async Python mein \"concurrent\" ka matlab parallel nahi; interview mein yeh fark aur uska performance impact samjhana important hai.",
+  "real_world_analogy": "Ek chef (event loop) jo 8 handi (activities) ek saath chadha sakta hai kyunki pakne mein wait hota hai; lekin sabzi kaatna (replay) hathon ka kaam hai -- tab baaki handi pe dhyan nahi.",
+  "how_it_works": "Semaphore activity parallelism bound karta hai; asyncio cooperative scheduling hai, toh koi bhi coroutine jo await nahi karti (replay ka CPU part) poore loop ko rokti hai; GIL ki wajah se threads se bhi CPU parallelism nahi milta.",
+  "in_this_project": "`worker.py::Worker` (`self.slots`, `self._running`, `_activity_loop` ka done callback `running.discard(x), self.slots.release()`), `worker.py::main` (`--activity-concurrency`), `docker-compose.yml` (`--activity-concurrency 16`, `replicas: 2`). Benchmark `bench/bench.py::throughput` vs `throughput_processes`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/worker.py::Worker",
+   "projects/10-workflow-engine/flowengine/worker.py::_activity_loop",
+   "projects/10-workflow-engine/bench/bench.py::throughput_processes",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/docker-compose.yml"
+  ],
+  "code_example": "# real, flowengine/worker.py _activity_loop (trimmed)\nawait self.slots.acquire()\ntask = await store.claim_activity(self.sm, self.id, self.queues, sorted(self.activities))\nif task is None:\n    self.slots.release(); await self._sleep(); continue\nt = asyncio.create_task(self._execute(task))\nrunning.add(t)\nt.add_done_callback(lambda x: (running.discard(x), self.slots.release()))",
+  "code_language": "python",
+  "advantages": [
+   "I/O-bound activities high concurrency pe sasti",
+   "Bounded concurrency -- worker overload nahi hota",
+   "Simple single-threaded model, koi locks nahi"
+  ],
+  "disadvantages": [
+   "CPU-bound replay poore loop ko block karta hai (heartbeats delay -> false lease expiry possible)",
+   "Blocking (sync) activity code event loop rok degi"
+  ],
+  "common_mistakes": [
+   "Activity mein sync `requests`/`time.sleep` use karna",
+   "Throughput badhane ke liye in-process workers badhana instead of processes"
+  ],
+  "follow_up_questions": [
+   "Replay ko thread/process pool mein kyun nahi daala?",
+   "CPU-heavy activity ho toh kya karoge?",
+   "activity_concurrency kitna rakhna chahiye?"
+  ],
+  "concepts": [
+   "asyncio",
+   "semaphore",
+   "GIL",
+   "CPU-bound vs I/O-bound"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-061",
+  "project_slug": "p10-workflow-engine",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why does every writer (signal, cancel, activity completion, timer fire, workflow-task commit) lock the workflow row first?",
+  "answer_hinglish": "flowengine mein workflow row ek serialization point hai -- har woh operation jo history mein event likhta hai, pehle `SELECT ... FROM workflows WHERE workflow_id = :w FOR UPDATE` (`_lock`) karta hai. `store.signal`, `store.cancel`, `complete_activity`, `fail_activity`, `fire_due_timers`, `complete_workflow_task` -- sab.\n\nTeen reasons:\n\n1. Gap-free event ids: `_append` `last_event_id` padh ke +1 karta hai. Bina lock ke do writers same id padh lenge -> PK conflict ya galat order.\n\n2. Status checks atomic: signal/cancel `wf[\"status\"] != \"running\"` check karte hain. Lock ke bina check aur append ke beech workflow close ho sakta hai.\n\n3. Consistent lock ordering = deadlock avoidance. Activity completion do rows touch karta hai: workflow row aur activity_tasks row. Agar ek code path pehle activity row lock karta aur doosra pehle workflow row, toh deadlock possible. Yahan `complete_activity` aur `fail_activity` jaan-boojh ke PEHLE `_lock(workflow)` karte hain, phir activity UPDATE. `cancel` bhi pehle workflow lock, phir activity_tasks update. Ek global order: workflow row first.\n\nCost: ek workflow pe saare writes serial hain. Normal workflows ke liye fine (per-workflow write rate kam hota hai), lekin ek \"hot\" workflow (hazaron signals) contention dekhega. Different workflows ke beech koi contention nahi -- yeh natural sharding unit hai, jaise Temporal mein workflow history ek shard ke andar single-writer hoti hai.",
+  "why_needed": "Concurrency bugs (duplicate ids, lost updates, deadlocks) yahin se aate hain; ek clear serialization point design ko reason karne layak banata hai.",
+  "real_world_analogy": "Ek file ke liye ek hi register-keeper; jisko bhi entry karni hai woh pehle register maangta hai -- isliye entries kabhi overwrite nahi hoti.",
+  "how_it_works": "FOR UPDATE row-level exclusive lock lata hai jo transaction end tak rehta hai; same row pe doosra FOR UPDATE wait karta hai. Saare paths same order (workflow -> child rows) follow karte hain, toh wait-for graph mein cycle nahi banta.",
+  "in_this_project": "`store.py::_lock` helper; usage `signal`, `cancel`, `complete_workflow_task`, `complete_activity` (`await _lock(s, task[\"workflow_id\"])` before UPDATE activity_tasks), `fail_activity`, `fire_due_timers`. `start_workflow` mein INSERT ke baad `SELECT 1 ... FOR UPDATE` (redundant -- inserting tx already row own karti hai, lekin pattern consistent rakhta hai). Claim queries (`claim_*`) SKIP LOCKED use karti hain, toh woh locked workflow ko wait nahi karti, skip karti hain.",
+  "implementation_files": [
+   "projects/10-workflow-engine/flowengine/store.py::_lock",
+   "projects/10-workflow-engine/flowengine/store.py::complete_activity",
+   "projects/10-workflow-engine/flowengine/store.py::fail_activity",
+   "projects/10-workflow-engine/flowengine/store.py::fire_due_timers",
+   "projects/10-workflow-engine/flowengine/store.py::start_workflow"
+  ],
+  "code_example": "# real, flowengine/store.py fail_activity (trimmed)\nasync with sm() as s, s.begin():\n    await _lock(s, task[\"workflow_id\"])          # 1. workflow row first (global lock order)\n    res = await s.execute(text(\"UPDATE activity_tasks SET status = 'failed' ... \"\n                               \"WHERE id = :i AND status = 'started' AND attempt = :a\"), {...})   # 2. child row",
+  "code_language": "python",
+  "advantages": [
+   "Simple mental model: per-workflow single writer",
+   "Deadlock-free by ordering",
+   "Gap-free ordering free mein"
+  ],
+  "disadvantages": [
+   "Hot workflow pe write contention",
+   "Har activity completion ek extra row lock + round trip"
+  ],
+  "common_mistakes": [
+   "Child row pehle lock karna kuch paths mein -- deadlock",
+   "Status check lock ke bina karna (TOCTOU)"
+  ],
+  "follow_up_questions": [
+   "Postgres deadlock detect karke kya karta hai?",
+   "Hot workflow ka contention kaise kam karoge?",
+   "Temporal mein yeh serialization kahan hota hai?"
+  ],
+  "concepts": [
+   "row lock",
+   "lock ordering",
+   "deadlock avoidance",
+   "single writer"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-workflow serialization correctness ko simple banata hai; cost hot-entity contention. Fine-grained (event-level) locking ya lock-free append (sequence) complexity badhate aur ordering guarantee kamzor karte.",
+   "failure_scenarios": "Long transaction workflow row pakad ke baithe (e.g. fire_due_timers ka loop slow DB pe) toh us workflow ke saare signals wait karenge; lock_timeout set na ho toh request hang. Deadlock agar koi naya code path order tod de.",
+   "alternatives": "Advisory locks per workflow_id, serializable isolation with retries, single-writer actor per workflow (in-memory owner, jaise Temporal history shard owner), append via sequence + reorder on read.",
+   "scale_10x_100x": "10x: per-workflow contention same rehta hai, total throughput DB pe. 100x: workflows ko shards mein baanto; har shard ka ek owner process (lock DB se memory mein shift) -- Temporal history service.",
+   "production_improvements": "lock_timeout aur statement_timeout set karo, deadlock count metric, hot workflow detection (events/sec per workflow), aur signal rate limits."
+  }
+ },
+ {
+  "id": "FLOW-062",
+  "project_slug": "p10-workflow-engine",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What do the benchmark numbers in TESTING.md show, and how should you quote them in an interview?",
+  "answer_hinglish": "TESTING.md mein real run (2026-11-17, Postgres Docker Desktop on Windows) ke do benchmark hain, `bench/bench.py` se.\n\nThroughput (60 order workflows, har ek 4 activities):\n- 1 worker in-process: 5.2 workflows/s\n- 2 workers same process: 5.2 -- 6.1 (CPU-bound: 80% of wall; 97 SQL statements per workflow)\n- 1 worker process: 4.9\n- 2 worker processes: 7.6\n- 4 worker processes: 8.3 (process start-up included; shared Postgres)\n\nReplay cost vs history length: 21 events 0.5 -- 2.1 ms, 201 events 3.4 -- 12.6 ms, 2,001 events 102 -- 132 ms.\n\nInterview mein main inhe aise frame karunga: \"Absolute numbers chhote hain kyunki yeh laptop pe Docker Desktop Postgres hai, aur har workflow ~97 SQL statements karta hai. Important cheez trends hain: (1) ek process CPU-bound hai, toh same process mein worker badhane se fayda nahi; (2) processes add karne se scale hota hai lekin shared Postgres pe diminishing returns; (3) replay cost history ke saath super-linearly badhta hai -- isliye production engines sticky cache aur continue-as-new use karte hain.\"\n\nKabhi bhi in numbers ko \"production throughput\" claim nahi karna -- yeh ek educational engine ka single-machine measurement hai. Temporal jaisi systems sharded clusters pe hazaron workflows/s karti hain; comparison ka point design hai, numbers nahi.",
+  "why_needed": "Interviewer numbers poochhta hai taaki dekhe aapne measure kiya ya guess; honest framing credibility deta hai.",
+  "real_world_analogy": "Gaadi ka mileage test track pe naapa -- shahar ki traffic mein alag hoga, lekin \"AC on karne se mileage girta hai\" trend sach hai.",
+  "how_it_works": "bench.py: TRUNCATE tables, 60 workflows start, workers chalao, completed count poll karo, elapsed time naapo. Replay cost: hand-built histories (n activities) pe pure `replay()` timing, DB ke bina.",
+  "in_this_project": "`bench/bench.py::throughput` (in-process workers, poll_interval 0.01, activity_concurrency 16), `bench/bench.py::throughput_processes` (`python -m flowengine` subprocesses), `bench/bench.py::replay_cost` (10/100/1000 activities -> 21/201/2001 events). Results `TESTING.md` aur summary `SYSTEM_DESIGN.md` \"Performance characteristics\".",
+  "implementation_files": [
+   "projects/10-workflow-engine/bench/bench.py::throughput",
+   "projects/10-workflow-engine/bench/bench.py::throughput_processes",
+   "projects/10-workflow-engine/bench/bench.py::replay_cost",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# real, bench/bench.py replay_cost (trimmed)\nfor n in (10, 100, 1000):\n    hist = [{\"event_type\": \"WorkflowStarted\", \"attrs\": {\"input\": {\"n\": n}}, \"created_at\": T}]\n    for i in range(1, n + 1):\n        hist += [{\"event_type\": \"ActivityScheduled\", ...}, {\"event_type\": \"ActivityCompleted\", ...}]\n    t = time.perf_counter()\n    r = await replay(loop_wf, \"w\", \"r\", hist)",
+  "code_language": "python",
+  "advantages": [
+   "Real measured data, conditions documented",
+   "Trends design decisions justify karte hain (sticky cache, continue-as-new)"
+  ],
+  "disadvantages": [
+   "Single machine, Docker Desktop -- absolute numbers representative nahi",
+   "60 workflows chhota sample; process start-up time 4-process number mein included"
+  ],
+  "common_mistakes": [
+   "Laptop numbers ko production capacity bolna",
+   "97 statements ko ignore karke sirf CPU ko blame karna"
+  ],
+  "follow_up_questions": [
+   "97 statements kahan se aate hain aur kaise kam karoge?",
+   "Replay super-linear kyun hai?",
+   "Agar 100 workflows/s chahiye toh kya karoge?"
+  ],
+  "concepts": [
+   "benchmarking",
+   "throughput",
+   "replay cost",
+   "measurement honesty"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "FLOW-063",
+  "project_slug": "p10-workflow-engine",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why do separate worker processes scale while extra in-process workers do not?",
+  "answer_hinglish": "TESTING.md ka result: same process mein 2 workers = 5.2 -- 6.1 workflows/s (1 worker 5.2 se barely better), jabki processes 4.9 -> 7.6 -> 8.3 (1/2/4). Note kaha gaya hai \"CPU-bound: 80% of wall\".\n\nReason: ek Python process = ek event loop + GIL. In-process 2 workers ka matlab do sets of coroutines usi ek loop pe. Har workflow ka kaam -- replay, SQL statements build karna, asyncpg protocol parsing, JSON encode/decode (har event `json.dumps`) -- CPU hai. Agar process 80% time CPU pe busy hai, toh doosra worker sirf baaki 20% idle time (DB wait) use kar sakta hai -- isliye max ~1.2x.\n\nAlag processes alag cores pe chalte hain, GIL share nahi karte -- toh CPU kaam parallel hota hai. 1 -> 2 processes ~1.55x. 2 -> 4 sirf ~1.1x, kyunki: (1) shared Postgres ab bottleneck (har workflow ~97 statements, sab ek DB pe, Docker Desktop VM mein), (2) 4-process number mein process start-up time included hai (60 workflows ka chhota run), (3) machine ke cores bhi shared hain (Postgres VM bhi wahi CPU use karta hai).\n\nLesson: workflow engine ke workers ko horizontally processes/containers mein scale karo (`docker compose up --scale worker=4`), aur jab woh bhi flatten ho toh bottleneck DB hai -- statements per workflow kam karo (batch inserts, sticky cache) ya DB shard karo.",
+  "why_needed": "Python async ka sabse common misconception: \"async hai toh scale karega\". Interviewer CPU-bound vs I/O-bound ka samajh check karta hai.",
+  "real_world_analogy": "Ek cashier ko do billing counters de do toh bhi speed wahi -- haath do hi hain. Do cashier rakho toh double, lekin agar card machine ek hi hai (DB), toh teesra-chautha cashier zyada help nahi karta.",
+  "how_it_works": "asyncio concurrency = interleaving on one thread; parallelism ke liye multiple OS processes. Amdahl: speedup serial/shared part (DB) se capped.",
+  "in_this_project": "`bench/bench.py::throughput` (in-process Worker objects) vs `bench/bench.py::throughput_processes` (`subprocess.Popen([sys.executable, \"-m\", \"flowengine\", ...])`). Deployment shape `docker-compose.yml` mein `worker` service `replicas: 2`, aur `DEPLOYMENT.md` `--scale worker=4`.",
+  "implementation_files": [
+   "projects/10-workflow-engine/bench/bench.py::throughput",
+   "projects/10-workflow-engine/bench/bench.py::throughput_processes",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/docker-compose.yml",
+   "projects/10-workflow-engine/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, bench/bench.py throughput_processes (trimmed)\nps = [subprocess.Popen([sys.executable, \"-m\", \"flowengine\", \"--activity-concurrency\", \"16\"], cwd=root, env=env,\n                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL) for _ in range(procs)]",
+  "code_language": "python",
+  "advantages": [
+   "Stateless workers -- process count badhana trivial",
+   "Failure isolation: ek process crash, baaki chalte"
+  ],
+  "disadvantages": [
+   "Har process apna DB pool (10 + 10 overflow) -- connections multiply",
+   "Shared Postgres jaldi bottleneck"
+  ],
+  "common_mistakes": [
+   "Throughput ke liye threads ya in-process workers add karna",
+   "DB bottleneck ko ignore karke workers scale karte jaana"
+  ],
+  "follow_up_questions": [
+   "4 processes pe Postgres connections kitne ho jaayenge?",
+   "Profiling kaise karoge ki CPU kahan ja raha hai?",
+   "97 statements per workflow kaise kam karoge?"
+  ],
+  "concepts": [
+   "GIL",
+   "horizontal scaling",
+   "Amdahl's law",
+   "CPU-bound"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Processes = true parallelism lekin zyada memory aur DB connections; threads Python mein CPU ke liye bekaar; replay ko ProcessPool mein offload karna ek middle ground lekin serialization overhead.",
+   "failure_scenarios": "Bahut processes -> Postgres max_connections hit -> connection errors, claim loops fail. Saare processes idle poll karein toh idle query load.",
+   "alternatives": "PgBouncer se connection pooling, replay ko compiled/faster runtime mein (Temporal ke Go/Java workers), sticky cache se replay CPU kam, statement batching.",
+   "scale_10x_100x": "10x: worker processes + PgBouncer + sticky cache. 100x: DB sharding by workflow_id, matching service with push delivery, workers ko per-task-queue scale.",
+   "production_improvements": "Per-process CPU aur DB-time metrics, py-spy profiling, statements per workflow ko metric banana, autoscaling on workflow_task_backlog."
+  }
+ },
+ {
+  "id": "FLOW-064",
+  "project_slug": "p10-workflow-engine",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why does replay cost grow super-linearly with history length, and what does that imply?",
+  "answer_hinglish": "TESTING.md: 21 events 0.5 -- 2.1 ms, 201 events 3.4 -- 12.6 ms, 2,001 events 102 -- 132 ms. History 10x hone pe time ~7x, phir ~30x -- super-linear.\n\nPehli baat, full replay inherently O(N) per workflow task: har task pe code shuru se chalta hai aur saare N events feed hote hain. Aur ek workflow apni life mein ~N tasks chalata hai, toh total O(N^2) -- yeh design-level cost hai.\n\nEk replay ke andar bhi super-linear kyun? `runtime.py::replay` har resolve-type event ke baad `_settle()` call karta hai. `_settle` har iteration mein `sum(f.done() for f in ctx._futures.values())` compute karta hai -- yeh saare futures pe loop hai, jo history ke saath badhte hain. Toh har event pe O(N) kaam -> ek replay O(N^2). Plus har settle mein kam se kam 3-6 `asyncio.sleep(0)` event loop round trips. Yeh mera reading hai code ka; TESTING.md sirf numbers aur \"super-linearly\" likhta hai.\n\nImplications:\n1. Lambi histories (loops, long campaigns) har step pe expensive ho jaati hain -- aur replay event loop block karta hai.\n2. Production answer: sticky cache (workflow state worker memory mein, sirf naye events apply -- O(new events)), continue-as-new (history reset karke naya run with carried state), aur history size limits.\n3. Quick win is code mein: `_settle` mein done-futures counter incrementally maintain karna instead of har baar sum.",
+  "why_needed": "Replay-based engines ki sabse badi scaling limit; interviewer expects you to know continue-as-new aur sticky cache kyun exist karte hain.",
+  "real_world_analogy": "Har baar kahani ka agla page padhne ke liye kitab shuru se padhna -- 10 page ki kitab mein theek, 1000 page mein pagal kar dega. Bookmark (sticky cache) ya naya volume (continue-as-new) chahiye.",
+  "how_it_works": "Per task: O(N) events x O(N) settle bookkeeping = O(N^2); lifetime mein N tasks. Sticky cache per task cost ko O(delta) karta hai.",
+  "in_this_project": "`bench/bench.py::replay_cost` 10/100/1000 activities ka loop workflow replay karta hai. `runtime.py::_settle` ka state tuple aur `runtime.py::replay` ka per-event settle. `README.md` Known limitations: \"Full replay on every workflow task (no sticky in-memory cache): cost grows with history (measured); no continue-as-new\". `TRADEOFFS.md` #2.",
+  "implementation_files": [
+   "projects/10-workflow-engine/bench/bench.py::replay_cost",
+   "projects/10-workflow-engine/flowengine/runtime.py::_settle",
+   "projects/10-workflow-engine/flowengine/runtime.py::replay",
+   "projects/10-workflow-engine/TESTING.md",
+   "projects/10-workflow-engine/README.md"
+  ],
+  "code_example": "# real, flowengine/runtime.py _settle -- the per-call O(#futures) sum\nstate = (task.done(), len(ctx.commands), sum(f.done() for f in ctx._futures.values()))",
+  "code_language": "python",
+  "advantages": [
+   "Full replay simple aur always correct",
+   "Measured, toh limitation honest aur quantified"
+  ],
+  "disadvantages": [
+   "Long-running loops wale workflows impractical",
+   "Replay event loop block karta hai -> heartbeats aur doosra kaam delay"
+  ],
+  "common_mistakes": [
+   "Ek workflow mein unbounded loop (e.g. har din ek iteration forever) bina continue-as-new",
+   "Sirf event count dekhna, payload size (JSON decode) ignore karna"
+  ],
+  "follow_up_questions": [
+   "Sticky cache invalidation kaise hogi?",
+   "continue-as-new mein state kaise carry karoge?",
+   "_settle ko O(1) kaise banaoge?"
+  ],
+  "concepts": [
+   "replay cost",
+   "super-linear",
+   "sticky cache",
+   "continue-as-new"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Stateless full replay = crash-proof aur worker-agnostic lekin CPU heavy; sticky cache = fast lekin worker affinity aur cache memory; continue-as-new = bounded history lekin workflow author ko design karna padta hai.",
+   "failure_scenarios": "2,001-event workflow ka 100+ ms replay event loop block karta hai -> heartbeats late -> doosri activities ki lease expire -> false retries. History aur badhe toh workflow tasks lease (10s) se zyada le sakte -> duplicate replays.",
+   "alternatives": "Temporal: sticky task queues + workflow cache, continue-as-new, history size limits (warning/termination). Snapshotting (periodic state snapshot) -- workflow engines mein mushkil kyunki coroutine state serialize nahi hota.",
+   "scale_10x_100x": "10x history: sticky cache must. 100x: continue-as-new enforce (event count limit), replay dedicated CPU workers pe, aur incremental settle bookkeeping.",
+   "production_improvements": "History length metric per workflow type, warning threshold, continue-as-new API, sticky cache with LRU eviction, `_settle` ka incremental done-counter."
+  }
+ }
+]

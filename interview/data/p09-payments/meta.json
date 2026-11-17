@@ -1,0 +1,210 @@
+{
+ "project_slug": "p09-payments",
+ "project": "Payment System",
+ "source_dir": "projects/09-payments",
+ "summary": "A payments backend built around the failure cases that matter with money: Stripe-style idempotency keys, a payment state machine with persisted intermediate states and compare-and-set transitions, a double-entry ledger whose invariants Postgres enforces (deferred per-currency balance trigger, append-only triggers on ledger entries and payment_events, unique posting refs), ambiguous provider timeouts treated as unknown (requires_reconciliation) and resolved by a recovery worker, signed idempotent provider webhooks, a reconciliation engine against the provider's settlement report, and an orchestrated checkout saga with compensations. Idempotent takeovers resume the same payment/refund (ids derived from the Idempotency-Key); review fixes are pinned by regression tests (25 tests). Mock provider only -- never real money or credentials.",
+ "pitch": {
+  "intro_30s": "Maine ek payment system backend banaya hai jo un failures ke around design hai jo paise ke saath matter karte hain: double charge aur 'paisa kata par order nahi bana'. Isme Stripe-style idempotency keys, intermediate states wala payment state machine, database-enforced double-entry ledger, timeouts ko 'unknown' maan ke recovery worker, signed webhooks, daily reconciliation, aur checkout saga with compensations hai. Provider ek mock HTTP service hai, toh timeouts aur retries real hain.",
+  "explain_2min": "Payments mein do galtiyan unforgivable hain: customer ka paisa do baar katna, aur paisa katna par order na banna. Yeh project dono ko rokne ke liye bana hai.\n\nPehli layer idempotency hai, har hop pe. Merchant har POST ke saath Idempotency-Key bhejta hai; same key aur same body pe stored response replay hota hai, alag body pe 422, aur agar pehli request abhi chal rahi hai toh 409. Provider ko hum deterministic keys bhejte hain jaise auth-{payment_id}, taaki koi bhi retry -- request ke andar ya crash ke baad recovery se -- ek hi charge kare. Upar se ek partial unique index ek order pe ek hi live payment allow karta hai.\n\nDoosri cheez state machine hai. Provider call se pehle hum payment ko 'authorizing' ya 'capturing' mein commit karte hain, provider ko transaction ke BAHAR call karte hain, phir compare-and-set se result likhte hain. Crash kahin bhi ho, DB mein trace rehta hai. Timeout ko kabhi failure nahi maante -- woh requires_reconciliation hai, aur recovery worker provider se poochh ke resolve karta hai.\n\nTeesri cheez ledger hai: har capture aur refund ek balanced double-entry transaction hai, aur Postgres ka deferred constraint trigger commit pe sum zero check karta hai; entries append-only hain. Status change aur ledger posting ek hi transaction mein hain.\n\nUpar se webhooks (dedupe + HMAC), recovery, aur daily reconciliation teen safety nets hain. 25 tests yeh sab prove karte hain (6 unme se code review mein mile bugs ke regression tests hain), including concurrency: paanch parallel captures mein exactly ek jeetta hai, aur parallel refunds over-refund nahi kar paate.",
+  "deep_5min": "Main ek payment ki poori life walk karta hoon.\n\nMerchant POST /payments bhejta hai Idempotency-Key ke saath. Route ka idempotent() wrapper pehle idempotency_keys table mein INSERT ON CONFLICT DO NOTHING karta hai -- yeh atomic claim hai. Row mili toh hash compare: alag request pe 422, completed pe replay, in-progress aur lease valid pe 409, lease expire pe takeover. Handler ke baad success aur deterministic 4xx store hote hain; 5xx aur 409 abandon, taaki client same key se retry kar sake.\n\ncreate_payment khud payment id generate karta hai, row insert karke turant 'authorizing' mein transition karta hai aur commit. Agar same merchant_reference ka live payment pehle se hai, partial unique index IntegrityError deta hai aur hum 409 duplicate_payment lautate hain. Phir provider.authorize transaction ke bahar, key auth-{pid} ke saath. HttpProvider har attempt pe overall deadline lagata hai, 4xx turant raise karta hai, aur 5xx ya timeout pe same key se backoff ke saath retry karta hai. Agar phir bhi unknown -- requires_reconciliation. Kyunki mock provider ka tok_slow authorization commit karke response late deta hai; agar hum timeout ko failure maante toh customer charged hota aur order fail.\n\nResult aane pe compare-and-set: UPDATE payments ... WHERE status = ANY(expected), aur usi transaction mein payment_events row. Capture ke liye pehle 'capturing' commit, phir provider capture with capture-{pid}, phir finalize_capture: CAS to captured, fee Decimal half-up se, aur ledger posting -- provider_receivable debit, merchant_payable aur platform_fee_revenue credit -- sab ek transaction mein. Ledger ka deferred trigger commit pe sum zero verify karta hai, idempotency_ref capture:{pid} UNIQUE double booking rokta hai.\n\nAb race: provider capture ke baad async webhook bhejta hai jo humare API response se pehle aa sakta hai. Webhook handler HMAC aur timestamp verify karta hai, event id se dedupe karta hai, payment row FOR UPDATE leta hai aur agar status capturing hai toh wahi finalize_capture chalata hai. Humara API path baad mein 'captured' dekh ke no-op karta hai.\n\nRefunds pe aggregate invariant hai, toh wahan payment row FOR UPDATE leke pending refunds bhi count karte hain -- warna do parallel refunds dono check pass kar lete. Test mein 6 parallel 3000 ke refunds pe exactly 3 succeed hote hain.\n\nCrash ke liye recovery worker har 15 second stuck payments uthata hai, payment_events se last intent padhta hai: authorizing ho toh provider se reference pe lookup -- mila toh adopt, nahi mila toh failed; capturing/voiding/refund ho toh same key se retry, jo provider pe ya toh naya kaam karta hai ya stored response deta hai -- kabhi do baar nahi.\n\nDaily reconciliation provider ki settlement report ko humare payments aur ledger se match karta hai aur matched, missing_internally, missing_at_provider, amount_mismatch, status_mismatch, ledger_mismatch record karta hai. Testing ke time do real bugs mile: mock provider ka flaky marker 500 ke saath rollback ho jaata tha, aur reconciliation local date pe IST midnight ke paas kuch match nahi karta tha kyunki DB UTC mein bucket karta hai.\n\nSecurity side pe backend kabhi card number nahi dekhta -- payment_method sirf tok_* pattern accept karta hai, toh PCI scope se bahar. Merchant API keys SHA-256 hash ke roop mein store hoti hain aur sirf ek baar dikhti hain; har query merchant_id se scoped hai, dusre merchant ka payment 404. Admin endpoints ek constant-time compared token se protected hain -- RBAC aur rate limiting documented gaps hain. Code review mein bhi kuch real bugs mile jo main as a story batata hoon: crash ke baad lease takeover pe create path naya payment id banata tha (client ko 409 duplicate_payment) aur refund path naya refund id -- do refunds possible. Fix: payment/refund id Idempotency-Key se uuid5 derive hota hai, toh takeover same row same provider key se resume karta hai. Saath mein: webhook jiska apply fail hua tha woh redelivery pe dobara apply hota hai, saga unknown payment pe order cancel nahi karta aur failed refund pe 'compensated' nahi bolta, ledger trigger per currency balance check karta hai, payment_events DB-level append-only hai, aur 429 retryable hai. Har fix ka regression test test_review_fixes.py mein hai.\n\nCheckout ke liye orchestrated saga hai:inventory reserve, charge, ship; shipping fail pe refund aur stock release; payment outcome unknown ho toh saga ruk jaata hai (reservation held), aur refund fail ho toh saga 'failed', 'compensated' nahi. 2PC isliye nahi kyunki third-party provider humare transaction mein participate nahi karega.\n\nBenchmark honest hai: 26 SQL statements per payment, sequential 7.5 payments/s dev machine pe Docker Desktop ke saath, aur concurrency pe single process CPU-bound. Design crash safety ke liye optimise hai, benchmark ke liye nahi.",
+  "architecture_walkthrough": "Payments API (payments/main.py, api/routes.py): FastAPI app, merchant endpoints (payments, capture, void, refunds, balances, checkout), admin endpoints (merchants, recovery run, reconciliation, trial balance, inventory), provider webhook endpoint aur dashboard. Har mutating merchant endpoint idempotent() wrapper se jaata hai, merchant() dependency hashed API key se tenant resolve karti hai.\n\nServices: payments.py (create/capture/void/refund flows, 3-step intent -> provider -> CAS pattern), state.py (TRANSITIONS table, transition() compare-and-set + payment_events), ledger.py (balanced postings, derived balances, trial balance), idempotency.py (begin/complete/abandon), provider.py (PaymentProvider protocol, HttpProvider with deadline and same-key retries, error taxonomy), webhooks.py (verify + dedupe + idempotent apply), recovery.py, reconcile.py, saga.py, money.py.\n\nPostgres: payments, payment_events, refunds, idempotency_keys, ledger_accounts/transactions/entries with deferred balance trigger and append-only trigger, provider_events, reconciliation tables, saga tables. Mock provider ka apna provider schema hai jo app kabhi directly nahi padhta.\n\nMock provider (mockprovider/app.py): alag FastAPI service -- authorizations, capture, void, refunds, find by reference, settlements report, signed async webhooks, test tokens (tok_visa, tok_declined, tok_insufficient_funds, tok_slow, tok_flaky, tok_capture_fails) aur drift test hook.\n\nRecovery worker (payments/worker.py): har 15s run_recovery. Docker compose: postgres, migrate, provider, api, worker.",
+  "difficult_decisions": [
+   "Timeout = unknown, not failure: requires_reconciliation state aur recovery worker add karne pade, clients ko ek extra status handle karna padta hai, par 'charged but no order' impossible ho gaya.",
+   "Provider call kabhi DB transaction ke andar nahi: har operation teen short transactions mein (intent, call, outcome). Cost 26 statements per payment, par locks/connections network pe hold nahi hote aur crash pe durable trace rehta hai.",
+   "Ledger invariants database mein (deferred constraint trigger + append-only trigger + unique idempotency_ref): Postgres-specific logic aur per-entry trigger cost accept kiya taaki koi bug ya manual SQL money create na kar sake.",
+   "Store 4xx but not 5xx (aur 409) under idempotency keys: deterministic errors same replay hote hain, transient errors same key se retry ho sakte hain.",
+   "Partial unique index on (merchant_id, merchant_reference) for live payments: client key bugs se bhi double charge blocked, par decline/fail/void ke baad retry allowed.",
+   "Saga with compensations instead of 2PC: third-party provider transaction mein participate nahi karega; trade-off visible refunds aur no isolation."
+  ],
+  "biggest_challenges": [
+   "Bug 1 (TESTING/FAILURE_SCENARIOS): mock provider ka tok_flaky marker usi transaction mein insert hota tha jismein 500 raise hota tha -- rollback se marker gayab, har retry fail. Fix: marker apne transaction mein commit, phir 500. Lesson: jo side effect error ke baad bhi chahiye use error se pehle commit karo.",
+   "Bug 2: reconciliation local date se chalta tha aur Postgres UTC mein bucket karta hai, toh IST midnight ke paas kuch match nahi hota tha. Fix: settlement days UTC days hain, test UTC date bhejta hai.",
+   "Webhook vs API response race: provider ka webhook humare response se pehle aa sakta hai. Dono paths ko CAS + unique ledger ref ke through same finalize_capture pe converge karwana pada.",
+   "Over-refund race: parallel refunds dono check pass kar lete the kyunki amount_refunded sirf success pe badhta hai. Payment row FOR UPDATE + pending refunds count karke fix; test mein 6 mein se exactly 3 succeed.",
+   "Benchmark interpretation: 16x concurrency sirf 2x throughput -- profiling se pata chala single process CPU-bound (96%), design ka nahi harness ka bottleneck.",
+   "Code review (interview prep ke time) mein 6+ bugs mile aur har ek ka regression test likha (tests/test_review_fixes.py): lock takeover pe naya payment/refund id (double refund possible) -> ids Idempotency-Key se derive; webhook apply fail hone pe redelivery 'duplicate' -> 'received' outcome pe re-apply; saga unknown payment pe order cancel karta tha aur failed refund pe 'compensated' bolta tha; ledger trigger currencies ke across sum karta tha. Lesson: tests happy-path crash points cover karte the, par 'retry after takeover' jaise seams nahi."
+  ],
+  "failure_scenarios": [
+   "Client network error ke baad same key se retry: stored response replay, provider pe ek hi authorization (test_idempotency_key_semantics).",
+   "Provider timeout par charge ho gaya (tok_slow): same-key retry turant existing authorization lauta deta hai; retries bhi fail toh requires_reconciliation aur recovery reference se dhoond ke authorized adopt karta hai.",
+   "Crash after 'authorizing' before provider call: recovery ko provider pe record nahi milta -> failed, customer safely retry kar sakta hai.",
+   "Crash mid-capture: recovery capture-{pid} key se retry karta hai, do baar chalane pe bhi ledger mein ek hi capture.",
+   "Duplicate/forged webhook: event id dedupe -> 'duplicate', bad signature -> 401; agar pehli delivery ka apply fail hua tha (outcome 'received'), redelivery use dobara apply karti hai.",
+   "Provider-side drift (chargeback/manual adjustment) ya unrecorded charge: daily reconciliation amount_mismatch / missing_internally pakadta hai.",
+   "Crash ke baad same Idempotency-Key se retry (lock expired): derived id se same payment/refund resume hota hai -- ek charge, ek refund (test_payment_takeover_after_crash_resumes_the_same_payment, test_refund_takeover_after_crash_does_not_refund_twice)."
+  ],
+  "improvements": [
+   "Webhook 'received' events ke liye background inbox processor -- abhi failed apply sirf provider redelivery pe re-apply hota hai.",
+   "Idempotency recovery points: takeover ab same payment/refund resume karta hai, par capture=true intent ambiguous auth ke baad lost ho jaata hai (recovery authorized pe rukta hai); /checkout ko Idempotency-Key ke peeche lana aur sagas.order_id ko per merchant unique.",
+   "Saga resumer worker: crash mid-saga aur payment_outcome_unknown sagas ko recovery ke baad continue/compensate kare; failed sagas pe alert; authorize-then-capture-after-ship.",
+   "Recovery ko SKIP LOCKED batches aur attempt counters ke saath horizontally scalable banana; metrics aur alerts (stuck age, trial balance, recon exceptions).",
+   "Idempotency key retention/cleanup, payment_events/ledger_entries monthly partitions, balance snapshots.",
+   "Reconciliation: created_at::date session time zone pe depend karta hai (explicit AT TIME ZONE 'UTC' chahiye), ledger query mein date filter nahi, resolution column use nahi hota; reference-based matching aur +/- 1 day window for day-boundary false positives."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Payment lifecycle and money basics",
+   "steps": [
+    "1. Concept: authorize (hold), capture (take), void (release before capture), refund (return after capture); money integer minor units mein.",
+    "2. Why here: poora state machine aur ledger isi lifecycle pe based hai; float money ledger ke sum = 0 invariant ko tod deta.",
+    "3. API: API_DOCUMENTATION.md -- POST /payments (capture flag), /capture {amount?}, /void, /refunds {amount}.",
+    "4. Implementation: services/payments.py create_payment, capture_payment, void_payment, create_refund; money.py fee_for (Decimal, ROUND_HALF_UP, min cap).",
+    "5. Demonstrate: pytest -k 'partial_capture_and_refunds or fee_rounding' -- 6000 capture, 4001 refund 422, final refunded; fee 1017 -> 59, 1018 -> 60.",
+    "6. Interviewer next: 'partial capture ke baad remainder?', 'refund pe fee kyun wapas nahi?'"
+   ],
+   "files": [
+    "projects/09-payments/API_DOCUMENTATION.md",
+    "projects/09-payments/payments/services/payments.py::capture_payment",
+    "projects/09-payments/payments/services/money.py::fee_for",
+    "projects/09-payments/tests/test_payments.py::test_partial_capture_and_refunds"
+   ]
+  },
+  {
+   "concept": "Idempotency keys (Stripe semantics)",
+   "steps": [
+    "1. Concept: same key + same request -> replay; different request -> 422; in progress -> 409; crashed -> lease takeover.",
+    "2. Why here: client retries after network errors are the #1 source of double charges.",
+    "3. API: Idempotency-Key header required on every mutating endpoint; replays carry Idempotent-Replayed: true.",
+    "4. Implementation: idempotency.begin (INSERT ON CONFLICT DO NOTHING claim, FOR UPDATE, hash compare, locked_until lease); routes.idempotent stores 4xx except 409, abandons 5xx.",
+    "5. Demonstrate: pytest -k idempotency_key_semantics -- replay header, amount=999 -> 422, 5 concurrent same-key requests -> one payment row.",
+    "6. Interviewer next: 'lease expire hone pe pehli request zinda ho toh?', 'keys kab delete karoge?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/idempotency.py::begin",
+    "projects/09-payments/payments/api/routes.py::idempotent",
+    "projects/09-payments/tests/test_payments.py::test_idempotency_key_semantics"
+   ]
+  },
+  {
+   "concept": "State machine, intermediate states and compare-and-set",
+   "steps": [
+    "1. Concept: explicit TRANSITIONS table; '-ing' states persist intent; CAS UPDATE ... WHERE status = ANY(expected).",
+    "2. Why here: crash recovery needs durable intent; concurrent captures need exactly one winner.",
+    "3. API: GET /payments/{id} shows the events timeline (authorizing, authorized, capturing, captured).",
+    "4. Implementation: state.transition -- AssertionError for illegal transitions, InvalidTransition 409 on CAS miss, RETURNING _old subquery for from_status, payment_events insert in the same tx.",
+    "5. Demonstrate: pytest -k concurrent_captures_capture_once -- 5 parallel captures, exactly one 200 captured, one ledger capture.",
+    "6. Interviewer next: 'transitions DB mein kyun nahi?', 'refunds ke liye CAS kaafi kyun nahi?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/state.py::transition",
+    "projects/09-payments/ARCHITECTURE.md",
+    "projects/09-payments/tests/test_payments.py::test_concurrent_captures_capture_once"
+   ]
+  },
+  {
+   "concept": "Ambiguous outcomes, retries and recovery",
+   "steps": [
+    "1. Concept: timeout/5xx = unknown, never failure; retry with the SAME idempotency key; leftover unknowns -> requires_reconciliation.",
+    "2. Why here: tok_slow commits the authorization and responds late -- treating it as failure means charged without order.",
+    "3. API: POST /admin/recovery/run?stuck_after_seconds= ; worker runs every 15s.",
+    "4. Implementation: provider.HttpProvider._call (deadline, classification, backoff); recovery.run_recovery (_last_intent phase, find_by_reference for authorizing, same-key retry for capturing/voiding/refunds).",
+    "5. Demonstrate: pytest tests/test_failures.py -k 'timeout or crash_mid_capture or unknown_to_provider'.",
+    "6. Interviewer next: 'stuck threshold kitna?', 'provider key retention ke baad retry?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/provider.py::HttpProvider",
+    "projects/09-payments/payments/services/recovery.py::run_recovery",
+    "projects/09-payments/tests/test_failures.py::test_timeout_is_not_treated_as_failure_and_recovery_resolves_it"
+   ]
+  },
+  {
+   "concept": "Never hold a DB transaction across a network call",
+   "steps": [
+    "1. Concept: short tx (intent) -> provider call outside any tx -> short tx (CAS outcome + ledger).",
+    "2. Why here: rollback cannot undo a provider charge; long tx exhaust the pool and hold row locks.",
+    "3. API: invisible to clients, but explains intermediate statuses and the 26-statement cost.",
+    "4. Implementation: every flow in services/payments.py uses separate `async with sm() as s, s.begin()` blocks around provider calls.",
+    "5. Demonstrate: read void_payment / capture_payment and TESTING.md benchmark analysis (26 statements, ~128 ms sequential on the dev setup).",
+    "6. Interviewer next: 'gap ke beech crash?', 'outbox se kaise relate karta hai?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/payments.py::void_payment",
+    "projects/09-payments/SYSTEM_DESIGN.md",
+    "projects/09-payments/TESTING.md"
+   ]
+  },
+  {
+   "concept": "Double-entry ledger with DB-enforced invariants",
+   "steps": [
+    "1. Concept: every movement is >= 2 entries summing to zero (debit +, credit -); balances derived; history immutable.",
+    "2. Why here: status and books must never disagree, and bugs must not create money.",
+    "3. API: GET /ledger/balances (merchant), GET /admin/ledger/trial-balance (must be 0).",
+    "4. Implementation: ledger.post (python sum check, ON CONFLICT idempotency_ref, skip zero lines), book_capture/book_refund; migration ledger_balanced DEFERRABLE INITIALLY DEFERRED trigger and ledger_no_update trigger.",
+    "5. Demonstrate: pytest -k ledger_invariants_enforced_by_database -- unbalanced insert fails at commit ('unbalanced'), UPDATE fails ('append-only').",
+    "6. Interviewer next: 'hot accounts?', 'galti kaise sudharoge?', 'multi-currency?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/ledger.py::post",
+    "projects/09-payments/migrations/versions/0001_initial.py",
+    "projects/09-payments/DATABASE_DESIGN.md",
+    "projects/09-payments/tests/test_payments.py::test_ledger_invariants_enforced_by_database"
+   ]
+  },
+  {
+   "concept": "Concurrency: row locks and over-refund prevention",
+   "steps": [
+    "1. Concept: CAS for single-row invariants, FOR UPDATE for aggregate invariants; reservations (pending refunds) count against limits.",
+    "2. Why here: concurrent refunds could each pass a naive check and over-refund.",
+    "3. API: POST /payments/{id}/refunds returns succeeded / failed / requires_reconciliation; over-limit -> 422 with captured/refunded/pending details.",
+    "4. Implementation: create_refund locks the payment row and sums pending + requires_reconciliation refunds; finalize_refund locks refund then payment.",
+    "5. Demonstrate: pytest -k concurrent_refunds_cannot_over_refund -- 6 x 3000 on 10000, exactly 3 succeed.",
+    "6. Interviewer next: 'optimistic version se kaise?', 'stuck pending refund ka reservation?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/payments.py::create_refund",
+    "projects/09-payments/payments/services/payments.py::finalize_refund",
+    "projects/09-payments/tests/test_payments.py::test_concurrent_refunds_cannot_over_refund"
+   ]
+  },
+  {
+   "concept": "Webhooks: verification, dedupe and out-of-order delivery",
+   "steps": [
+    "1. Concept: HMAC over timestamp.body, tolerance window, event-id dedupe, idempotent CAS-based apply.",
+    "2. Why here: provider webhooks can arrive before our API response, twice, late, or forged.",
+    "3. API: POST /webhooks/provider with x-provider-signature: t=..,v1=..",
+    "4. Implementation: webhooks.verify (compare_digest, 300s tolerance), webhooks.handle (savepoint insert into provider_events, FOR UPDATE OF p, finalize_capture / finalize_refund, outcome column).",
+    "5. Demonstrate: pytest -k webhooks_are_verified -- webhook finalizes capture, replay -> duplicate, bad sig -> 401, one ledger capture.",
+    "6. Interviewer next: 'dedupe aur apply ek tx mein kyun nahi?', 'secret rotation?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/webhooks.py::verify",
+    "projects/09-payments/payments/services/webhooks.py::handle",
+    "projects/09-payments/tests/test_failures.py::test_webhooks_are_verified_deduplicated_and_can_finalize_capture"
+   ]
+  },
+  {
+   "concept": "Reconciliation and eventual consistency",
+   "steps": [
+    "1. Concept: compare our records + ledger with the provider settlement report; drift is inevitable.",
+    "2. Why here: webhooks are lossy and recovery only sees what we know is stuck; reconciliation is the complete net.",
+    "3. API: POST /admin/reconciliation/runs?day=YYYY-MM-DD (UTC day), GET /admin/reconciliation/runs/{id} (exceptions).",
+    "4. Implementation: reconcile.run -- PROVIDER_TO_OURS mapping, kinds matched / missing_internally / missing_at_provider / amount_mismatch / status_mismatch / ledger_mismatch.",
+    "5. Demonstrate: pytest -k reconciliation_finds_drift -- summary {matched: 1, amount_mismatch: 1, missing_internally: 1}; note the UTC date bug story.",
+    "6. Interviewer next: 'day boundary false positives?', 'exceptions ko resolve kaun karta hai?'"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/reconcile.py::run",
+    "projects/09-payments/FAILURE_SCENARIOS.md",
+    "projects/09-payments/tests/test_failures.py::test_reconciliation_finds_drift_and_unrecorded_charges"
+   ]
+  },
+  {
+   "concept": "Saga pattern vs 2PC",
+   "steps": [
+    "1. Concept: local steps + persisted progress + compensations in reverse order; no distributed locks.",
+    "2. Why here: the provider and shipping are third parties and cannot join a 2PC.",
+    "3. API: POST /checkout {order_id, items, amount, payment_method, simulate_shipping_failure}.",
+    "4. Implementation: saga.checkout (conditional inventory decrement, create_payment with merchant_reference=order_id, saga_steps upsert) and saga.compensate (refund, release reservations).",
+    "5. Demonstrate: pytest -k saga_success_and_compensation -- A2 refunded and stock released, A3 never charged, final stock 3.",
+    "6. Interviewer next: 'crash mid-saga?' (no auto-resume -- README limitation), 'ambiguous payment inside saga?' (saga 'failed'/payment_outcome_unknown, reservation held -- review fix)"
+   ],
+   "files": [
+    "projects/09-payments/payments/services/saga.py::checkout",
+    "projects/09-payments/payments/services/saga.py::compensate",
+    "projects/09-payments/SYSTEM_DESIGN.md",
+    "projects/09-payments/tests/test_failures.py::test_saga_success_and_compensation"
+   ]
+  }
+ ]
+}

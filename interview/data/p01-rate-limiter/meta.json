@@ -1,0 +1,215 @@
+{
+ "project_slug": "p01-rate-limiter",
+ "project": "Distributed Rate Limiter",
+ "source_dir": "projects/01-rate-limiter",
+ "summary": "A FastAPI + Redis rate limiting service with five algorithms (fixed window, sliding log, sliding counter, token bucket, leaky bucket meter) implemented as atomic Lua scripts using Redis server time; per-IP / per-user / per-API-key scopes with subscription plans; runtime policy overrides shared via Redis with local TTL caches; hashed API keys; per-policy fail-open / fail-closed; standard RateLimit headers; Prometheus metrics; tests proving exactness across three clients and the failure of in-memory and naive GET/SET limiters; and k6 / Python load tests behind nginx with three replicas that uncovered two real bugs (pool exhaustion failing open, blocking logging).",
+ "pitch": {
+  "intro_30s": "Maine ek distributed rate limiter banaya hai -- FastAPI service jo Redis pe paanch algorithms ko atomic Lua scripts ke roop mein chalati hai: fixed window, sliding log, sliding counter, token bucket aur leaky bucket. Per-IP, per-user aur per-API-key limits, subscription plans, standard RateLimit headers, aur per-policy fail-open ya fail-closed. Tests se prove kiya ki 3 servers pe bhi limit exact rehti hai, aur load testing se do real production bugs pakde.",
+  "explain_2min": "Maine ek distributed rate limiter banaya hai jo 3 app replicas aur nginx ke peeche bhi exact limit enforce karta hai.\n\nProblem simple hai: agar counter har server ki memory mein ho, toh 3 servers pe user ko 3x quota milta hai. Maine yeh ek test se prove kiya -- in-memory limiter 50 ki limit pe exactly 150 allow karta hai. Toh state Redis mein rakhi. Lekin sirf shared Redis kaafi nahi -- naive GET phir SET bhi race karta hai, aur woh bhi test se overshoot karta dikhaya.\n\nSolution: har algorithm ek Lua script hai jo Redis ke andar atomically read, decide aur write karti hai. Time bhi Redis TIME se aata hai taaki servers ke beech clock skew ka asar na ho. 200 concurrent requests, 3 alag clients -- paanchon algorithms exactly 50 allow karte hain.\n\nAlgorithms use case ke hisaab se choose kiye: per-IP anti-abuse ke liye sliding counter (O(1) memory), login brute force ke liye exact sliding log, subscription quota ke liye fixed window, bursty search ke liye token bucket, aur slow report service ke liye leaky bucket.\n\nIdentity API key se resolve hoti hai -- keys SHA-256 hashed store hoti hain -- aur plan (free, pro, enterprise) ke hisaab se limit milti hai. Policies JSON defaults hain jinhe admin API se runtime pe override kar sakte hain; Redis ke through saare instances 5 second mein converge karte hain.\n\nRedis down ho toh har policy apna fail mode follow karti hai: normal APIs fail open with a degraded header, login fail closed with 503, aur API key auth hamesha 503.\n\nSabse interesting part load testing tha: do real bugs mile -- connection pool exhaustion jo silently fail-open kar raha tha, aur blocking logging jo false Redis timeouts de raha tha. Dono fix kiye aur regression tests likhe.",
+  "deep_5min": "Main request lifecycle se shuru karta hoon, phir hardest decisions pe aata hoon.\n\nClient request nginx pe aati hai, jo round-robin karke teen FastAPI replicas mein se ek ko bhejta hai aur X-Real-IP header ko actual client IP se overwrite karta hai. App sirf tabhi yeh header trust karti hai jab RL_TRUST_FORWARDED_FOR true ho -- warna attacker fake IP header bhej ke per-IP limits bypass kar deta; iska test bhi hai.\n\nHar route pe ek FastAPI dependency hai, jaise rate_limited(\"search\"). Yeh pehle identity resolve karti hai: API key ho toh uska SHA-256 hash nikaal ke local cache dekho, miss pe Redis se lookup. Key invalid toh 401. Redis down aur key cached nahi toh 503 -- authentication hamesha fail closed, kyunki hum valid aur forged key mein fark nahi kar sakte.\n\nPhir RateLimitService route group ki policies lata hai -- search ke liye ip_global, user_plan aur search_burst. Policies local cache se aati hain (5 second TTL), Redis overrides ke saath merged. Har policy ke liye plan ke hisaab se limit choose hoti hai, key banti hai jaise rl:search_burst:{api_key:abc}, aur EVALSHA se Lua script chalti hai. Curly braces hash tag hain taaki Redis Cluster mein ek identity ki saari keys ek slot pe rahein. Pehli denial pe loop ruk jata hai.\n\nScript ke andar sab atomic hai. Token bucket mein lazy refill hai -- koi timer nahi, elapsed time se tokens calculate. Fractional tokens full precision mein store hote hain, warna slow plans kabhi refill nahi hote. Har key pe TTL hai jo algorithm ke semantics se aata hai -- jaise token bucket ka TTL itna jitne mein bucket full ho jata, toh state drop karna safe hai.\n\nResponse pe RateLimit headers us policy ke jaate hain jo binding hai -- deny hua toh sabse lamba retry, warna sabse kam remaining. 429 pe Retry-After whole seconds mein, kabhi zero nahi.\n\nAb hardest decisions.\n\nPehla: atomicity ka tarika. INCR-first sirf fixed window pe fit hai aur rejected requests bhi count karta hai. WATCH/MULTI hot key pe retries maangta hai. Lua har algorithm ke liye ek round-trip mein atomic hai; cost yeh hai ki script chalte waqt Redis blocked rehta hai, isliye scripts O(1) rakhi, aur sliding log sirf chhoti limits ke liye.\n\nDoosra: multiple policies atomic nahi hain. Agar ip_global allow kare aur user_plan deny, toh ip_global ka ek unit consume ho chuka. Ek multi-key script isse fix kar sakti thi, lekin Redis Cluster mein IP aur user keys alag slots pe hain, aur policies coupled ho jaati. Maine sequential rakha, broad policy pehle, aur trade-off document kiya.\n\nTeesra: failure mode. Fail-open availability bachata hai lekin protection hata deta hai; fail-closed ulta. Maine per-policy setting banayi: login closed, baaki open, aur degraded decisions ke liye header, metric aur alert.\n\nChautha: caching ka staleness. Policy cache 5 second aur API key cache 30 second -- isse Redis calls kam aur short Redis blips mein resilience, lekin revocation 30 second tak delayed. Yeh README mein documented limitation hai.\n\nAur sabse valuable learning load test se aayi. Unit tests sab green the. Lekin 3 replicas pe load chalane pe pehle dekha ki traffic spike pe degraded decisions aa rahe the jabki Redis healthy tha -- redis-py ka default pool exhausted hone pe error throw karta hai, jise hum Redis down samajh ke fail-open kar rahe the. Fix BlockingConnectionPool aur regression test. Phir 67 HTTP 500s aur 357 allowed instead of 300 -- synchronous stdout logging event loop ko block kar raha tha, isliye 50ms Redis timeout false fire ho raha tha. Fix QueueHandler logging, timeout 250ms, aur auth errors ko 503. Uske baad exactly 300 allowed, teeno instances pe almost equally spread, zero errors.\n\nHonest limitations: Redis Cluster ya Sentinel deploy nahi kiya, sirf keys cluster-ready hain; leaky bucket meter variant hai, queue nahi; aur load numbers ek contended Windows laptop ke hain, isliye main unhe relative comparison ke liye hi use karta hoon.",
+  "architecture_walkthrough": "Nginx (deploy/nginx.conf): round-robin load balancer teen replicas ke aage; X-Real-IP ko $remote_addr se overwrite karta hai. Koi rate limit yahan nahi.\n\nAPI layer (api/deps.py, api/routes.py): client_ip trusted proxy logic, resolve_identity (API key -> Identity), rate_limited(route_group, cost) dependency factory, require_admin with constant-time compare. Public routes: /api/resource, /api/search, /api/login, /api/reports. Admin: api-keys, policies (GET/PUT/DELETE override), stats.\n\nService layer: RateLimitService (identity -> ordered policies -> check_one per policy -> CombinedDecision -> headers / 429 / 503), PolicyStore (policies.json defaults + Redis hash overrides + 5s local cache, last-known-good on errors), ApiKeyStore (SHA-256 hashed keys, 30s cache incl. negative cache, auth fails closed), metrics (decisions, backend errors, latency histogram).\n\nLimiter layer: RateLimiter Protocol aur BackendUnavailable (base.py); RedisRateLimiter jo register_script se EVALSHA chalata hai aur errors ko BackendUnavailable mein map karta hai; paanch Lua scripts; plus do teaching contrasts -- InMemoryRateLimiter aur NaiveRedisFixedWindow.\n\nDomain layer (domain/models.py): Algorithm, Scope, FailMode, Plan enums; PlanLimit aur Policy Pydantic models with validation; Decision aur Identity frozen dataclasses. Koi I/O nahi.\n\nComposition root (main.py): settings, BlockingConnectionPool, saare objects app.state pe wire. Shared bpcommon: JSON logging via QueueHandler, uniform error responses, request ids, /metrics, /healthz.\n\nRedis: counters/buckets with TTLs, rl:config:policies hash, rl:apikey:<sha256> strings, script cache. Prometheus har instance ka /metrics scrape karta hai.",
+  "difficult_decisions": [
+   "Lua scripts over INCR-first ya WATCH/MULTI: har algorithm ke liye ek round-trip mein atomic read-decide-write, koi retry nahi. Cost: script Redis ko block karti hai, isliye scripts O(1) rakhi aur sliding log sirf chhoti limits (login) pe.",
+   "Redis TIME instead of app clock: servers ke beech clock skew khatam; tests ke liye now_ms injectable taaki deterministic rahein; negative elapsed ke liye max(...,0) guard.",
+   "Algorithm per use case: ip_global sliding counter (O(1), huge key space), login sliding log (exact, limit 5), user_plan fixed window (simple quota), search token bucket (bursts), reports leaky bucket (smooth downstream).",
+   "Sequential multi-policy checks instead of one combined script: decoupled aur cluster-friendly, lekin non-atomic -- earlier policy ka unit consume ho sakta hai. Broad policy pehle rakh ke effect chhota kiya aur TRADEOFFS mein document kiya.",
+   "Per-policy fail mode: normal APIs fail open (degraded header + metric + alert), login fail closed (503), API key auth hamesha fail closed with 503 kyunki forged aur valid key alag nahi kar sakte.",
+   "Local caches with TTL (policies 5s, API keys 30s): hot path se Redis calls hataye aur Redis blips mein resilience mili; price eventual consistency -- config changes aur revocation instant nahi."
+  ],
+  "biggest_challenges": [
+   "Load test bug 1: redis-py ka default async pool exhausted hone pe MaxConnectionsError deta hai; hamara code use Redis down samajh ke fail-open kar raha tha -- exactly traffic spike pe limiter band. Fix BlockingConnectionPool + regression test test_small_pool_waits_instead_of_failing_open.",
+   "Load test bug 2: synchronous stdout logging event loop block kar raha tha, Redis healthy hone ke bawajood 50ms timeouts fire ho rahe the -> 67 HTTP 500s aur 357 allowed instead of 300. Fix: QueueHandler/QueueListener logging in bpcommon, timeout 250ms, API key auth errors -> 503.",
+   "Distributed correctness ko prove karna, sirf claim nahi: teen alag Redis clients, 200 concurrent requests, injected time -- paanchon algorithms exactly 50; saath mein in-memory (150) aur naive GET/SET (> 50) negative controls.",
+   "Load test mein 315 allowed vs limit 300 ka confusion: race nahi tha, sliding counter ka naye window ka legitimate share tha -- server log timestamps se verify kiya aur test ko minute boundary pe align kiya.",
+   "Sliding log mein same-millisecond requests ka collision: ZSET member unique hona chahiye, isliye har request ka uuid member; token bucket mein fractional tokens ko full precision mein store karna taaki slow plans refill hon."
+  ],
+  "failure_scenarios": [
+   "Redis down: BackendUnavailable -> fail-open policies 200 + X-RateLimit-Status: degraded; login_bruteforce 503 + Retry-After: 1; metric rate_limit_backend_errors_total pe page.",
+   "Redis down during API key auth: cached keys 30s tak kaam karti hain, uncached keys 503 (kabhi 500 nahi, kabhi 'authenticated' nahi).",
+   "Redis restart: script cache khali -> NOSCRIPT -> redis-py automatically reload; counters reset (soft state, accepted). Bina persistence ke API keys aur overrides bhi kho jaate -- production gap.",
+   "Connection pool exhausted: BlockingConnectionPool 0.1s tak wait karta hai instead of raising, taaki spike pe false fail-open na ho.",
+   "Invalid policy override ya Redis unreachable during refresh: invalid override ignore + error log; last known policies chalti rehti hain.",
+   "Spoofed X-Real-IP: trust sirf RL_TRUST_FORWARDED_FOR=true pe (nginx ke peeche); ek instance dies: nginx baaki pe bhejta hai, state Redis mein safe."
+  ],
+  "improvements": [
+   "Redis HA: Sentinel ya managed Redis, AUTH/ACL + TLS, maxmemory with volatile-ttl; API keys aur overrides ko durable store mein rakhna.",
+   "Circuit breaker aur local fallback limiter taaki Redis outage mein har request timeout na khaaye aur login ko 503 ki jagah approximate protection mile.",
+   "Local deny cache aur pre-check for hot keys, aur 100x pe Redis Cluster (keys already hash-tagged; window-suffix keys ko KEYS mein pass karna padega).",
+   "Instant invalidation via Redis pub/sub for API key revocation aur policy changes; API key cache ko LRU banana.",
+   "Shadow mode for new policies, policy change audit log, per-operator admin auth (RBAC).",
+   "IPv6 /64 grouping, per-username login limit, aur failed-auth (401) traffic pe per-IP limit."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Why distributed rate limiting (in-memory fails)",
+   "steps": [
+    "1. Concept: rate limiting ek identity ko time period mein limited requests deta hai; fleet mein state global honi chahiye.",
+    "2. Project need: 3 replicas nginx ke peeche; local counters har server pe poori limit dete hain.",
+    "3. Code/API: limiter/memory_limiter.py -- InMemoryRateLimiter.check, dict counters, asyncio.Lock.",
+    "4. Detail: lock sirf ek event loop ke andar protect karta hai; process ya server ke bahar koi effect nahi.",
+    "5. Demo: pytest -q tests/test_distributed_correctness.py -k in_memory -> exactly LIMIT * 3 allowed.",
+    "6. Interviewer next: 'limit/N kyun nahi?' -- autoscaling aur uneven load balancing pe galat."
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/limiter/memory_limiter.py",
+    "projects/01-rate-limiter/tests/test_distributed_correctness.py",
+    "projects/01-rate-limiter/LEARNING_GUIDE.md"
+   ]
+  },
+  {
+   "concept": "Atomicity with Lua (race condition)",
+   "steps": [
+    "1. Concept: check-then-act race -- do requests same purana count padh ke dono allow.",
+    "2. Project need: shared Redis bhi kaafi nahi agar GET aur SET alag commands hain.",
+    "3. Code/API: naive_redis_limiter.py (anti-pattern) vs redis_limiter.py register_script + EVALSHA.",
+    "4. Detail: Redis script ko bina interleaving chalata hai; NOSCRIPT pe redis-py script reload karta hai.",
+    "5. Demo: pytest -q tests/test_distributed_correctness.py -k 'naive or three_servers'; test_survives_script_cache_flush.",
+    "6. Interviewer next: INCR-first aur WATCH/MULTI kyun nahi? Script Redis ko kitni der block karti hai?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/limiter/naive_redis_limiter.py",
+    "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py",
+    "projects/01-rate-limiter/ratelimiter/limiter/lua/fixed_window.lua",
+    "projects/01-rate-limiter/TRADEOFFS.md"
+   ]
+  },
+  {
+   "concept": "The five algorithms",
+   "steps": [
+    "1. Concept: fixed window, sliding log, sliding counter, token bucket, leaky bucket (meter) -- memory, accuracy, burst trade-offs.",
+    "2. Project need: har policy ka alag goal (anti-abuse, login, quota, burst, smooth downstream).",
+    "3. Code/API: limiter/lua/*.lua, sab ka contract {allowed, remaining, retry_after_ms, reset_ms}.",
+    "4. Detail: fixed window boundary burst, sliding counter weighted estimate, token bucket lazy refill with fractional tokens.",
+    "5. Demo: pytest -q tests/test_algorithms.py -k 'boundary or weights or fractional'.",
+    "6. Interviewer next: token vs leaky bucket fark? GCRA kya hai? Sliding counter ka error kab aata hai?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_counter.lua",
+    "projects/01-rate-limiter/ratelimiter/limiter/lua/token_bucket.lua",
+    "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_log.lua",
+    "projects/01-rate-limiter/tests/test_algorithms.py",
+    "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+   ]
+  },
+  {
+   "concept": "Time and clock skew",
+   "steps": [
+    "1. Concept: servers ki ghadiyan sync nahi hoti; window aur refill time pe depend karte hain.",
+    "2. Project need: teen instances ek hi identity ka state update karte hain.",
+    "3. Code/API: har script mein ARGV[3] == '' -> redis.call('TIME'); _args mein now_ms injection.",
+    "4. Detail: math.max(now - ts, 0) backward jumps se bachata hai; windows epoch-aligned hain.",
+    "5. Demo: test_uses_redis_server_time_when_now_not_given; baaki tests fixed T0 se deterministic.",
+    "6. Interviewer next: Redis Cluster ya failover pe clock ka kya? Purane Redis mein TIME + replication issue?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/limiter/lua/token_bucket.lua",
+    "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py",
+    "projects/01-rate-limiter/tests/test_algorithms.py"
+   ]
+  },
+  {
+   "concept": "Identity, scopes and plans",
+   "steps": [
+    "1. Concept: counter kis identity pe -- IP, user, ya API key -- aur plan se limit.",
+    "2. Project need: anonymous abuse, subscription quotas, per-integration bursts alag identities pe.",
+    "3. Code/API: api/deps.py resolve_identity, domain/models.py Identity.key_for, Policy.limit_for.",
+    "4. Detail: anonymous caller user-scoped policy pe anon-ip key pe fall back; keys rl:<policy>:{<scope>:<id>}.",
+    "5. Demo: test_user_quota_shared_across_keys_but_api_key_scope_is_per_key, test_plan_limits_via_api_key.",
+    "6. Interviewer next: IP rotation aur IPv6 se kaise bachoge?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/api/deps.py",
+    "projects/01-rate-limiter/ratelimiter/domain/models.py",
+    "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py",
+    "projects/01-rate-limiter/tests/test_api.py"
+   ]
+  },
+  {
+   "concept": "Trusted proxy and client IP",
+   "steps": [
+    "1. Concept: headers client control karta hai; sirf trusted proxy ka header maano.",
+    "2. Project need: nginx ke peeche socket peer hamesha nginx; per-IP limits ke liye real IP chahiye.",
+    "3. Code/API: client_ip() + RL_TRUST_FORWARDED_FOR; nginx proxy_set_header X-Real-IP $remote_addr.",
+    "4. Detail: trust sirf tab jab app ports directly exposed nahi.",
+    "5. Demo: test_untrusted_forwarded_header_is_ignored -- 21 fake IPs, phir bhi 429.",
+    "6. Interviewer next: CDN + nginx do hops pe kya? X-Forwarded-For leftmost kyun untrusted?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/api/deps.py",
+    "projects/01-rate-limiter/deploy/nginx.conf",
+    "projects/01-rate-limiter/ratelimiter/config.py",
+    "projects/01-rate-limiter/SECURITY.md"
+   ]
+  },
+  {
+   "concept": "Fail-open vs fail-closed",
+   "steps": [
+    "1. Concept: dependency down pe default allow ya deny -- availability vs protection.",
+    "2. Project need: normal APIs chalni chahiye, login unlimited nahi hona chahiye.",
+    "3. Code/API: FailMode enum, RateLimitService.check_one, raise_if_denied, ApiKeyStore.lookup.",
+    "4. Detail: degraded decision -> X-RateLimit-Status header ya 503 + Retry-After: 1; auth hamesha 503.",
+    "5. Demo: pytest -q tests/test_failure_modes.py; ya docker compose stop redis aur curl.",
+    "6. Interviewer next: har request timeout kyun khaaye -- circuit breaker? Local fallback limiter?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py",
+    "projects/01-rate-limiter/ratelimiter/services/api_keys.py",
+    "projects/01-rate-limiter/tests/test_failure_modes.py",
+    "projects/01-rate-limiter/FAILURE_SCENARIOS.md"
+   ]
+  },
+  {
+   "concept": "Runtime policies and caching",
+   "steps": [
+    "1. Concept: config defaults code mein, overrides runtime pe, distribution with TTL cache.",
+    "2. Project need: operators bina deploy limits badlein, saare instances converge karein.",
+    "3. Code/API: PolicyStore (_refresh, upsert, reset), admin PUT/DELETE routes, Pydantic validation.",
+    "4. Detail: writer instance turant, baaki 5s mein; invalid override ignore; Redis down pe last known.",
+    "5. Demo: test_policy_override_propagates_to_other_instance, test_invalid_policy_rejected.",
+    "6. Interviewer next: instant propagation kaise? Audit log kahan?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/ratelimiter/services/policy_store.py",
+    "projects/01-rate-limiter/ratelimiter/api/routes.py",
+    "projects/01-rate-limiter/ratelimiter/domain/models.py",
+    "projects/01-rate-limiter/tests/test_api.py"
+   ]
+  },
+  {
+   "concept": "Load testing and the two real bugs",
+   "steps": [
+    "1. Concept: unit tests correctness dikhate hain; load tests concurrency, pools aur event loop ke bugs.",
+    "2. Project need: 3 replicas + nginx + Redis pe exact limit aur zero errors prove karna.",
+    "3. Code/API: loadtest/load_test.py, loadtest/k6_benchmark.js, loadtest/bench_lua.py.",
+    "4. Detail: BlockingConnectionPool fix; QueueHandler logging fix; timeout 50ms -> 250ms.",
+    "5. Demo: TESTING.md reproduce commands; result {200: 300, 429: 2700}, served_by spread across api1..3.",
+    "6. Interviewer next: numbers production capacity kyun nahi? Event-loop lag kaise measure karoge?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/TESTING.md",
+    "projects/01-rate-limiter/loadtest/load_test.py",
+    "projects/01-rate-limiter/loadtest/k6_benchmark.js",
+    "projects/01-rate-limiter/ratelimiter/main.py",
+    "shared/bpcommon/logging.py"
+   ]
+  },
+  {
+   "concept": "Scaling path",
+   "steps": [
+    "1. Concept: app stateless scale; Redis bottleneck; round-trips aur hot keys.",
+    "2. Project need: 1x setup se 10x aur 100x tak kya badlega yeh batana.",
+    "3. Code/API: build_key hash tags, RateLimiter Protocol (hybrid backend ke liye), SYSTEM_DESIGN scaling table.",
+    "4. Detail: 10x Sentinel + edge ip_global; 100x Cluster + local pre-check + batching.",
+    "5. Demo: docker compose up --build aur load_test.py se served_by distribution dekho; docker compose stop api2.",
+    "6. Interviewer next: multi-region limits? Hot tenant jo 30% traffic hai?"
+   ],
+   "files": [
+    "projects/01-rate-limiter/SYSTEM_DESIGN.md",
+    "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py",
+    "projects/01-rate-limiter/docker-compose.yml",
+    "projects/01-rate-limiter/deploy/nginx.conf"
+   ]
+  }
+ ]
+}

@@ -1,0 +1,947 @@
+[
+ {
+  "id": "RATE-064",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "How could connection pool exhaustion silently turn off rate limiting, and how did you fix it?",
+  "answer_hinglish": "Yeh load testing mein mila pehla real bug hai (TESTING.md bug 1).\n\nMechanism: redis-py ka default async `ConnectionPool` jab saare `max_connections` busy hon aur ek aur coroutine connection maange, toh wait nahi karta -- turant `MaxConnectionsError` raise karta hai (jo ek `RedisError`/`ConnectionError` type hai). Hamara `RedisRateLimiter.check` saare `RedisError` ko `BackendUnavailable` mein map karta hai. `check_one` usse \"Redis down\" samajhta hai aur fail-open policies ke liye request ALLOW kar deta hai with `degraded=True`.\n\nAb socho kab pool exhaust hota hai -- traffic spike pe. Matlab exactly jab rate limiter ki sabse zyada zaroorat hai, tab woh silently band ho jata. Redis bilkul healthy, sirf client-side pool full. Bahar se dekho toh lagta hai \"kuch requests degraded hain\", koi crash nahi -- isliye silent.\n\nFix: `main.py` mein `BlockingConnectionPool` -- jab connection free na ho toh `timeout=redis_pool_timeout` (0.1s) tak wait karo. Comment: \"The default pool raises MaxConnectionsError, which would be treated as 'Redis down' and silently fail-open exactly during a traffic spike.\" Pool size `RL_REDIS_MAX_CONNECTIONS=200` per process.\n\nRegression test `test_small_pool_waits_instead_of_failing_open`: pool sirf 5 connections, 100 concurrent requests -- assert koi response `X-RateLimit-Status: degraded` nahi, aur exactly 20 allowed (anonymous limit). Default pool ke saath yeh test fail hota.\n\nLesson: \"dependency unavailable\" aur \"humara client overloaded\" alag failure modes hain; dono ko ek bucket mein daalna galat decisions deta hai.",
+  "why_needed": "Failure classification galat ho toh safety mechanism exactly peak load pe fail hota hai.",
+  "real_world_analogy": "Bank mein saare counters busy hain toh guard customer ko bolta hai \"bank band hai, jao free mein le lo\" -- jabki sirf 2 minute wait karna tha.",
+  "how_it_works": "Non-blocking pool: get_connection raises on exhaustion. Blocking pool: waits on a queue up to timeout, then raises.",
+  "in_this_project": "`main.py::create_app` BlockingConnectionPool; `config.py` `redis_pool_timeout: float = 0.1`, `redis_max_connections: int = 200`; test in `test_api.py`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/main.py::create_app",
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/tests/test_api.py::test_small_pool_waits_instead_of_failing_open",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# real: tests/test_api.py\nsettings = Settings(..., redis_max_connections=5, redis_pool_timeout=5, redis_socket_timeout=2)\napp = create_app(settings)  # app builds its own BlockingConnectionPool\n...\nrs = await asyncio.gather(*[c.get(\"/api/resource\") for _ in range(100)])\nassert not any(r.headers.get(\"X-RateLimit-Status\") == \"degraded\" for r in rs)\nassert sum(r.status_code == 200 for r in rs) == 20  # anonymous limit, exact",
+  "code_language": "python",
+  "advantages": [
+   "No false fail-open under spikes",
+   "Regression-tested"
+  ],
+  "disadvantages": [
+   "Requests may queue up to pool_timeout",
+   "Pool timeout still eventually maps to degraded"
+  ],
+  "common_mistakes": [
+   "Default pool assume karna",
+   "Saare RedisError ko ek hi tarah treat karna bina sochke"
+  ],
+  "follow_up_questions": [
+   "Should pool exhaustion be distinguishable from Redis down in metrics?",
+   "How do you size the pool?",
+   "Why did unit tests not catch this?"
+  ],
+  "concepts": [
+   "connection pool",
+   "load testing",
+   "fail-open"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Blocking pool trades a bit of queueing latency for correct decisions; non-blocking fails fast with wrong semantics.",
+   "failure_scenarios": "Agar Redis sach mein slow ho, blocking pool mein coroutines queue hoti hain -> memory aur latency badhti hai; pool_timeout (0.1s) isko bound karta hai.",
+   "alternatives": "Separate exception types / metric labels for pool exhaustion vs connection failure; adaptive concurrency limit before the pool.",
+   "scale_10x_100x": "Zyada workers -> zyada pools -> Redis maxclients ka dhyan; per-worker pool size = expected concurrency per worker.",
+   "production_improvements": "Pool wait-time and in-use metrics, alert when pool saturation is high, label degraded reasons."
+  }
+ },
+ {
+  "id": "RATE-065",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens if a policy override in Redis is invalid, or Redis is unreachable when policies refresh?",
+  "answer_hinglish": "Dono cases `PolicyStore._refresh` handle karta hai, aur dono mein philosophy hai: \"config staleness is better than outage\".\n\nInvalid override: kisi ne `redis-cli HSET rl:config:policies user_plan '{bad json}'` likh diya, ya schema galat (jaise token bucket bina rate). Admin API se yeh possible nahi kyunki wahan Pydantic validate karta hai, lekin direct Redis write se ho sakta hai. Refresh mein har override `Policy.model_validate_json(payload)` se parse hota hai; `ValueError` (Pydantic `ValidationError` bhi `ValueError` ka subclass hai) aaye toh woh override skip, `invalid_policy_override_ignored` error log, aur us policy ka default (policies.json) use hota hai. Baaki valid overrides apply hote hain. FAILURE_SCENARIOS #7.\n\nRedis unreachable: `HGETALL` `RedisError` deta hai. Hum `policy_refresh_failed` warning log karte hain, `_loaded_at` ko abhi set karte hain (taaki har request pe retry karke Redis ko hammer na karein -- agla try TTL baad), aur last known `_cache` chalta rehta hai. Startup pe cache defaults se initialized hai, toh Redis kabhi na mile tab bhi policies available. FAILURE_SCENARIOS #8.\n\nNote: is case mein limiter khud Redis use karta hai, toh woh waise bhi degraded hoga -- lekin policy lookup crash nahi karta, toh fail-open/closed logic sahi policy ke saath chalta hai.\n\nStartup validation alag hai: route group mein unknown policy name ho toh `ValueError` aur app start nahi hoti -- yeh deploy-time error hai, runtime nahi.",
+  "why_needed": "Config store failures ko poore service ko down nahi karna chahiye.",
+  "real_world_analogy": "Naya timetable notice board pe phata hua laga hai toh purana timetable follow karo, school band mat karo.",
+  "how_it_works": "Per-entry validation with skip-on-error; last-known-good cache; backoff via loaded_at update.",
+  "in_this_project": "`services/policy_store.py::_refresh`; logs `policy_refresh_failed`, `invalid_policy_override_ignored`; FAILURE_SCENARIOS #7, #8.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py::_refresh",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: policy_store.py\ntry:\n    overrides = await self._redis.hgetall(OVERRIDES_KEY)\nexcept RedisError as exc:\n    log.warning(\"policy_refresh_failed\", extra={\"error\": str(exc)})\n    self._loaded_at = time.monotonic()\n    return\nmerged = dict(self._defaults)\nfor name, payload in overrides.items():\n    try:\n        merged[name] = Policy.model_validate_json(payload)\n    except ValueError:\n        log.error(\"invalid_policy_override_ignored\", extra={\"policy\": name})",
+  "code_language": "python",
+  "advantages": [
+   "Bad config cannot crash the service",
+   "No retry storm on Redis outage"
+  ],
+  "disadvantages": [
+   "Invalid override silently falls back -- needs alerting on the log",
+   "Stale config during outage"
+  ],
+  "common_mistakes": [
+   "Ek invalid override se poora refresh fail karna",
+   "Har request pe failed refresh retry karna"
+  ],
+  "follow_up_questions": [
+   "How would an operator notice an ignored override?",
+   "Should an invalid override fall back to default or last valid version?",
+   "Why not crash on invalid config?"
+  ],
+  "concepts": [
+   "last known good",
+   "config validation",
+   "resilience"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-066",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens if one app instance dies behind nginx?",
+  "answer_hinglish": "Kuch khaas nahi -- aur yahi stateless design ka fayda hai. Teen replicas (api1, api2, api3) nginx ke `upstream ratelimiter` block mein hain. Ek instance crash ho ya `docker compose stop api2` karo, toh nginx ke connections us pe fail honge aur nginx (default `proxy_next_upstream error timeout`) request ko agle upstream pe try karta hai aur failed server ko kuch der ke liye mark kar deta hai (passive health check, `max_fails`/`fail_timeout` defaults). Traffic baaki do pe chala jata hai.\n\nRate limit state ka kya? Kuch nahi khota, kyunki saare counters, buckets, overrides aur API keys Redis mein hain. Instance ke paas sirf caches the (policies 5s, API keys 30s) jo doosre instances pe independently hain. Toh limits exactly same rehti hain. FAILURE_SCENARIOS #11: \"no state is lost because state is in Redis\" -- verified manually.\n\nAgar in-memory limiter hota toh? Crashed instance ke counters gayab, aur remaining instances naye counters se start -- plus wahi N x overshoot problem.\n\nIn-flight requests: jo request dying instance pe process ho rahi thi woh fail hogi (502/connection reset). Agar uske Lua script ne already counter badha diya tha, toh client ka ek unit consume hua bina response ke -- minor.\n\nProduction improvement: active health checks / readiness probes (`/healthz`, aur readiness jo Redis PING kare -- DEPLOYMENT.md mein suggested, implemented nahi).",
+  "why_needed": "Horizontal scaling ka main promise: instance failure se correctness nahi tootti.",
+  "real_world_analogy": "Teen cashiers mein se ek chala gaya -- line baaki do pe shift, aur ledger common hai toh kisi ka hisaab nahi bigda.",
+  "how_it_works": "LB passive failure detection + retry on next upstream; all authoritative state external.",
+  "in_this_project": "`deploy/nginx.conf` upstream with api1..3; `docker-compose.yml`; FAILURE_SCENARIOS #11.",
+  "implementation_files": [
+   "projects/01-rate-limiter/deploy/nginx.conf",
+   "projects/01-rate-limiter/docker-compose.yml",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md",
+   "projects/01-rate-limiter/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: deploy/nginx.conf\nupstream ratelimiter {\n    server api1:8000;\n    server api2:8000;\n    server api3:8000;\n    keepalive 64;\n}",
+  "code_language": "text",
+  "advantages": [
+   "No state loss",
+   "Automatic traffic shift"
+  ],
+  "disadvantages": [
+   "In-flight requests on the dead instance fail",
+   "Remaining instances get more load"
+  ],
+  "common_mistakes": [
+   "Instance-local state rakhna",
+   "Health checks bina deploy karna"
+  ],
+  "follow_up_questions": [
+   "What is the difference between liveness and readiness here?",
+   "Would sticky sessions help or hurt?",
+   "How fast does nginx stop sending traffic to a dead instance?"
+  ],
+  "concepts": [
+   "stateless",
+   "load balancer",
+   "high availability"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-067",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "An API key was revoked but the client can still call the API. Why, and how would you fix it?",
+  "answer_hinglish": "Yeh `ApiKeyStore` ke cache ka documented trade-off hai. Lookups har instance pe 30 seconds (`RL_API_KEY_CACHE_TTL_SECONDS`) tak cache hote hain. `revoke(raw_key)` do kaam karta hai: is instance ke cache se digest `pop` karta hai aur Redis se `DEL rl:apikey:<digest>`. Lekin doosre instances ke caches mein woh key abhi bhi valid record ke saath cached hai -- unhe pata nahi chalta. Toh up to 30s tak un instances pe revoked key kaam karti hai. Code comment: \"this instance forgets immediately; others within TTL\". README known limitation: \"revocation takes up to 30s per instance\".\n\nInvestigate kaise: confirm karo Redis mein key gayi -- `redis-cli EXISTS rl:apikey:<sha256>` = 0. Responses ka `served_by` dekho -- revoked key sirf un instances pe pass ho rahi hogi jo abhi revoke nahi hue. 30s baad khud theek ho jayega.\n\nNote: is repo mein revoke ka admin HTTP endpoint nahi hai -- `revoke` method `ApiKeyStore` mein hai, route nahi.\n\nFix options: (1) TTL chhota karo (5s) -- simple, zyada Redis calls. (2) Redis pub/sub: revoke pe `PUBLISH rl:revocations <digest>`, har instance subscribe karke cache se pop kare -- near-instant; pub/sub fire-and-forget hai toh TTL backstop rakho. (3) Revocation version counter key jo har request pe sasta check ho. Security-critical revocation (leaked key) ke liye (2) + chhota TTL best hai.",
+  "why_needed": "Caching aur security revocation ka conflict real production incidents ka source hai.",
+  "real_world_analogy": "Building ke ek gate pe guard ko bataya \"yeh pass cancel\", lekin baaki do gates ke guards ke paas purani list hai jo har aadhe ghante update hoti hai.",
+  "how_it_works": "Per-instance TTL cache; invalidation only local; global convergence after TTL.",
+  "in_this_project": "`services/api_keys.py::revoke` comment; README known limitations; TRADEOFFS #7.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::revoke",
+   "projects/01-rate-limiter/README.md",
+   "projects/01-rate-limiter/TRADEOFFS.md"
+  ],
+  "code_example": "# real: api_keys.py\nasync def revoke(self, raw_key: str) -> bool:\n    digest = hash_key(raw_key)\n    self._cache.pop(digest, None)  # this instance forgets immediately; others within TTL\n    return bool(await self._redis.delete(KEY_PREFIX + digest))",
+  "code_language": "python",
+  "advantages": [
+   "Cache keeps auth fast and resilient"
+  ],
+  "disadvantages": [
+   "Revocation not instant across instances"
+  ],
+  "common_mistakes": [
+   "Revocation ko instant maan lena",
+   "Cache invalidation sirf local karna aur bhool jana"
+  ],
+  "follow_up_questions": [
+   "Design pub/sub invalidation for this cache.",
+   "What TTL would you pick for a security-sensitive API?",
+   "How would you add a revoke endpoint safely?"
+  ],
+  "concepts": [
+   "cache invalidation",
+   "revocation",
+   "eventual consistency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-068",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What happens if Redis runs out of memory?",
+  "answer_hinglish": "Depend karta hai `maxmemory` aur eviction policy pe. Is repo ki demo Redis mein yeh configure nahi hai; DATABASE_DESIGN.md aur DEPLOYMENT.md production ke liye recommend karte hain.\n\nCase 1 -- `maxmemory` set, policy `noeviction` (Redis default policy): memory full hone pe write commands (INCRBY, HSET, ZADD) `OOM command not allowed` error dete hain. Lua script ke andar write fail -> script error -> redis-py `ResponseError` (ek `RedisError`) -> hamara code `BackendUnavailable` (comment: \"READONLY replica, OOM -> treat as unavailable too\"). Result: saari fail-open policies degraded allow, login 503. Matlab memory full = rate limiting effectively off. Bahut bura failure mode, aur Redis \"up\" dikhta hai.\n\nCase 2 -- `volatile-ttl` ya `allkeys-lru`: Redis keys evict karta hai aur writes succeed. Rate limit counters evict hue toh woh identities fresh quota paayengi -- small overshoot. `volatile-ttl` sirf TTL wali keys (counters) evict karta hai, sabse kam TTL pehle -- jo waise bhi jaldi expire hone wali thi. API keys aur config (no TTL) safe. Isliye yeh is data mix ke liye best fit hai. `allkeys-lru` API keys bhi evict kar sakta hai -> random 401s.\n\nCase 3 -- `maxmemory` set hi nahi: Redis OS memory tak badhta hai, phir OOM killer ya swap -- latency explode ya crash.\n\nDetection: `INFO memory` (used_memory vs maxmemory), `evicted_keys` stat, aur hamara `rate_limit_backend_errors_total` spike.",
+  "why_needed": "Memory exhaustion common production failure hai, aur rate limiter mein yeh silently protection band kar sakta hai.",
+  "real_world_analogy": "Godown full: ya toh naya maal lena band (noeviction -> dukaan band), ya sabse jaldi expire hone wala purana maal phenko (volatile-ttl).",
+  "how_it_works": "maxmemory + policy decides: reject writes (noeviction) vs evict keys. Script write failure surfaces as RedisError.",
+  "in_this_project": "`redis_limiter.py` broad `RedisError` mapping; DATABASE_DESIGN.md \"Memory considerations\"; DEPLOYMENT.md checklist item 1.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py::check",
+   "projects/01-rate-limiter/DATABASE_DESIGN.md",
+   "projects/01-rate-limiter/DEPLOYMENT.md"
+  ],
+  "code_example": "# illustrative redis.conf for the counters Redis (NOT in this repo)\nmaxmemory 2gb\nmaxmemory-policy volatile-ttl\n# check: redis-cli INFO memory ; redis-cli INFO stats | grep evicted_keys",
+  "code_language": "text",
+  "advantages": [
+   "Eviction keeps the limiter working",
+   "Counters are safe to lose"
+  ],
+  "disadvantages": [
+   "noeviction makes OOM look like an outage",
+   "Eviction policy choice affects API keys"
+  ],
+  "common_mistakes": [
+   "maxmemory set na karna",
+   "allkeys-* policy jab same Redis mein durable data hai"
+  ],
+  "follow_up_questions": [
+   "volatile-ttl vs volatile-lru here?",
+   "How would you separate durable data from counters?",
+   "What alert catches this before it happens?"
+  ],
+  "concepts": [
+   "oom",
+   "eviction",
+   "redis memory"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Evicting counters (small overshoot) vs rejecting writes (limiter off). Single Redis for mixed data complicates the choice.",
+   "failure_scenarios": "Script mid-way write fail: Lua scripts are not rolled back automatically -- partial writes possible (e.g. INCRBY succeeded, PEXPIRE failed). Redis 7 `allow-oom` flags / script flags matter here.",
+   "alternatives": "Dedicated counters Redis with volatile-ttl; durable data in Postgres or a separate Redis with noeviction + persistence.",
+   "scale_10x_100x": "100x pe memory per shard plan karo; hot sliding_log identities ko cap karo.",
+   "production_improvements": "Alerts on used_memory/maxmemory > 80%, evicted_keys rate, and backend errors; capacity planning per active identity."
+  }
+ },
+ {
+  "id": "RATE-069",
+  "project_slug": "p01-rate-limiter",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "Redis is not down, but it is slow (p99 latency spikes). What happens and how is it handled?",
+  "answer_hinglish": "Slow Redis down Redis se zyada tricky hai, kyunki partial failure hai.\n\nHar check pe `socket_timeout=0.25s` (`RL_REDIS_SOCKET_TIMEOUT`). Agar Redis reply 250ms se zyada le, toh redis-py `TimeoutError` -> `BackendUnavailable` -> degraded decision. 250ms se kam le toh request intezaar karti hai. Route pe 2-3 policies sequential hain, toh worst case 0.5-0.75s extra latency, plus pool wait (0.1s) per check.\n\nProblems: (1) Mix of real decisions aur degraded decisions -- kuch requests limited, kuch fail-open. (2) Timeout ke baad command shayad Redis pe execute ho chuki ho (counter badh gaya) lekin humne degraded allow kiya -- over-count + under-protection dono. (3) Slow requests coroutines aur connections pakad ke rakhte hain -> pool exhaustion -> aur waits.\n\nKyun 250ms, 50ms nahi? TRADEOFFS #9 aur TESTING bug 2: 50ms timeout load test mein false \"Redis down\" de raha tha kyunki event loop khud blocked tha (sync logging) -- timer humare process ki slowness naap raha tha, Redis ki nahi. 250ms latency cap karta hai lekin loop jitter tolerate karta hai.\n\nDetection: `rate_limit_check_seconds` histogram -- alert p99 > 50ms (FAILURE_SCENARIOS). Redis side: `SLOWLOG GET`, `LATENCY DOCTOR`, `INFO commandstats`.\n\nNot implemented but recommended: circuit breaker -- agar error rate high ho toh kuch seconds ke liye Redis call skip karke seedha fail mode apply karo, taaki har request timeout na khaaye aur Redis ko recover hone ka time mile.",
+  "why_needed": "Gray failures (slow, not dead) production mein sabse common aur sabse confusing hain.",
+  "real_world_analogy": "Phone line pe awaaz kat-kat ke aa rahi hai -- band bhi nahi, chal bhi nahi rahi. Kab tak \"hello hello\" karoge?",
+  "how_it_works": "Timeouts bound latency; timeout -> fail mode; sequential policies multiply worst case; no circuit breaker yet.",
+  "in_this_project": "`config.py` `redis_socket_timeout: float = 0.25` with comment about 50ms; `services/metrics.py::CHECK_LATENCY`; FAILURE_SCENARIOS alerts.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/ratelimiter/services/metrics.py::CHECK_LATENCY",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md",
+   "projects/01-rate-limiter/TRADEOFFS.md"
+  ],
+  "code_example": "# illustrative (NOT in repo): minimal circuit breaker around the limiter\nclass Breaker:\n    def __init__(self, threshold=20, cooldown=5.0):\n        self.failures, self.open_until = 0, 0.0\n        self.threshold, self.cooldown = threshold, cooldown\n    def allow_call(self) -> bool:\n        return time.monotonic() >= self.open_until\n    def record(self, ok: bool) -> None:\n        self.failures = 0 if ok else self.failures + 1\n        if self.failures >= self.threshold:\n            self.open_until, self.failures = time.monotonic() + self.cooldown, 0",
+  "code_language": "python",
+  "advantages": [
+   "Latency bounded by timeouts",
+   "Per-policy fail mode still applies"
+  ],
+  "disadvantages": [
+   "Worst case multiplies across policies",
+   "Timed-out commands may still have executed"
+  ],
+  "common_mistakes": [
+   "Very tight timeouts that measure event-loop lag",
+   "No circuit breaker, so every request pays the timeout"
+  ],
+  "follow_up_questions": [
+   "Design a circuit breaker for this limiter.",
+   "How do you tell Redis slowness from event-loop lag?",
+   "Should timeouts differ per policy?"
+  ],
+  "concepts": [
+   "gray failure",
+   "timeouts",
+   "circuit breaker"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Short timeout: low latency, more false degraded. Long timeout: fewer false degraded, higher tail latency.",
+   "failure_scenarios": "Retry storms: if clients retry on 503 from fail-closed login while Redis is slow, load increases further.",
+   "alternatives": "Circuit breaker, hedged requests (not for writes), local fallback limiter, deadline budget per request instead of per call.",
+   "scale_10x_100x": "Bade scale pe ek slow shard kuch identities ko affect karta hai; per-shard breakers useful.",
+   "production_improvements": "Request-level deadline across policies, breaker with metrics, separate alerts for Redis latency vs loop lag."
+  }
+ },
+ {
+  "id": "RATE-070",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Under load you saw 67 HTTP 500s and 357 requests allowed when the limit was 300, while Redis was healthy. How did you debug it?",
+  "answer_hinglish": "Yeh TESTING.md ka bug 2 hai -- sabse achha interview story.\n\nSymptom: load test (3 replicas, nginx, ek IP, limit `ip_global` 300/min) mein 67 HTTP 500s aur 357 allowed instead of 300. Redis metrics normal the -- CPU low, latency low.\n\nInvestigation: (1) Allowed 300 se zyada matlab kuch decisions degraded the -- `rate_limit_decisions_total{result=\"degraded_allow\"}` aur `rate_limit_backend_errors_total` badhe hue the, aur logs mein `rate_limit_backend_unavailable` warnings with timeout errors. (2) Lekin Redis healthy tha -- toh timeout Redis ki slowness nahi naap raha tha. (3) Socket timeout tab 50ms tha. Asyncio mein timer tab expire hota hai jab event loop us coroutine ko resume nahi kar paata. Agar loop busy/blocked hai toh Redis ka reply socket pe pada hai lekin padha nahi gaya -- timeout fire. (4) Kya loop block kar raha tha? Har request pe access log `StreamHandler` se synchronously stdout pe likha ja raha tha; Docker log driver slow hone pe har write loop ko stall karta tha. (5) 500s kahan se? API key lookup pe Redis timeout ek unhandled error ban raha tha.\n\nFix (teen parts): bpcommon logging ko `QueueHandler` + `QueueListener` banaya -- event loop sirf queue mein record daalta hai, ek background thread I/O karta hai. Socket timeout 50ms -> 250ms. API key lookup ka Redis error `ServiceUnavailable` 503 mein map kiya (fail closed, never 500).\n\nAfter: exactly 300 allowed, 0 server errors.",
+  "why_needed": "Real bug ka symptom -> hypothesis -> evidence -> fix story senior interviews mein bahut valuable hai.",
+  "real_world_analogy": "Doctor ko lagta hai pulse slow hai (Redis slow), lekin actually nurse ki ghadi atak rahi thi (event loop) -- naapne wala instrument hi galat tha.",
+  "how_it_works": "Blocking I/O in event loop -> delayed coroutine resumption -> client-side timeouts though server replied -> false BackendUnavailable -> fail-open overshoot.",
+  "in_this_project": "`shared/bpcommon/logging.py::configure_logging` docstring explains it; `config.py` timeout comment; `api_keys.py::lookup` 503; TESTING.md bug 2.",
+  "implementation_files": [
+   "shared/bpcommon/logging.py::configure_logging",
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/ratelimiter/services/api_keys.py::lookup",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# real: shared/bpcommon/logging.py\nq: queue.SimpleQueue = queue.SimpleQueue()\nroot = logging.getLogger()\nroot.handlers[:] = [_ContextQueueHandler(q)]\n_listener = logging.handlers.QueueListener(q, stream, respect_handler_level=False)\n_listener.start()",
+  "code_language": "python",
+  "advantages": [
+   "Root cause fixed, not symptom",
+   "Generic fix in shared library helps every project"
+  ],
+  "disadvantages": [
+   "Background logging thread can drop logs on hard crash",
+   "Larger timeout raises tail latency in real outages"
+  ],
+  "common_mistakes": [
+   "Sirf timeout badha ke chhod dena",
+   "Redis ko blame karke Redis scale karna"
+  ],
+  "follow_up_questions": [
+   "How would you measure event-loop lag directly?",
+   "Why did unit tests not catch this?",
+   "What else commonly blocks an asyncio loop?"
+  ],
+  "concepts": [
+   "event loop blocking",
+   "debugging",
+   "logging",
+   "timeouts"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Async logging decouples I/O from request path but adds a thread and possible log loss on crash.",
+   "failure_scenarios": "Any other blocking call (sync HTTP, CPU-heavy JSON, DNS) would recreate the same symptom.",
+   "alternatives": "uvloop, structured logging to a sidecar, sampling access logs, aiologger.",
+   "scale_10x_100x": "Bade scale pe har instance ke logs zyada -- async logging aur sampling dono zaroori.",
+   "production_improvements": "Event loop lag metric (e.g. periodic task drift), alert when degraded decisions rise while Redis latency is flat."
+  }
+ },
+ {
+  "id": "RATE-071",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "During traffic spikes you see X-RateLimit-Status: degraded even though Redis is healthy. How do you investigate?",
+  "answer_hinglish": "Pehle confirm karo ki Redis sach mein healthy hai: `redis-cli INFO stats` (instantaneous_ops_per_sec), `redis-cli --latency`, `SLOWLOG GET 10`, Redis CPU. Agar sab normal hai toh problem client side pe hai.\n\nPhir metrics: `rate_limit_backend_errors_total` per policy kab badhta hai -- spikes ke saath correlate karta hai? `rate_limit_check_seconds` histogram ka shape -- agar latency timeout (250ms) pe pile ho rahi hai toh timeouts hain; agar errors bina high latency ke hain toh instant failure (jaise pool exhaustion).\n\nLogs: `rate_limit_backend_unavailable` warnings ke `error` field mein exception text hota hai. Do classic causes:\n\n1) Pool exhaustion: error text mein \"Too many connections\" / `MaxConnectionsError`. Matlab default non-blocking pool. Is project mein yeh bug tha aur fix `BlockingConnectionPool` hai -- check karo ki kisi ne `create_app` ko apna `redis` client pass karke yeh pool bypass toh nahi kiya (create_app ka `redis` parameter tests ke liye hai). Regression test `test_small_pool_waits_instead_of_failing_open`.\n\n2) Timeouts from event-loop lag: error text \"Timeout reading from socket\". Redis fast hai lekin loop blocked. Check karo koi sync I/O (logging, sync HTTP client, bada JSON parse) hot path pe toh nahi. Fix wahi jo bug 2 mein kiya.\n\nTeesra possible: `redis_max_connections` per worker chhota hai concurrency ke hisaab se -- pool_timeout (0.1s) ke baad bhi error.\n\nFix verify: same load dobara chalao aur `degraded_allow` zero, allowed count exact.",
+  "why_needed": "Degraded decisions = rate limiting silently off; root cause dhoondhna zaroori hai.",
+  "real_world_analogy": "Gaadi slow chal rahi hai -- engine theek hai (Redis), toh check karo handbrake (event loop block) ya traffic jam (pool full).",
+  "how_it_works": "Classify errors by message/type and latency profile: instant errors -> pool; timeout-shaped -> loop lag or slow Redis.",
+  "in_this_project": "Metrics in `services/metrics.py`; warning in `rate_limit_service.py::check_one`; `main.py` pool; TESTING.md bugs 1 and 2.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/metrics.py::BACKEND_ERRORS",
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::check_one",
+   "projects/01-rate-limiter/ratelimiter/main.py::create_app",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# illustrative investigation commands\nredis-cli --latency -h <redis>            # is Redis itself slow?\nredis-cli SLOWLOG GET 10\ncurl -s http://api1:8000/metrics | grep -E 'rate_limit_backend_errors_total|rate_limit_check_seconds_bucket'\ndocker compose logs api1 | grep rate_limit_backend_unavailable | tail",
+  "code_language": "bash",
+  "advantages": [
+   "Metrics + logs pinpoint the class of failure"
+  ],
+  "disadvantages": [
+   "Requires error text/labels to distinguish causes"
+  ],
+  "common_mistakes": [
+   "Redis ko scale karna bina client side check kiye",
+   "Degraded header ko ignore karna kyunki 200 aa raha hai"
+  ],
+  "follow_up_questions": [
+   "How would you label metrics by failure reason?",
+   "What's the impact on login during this?",
+   "How do you reproduce it locally?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "connection pool",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Investigating client-side first saves expensive Redis scaling; but needs good error classification.",
+   "failure_scenarios": "While degraded, fail-open policies give no protection exactly during spikes -- the worst time.",
+   "alternatives": "Separate metrics for pool wait, connection errors, timeouts; tracing spans around EVALSHA.",
+   "scale_10x_100x": "More workers/replicas multiply pools; Redis maxclients and per-worker pool sizing must be planned.",
+   "production_improvements": "Add reason label to BACKEND_ERRORS, event-loop lag gauge, pool usage gauge."
+  }
+ },
+ {
+  "id": "RATE-072",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A load test allowed 315 requests when the limit was 300 per minute. Is that a bug?",
+  "answer_hinglish": "Nahi, yeh sliding counter ka correct behaviour tha -- aur maine assume nahi kiya, server log timestamps se verify kiya (TESTING.md).\n\nContext: binding policy `ip_global` hai -- sliding counter, 300 per 60s. Test run ek minute boundary cross kar gaya. Sliding counter ka estimate `cur + prev * (window - elapsed)/window` hai. Naye window mein jaise-jaise time badhta hai, previous window ka weight ghatta hai aur naye requests ke liye jagah banti hai. Agar previous window mein 300 the aur hum naye window mein 5% andar hain, weight 0.95, estimate = 285 + cur -- toh ~15 aur requests legitimately allow hongi. Total observed 315 -- matlab test ne do windows ka hissa dekha, ek single 60s window nahi.\n\nKaise prove kiya: load generator ka total time minute boundary cross kar raha tha. Server logs ke timestamps se allowed requests ka distribution dekha -- extra 15 boundary ke baad aaye the. Jab test minute boundary pe start karke ek window ke andar khatam kiya, toh exactly 300 aaye, `{200: 300, 429: 2700}`.\n\nDebugging lesson: kisi bhi \"limit se zyada allowed\" ko pehle algorithm semantics se check karo. Fixed window hota toh boundary cross pe 600 tak possible tha; sliding log mein kisi bhi 60s window mein 300 se zyada kabhi nahi. Test ka observation window aur limiter ka window match karna zaroori hai.",
+  "why_needed": "Har anomaly bug nahi hoti; algorithm semantics se reason karna aur evidence se verify karna zaroori hai.",
+  "real_world_analogy": "Monthly data plan ka \"last 30 days\" usage vs \"is calendar month\" usage -- dono alag numbers denge aur dono sahi.",
+  "how_it_works": "Observation interval spans two limiter windows -> sliding estimate admits new-window share.",
+  "in_this_project": "TESTING.md \"Correctness under load\" -- 315 explanation; `lua/sliding_counter.lua`; `policies.json` ip_global.",
+  "implementation_files": [
+   "projects/01-rate-limiter/TESTING.md",
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_counter.lua",
+   "projects/01-rate-limiter/loadtest/load_test.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Shows understanding of algorithm semantics",
+   "Evidence-based conclusion"
+  ],
+  "disadvantages": [
+   "Load tests must be aligned to windows to compare exactly"
+  ],
+  "common_mistakes": [
+   "Turant 'race condition' assume karna",
+   "Test duration aur window alignment ignore karna"
+  ],
+  "follow_up_questions": [
+   "What maximum would fixed window allow in the same test?",
+   "How would sliding log behave here?",
+   "How would you design the load test to be window-aligned?"
+  ],
+  "concepts": [
+   "debugging",
+   "sliding counter",
+   "load testing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-073",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A customer complains they get 429 much earlier than their plan allows. How do you investigate?",
+  "answer_hinglish": "Step by step, data se:\n\n1) Response headers maango ya reproduce karo: `RateLimit-Policy` header batata hai kaunsi policy ne deny kiya aur kaunsa algorithm, `RateLimit-Limit` uski limit, aur 429 body mein `details.policy`, `retry_after_ms`. Aksar jawab yahin mil jata hai -- jaise pro customer `user_plan` (600/min) se nahi, `ip_global` (300/min per IP) se block ho raha hai kyunki unki saari traffic ek NAT/server IP se aati hai. Test `test_plan_limits_via_api_key` mein bhi pro user ke liye binding `ip_global` 300 hai.\n\n2) Identity check: kya woh API key bhej rahe hain? Bina key ke woh anonymous hain -> `user_plan` anonymous limit 20/min. Kya key unke expected plan pe hai? Redis mein `GET rl:apikey:<sha256(key)>` -> plan field.\n\n3) Scope check: `search_burst` per API key hai, `user_plan` per user -- agar customer ki 5 integrations ek user ki keys share karti hain toh `user_plan` total count hota hai.\n\n4) Policy overrides: `GET /admin/policies` effective policies dikhata hai -- kisi ne override se limit kam toh nahi ki?\n\n5) Counter state: `redis-cli HGETALL` / `GET` relevant key aur `PTTL`.\n\n6) Metrics: `rate_limit_decisions_total{policy, result=\"denied\"}`.\n\nFix depend karta hai: ip_global binding hai toh customer ke IP ke liye exception chahiye (abhi feature nahi hai) ya ip_global ko plan-aware banana; plan galat hai toh key re-issue; override galat hai toh `DELETE /admin/policies/{name}/override`.",
+  "why_needed": "Customer-facing debugging mein headers aur admin endpoints hi sabse fast tools hain.",
+  "real_world_analogy": "Bijli bill zyada aaya -- meter number, tariff plan, aur reading teeno check karo.",
+  "how_it_works": "Binding-policy headers + identity resolution + effective config + raw counter state.",
+  "in_this_project": "`RateLimit-Policy` header from `rate_limit_headers`; `/admin/policies`; key layout in DATABASE_DESIGN.md.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::rate_limit_headers",
+   "projects/01-rate-limiter/ratelimiter/api/routes.py::list_policies",
+   "projects/01-rate-limiter/tests/test_api.py::test_plan_limits_via_api_key",
+   "projects/01-rate-limiter/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# illustrative\ncurl -i -H \"X-API-Key: $KEY\" http://127.0.0.1:58001/api/resource\n#   RateLimit-Policy: ip_global;alg=sliding_counter   <- binding policy is per-IP, not the plan\ncurl -s -H \"X-Admin-Token: $ADMIN\" http://127.0.0.1:58001/admin/policies | jq '.policies[] | {name, plans}'",
+  "code_language": "bash",
+  "advantages": [
+   "Self-describing headers speed up support",
+   "Admin view of effective config"
+  ],
+  "disadvantages": [
+   "No per-customer IP allowlist feature",
+   "No per-identity debug endpoint"
+  ],
+  "common_mistakes": [
+   "Sirf plan dekhna, binding policy nahi",
+   "Production mein KEYS rl:* chalana"
+  ],
+  "follow_up_questions": [
+   "Should ip_global be plan-aware?",
+   "How would you build an allowlist safely?",
+   "What would a per-identity debug endpoint expose?"
+  ],
+  "concepts": [
+   "debugging",
+   "customer support",
+   "headers"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-074",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "An operator updated a policy but some requests still use the old limit. Why?",
+  "answer_hinglish": "Yeh expected behaviour hai -- policy cache ki eventual consistency.\n\nJab admin `PUT /admin/policies/user_plan` karta hai, request jis instance pe gayi (say api1) woh Redis mein `HSET rl:config:policies user_plan <json>` karta hai aur apna cache invalidate karta hai (`_loaded_at = 0.0`), toh api1 turant naya limit use karta hai. Lekin api2 aur api3 apna local cache `RL_POLICY_CACHE_TTL_SECONDS` (default 5s) tak rakhte hain. Nginx round-robin hai, toh client ki kuch requests naye limit pe aur kuch purane pe -- up to 5 seconds.\n\nVerify kaise: (1) `GET /admin/policies` multiple baar karo -- har response alag instance se aa sakta hai; 5s ke andar converge hona chahiye. (2) Redis mein `HGET rl:config:policies user_plan` -- yahan naya value hona chahiye. Agar yahan bhi purana hai toh write fail hua. (3) Agar 5s se zyada ho gaye aur ek instance abhi bhi purana use kar raha hai: us instance ke logs mein `policy_refresh_failed` (Redis issue) ya `invalid_policy_override_ignored` (override invalid -- lekin admin API validate karta hai, toh yeh tabhi jab kisi ne Redis mein direct likha).\n\nEk aur gotcha: counters reset nahi hote. Limit 600 se 60 ki aur user is window mein already 200 use kar chuka, toh fixed window turant deny karega jab tak window reset na ho.\n\nTest: `test_policy_override_propagates_to_other_instance` -- instance A update karta hai, B (cache TTL 0) naya limit `[200, 200, 429]` dikhata hai.",
+  "why_needed": "Ops team ko caching behaviour samajhna chahiye warna woh \"bug\" report karte hain.",
+  "real_world_analogy": "WhatsApp group mein naya rule post kiya -- kuch log abhi tak purana message padh ke chal rahe hain jab tak refresh na karein.",
+  "how_it_works": "Write-through on writer + TTL pull on others = bounded staleness.",
+  "in_this_project": "`services/policy_store.py::upsert`, `_refresh`; `config.py` `policy_cache_ttl_seconds`; SYSTEM_DESIGN.md policy change sequence diagram.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py::upsert",
+   "projects/01-rate-limiter/tests/test_api.py::test_policy_override_propagates_to_other_instance",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "# illustrative\nredis-cli HGET rl:config:policies user_plan        # source of truth\nfor i in 1 2 3; do curl -s -H \"X-Admin-Token: $T\" http://127.0.0.1:58001/admin/policies \\\n  | jq '.policies[] | select(.name==\"user_plan\") | .plans.anonymous.limit'; done",
+  "code_language": "bash",
+  "advantages": [
+   "Bounded, predictable staleness"
+  ],
+  "disadvantages": [
+   "Mixed limits for a few seconds"
+  ],
+  "common_mistakes": [
+   "Bug samajh ke instances restart karna",
+   "Counters ka reset expect karna"
+  ],
+  "follow_up_questions": [
+   "How would you make propagation instant?",
+   "What happens to existing counters when the limit changes?",
+   "How would you show each instance's policy version?"
+  ],
+  "concepts": [
+   "eventual consistency",
+   "configuration",
+   "caching"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-075",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "Behind nginx, all users are suddenly rate limited together as if they were one client. What went wrong?",
+  "answer_hinglish": "Sabse likely cause: app instances pe `RL_TRUST_FORWARDED_FOR` false hai (default false hai `config.py` mein). Tab `client_ip` `X-Real-IP` header ignore karta hai aur `request.client.host` use karta hai -- jo nginx container ka IP hai. Saare users ek hi IP lagte hain, toh `ip_global` (300/min) aur anonymous `user_plan` (20/min) saare users ke beech share ho jaate hain -- poori site ek client ki tarah throttle.\n\nKaise confirm: (1) Response mein `RateLimit-Policy` -- `ip_global` ya `user_plan` binding hai. (2) Redis keys dekho: `SCAN 0 MATCH rl:ip_global:* COUNT 1000` -- agar sirf ek key hai jaise `rl:ip_global:{ip:172.18.0.5}:...` (nginx ka internal IP) toh confirmed. (3) Instance ka env: `docker compose exec api1 env | grep RL_TRUST`.\n\nFix: nginx ke peeche wale instances pe `RL_TRUST_FORWARDED_FOR=true` -- jaise `docker-compose.yml` mein api1..api3 pe set hai. Aur nginx config mein `proxy_set_header X-Real-IP $remote_addr;` hona chahiye.\n\nUlta galti bhi possible: trust true hai lekin app port directly internet pe exposed hai -- tab attacker apna X-Real-IP choose kar sakta hai. Isliye DEPLOYMENT.md: \"enable only there; never expose app ports directly\".\n\nAgar nginx ke aage ek aur proxy/CDN hai, toh `$remote_addr` CDN ka IP hoga -- tab nginx mein `real_ip` module se trusted CDN ranges configure karne padte hain. Yeh is repo mein nahi hai.",
+  "why_needed": "Proxy aur client IP configuration production ka sabse common rate limiting misconfig hai.",
+  "real_world_analogy": "Reception pe saare visitors ek hi courier boy ke naam pe register ho rahe hain kyunki guard sirf darwaze tak laane wale ka naam likh raha hai.",
+  "how_it_works": "Peer address behind a proxy is the proxy; real client IP must come from a trusted proxy header.",
+  "in_this_project": "`api/deps.py::client_ip`; `config.py` `trust_forwarded_for: bool = False`; `docker-compose.yml` sets it true for api1..3; `deploy/nginx.conf`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/api/deps.py::client_ip",
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/docker-compose.yml",
+   "projects/01-rate-limiter/deploy/nginx.conf"
+  ],
+  "code_example": "# real: docker-compose.yml (trimmed)\napi1: {<<: *api, environment: {RL_REDIS_URL: \"redis://redis:6379/0\", RL_TRUST_FORWARDED_FOR: \"true\", RL_INSTANCE_NAME: api1}}",
+  "code_language": "text",
+  "advantages": [
+   "Safe default (no trust)",
+   "Simple env toggle"
+  ],
+  "disadvantages": [
+   "Easy to misconfigure in either direction"
+  ],
+  "common_mistakes": [
+   "Trust flag bhool jana (sab ek IP)",
+   "Trust flag on with directly exposed app (spoofing)"
+  ],
+  "follow_up_questions": [
+   "How would you handle CDN -> nginx -> app?",
+   "How can a startup check detect this misconfig?",
+   "Why X-Real-IP instead of parsing X-Forwarded-For?"
+  ],
+  "concepts": [
+   "misconfiguration",
+   "proxy",
+   "client ip"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-076",
+  "project_slug": "p01-rate-limiter",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Senior/System Design",
+  "question": "Limiter check p99 latency jumped from a few ms to 200ms. Walk through how you would find the cause.",
+  "answer_hinglish": "Systematic layers mein jaata hoon: Redis server -> network -> client pool -> event loop -> script.\n\n1) Metric confirm: `histogram_quantile(0.99, rate(rate_limit_check_seconds_bucket[5m]))` per `algorithm` label. Kya sab algorithms affected hain ya ek? Sirf `sliding_log` -> script-specific (badi ZSET). Sab -> shared cause. Alert threshold FAILURE_SCENARIOS mein p99 > 50ms hai.\n\n2) Redis server: `redis-cli --latency`, `SLOWLOG GET 20` (koi slow script ya KEYS command?), `LATENCY DOCTOR`, `INFO commandstats` (evalsha usec_per_call), `INFO stats` (ops/s spike?), `INFO persistence` (fork for RDB/AOF rewrite causing latency?), `INFO memory` (swap, eviction).\n\n3) Network: kya app aur Redis alag AZ mein chale gaye? Packet loss?\n\n4) Client pool: pool wait time. Agar concurrency badh gayi aur 200 connections per process kam pad rahe hain toh coroutines `BlockingConnectionPool` mein queue hoti hain -- yeh time bhi `CHECK_LATENCY` mein count hota hai kyunki timer `check()` ke around hai.\n\n5) Event loop: agar Redis `--latency` fast dikhata hai lekin hamara histogram slow -- loop lag. Kya koi naya sync call aaya (logging, sync HTTP, CPU-heavy kaam)? Exactly TESTING.md bug 2 jaisa.\n\n6) Hot key: ek identity bahut traffic -- `redis-cli --hotkeys` (LFU policy chahiye).\n\nFix accordingly: script cap, pool size, async I/O, Redis scaling. Har hypothesis ek metric/command se prove ya disprove -- guess nahi.",
+  "why_needed": "Latency regression debugging senior on-call skill hai.",
+  "real_world_analogy": "Pizza late aa rahi hai -- kitchen slow hai, delivery boy traffic mein hai, ya counter pe order lene wala hi busy hai? Har stage ka time naapo.",
+  "how_it_works": "Decompose latency: server exec + network RTT + pool wait + loop scheduling delay.",
+  "in_this_project": "`services/metrics.py::CHECK_LATENCY` buckets 0.5ms..250ms with algorithm label; timer wraps `check_one` limiter call.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/metrics.py::CHECK_LATENCY",
+   "projects/01-rate-limiter/ratelimiter/services/rate_limit_service.py::check_one",
+   "projects/01-rate-limiter/FAILURE_SCENARIOS.md",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# real: services/metrics.py\nCHECK_LATENCY = Histogram(\"rate_limit_check_seconds\", \"Latency of one limiter check\", [\"algorithm\"],\n                          buckets=(0.0005, 0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25))",
+  "code_language": "python",
+  "advantages": [
+   "Per-algorithm histogram narrows scope fast"
+  ],
+  "disadvantages": [
+   "Histogram includes pool wait and loop lag -- not pure Redis time"
+  ],
+  "common_mistakes": [
+   "Ek hi metric dekh ke Redis blame karna",
+   "Server-side aur client-side latency ko mix karna"
+  ],
+  "follow_up_questions": [
+   "How would you separate pool wait from Redis time in metrics?",
+   "What Redis background operations cause latency spikes?",
+   "Would tracing help here?"
+  ],
+  "concepts": [
+   "latency debugging",
+   "observability",
+   "redis"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Client-side histogram is closest to user impact but mixes causes; server-side Redis metrics isolate Redis but miss client issues.",
+   "failure_scenarios": "RDB fork on large dataset, AOF fsync, swap, noisy neighbour on shared host, network change.",
+   "alternatives": "OpenTelemetry spans around EVALSHA, Redis exporter for Prometheus, eBPF tools.",
+   "scale_10x_100x": "Bade scale pe per-shard latency aur per-instance loop lag dashboards zaroori.",
+   "production_improvements": "Add pool-wait and loop-lag metrics, Redis exporter, SLO-based alerting on check latency."
+  }
+ },
+ {
+  "id": "RATE-077",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Fail-open vs fail-closed: how did you decide, and why make it per policy?",
+  "answer_hinglish": "Fail mode ka sawaal: limiter ka backend down ho toh default answer \"haan\" ho ya \"naa\"? Dono ki cost alag hai.\n\nFail-open: availability > protection. Redis outage se product down nahi hota, lekin us dauraan limits enforce nahi hoti. Normal APIs ke liye sahi, kyunki limiter ek protective layer hai, core function nahi.\n\nFail-closed: protection > availability. Outage ke dauraan endpoint 503 deta hai. Security-critical endpoints (login brute force) ke liye sahi, kyunki unlimited guessing ka cost (account takeover) temporary login outage se zyada hai.\n\nPer policy kyun, global kyun nahi? Kyunki ek hi service mein dono types ke endpoints hain. Global fail-closed = Redis outage pe poori API down. Global fail-open = Redis outage pe login brute-forceable. `Policy.fail_mode` field (enum `FailMode.OPEN/CLOSED`) aur `policies.json` mein sirf `login_bruteforce` closed hai.\n\nSequential evaluation ke saath interplay: agar ek route pe ek open aur ek closed policy ho aur Redis down ho, toh closed waali deny karegi -> 503. Abhi login group mein sirf ek policy hai.\n\nFail-open ko safe banane ke liye: `X-RateLimit-Status: degraded` header, metric `degraded_allow`, aur alert `rate(rate_limit_backend_errors_total[1m]) > 0` -> page. TRADEOFFS #6: \"alerting on rate_limit_backend_errors_total is mandatory\".",
+  "why_needed": "Har distributed dependency ke liye failure default decide karna design ka hissa hai.",
+  "real_world_analogy": "Fire alarm system fail ho: office ke normal darwaze khule (fail open) taaki log nikal sakein, lekin vault ka darwaza lock (fail closed).",
+  "how_it_works": "FailMode enum on Policy; check_one picks allowed = fail_mode is OPEN on BackendUnavailable.",
+  "in_this_project": "`domain/models.py::FailMode`, `policies.json` login_bruteforce `\"fail_mode\": \"closed\"`; TRADEOFFS #6; tests `test_fail_open_allows_and_marks_degraded`, `test_fail_closed_denies`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/domain/models.py::FailMode",
+   "projects/01-rate-limiter/ratelimiter/policies.json",
+   "projects/01-rate-limiter/tests/test_failure_modes.py::test_fail_closed_denies",
+   "projects/01-rate-limiter/TRADEOFFS.md"
+  ],
+  "code_example": "# real: domain/models.py\nclass FailMode(StrEnum):\n    OPEN = \"open\"      # Redis down -> allow request (availability over protection)\n    CLOSED = \"closed\"  # Redis down -> reject with 503 (protection over availability)",
+  "code_language": "python",
+  "advantages": [
+   "Right trade-off per endpoint",
+   "Configurable at runtime"
+  ],
+  "disadvantages": [
+   "Two behaviours to monitor",
+   "Mixed routes need care"
+  ],
+  "common_mistakes": [
+   "Fail-open bina alerting",
+   "Global setting for everything"
+  ],
+  "follow_up_questions": [
+   "What would you do for a payment endpoint?",
+   "Could a local fallback limiter replace hard fail-closed?",
+   "Who owns this decision?"
+  ],
+  "concepts": [
+   "fail-open",
+   "fail-closed",
+   "trade-off"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-078",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "Why are rejected requests not counted against the limit?",
+  "answer_hinglish": "Fixed window script mein check pehle hota hai: `if current + cost > limit then return {0, ...}` -- INCRBY sirf allow pe hota hai. Comment: \"Rejected requests are NOT counted, so a client that backs off is not punished.\" Sliding log aur sliding counter bhi sirf allow pe write karte hain; token/leaky bucket reject pe cost subtract/add nahi karte.\n\nFayda: ek client jo limit hit karke `Retry-After` follow karta hai, woh window/bucket refill ke turant baad wapas normal ho jata hai. Agar rejections count hote, toh ek buggy retry loop window bhar counter badhata rehta -- aur fixed window mein toh agle window tak, sliding log mein lagaatar retry pe kabhi bhi unblock nahi hota.\n\nNuksaan: aggressive client jo 429 ke baad bhi hammer karta rehta hai, use koi extra penalty nahi milti -- har window start pe woh phir se poora quota le leta hai. Aur rejected requests bhi server resources (Redis call, CPU) khaati hain.\n\nKuch APIs jaan-boojh ke rejections count karti hain (penalty) -- TRADEOFFS #5: \"that would be a one-line change in the script\" -- fixed window mein INCRBY ko check se pehle le jao (INCR-first pattern). Test `test_denied_requests_are_not_counted` current behaviour lock karta hai: 1 allowed + 5 denied, Redis counter = 1.\n\nAbuse ke liye better tool penalty nahi balki alag policy hai (jaise ip_global) ya edge-level blocking.",
+  "why_needed": "Rate limiter ki fairness aur abuse deterrence ke beech ka chhota lekin real trade-off.",
+  "real_world_analogy": "Gym mein bheed hai toh wapas jaane wale ko attendance mein count nahi karte; agar karte toh woh agle din bhi andar nahi aa pata.",
+  "how_it_works": "Check-then-increment inside one atomic script; increment only on allow.",
+  "in_this_project": "`lua/fixed_window.lua` comment; `tests/test_algorithms.py::test_denied_requests_are_not_counted`; TRADEOFFS #5.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/fixed_window.lua",
+   "projects/01-rate-limiter/tests/test_algorithms.py::test_denied_requests_are_not_counted",
+   "projects/01-rate-limiter/TRADEOFFS.md"
+  ],
+  "code_example": "# real: tests/test_algorithms.py\nasync def test_denied_requests_are_not_counted(self, redis):\n    lim, p = RedisRateLimiter(redis), make_policy(Algorithm.FIXED_WINDOW, 1, window=1)\n    assert (await run(lim, p, T0)).allowed\n    for _ in range(5):\n        assert not (await run(lim, p, T0 + 1)).allowed\n    assert int(await redis.get(f\"rl:test:{{u1}}:{T0}\")) == 1",
+  "code_language": "python",
+  "advantages": [
+   "Well-behaved clients recover fast",
+   "Counters reflect real usage"
+  ],
+  "disadvantages": [
+   "No penalty for hammering",
+   "Rejections still cost a Redis call"
+  ],
+  "common_mistakes": [
+   "INCR-first use karke unintentionally penalty lagana",
+   "Sochna ki penalty abuse ka main solution hai"
+  ],
+  "follow_up_questions": [
+   "How would you implement a penalty box?",
+   "Does token bucket count rejections?",
+   "How would a local deny cache reduce rejected-request cost?"
+  ],
+  "concepts": [
+   "fairness",
+   "penalty",
+   "design decision"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-079",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Sliding window counter vs sliding window log: how do you choose?",
+  "answer_hinglish": "Dono \"sliding window\" problem solve karte hain (fixed window ka boundary burst), lekin alag cost pe.\n\nSliding log: exact. Har accepted request ka timestamp ZSET mein. Kisi bhi window-length period mein kabhi limit se zyada nahi. Exact retry-after (oldest + window). Cost: O(limit) memory per identity aur O(log N + M) time per check. Limit 5 pe trivial, limit 10000 pe ek identity hi heavy.\n\nSliding counter: approximate. Do integers per identity (current aur previous window counters), weighted estimate. O(1) memory aur time. Error tab aata hai jab previous window ka traffic uneven tha -- jaise saare requests uske end mein aaye. Worst case kuch overshoot ya undershoot; smooth traffic pe error chhota.\n\nIs project mein: `login_bruteforce` sliding log -- limit chhoti (5/min), exactness security ke liye zaroori, memory negligible. `ip_global` sliding counter -- lakhon IPs, 300/min; exact log se per IP 300 members x lakhon IPs = bahut memory, aur thoda approximation anti-abuse ke liye fine. TRADEOFFS #8 aur SYSTEM_DESIGN algorithm guide yahi kehte hain.\n\nDecision rule jo main interview mein deta hoon: limit x active identities chhota aur exactness critical -> log. Bada key space ya badi limit -> counter. Burst allow karna hai -> token bucket. Load test mein sliding counter ka 315-vs-300 observation approximation nahi, window semantics tha -- yeh distinction bhi samjhana chahiye.",
+  "why_needed": "Algorithm choice ko memory/accuracy trade-off se justify karna core design skill hai.",
+  "real_world_analogy": "Har mehmaan ka naam register mein likhna (log) vs sirf \"kal 100 aaye, aaj abhi tak 20\" ka hisaab (counter).",
+  "how_it_works": "Log: ZSET per identity. Counter: two string keys with weighted sum.",
+  "in_this_project": "`lua/sliding_log.lua`, `lua/sliding_counter.lua`, `policies.json`, TRADEOFFS #8, SYSTEM_DESIGN algorithm guide.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_log.lua",
+   "projects/01-rate-limiter/ratelimiter/limiter/lua/sliding_counter.lua",
+   "projects/01-rate-limiter/TRADEOFFS.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Log: exact",
+   "Counter: O(1), scales to huge key spaces"
+  ],
+  "disadvantages": [
+   "Log: memory/time grows with limit",
+   "Counter: approximation error"
+  ],
+  "common_mistakes": [
+   "Badi limits pe log",
+   "Security-critical small limits pe approximation"
+  ],
+  "follow_up_questions": [
+   "Quantify the worst-case error of the sliding counter.",
+   "What about cost > 1 in sliding log?",
+   "Could you combine both?"
+  ],
+  "concepts": [
+   "sliding log",
+   "sliding counter",
+   "accuracy vs memory"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Exactness costs memory proportional to limit; approximation costs correctness under uneven traffic.",
+   "failure_scenarios": "Sliding log with huge limit -> long scripts block Redis; counter with bursty traffic -> brief overshoot.",
+   "alternatives": "Token bucket / GCRA (O(1) and exact for rate semantics), hybrid: counter for coarse, log for fine.",
+   "scale_10x_100x": "100x identities pe sirf O(1) algorithms viable; log sirf small-limit security policies tak.",
+   "production_improvements": "Cap sliding_log limit in validation; monitor ZSET sizes; document approximation for customers."
+  }
+ },
+ {
+  "id": "RATE-080",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Centralized Redis counters vs local per-instance counters vs a hybrid: which would you choose and when?",
+  "answer_hinglish": "Teen options:\n\nLocal counters (in-process): zero latency, no dependency. Lekin N instances pe N x overshoot -- proven 3x in `test_in_memory_limiter_overshoots_with_multiple_servers`. Autoscaling ke saath N badalta rehta hai, toh \"limit/N\" bhi unreliable. Restart pe state lost.\n\nCentralized Redis (yeh project): ek global truth, exact limits, policies runtime pe share. Cost: har check ek network round-trip, Redis ek dependency jo fail ho sakti hai (fail-open/closed chahiye), aur ek capacity bottleneck. TRADEOFFS #1.\n\nHybrid: local first, central truth. Kai designs: (a) Local deny cache -- Redis ne deny kiya toh retry_after tak locally deny, Redis call nahi. Exact-safe. (b) Local pre-check -- obvious abuse (10k req/s from one IP) ko local token bucket rokta hai, baaki Redis jaata hai. (c) Batched sync -- har instance locally count karta hai aur har 100ms Redis mein INCRBY karke global count padhta hai. Bounded overshoot (sync interval x instances x rate), lekin Redis calls 100x kam. (d) Quota leasing -- har instance central se \"100 tokens\" lease leta hai aur locally kharch karta hai.\n\nMera choice: 1x-10x pe centralized (correctness simple, Redis kaafi fast). 100x pe hybrid -- pehle (a) deny cache (free win), phir (b) pre-check, aur bahut hot tenants ke liye (d) leasing. SYSTEM_DESIGN 100x row yahi kehta hai. Is repo mein sirf centralized implement hai; Protocol design hybrid backend ke liye ready hai.",
+  "why_needed": "Yeh distributed rate limiting ka central architectural trade-off hai.",
+  "real_world_analogy": "Har branch apna cash register rakhe (local), ya har transaction head office se approve ho (central), ya branch ko daily cash limit advance mein mile (leasing).",
+  "how_it_works": "Accuracy vs latency vs availability; hybrids trade bounded error for fewer central calls.",
+  "in_this_project": "Centralized: `RedisRateLimiter`. Local: `InMemoryRateLimiter` (teaching). Hybrid: not implemented; Protocol in `limiter/base.py` allows it.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/limiter/redis_limiter.py::RedisRateLimiter",
+   "projects/01-rate-limiter/ratelimiter/limiter/memory_limiter.py::InMemoryRateLimiter",
+   "projects/01-rate-limiter/ratelimiter/limiter/base.py::RateLimiter",
+   "projects/01-rate-limiter/TRADEOFFS.md",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Centralized: exact and simple",
+   "Hybrid: scales with bounded error"
+  ],
+  "disadvantages": [
+   "Centralized: latency + dependency",
+   "Hybrid: complexity and approximation"
+  ],
+  "common_mistakes": [
+   "Local counters with limit/N under autoscaling",
+   "Hybrid that caches ALLOW decisions (unbounded overshoot)"
+  ],
+  "follow_up_questions": [
+   "Calculate the max overshoot of batched sync.",
+   "How does quota leasing handle an instance crash?",
+   "Which hybrid is safe for login?"
+  ],
+  "concepts": [
+   "centralized vs local",
+   "hybrid limiter",
+   "architecture"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Central exact vs local fast; hybrid bounded error. Decision driven by scale and how much overshoot business tolerates.",
+   "failure_scenarios": "Central: Redis outage = no limits (fail-open). Local: wrong limits always. Hybrid: on Redis outage local part still gives partial protection -- better degraded mode.",
+   "alternatives": "Envoy local + global rate limit, Redis-cell / GCRA, gossip-based counters, CRDT counters across regions.",
+   "scale_10x_100x": "100x: hybrid mandatory to keep Redis ops/request below 1. Multi-region: per-region central + periodic global reconcile.",
+   "production_improvements": "Start with local deny cache; measure Redis ops saved; add pre-check behind a feature flag."
+  }
+ },
+ {
+  "id": "RATE-081",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why is the policy cache TTL 5 seconds but the API key cache TTL 30 seconds?",
+  "answer_hinglish": "Dono caches same trade-off karte hain (fewer Redis calls + resilience vs staleness), lekin data ki nature alag hai, isliye TTL alag.\n\nPolicy cache 5s (`RL_POLICY_CACHE_TTL_SECONDS`): policy changes operational hote hain -- incident ke dauraan operator limit kam karta hai aur chahta hai jaldi lage. 5s staleness acceptable. Data chhota hai (5 policies) aur refresh ek `HGETALL` hai per instance per 5s -- load negligible chahe 5s ho ya 30s. Toh freshness ko prefer kiya.\n\nAPI key cache 30s (`RL_API_KEY_CACHE_TTL_SECONDS`): har authenticated request pe lookup chahiye, aur key space bada hai (har customer ki keys). TTL lamba = zyada hit rate = Redis calls kam. Aur 30s ka cache Redis blip ke dauraan already-seen keys ko kaam karte rehne deta hai -- auth fail-closed hai, toh yeh resilience direct availability hai. Cost: revocation 30s tak delay (README known limitations).\n\nKya main inhe badalunga? Security-sensitive environment mein API key TTL chhota (5-10s) aur pub/sub invalidation add karunga taaki revoke instant ho, phir TTL lamba bhi rakh sakte hain as backstop. Policy TTL ko 1-2s bhi kar sakte hain -- cost negligible hai.\n\nTests mein `policy_cache_ttl_seconds=0` set hota hai taaki behaviour deterministic ho. TRADEOFFS #7 yeh trade-off document karta hai.",
+  "why_needed": "Cache TTL random numbers nahi hone chahiye; har value ka reason explain karna chahiye.",
+  "real_world_analogy": "Office notice board har 5 minute dekho (rules jaldi badal sakte hain), lekin employee ID list din mein ek baar (rarely badalti, har baar dekhna mehenga).",
+  "how_it_works": "TTL chosen by change frequency, urgency of change, lookup volume, and resilience value.",
+  "in_this_project": "`config.py` `policy_cache_ttl_seconds: float = 5.0`, `api_key_cache_ttl_seconds: float = 30.0`; TRADEOFFS #7; DEPLOYMENT.md env table.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/TRADEOFFS.md",
+   "projects/01-rate-limiter/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: config.py\npolicy_cache_ttl_seconds: float = 5.0\napi_key_cache_ttl_seconds: float = 30.0",
+  "code_language": "python",
+  "advantages": [
+   "Each TTL matches its data's change profile"
+  ],
+  "disadvantages": [
+   "Revocation delay of 30s",
+   "Config delay of 5s"
+  ],
+  "common_mistakes": [
+   "Same TTL everywhere bina soche",
+   "Very long TTL on security-relevant data without invalidation"
+  ],
+  "follow_up_questions": [
+   "What TTL for a bank API?",
+   "How does the API key cache help availability during Redis blips?",
+   "Why set TTL 0 in tests?"
+  ],
+  "concepts": [
+   "cache ttl",
+   "staleness",
+   "trade-off"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RATE-082",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why is the Redis socket timeout 250ms and not 50ms or 2 seconds?",
+  "answer_hinglish": "Timeout ek trade-off hai: Redis slow ho toh request kitni der wait kare before fail mode apply.\n\nBahut lamba (2s): Redis slow ho toh har request 2s tak hang, 3 policies pe 6s. Coroutines aur pool connections pakde rehte hain -> pool exhaustion -> cascading slowness. Users ka experience Redis outage se bhi bura.\n\nBahut chhota (50ms): pehle yahi tha, aur load testing mein galat nikla (TESTING.md bug 2, TRADEOFFS #9). Asyncio mein timeout tab fire hota hai jab coroutine time pe resume na ho. Event loop busy hone pe (us waqt sync logging ki wajah se) Redis ka reply aa chuka tha lekin padha nahi gaya -> 50ms timeout fire -> false \"Redis down\" -> degraded fail-open -> 357 allowed instead of 300, aur 500s. Matlab chhota timeout Redis ki latency nahi, humare process ka jitter naap raha tha.\n\n250ms: same-datacenter Redis normally ms se kam leta hai, toh 250ms real outage ko jaldi pakadta hai, lekin loop jitter aur GC pauses ko tolerate karta hai. `config.py` mein comment yahi explain karta hai. Connect timeout alag 200ms, pool wait 100ms.\n\nBetter long-term: per-request deadline budget (saari policies milake max X ms) aur circuit breaker, taaki Redis outage mein har request timeout na khaaye. Aur event-loop lag metric taaki \"timeout = Redis slow\" assumption verify ho sake.",
+  "why_needed": "Timeout values production behaviour ko define karte hain; galat value false positives ya cascading failures deti hai.",
+  "real_world_analogy": "Phone pe \"hello\" ke baad kitni der wait karo: 1 second mein kaat doge toh slow network pe bhi kat jayega, 1 minute wait karoge toh line pe atke rahoge.",
+  "how_it_works": "Timeout must exceed normal latency + scheduler jitter, but stay below user-visible latency budget.",
+  "in_this_project": "`config.py`: `redis_socket_timeout: float = 0.25` with comment about 50ms; `redis_connect_timeout: float = 0.2`; `redis_pool_timeout: float = 0.1`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/config.py::Settings",
+   "projects/01-rate-limiter/TRADEOFFS.md",
+   "projects/01-rate-limiter/TESTING.md"
+  ],
+  "code_example": "# real: config.py\n# Small but not tiny: a 50ms timeout measured event-loop lag under load, not Redis\n# latency, and produced false \"Redis down\" decisions (see TESTING.md, load test notes).\nredis_socket_timeout: float = 0.25\nredis_connect_timeout: float = 0.2",
+  "code_language": "python",
+  "advantages": [
+   "Bounded latency",
+   "Tolerant of loop jitter"
+  ],
+  "disadvantages": [
+   "Up to 250ms x policies in a real slowdown",
+   "Not adaptive"
+  ],
+  "common_mistakes": [
+   "Timeouts copy-paste karna bina load test",
+   "Timeout ko sirf server latency se tune karna"
+  ],
+  "follow_up_questions": [
+   "How would a deadline budget work across policies?",
+   "Should connect and read timeouts differ?",
+   "How would you tune this from production data?"
+  ],
+  "concepts": [
+   "timeouts",
+   "latency budget",
+   "tuning"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Short timeouts favour latency and fast failure; long ones favour fewer false failures. Loop jitter shifts the safe minimum up.",
+   "failure_scenarios": "Real Redis slowdown: 250ms x 3 policies = 750ms worst case added; cascading pool pressure.",
+   "alternatives": "Adaptive timeouts from observed p99, request-level deadlines, circuit breakers.",
+   "scale_10x_100x": "Bade scale pe tail latency multiplies across services; deadline propagation zyada important.",
+   "production_improvements": "Event-loop lag metric, per-request deadline, breaker, and load-test any timeout change."
+  }
+ },
+ {
+  "id": "RATE-083",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why build a custom rate limiter instead of using an API gateway or nginx limit_req?",
+  "answer_hinglish": "Honest answer: bahut cases mein gateway ya nginx hi sahi choice hai. Coarse per-IP limits ke liye nginx `limit_req` ya CDN rules sasta aur fast hai -- aur SYSTEM_DESIGN.md ke 10x step mein `ip_global` ko edge pe move karna isi liye plan hai.\n\nCustom application-level limiter tab justify hota hai jab requirements yeh hon:\n\n1) Plan-aware limits: same endpoint pe anonymous 20, free 60, pro 600, enterprise 6000 per minute. Identity -> plan resolution API key se hoti hai, jo app ka business data hai.\n\n2) Multiple scopes per request: ek route pe per-IP + per-user + per-API-key policies ek saath, har ek alag algorithm ke saath.\n\n3) Per-policy fail modes: login fail-closed, baaki fail-open -- gateways aksar ek global behaviour dete hain.\n\n4) Algorithm choice: sliding log for login, leaky bucket for a slow downstream. nginx `limit_req` leaky-bucket-style hai aur per-node shared memory zone use karta hai -- multiple nginx nodes ke across global nahi.\n\n5) Runtime policy changes via API, cost-weighted requests, custom headers.\n\nGateways (Kong, Envoy global rate limit service, cloud API gateways) inme se kaafi kuch dete hain, aur production mein main pehle unhe evaluate karunga. Is project ka maqsad yeh bhi tha ki algorithms, atomicity aur failure modes ko andar se samjhun aur prove karun. Interview mein main dono baatein clearly bolta hoon: \"yeh portfolio implementation hai, production mein build vs buy evaluate karunga\".",
+  "why_needed": "Build-vs-buy judgement senior engineers se expected hai.",
+  "real_world_analogy": "Ghar mein khud ka water filter banana vs market se lena: special requirement (mineral control) ho toh custom, warna standard filter.",
+  "how_it_works": "Requirements matrix: plan awareness, scopes, algorithms, fail modes, config, ops cost -> build or buy.",
+  "in_this_project": "`policies.json` plans/scopes/fail modes; `deploy/nginx.conf` (no limit_req); SYSTEM_DESIGN.md scaling path.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/policies.json",
+   "projects/01-rate-limiter/deploy/nginx.conf",
+   "projects/01-rate-limiter/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Full control over semantics",
+   "Business-context-aware limits"
+  ],
+  "disadvantages": [
+   "Maintenance burden",
+   "Reinventing what gateways provide"
+  ],
+  "common_mistakes": [
+   "Custom build bina gateways evaluate kiye",
+   "Gateway per-node limits ko global maan lena"
+  ],
+  "follow_up_questions": [
+   "How does Envoy's global rate limit service work?",
+   "What would you still keep in-app if you adopted a gateway?",
+   "What is the ops cost of your custom limiter?"
+  ],
+  "concepts": [
+   "build vs buy",
+   "api gateway",
+   "nginx"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Custom: flexibility + ownership cost. Gateway: less code, less flexibility, vendor coupling.",
+   "failure_scenarios": "Custom limiter bugs are yours to find (two found in load testing); gateway bugs need vendor fixes.",
+   "alternatives": "Kong rate-limiting-advanced, Envoy + ratelimit service (Redis-backed), AWS API Gateway usage plans, Cloudflare rules.",
+   "scale_10x_100x": "At 100x a hybrid is typical: gateway/edge for coarse limits, app for plan/business limits.",
+   "production_improvements": "Move ip_global to edge, keep plan and login policies in app, document which layer owns which limit."
+  }
+ },
+ {
+  "id": "RATE-084",
+  "project_slug": "p01-rate-limiter",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why are policies defined as validated JSON with Redis overrides, instead of a database table or environment variables?",
+  "answer_hinglish": "Teen requirements the: (1) defaults version-controlled aur code review se change hon, (2) operators runtime pe tune kar sakein bina deploy, (3) changes saare instances tak pahunchein.\n\n`policies.json` defaults: Git mein hai, PR review se badalta hai, aur route groups (kaunsa route kaunsi policies use kare) bhi yahin hain. Startup pe Pydantic se validate -- invalid file pe app start hi nahi hoti.\n\nRedis overrides (`rl:config:policies` hash): `PUT /admin/policies/{name}` se runtime tuning. Redis isliye kyunki woh already shared hai -- naya component nahi, aur saare instances padh sakte hain. Defaults + overrides merge hota hai; `DELETE .../override` se wapas default. Upsert sirf existing policies ke liye -- naya policy ya route group change code review se.\n\nEnv vars kyun nahi? Nested structure (plans x limits x algorithms) env vars mein awkward hai, aur change ke liye restart chahiye -- runtime tuning nahi.\n\nDB table kyun nahi? Is project mein SQL DB hai hi nahi; sirf config ke liye Postgres add karna extra dependency. Lekin trade-off honest: Redis mein bina persistence overrides restart pe kho jaate hain, aur koi audit trail nahi (kisne kab kya badla). Production mein main overrides ko durable store (Postgres ya config service) mein rakhunga with audit log, aur Redis/local cache distribution ke liye.\n\nPydantic model `Policy` single source of validation hai -- file load, admin API, aur Redis read teeno pe same rules.",
+  "why_needed": "Configuration management design production operability decide karta hai.",
+  "real_world_analogy": "Restaurant menu printed hai (JSON defaults) lekin aaj ke specials board pe chalk se (overrides) -- board mitao toh printed menu wapas.",
+  "how_it_works": "Defaults from file -> overrides from Redis -> merge -> cached per instance; one Pydantic schema validates all paths.",
+  "in_this_project": "`services/policy_store.py::PolicyStore`, `ratelimiter/policies.json`, `api/routes.py` admin endpoints, `domain/models.py::Policy`.",
+  "implementation_files": [
+   "projects/01-rate-limiter/ratelimiter/services/policy_store.py::PolicyStore",
+   "projects/01-rate-limiter/ratelimiter/policies.json",
+   "projects/01-rate-limiter/ratelimiter/api/routes.py::update_policy",
+   "projects/01-rate-limiter/ratelimiter/domain/models.py::Policy"
+  ],
+  "code_example": "# real: policy_store.py\nasync def upsert(self, policy: Policy) -> None:\n    if policy.name not in self._defaults:\n        # Only existing policies can be tuned; adding a policy also needs a route group change (code review).\n        raise KeyError(policy.name)\n    await self._redis.hset(OVERRIDES_KEY, policy.name, policy.model_dump_json())\n    self._loaded_at = 0.0",
+  "code_language": "python",
+  "advantages": [
+   "Reviewed defaults + runtime tuning",
+   "No new infrastructure",
+   "Single validation schema"
+  ],
+  "disadvantages": [
+   "Overrides not durable without Redis persistence",
+   "No audit trail"
+  ],
+  "common_mistakes": [
+   "Config in env vars for nested data",
+   "Allowing runtime creation of arbitrary policies"
+  ],
+  "follow_up_questions": [
+   "How would you add an audit log?",
+   "What if the JSON default and an override conflict after a deploy?",
+   "Would you use a feature-flag service for this?"
+  ],
+  "concepts": [
+   "configuration management",
+   "pydantic",
+   "runtime config"
+  ],
+  "advanced": null
+ }
+]

@@ -1,0 +1,971 @@
+[
+ {
+  "id": "MKFK-067",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Intermediate",
+  "question": "How much does producer batching help, and why? Use your measured numbers.",
+  "answer_hinglish": "TESTING.md ke real numbers (2026-11-17, Windows 11 laptop-class machine, local SSD, HTTP producer client -> ASGI in-process API, acks=all, rf=3, 4 partitions):\n\n- batch_size 1, linger 0ms: 376 msg/s\n- batch_size 100, linger 5ms: 13,400 msg/s\n- batch_size 1000, linger 10ms: 32,841 msg/s\n\nYaani ~87x. Kyun? Har request ki fixed cost hai jo message size pe depend nahi karti: HTTP parse, JSON decode, pydantic validation, routing, leader lookup, min ISR check, `log.append` + flush syscall, aur sabse badi -- acks=all ka replication round trip (follower fetch, phir dobara fetch taaki HW badhe). Batch 1 pe yeh poori cost har message pe; batch 1000 pe 1000 messages mein baant di. Records per request badhne se per-message overhead almost gayab ho jata hai, aur throughput latency ke bajaye CPU/bandwidth se bound ho jata hai.\n\nStorage layer pe bhi same pattern: `Log.append` batch 1 = 117,392 msg/s, batch 100 = 526,267, batch 1000 = 562,998 (100-byte values) -- yahan flush syscall per append amortize hota hai.\n\nCost: latency. linger_ms = har message us time tak ruk sakta hai; batch bada = memory. Kafka producers isi wajah se by default batch karte hain (`batch.size`, `linger.ms`; Kafka 3.x mein linger default bhi badhaya gaya). README ka conclusion: \"Batching is the single biggest lever\".",
+  "why_needed": "Throughput tuning ka sabse pehla aur sabse effective knob.",
+  "real_world_analogy": "Ek ek chitthi ke liye post office jaana vs din bhar ki chitthiyan ek baar mein le jaana -- trip ka kharcha same, chitthiyan zyada.",
+  "how_it_works": "Fixed per-request cost C, per-message cost m: throughput ~ batch / (C + batch*m). Batch badhne pe 1/m tak pahunchta hai.",
+  "in_this_project": "`bench/bench.py::http_producer` teen configs chalata hai; `Producer(batch_size=..., linger_ms=...)`. `bench/bench.py::storage` storage numbers.",
+  "implementation_files": [
+   "projects/05-mini-kafka/bench/bench.py::http_producer",
+   "projects/05-mini-kafka/bench/bench.py::storage",
+   "projects/05-mini-kafka/minikafka/client/producer.py::Producer",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real: bench/bench.py\nfor batch_size, linger in [(1, 0), (100, 5), (1000, 10)]:\n    ...\n    p = Producer(\"http://mk\", transport=tr, batch_size=batch_size, linger_ms=linger)",
+  "code_language": "python",
+  "advantages": [
+   "Order of magnitude throughput gain",
+   "Fewer requests = less broker CPU"
+  ],
+  "disadvantages": [
+   "Added latency (linger)",
+   "Bigger failure blast radius per request"
+  ],
+  "common_mistakes": [
+   "Benchmark bina batching ke karke system ko slow bolna",
+   "Linger ko ignore karke 'batching' maan lena"
+  ],
+  "follow_up_questions": [
+   "What latency does linger_ms add?",
+   "Why does acks=all benefit more from batching than acks=1?",
+   "How would compression interact with batching?"
+  ],
+  "concepts": [
+   "batching",
+   "throughput",
+   "amortization"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-068",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Tell the profiling story: how did acks=all go from 8.7k to 73.8k msg/s?",
+  "answer_hinglish": "Symptom: in-process cluster pe acks=1 sequential ~445k msg/s tha, lekin acks=all sirf 8,702 msg/s (rf=3, batch 100). Itna gap expected nahi tha.\n\nHypothesis 1: \"follower long-poll timeouts / Windows timer resolution\" -- shayad followers `replica_fetch_wait_ms` tak sote rehte hain. Test: fetch wait 1ms aur 50ms dono pe latency identical -> REJECTED.\n\nHypothesis 2: \"reads slow hain\". Micro-benchmark: `Segment.read` 0.83ms, file open 0.07ms -> itna nahi ki 8.7k explain ho -> REJECTED.\n\nMeasure, don't guess: 100 requests pe cProfile. Result: `io.open` = 239 calls, 0.75s -- 65% time, ~3.1ms per call. Insight: idle file kholna sasta (0.07ms) tha, lekin JUST-WRITTEN file kholna Windows pe bahut mehenga -- aur replication path exactly yahi karta tha: leader append karta, follower turant usi segment ko padhne ke liye open karta.\n\nFix: (1) har segment ka ek long-lived reusable read handle (`self._reader`), seek+read; (2) read only what can exist (bounded `want`). Result: acks=all sequential 73,795 msg/s (7.7x); 8 partitions concurrent 8,125 -> 63,202 msg/s, p50 94.6ms -> 9.6ms.\n\nLesson jo main bolta hoon: do plausible hypotheses data se reject hui; profiler ne non-obvious OS-level cause dikhaya. Micro-benchmark galat context mein tha (idle file) -- benchmark real access pattern pe karo.",
+  "why_needed": "Interviewers 'tell me about a performance problem you solved' poochte hain -- yeh measurable, honest story hai.",
+  "real_world_analogy": "Doctor ne pehle do guesses check kiye (BP, sugar) -- normal. Phir full blood test (profiler) se asli wajah mili jo kisi ne socha nahi tha.",
+  "how_it_works": "Hypothesis -> experiment -> reject; profile under real workload; fix the hot spot; re-measure.",
+  "in_this_project": "TESTING.md \"Investigation of the slow acks=all\"; fix `storage/segment.py::Segment.read` (comment mein numbers); TRADEOFFS #10; LEARNING_GUIDE step 9.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/segment.py::read",
+   "projects/05-mini-kafka/TESTING.md",
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/bench/bench.py::cluster"
+  ],
+  "code_example": "# how the profile was taken (illustrative)\nimport cProfile, pstats\ncProfile.run(\"asyncio.run(run_100_acks_all_requests())\", \"prof.out\")\npstats.Stats(\"prof.out\").sort_stats(\"cumtime\").print_stats(15)\n# -> io.open: 239 calls, 0.75s (~65% of total)",
+  "code_language": "python",
+  "advantages": [
+   "Data-driven, 7.7x gain",
+   "Small, targeted code change"
+  ],
+  "disadvantages": [
+   "Fix is partly OS-specific",
+   "Costs one fd per segment"
+  ],
+  "common_mistakes": [
+   "Pehla hypothesis bina test kiye fix kar dena",
+   "Micro-benchmark ko real workload maan lena"
+  ],
+  "follow_up_questions": [
+   "Why was opening a just-written file slow on Windows?",
+   "How would you profile an asyncio app?",
+   "Would this fix matter on Linux?"
+  ],
+  "concepts": [
+   "profiling",
+   "cProfile",
+   "performance debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Long-lived handles: speed vs fd count. Alternative mmap bhi fd + address space leta hai.",
+   "failure_scenarios": "Fd exhaustion, stale handle after truncation (handled by `_close_reader`), aur Linux pe gain chhota ho sakta hai (open sasta hota hai) -- toh claim sirf Windows measurement ka hai.",
+   "alternatives": "Page cache via mmap, sendfile, keeping data in memory for followers (in-process shortcut -- but that would cheat the storage path).",
+   "scale_10x_100x": "Bade scale pe profiling flame graphs (py-spy) aur continuous profiling; sampling profilers production-safe hain, cProfile nahi.",
+   "production_improvements": "Benchmarks ko CI mein regression guard, py-spy based profiling script, per-stage latency metrics (append, replicate, HW advance)."
+  }
+ },
+ {
+  "id": "MKFK-069",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why does adding concurrency (8 partitions in parallel) not increase throughput in this cluster?",
+  "answer_hinglish": "Measured: acks=all sequential 73,795 msg/s, 8 partitions concurrently 63,202 msg/s -- concurrent thoda KAM. Fix se pehle bhi 8,702 vs 8,125. Latency p50 9.6ms (concurrent) dikhata hai ki requests overlap toh ho rahi hain, lekin total kaam same CPU pe hai.\n\nReason: poora simulated cluster -- teen brokers, saare replicate loops, controller, aur benchmark producers -- ek hi Python process aur ek hi asyncio event loop pe hai. Python GIL + single loop = ek time pe ek hi core kaam karta hai. Kaam CPU-bound hai: record encode/decode, CRC32, struct pack/unpack, list building, file syscalls (synchronous). Concurrency (asyncio) sirf waiting overlap karti hai; jab waiting nahi, sirf CPU hai, toh concurrency se extra throughput nahi milta -- ulta scheduling aur context switching overhead.\n\nReal Kafka mein yahi 8 partitions alag brokers (alag machines/cores) pe lead hote hain, replication alag fetcher threads pe, aur network + disk I/O parallel -- isliye partitions add karne se linear-ish scaling milta hai. README limitation: \"concurrency across partitions doesn't add throughput (measured); real brokers are separate processes/machines\".\n\nInterview point: \"concurrency != parallelism\". Aur benchmark interpret karte waqt bottleneck identify karo -- yahan CPU, real Kafka mein usually network/disk.",
+  "why_needed": "Benchmark results ko sahi interpret karna aur architecture ki limit samajhna.",
+  "real_world_analogy": "Ek hi chef 8 dishes ek saath 'banane' ki koshish kare -- woh switch karta rahega par total speed nahi badhegi. 8 chefs (processes) chahiye.",
+  "how_it_works": "asyncio overlaps I/O waits; CPU-bound code serialises on one core; GIL prevents threads from helping pure-Python CPU work.",
+  "in_this_project": "`bench/bench.py::cluster` -- `worker(part)` per partition with `asyncio.gather`; TESTING.md table; TRADEOFFS #1 (\"one CPU for all brokers -- measured\").",
+  "implementation_files": [
+   "projects/05-mini-kafka/bench/bench.py::cluster",
+   "projects/05-mini-kafka/TESTING.md",
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/README.md"
+  ],
+  "code_example": "# real, trimmed: bench/bench.py\nasync def worker(part):\n    for _ in range(n // batch // 8):\n        t0 = time.perf_counter()\n        await c.produce(\"p8\", part, items, acks=\"all\")\n        lat.append(time.perf_counter() - t0)\nawait asyncio.gather(*[worker(i) for i in range(8)])",
+  "code_language": "python",
+  "advantages": [
+   "Honest measurement exposes architecture limit",
+   "Latency per request still improves"
+  ],
+  "disadvantages": [
+   "No horizontal scaling inside one process",
+   "Benchmark numbers not comparable to real Kafka"
+  ],
+  "common_mistakes": [
+   "asyncio ko parallelism samajhna",
+   "In-process numbers ko production capacity maan lena"
+  ],
+  "follow_up_questions": [
+   "How would you get parallelism in Python here?",
+   "What is the bottleneck in real Kafka usually?",
+   "Why did concurrent p50 latency drop?"
+  ],
+  "concepts": [
+   "concurrency vs parallelism",
+   "GIL",
+   "CPU-bound"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "In-process design deterministic tests deta hai lekin scaling experiments meaningless bana deta hai. Dono ek saath nahi milte.",
+   "failure_scenarios": "CPU saturation pe heartbeats late -> spurious failovers; event loop lag poore cluster ko slow karta hai.",
+   "alternatives": "Process per broker (multiprocessing / separate uvicorn apps), Rust/Go broker, ya CPU-heavy parts (CRC, encode) ko C extensions (zlib already C hai).",
+   "scale_10x_100x": "10x partitions in-process = same throughput, zyada latency. Multi-process = roughly per-core scaling tak.",
+   "production_improvements": "Broker processes with TCP RPC, per-broker benchmarks, event loop lag metric."
+  }
+ },
+ {
+  "id": "MKFK-070",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Beginner",
+  "question": "What do the storage benchmarks show about batching and fsync?",
+  "answer_hinglish": "`Log.append` with 100-byte values (TESTING.md, Windows 11 laptop, local SSD):\n\n- batch 1, no fsync: 117,392 msg/s (15.0 MB/s)\n- batch 100, no fsync: 526,267 msg/s (67.4 MB/s)\n- batch 1000, no fsync: 562,998 msg/s (72.1 MB/s)\n- batch 100, fsync every append: 85,229 msg/s (10.9 MB/s)\n- sequential read: 363,362 msg/s\n\nTeen lessons. (1) Batching yahan bhi 4.5x deta hai: har `append` pe ek `write` + `flush` syscall hota hai; batch mein yeh amortize hota hai. 100 se 1000 pe gain chhota -- ab Python-level per-record encode/CRC cost dominate karta hai. (2) fsync expensive hai: batch 100 pe 526k se 85k (~6x slower), kyunki fsync disk tak data jaane ka wait karta hai, page cache pe nahi rukta. (3) Isliye Kafka by default fsync nahi karta -- durability replication se aati hai (data 3 machines ki page cache mein; ek saath teeno ka power jaana unlikely). `log.flush.interval.messages` default effectively infinite hai.\n\nminikafka mein `Log(fsync_every_append=False)` default hai; sirf `__consumer_offsets` commit `flush(fsync=True)` karta hai. Caveat: yeh in-process numbers hain, Python mein; real Kafka (JVM, zero-copy, compression) MB/s mein kaafi upar jata hai.",
+  "why_needed": "fsync vs replication-based durability ka trade-off har storage interview mein aata hai.",
+  "real_world_analogy": "Har page likhne ke baad file almari mein lock karna (fsync) vs din ke end pe ek baar -- aur teen alag offices mein copy rakhna (replication).",
+  "how_it_works": "write() -> OS page cache (fast); fsync() -> wait until device persisted (slow). Batching amortizes both.",
+  "in_this_project": "`bench/bench.py::storage`, `Log.append_records` -> `segments[-1].flush(fsync=self.fsync_every_append)`, `Segment.flush` (`os.fsync`).",
+  "implementation_files": [
+   "projects/05-mini-kafka/bench/bench.py::storage",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::flush",
+   "projects/05-mini-kafka/minikafka/storage/log.py::append_records",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real: storage/segment.py\ndef flush(self, fsync: bool = False) -> None:\n    self._log.flush()\n    self._idx.flush()\n    if fsync:\n        os.fsync(self._log.fileno())",
+  "code_language": "python",
+  "advantages": [
+   "Clear quantified fsync cost",
+   "Shows batching at storage layer"
+  ],
+  "disadvantages": [
+   "Python CPU bound beyond batch 100",
+   "Windows-specific numbers"
+  ],
+  "common_mistakes": [
+   "Har write pe fsync karke 'durable' bolna aur throughput gawana",
+   "fsync ke bina single-replica durability claim karna"
+  ],
+  "follow_up_questions": [
+   "Why doesn't Kafka fsync every message?",
+   "When would you enable fsync?",
+   "Why is the read rate lower than the append rate?"
+  ],
+  "concepts": [
+   "fsync",
+   "page cache",
+   "storage benchmark"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-071",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why is real Kafka fast, and which of those techniques does minikafka use?",
+  "answer_hinglish": "Kafka ki speed ke main reasons:\n\n1. Sequential I/O: sirf append aur linear reads. Spinning disks pe bhi sequential throughput bahut high, random seeks nahi. -- minikafka: HAAN, append-only segments, sequential reads.\n2. OS page cache: Kafka apna cache nahi rakhta; recent data page cache se serve hota hai, consumers jo tail pe hain unhe disk touch hi nahi karni padti. -- minikafka: implicitly haan (OS cache), lekin Python read path data user space mein copy karta hai.\n3. Zero-copy (`sendfile`): page cache se seedha socket, bina user-space copy. -- NAHI: yahan records decode hoke JSON banake HTTP pe jaate hain.\n4. Batching end to end: producer batch, broker batch ko as-is likhta hai, consumer batch fetch. -- partially: producer batching haan, lekin broker records ko individually encode karta hai.\n5. Compression per batch (lz4/zstd/snappy): network + disk dono kam. -- NAHI (\"no compression\").\n6. Binary protocol + immutable batch format: broker ko records parse nahi karne padte (sirf CRC/header validate). -- NAHI: per-record CRC, JSON over HTTP.\n7. Partitioning across brokers: horizontal scale. -- logically haan, lekin ek process mein.\n\nIsliye minikafka ke numbers (HTTP ~33k msg/s batched) real Kafka (single broker pe millions msg/s typical ballpark) se compare nahi karne chahiye. Project ka goal internals samajhna tha, raw throughput nahi.",
+  "why_needed": "'Kafka itna fast kyun hai' sabse common Kafka interview question.",
+  "real_world_analogy": "Highway pe ek lane mein seedha chalna (sequential) vs gali gali mudna (random). Plus samaan ek truck mein pack karke (batch + compression) aur warehouse se seedha truck mein load (zero-copy).",
+  "how_it_works": "Append-only log + page cache + sendfile + batch compression + binary format + partition parallelism.",
+  "in_this_project": "`storage/` append-only design; `record.py` docstring per-record vs batch CRC; README limitations (no compression, UTF-8 strings over HTTP); SYSTEM_DESIGN \"Scaling path\".",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/record.py",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::read",
+   "projects/05-mini-kafka/README.md",
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Sequential I/O design captured",
+   "Clear list of missing optimisations"
+  ],
+  "disadvantages": [
+   "No zero-copy, no compression, JSON overhead"
+  ],
+  "common_mistakes": [
+   "Kafka speed ko sirf 'it uses disk cleverly' bolna bina specifics",
+   "Zero-copy ko TLS ke saath bhi kaam karta maan lena (TLS mein sendfile nahi hota bina kTLS)"
+  ],
+  "follow_up_questions": [
+   "Why does TLS disable zero-copy?",
+   "Which compression codec would you choose?",
+   "How does the page cache help consumers at the tail?"
+  ],
+  "concepts": [
+   "zero-copy",
+   "page cache",
+   "compression",
+   "sequential I/O"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Kafka ne in-process cache ke bajaye OS cache choose kiya -- GC pressure kam, restart pe cache warm. Cost: OS pe dependence aur memory isolation kam.",
+   "failure_scenarios": "Consumers jo bahut peeche hain (catch-up reads) page cache evict karke tail readers ko slow karte hain; tiered storage / separate fetch paths help.",
+   "alternatives": "Custom caching (Pulsar BookKeeper ledger cache), io_uring, direct I/O.",
+   "scale_10x_100x": "Network usually pehla bottleneck; compression + batching zaroori; NIC bandwidth per broker plan karo.",
+   "production_improvements": "Binary TCP protocol, batch-level CRC + compression, sendfile path for raw segment bytes."
+  }
+ },
+ {
+  "id": "MKFK-072",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "How would this design scale to production? Walk through the scaling path.",
+  "answer_hinglish": "SYSTEM_DESIGN \"Scaling path\" ke steps, priority order mein:\n\n1. Brokers as separate processes/machines: sabse pehla. In-process design ki CPU limit (measured) hatao. Har broker apna process, TCP binary protocol, apni disk.\n2. Partition leaders spread across brokers: already placement round-robin hai; plus rack awareness aur preferred-leader rebalancing.\n3. Controller quorum (KRaft): single controller SPOF hai. Kafka ne ZooKeeper hata ke KRaft banaya -- controllers ka Raft quorum, metadata ek replicated log (`__cluster_metadata`) mein; brokers us log ko follow karte hain. Failover seconds mein, lakhon partitions support.\n4. Group coordinators partitioned by group id: `__consumer_offsets` ke N partitions, group ka coordinator = `hash(group) % N` partition ka leader. Yahan single coordinator hai.\n5. Zero-copy (`sendfile`) from page cache to sockets: consumer read path cheap.\n6. Batch compression (zstd/lz4) aur batch-level CRC: network/disk 3-5x kam typical.\n7. Tiered storage (KIP-405): purane segments S3 jaise object store pe, local disk sirf hot data. Retention lambi, broker disks chhote, broker replace fast.\n8. Log compaction for keyed topics aur offsets topic.\n9. Quotas per client, auth (SASL/mTLS), ACLs.\n\n10x / 100x: partitions aur brokers badhao; consumer groups partitions tak scale; hot keys ke liye key salting. Bottleneck usually network, phir disk, phir metadata (partition count). Interview mein main yeh bhi bolta hoon ki maine kya measure kiya (in-process CPU bound) aur kaunsa step us bottleneck ko address karta hai.",
+  "why_needed": "Senior interviews mein toy design se production design tak ka roadmap expected hai.",
+  "real_world_analogy": "Ek dukaan se chain banana: alag branches (brokers), central HQ ki jagah board of directors (KRaft quorum), godown purane stock ke liye (tiered storage), aur har branch ki alag cash counter (coordinators).",
+  "how_it_works": "Remove process limit -> remove controller SPOF -> spread coordinators -> cheapen data path -> cheapen storage.",
+  "in_this_project": "SYSTEM_DESIGN.md \"Scaling path (real Kafka)\", README Known limitations, TRADEOFFS #1, #5, #6.",
+  "implementation_files": [
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md",
+   "projects/05-mini-kafka/README.md",
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::Cluster",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::GroupCoordinator"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear prioritised roadmap tied to measured limits"
+  ],
+  "disadvantages": [
+   "Each step adds operational complexity"
+  ],
+  "common_mistakes": [
+   "Scaling ko sirf 'add more brokers' bolna bina controller/metadata limits",
+   "Tiered storage ko free lunch samajhna (remote read latency)"
+  ],
+  "follow_up_questions": [
+   "What does KRaft change versus ZooKeeper?",
+   "How does tiered storage affect consumers reading old data?",
+   "What limits the number of partitions per cluster?"
+  ],
+  "concepts": [
+   "scaling",
+   "KRaft",
+   "tiered storage",
+   "zero-copy"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har step ka cost: multi-process = network failures real ho jaate hain; KRaft = Raft implement/operate; tiered storage = remote fetch latency aur cost.",
+   "failure_scenarios": "Scale pe naye failure modes: controller failover, metadata propagation lag, rebalance storms in big groups, page cache thrash from lagging consumers.",
+   "alternatives": "Managed Kafka (MSK, Confluent), Pulsar (compute/storage separation by design), Redpanda (C++, thread-per-core).",
+   "scale_10x_100x": "10x: more brokers + partitions. 100x: multiple clusters by domain, tiered storage, cluster linking / MirrorMaker for cross-region.",
+   "production_improvements": "Pehle process separation + binary protocol, phir KRaft-style metadata log, phir compression aur tiered storage; har step pe benchmark."
+  }
+ },
+ {
+  "id": "MKFK-073",
+  "project_slug": "p05-mini-kafka",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "What is a hot partition, how does key skew cause it, and how would you fix it?",
+  "answer_hinglish": "Hot partition: ek partition ko baaki se bahut zyada traffic. Key partitioning mein same key hamesha same partition jaati hai, toh agar keys ka distribution uneven hai (ek bada customer, celebrity user, ek popular product), us key ka partition overload hota hai: uska leader broker zyada busy, aur group mein us partition ka ek hi consumer -- uska lag badhta hai jabki baaki consumers idle.\n\nDemo example (SYSTEM_DESIGN): 5 keys (`customer-0..4`) over 3 partitions -> 36/12/12 records. 5 keys 3 partitions mein evenly nahi bat sakti, aur crc32 ke hisaab se teen keys ek hi partition mein gir gayi -- 60% traffic ek partition pe. Low-cardinality keys ka yeh natural result hai.\n\nFixes:\n1. Better key choice: high-cardinality key (order_id instead of country).\n2. Key salting: hot key ko `key#0..key#N` mein split -- load spread, lekin us key ki ordering ab sirf sub-key level pe. Consumer ko merge/reorder karna pad sakta hai.\n3. Zyada partitions -- tabhi help karta hai jab keys zyada hon; ek single hot key ek partition se zyada nahi le sakti.\n4. Custom partitioner: known hot keys ke liye dedicated partitions.\n5. Null key (round-robin / sticky) agar ordering ki zaroorat nahi.\n6. Consumer side: hot partition ke records ko consumer ke andar per-key worker pool mein parallel process karna.\n\nDetection: per-partition lag (`/groups/{g}`), per-partition LEO growth on `/metadata`.",
+  "why_needed": "Real systems mein key skew sabse common Kafka performance issue hai.",
+  "real_world_analogy": "Mall mein 3 billing counters lekin sab log ek hi counter pe kyunki 'brand X wale customers counter 1 pe' rule hai.",
+  "how_it_works": "partition = hash(key) % n; skewed key frequency -> skewed partition load; partition is the max unit of parallelism.",
+  "in_this_project": "`demo.py` (`key=f\"customer-{i % 5}\"`, 3 partitions), `producer.py` crc32 partitioner, SYSTEM_DESIGN aur LEARNING_GUIDE step 3 (\"36/12/12: hot partition / key skew ka real example\").",
+  "implementation_files": [
+   "projects/05-mini-kafka/demo.py",
+   "projects/05-mini-kafka/minikafka/client/producer.py::send",
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md",
+   "projects/05-mini-kafka/LEARNING_GUIDE.md"
+  ],
+  "code_example": "# illustrative: salting a known hot key across 4 sub-partitions\ndef salted_key(key: str, hot: set[str], salt_buckets: int = 4) -> str:\n    if key in hot:\n        return f\"{key}#{random.randrange(salt_buckets)}\"   # per-key order now only per salt bucket\n    return key",
+  "code_language": "python",
+  "advantages": [
+   "Key partitioning keeps per-key order",
+   "Salting restores parallelism for hot keys"
+  ],
+  "disadvantages": [
+   "Skew inherent with low-cardinality keys",
+   "Salting breaks strict per-key order"
+  ],
+  "common_mistakes": [
+   "Partitions badhakar single hot key fix karne ki ummeed",
+   "Country/status jaise low-cardinality key choose karna"
+  ],
+  "follow_up_questions": [
+   "How do you detect a hot partition?",
+   "What do you lose with key salting?",
+   "Why didn't 5 keys spread evenly?"
+  ],
+  "concepts": [
+   "hot partition",
+   "key skew",
+   "salting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Ordering vs parallelism: ek key ka order chahiye toh us key ki throughput ek partition (ek consumer) tak capped.",
+   "failure_scenarios": "Hot partition leader broker ka CPU/network saturate -> us broker ke baaki partitions bhi slow; consumer lag grows -> retention se data loss risk.",
+   "alternatives": "Custom partitioner, two-level partitioning, ya design change (aggregate pehle, phir publish).",
+   "scale_10x_100x": "Traffic 10x pe skew aur visible; bade tenants ke liye dedicated topics.",
+   "production_improvements": "Per-partition bytes-in metrics + alerts, partitioner choice documented per topic, hot-key detection in producer."
+  }
+ },
+ {
+  "id": "MKFK-074",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why is adding partitions to an existing topic risky for keyed data?",
+  "answer_hinglish": "Kyunki partition = `hash(key) % num_partitions`. Partition count 3 se 4 karo toh zyadatar keys ka partition badal jaata hai. `customer-42` pehle partition 1 mein jaata tha, ab partition 3 mein. Purane events partition 1 mein hain, naye partition 3 mein.\n\nProblems: (1) Per-key ordering transition pe toot sakti hai -- consumer partition 3 ka naya event (customer-42 ka \"order shipped\") partition 1 ke purane unprocessed event (\"order created\") se pehle process kar sakta hai, kyunki do alag partitions alag consumers pe alag speed se chalte hain. (2) Stateful consumers (per-key aggregates, local state stores) ka state ab galat partition pe hai. (3) Co-partitioned joins toot jaate hain agar sirf ek topic ke partitions badhe.\n\n`api/app.py::default_partition` docstring: \"Changing the partition count changes the mapping -- that's why Kafka partitions are rarely added.\" minikafka mein partitions add karne ka API hi nahi hai (create time pe fix). Producer client partition count `_partitions` mein cache bhi karta hai -- agar count badalta toh purana producer purani mapping use karta rehta.\n\nPractical approaches: shuru se partitions over-provision karo (expected peak consumer parallelism x headroom); agar badhane hi hain toh naya topic banao aur migrate karo (dual write ya drain-then-switch); ya consistent hashing based custom partitioner (sirf ~1/n keys move hoti hain, lekin phir bhi move hoti hain).",
+  "why_needed": "Capacity planning decision jo baad mein badalna mehenga hai.",
+  "real_world_analogy": "Sorting office mein 3 pincodes zones the, 4 kar diye -- ab aapke ghar ki chitthiyan naye zone ke postman ke paas, aur purani chitthiyan abhi purane postman ke bag mein.",
+  "how_it_works": "Modulo hashing is not stable under n changes; consistent hashing reduces but doesn't remove movement.",
+  "in_this_project": "`api/app.py::default_partition` docstring, `client/producer.py::_partition_count` caching, SYSTEM_DESIGN \"Adding partitions changes key -> partition mapping\".",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/api/app.py::default_partition",
+   "projects/05-mini-kafka/minikafka/client/producer.py::_partition_count",
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Fixed partition count = stable ordering",
+   "Simple modulo hashing"
+  ],
+  "disadvantages": [
+   "Must over-provision upfront",
+   "Scaling consumers capped by initial choice"
+  ],
+  "common_mistakes": [
+   "Load badhne pe casually partitions add karna",
+   "Producer metadata refresh na karna"
+  ],
+  "follow_up_questions": [
+   "How would you migrate to more partitions safely?",
+   "How does consistent hashing help?",
+   "How many partitions would you start with?"
+  ],
+  "concepts": [
+   "repartitioning",
+   "key mapping",
+   "capacity planning"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-075",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why build the cluster in-process instead of as real multi-process brokers? Defend the choice.",
+  "answer_hinglish": "Goal tha Kafka ke replication, HW, ISR, election aur group protocol ke RULES ko implement aur PROVE karna. Iske liye sabse important cheez thi deterministic failure tests: \"leader ko isolate karo, uske baad ek record leader pe likho, phir kill karo\" -- exactly us order mein. Real processes + sockets mein timing race hoti, tests flaky hote, aur har failure test seconds leta. In-process mein 40 tests ~8s mein, repeated runs pe stable.\n\nDoosra: code size aur focus. RPC layer, serialization, connection management, metadata propagation, retries -- yeh sab Kafka ke important parts hain lekin replication semantics se orthogonal. In-process mein fetch = method call, toh logic clean dikhta hai.\n\nTeesra: jo important tha woh REAL rakha -- storage (disk pe segments, recovery, truncation), aur follower actually records copy karta hai.\n\nCost (honestly): (1) one CPU for all brokers -- measured, concurrency throughput nahi badhati; (2) no real network partitions, split brain, stale metadata, partial failures; (3) kill = graceful-ish (OS buffers survive); (4) controller SPOF hidden. TRADEOFFS #1 yahi likhta hai.\n\nAgar dobara banata ya production-ise karta: same `Cluster` logic ko broker process mein daalta, ek thin RPC layer (fetch, produce, metadata, LeaderAndIsr) ke peeche, aur failure tests ke liye toxiproxy / network namespaces. Logic tests in-process hi rehte (fast), aur ek alag chaos suite multi-process pe.",
+  "why_needed": "Design choices defend karna -- aur unki cost maanna -- senior signal hai.",
+  "real_world_analogy": "Car ka engine test bench pe test karna (controlled, repeatable) vs highway pe -- dono chahiye, lekin pehle bench.",
+  "how_it_works": "Simulation boundary at the network; storage and protocol logic real.",
+  "in_this_project": "TRADEOFFS #1, README real-vs-simulated table, `cluster.py` docstring, TESTING.md (\"40 tests, ~8s; stable over repeated runs\").",
+  "implementation_files": [
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/README.md",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::Cluster",
+   "projects/05-mini-kafka/TESTING.md",
+   "projects/05-mini-kafka/tests/conftest.py::fast_config"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Deterministic, fast tests",
+   "Focus on semantics",
+   "Real storage"
+  ],
+  "disadvantages": [
+   "No parallelism",
+   "No real network failure modes",
+   "Hidden controller SPOF"
+  ],
+  "common_mistakes": [
+   "Simulation ko hide karna interview mein",
+   "In-process throughput numbers ko capacity claim banana"
+  ],
+  "follow_up_questions": [
+   "Which bugs would only show up with real processes?",
+   "How would you keep tests deterministic with real brokers?",
+   "What did the in-process design let you prove?"
+  ],
+  "concepts": [
+   "simulation",
+   "testability",
+   "design trade-off"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Determinism + simplicity vs realism + performance. Maine semantics-first choose kiya kyunki project ka goal learning + provable behaviour tha.",
+   "failure_scenarios": "Production mein jo failures sabse zyada hote hain (network partitions, slow nodes, metadata lag) wohi untested hain.",
+   "alternatives": "Multi-process on localhost with fault proxies; deterministic simulation testing (FoundationDB/TigerBeetle style) jahan network bhi controlled scheduler ke under.",
+   "scale_10x_100x": "Scale experiments in-process meaningless; multi-process zaroori 10x se pehle hi.",
+   "production_improvements": "RPC boundary introduce karo but keep an in-memory transport implementation for tests (same interface) -- best of both."
+  }
+ },
+ {
+  "id": "MKFK-076",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "Why one CRC per record instead of one per batch like Kafka?",
+  "answer_hinglish": "Kafka RecordBatch format mein ek CRC poore batch pe hota hai (aur compression bhi per batch). minikafka mein har record ka apna CRC hai.\n\nPer-record kyun choose kiya: (1) Readability -- format simple hai, har record self-contained frame hai, `decode_at` ek function. (2) Precise recovery -- torn write ya bit rot exact record pe pakda jata hai, toh recovery sirf us record se truncate karti hai. Per-batch CRC mein poora batch invalid hota hai (jo theek bhi hai, kyunki batch atomically likha jana chahiye). (3) Followers aur readers record-level pe kaam karte hain, batches ka concept storage mein nahi hai.\n\nCost: (1) Bytes -- har record pe 8 bytes (size + crc) + offset 8 + timestamp 8 = header overhead; 100-byte values pe significant. Kafka deltas aur varints use karta hai. (2) CPU -- per record CRC compute, encode aur decode pe dono. (3) Compression impossible jaisa -- compression batch pe hi meaningful hai.\n\nTRADEOFFS #8: \"Easier to read and to recover precisely; costs bytes and CPU vs per-batch CRC.\" README limitations mein bhi. Interview mein main bolta hoon ki production ke liye main batch format apnaunga kyunki batching hi throughput hai, aur batch ek atomic unit bhi hai (producer ka batch ya poora likha ya kuch nahi).",
+  "why_needed": "Storage format choices ka throughput aur recovery pe impact samjhana.",
+  "real_world_analogy": "Har chocolate pe alag wrapper (per record) vs poore dabbe pe ek seal (per batch): alag wrapper zyada kaagaz, lekin ek kharab chocolate ke liye poora dabba nahi phenkna padta.",
+  "how_it_works": "CRC32 over each record payload; decode validates each frame independently.",
+  "in_this_project": "`storage/record.py` docstring (\"Kafka really writes record BATCHES with one CRC per batch ... one CRC per record keeps this readable\"), TRADEOFFS #8.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/record.py::Record",
+   "projects/05-mini-kafka/minikafka/storage/record.py::decode_at",
+   "projects/05-mini-kafka/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Simple format, precise recovery"
+  ],
+  "disadvantages": [
+   "Overhead per record",
+   "No compression"
+  ],
+  "common_mistakes": [
+   "CRC ko security feature samajhna",
+   "Batch format ke atomicity benefit ko ignore karna"
+  ],
+  "follow_up_questions": [
+   "What else is in Kafka's batch header?",
+   "How would you add compression?",
+   "Is a batch written atomically to disk?"
+  ],
+  "concepts": [
+   "CRC",
+   "record batch",
+   "storage format"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-077",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why does the coordinator compute assignments here, while Kafka does it on the group leader client?",
+  "answer_hinglish": "Kafka classic protocol: JoinGroup ke response mein coordinator ek member ko \"leader\" banata hai aur use saare members ki subscriptions bhejta hai. Leader CLIENT assignor chalata hai aur SyncGroup mein assignment coordinator ko bhejta hai, coordinator sab members ko distribute karta hai. Kyun? Taaki naye assignment strategies (sticky, custom rack-aware, app-specific) ke liye broker upgrade na karna pade -- strategy client library mein hai. Brokers simple rehte hain.\n\nminikafka: coordinator khud `ASSIGNORS[g.strategy]` chala ke sabko result deta hai -- ek round trip (join) mein, SyncGroup phase nahi. `leader` field response mein hai (`min(g.members)`) lekin sirf informational. Groups.py docstring: \"here the coordinator computes it -- same result, fewer round trips. Documented difference.\"\n\nTrade-off: server-side = simple protocol, fewer round trips, central control; lekin new strategy = server deploy, aur custom app-aware assignment (e.g. \"partitions with local state cache prefer member X\") nahi ho sakta. Client-side = flexibility, lekin extra round trip aur leader client ki bug poore group ko affect karti hai.\n\nInteresting twist: Kafka ka naya protocol KIP-848 (consumer group protocol v2) assignment wapas SERVER side le aaya -- incremental, broker-driven, kyunki client-side stop-the-world rebalances bade groups mein dard the. Toh yeh design choice \"galat\" nahi, industry khud dono taraf gayi hai.",
+  "why_needed": "Protocol design trade-offs -- kahan logic rakho, client vs server.",
+  "real_world_analogy": "Team ka kaam baatna: manager khud baante (server) vs manager team ke ek senior ko list de aur woh baante (client leader). Pehla fast, doosra flexible.",
+  "how_it_works": "One-phase join with server-side assignment vs two-phase Join+Sync with client-side assignment.",
+  "in_this_project": "`cluster/groups.py` docstring + `_complete_rebalance`, `assignors.py::ASSIGNORS`, TRADEOFFS #5.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::_complete_rebalance",
+   "projects/05-mini-kafka/minikafka/cluster/assignors.py::ASSIGNORS",
+   "projects/05-mini-kafka/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Fewer round trips",
+   "Simpler client"
+  ],
+  "disadvantages": [
+   "New strategies need server change",
+   "No app-specific assignment"
+  ],
+  "common_mistakes": [
+   "Sochna Kafka brokers hamesha assignment karte the",
+   "Leader member ko 'partition leader' se confuse karna"
+  ],
+  "follow_up_questions": [
+   "What is SyncGroup?",
+   "What does KIP-848 change?",
+   "How would a custom assignor plug in here?"
+  ],
+  "concepts": [
+   "group protocol",
+   "assignment",
+   "client vs server logic"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Server-side central control vs client-side extensibility; KIP-848 shows incremental server-side won for large groups.",
+   "failure_scenarios": "Server-side bug = sab groups affected; client-side leader crash during sync = rebalance retry.",
+   "alternatives": "KIP-848 server-side incremental assignment, client-side assignors (classic), external assignment service.",
+   "scale_10x_100x": "Bade groups (1000 members) mein client-side leader ko bahut bada metadata process karna padta; server-side incremental better.",
+   "production_improvements": "Pluggable assignor registry on server, sticky assignor, incremental assignment diffs."
+  }
+ },
+ {
+  "id": "MKFK-078",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Compare stop-the-world (eager) rebalancing with incremental cooperative rebalancing and KIP-848.",
+  "answer_hinglish": "minikafka classic eager protocol implement karta hai: koi bhi membership change -> `PreparingRebalance` -> HAR member ko heartbeat pe `RebalanceInProgress` -> sab apne SAARE partitions chhod ke (on_revoke) re-join karte hain -> naya assignment. Is beech poora group processing pause. Ek member join kare toh bhi 10 members ke saare partitions revoke-reassign. Aur range/roundrobin sticky nahi hain, toh partitions bina wajah move bhi hote hain (local caches/state lost). TRADEOFFS #9.\n\nProblems scale pe: bade groups mein har rolling deploy = N rebalances; har rebalance = full pause = lag spike. \"Rebalance storms\" jab consumers flap karein.\n\nIncremental cooperative (KIP-429, CooperativeStickyAssignor): rebalance do rounds mein. Round 1 mein members apne partitions rakhte hain, sirf woh revoke hote hain jo move karne hain; round 2 mein woh naye owner ko milte hain. Baaki partitions processing chalti rehti hai. Plus sticky = minimum movement.\n\nStatic membership (KIP-345, `group.instance.id`): restart hone wala consumer same identity se wapas aaye toh session timeout ke andar rebalance hi nahi -- rolling deploys ke liye.\n\nKIP-848 (new consumer group protocol): broker-driven, fully incremental; har member apna target assignment independently reconcile karta hai, global barrier nahi; client-side JoinGroup/SyncGroup dance khatam.\n\nminikafka mein inme se kuch implement nahi -- mention karta hoon ki next step sticky assignor + cooperative two-phase hota, aur `on_revoke` sirf moved partitions ke liye.",
+  "why_needed": "Rebalance pauses production Kafka ki sabse common shikayat hai; evolution samajhna senior expectation.",
+  "real_world_analogy": "Office mein ek naya banda aaya toh sabki desk khaali karwa ke dobara allot karna (eager) vs sirf do logon ki desk shift karna (cooperative).",
+  "how_it_works": "Eager: revoke all -> barrier -> assign. Cooperative: assign minus moved -> revoke moved -> second round assigns moved.",
+  "in_this_project": "`GroupCoordinator._start_rebalance` / `_complete_rebalance` (global barrier), `Consumer._join` (`on_revoke` with full assignment), TRADEOFFS #9.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::_complete_rebalance",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::_join",
+   "projects/05-mini-kafka/minikafka/cluster/assignors.py::ASSIGNORS",
+   "projects/05-mini-kafka/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Eager: simple, obviously correct"
+  ],
+  "disadvantages": [
+   "Eager: full pause per change, unnecessary movement"
+  ],
+  "common_mistakes": [
+   "Rolling deploy ke time static membership na use karna",
+   "Cooperative assignor ko eager ke saath mix karna bina upgrade path"
+  ],
+  "follow_up_questions": [
+   "How does static membership avoid rebalances?",
+   "Why does cooperative need two rounds?",
+   "What did KIP-848 remove from the client?"
+  ],
+  "concepts": [
+   "rebalancing",
+   "cooperative sticky",
+   "KIP-848",
+   "static membership"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Eager = correctness simple (koi partition do jagah nahi), cost = availability. Cooperative = availability, cost = protocol complexity aur do rounds.",
+   "failure_scenarios": "Eager: rebalance storm -> group kabhi stable nahi -> lag explosion. Cooperative: buggy client do generations mix kare toh double ownership window.",
+   "alternatives": "Static membership, cooperative sticky, KIP-848, ya partition-per-consumer manual assignment (`assign()` without groups).",
+   "scale_10x_100x": "100s members: eager rebalance minutes le sakta hai; cooperative/KIP-848 zaroori.",
+   "production_improvements": "Sticky assignor first (sasta win), phir cooperative protocol, rebalance duration aur frequency metrics."
+  }
+ },
+ {
+  "id": "MKFK-079",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "How do acks, min.insync.replicas, replication factor and unclean election together express the durability vs availability trade-off?",
+  "answer_hinglish": "TRADEOFFS #4: \"acks / min ISR / unclean election are configuration, not code. The system exposes the CAP-style choice to the user.\"\n\nKnobs:\n- Replication factor: kitni copies. rf=3 standard.\n- acks: producer kab ack paaye. 0/1/all.\n- min.insync.replicas: acks=all ke liye minimum ISR, warna refuse.\n- unclean leader election: ISR khaali ho toh stale replica ko leader banana ya offline rehna.\n\nStandard durable setup: rf=3, min ISR=2, acks=all, unclean=false. Guarantee: ek broker kabhi bhi mare, koi acknowledged write lost nahi; aur writes ek broker down hone pe bhi chalti hain (ISR 2 >= 2). Do down -> acks=all writes refuse (availability sacrifice), committed data safe. Teeno ISR down -> offline. `DEPLOYMENT.md` yahi recommend karta hai aur demo isi config pe chalta hai.\n\nAvailability-first setup (logs, metrics, clickstream): rf=2 ya 3, acks=1, min ISR 1, unclean=true. Hamesha writable, lekin leader failover pe acks=1 tail lost (proven by test) aur unclean election pe bada loss.\n\nMistakes: min ISR = rf (ek broker down = writes band, zero tolerance); acks=all with min ISR 1 (ISR shrink ke baad acks=all = acks=1); rf=3 but acks=1 (\"3 copies hain toh safe\" -- nahi, ack copy hone se pehle).\n\nSab per-topic hai, toh ek cluster mein payments topic durable aur metrics topic available-first ho sakta hai.",
+  "why_needed": "Configuration se guarantees derive karna -- system design interviews mein direct sawal.",
+  "real_world_analogy": "Bank vault (do chaabi rule, band ho jaye toh band) vs ATM kiosk (hamesha khula, kabhi kabhi glitch). Same bank, alag cheezon ke liye alag rules.",
+  "how_it_works": "Guarantee = f(rf, acks, minISR, unclean). Survive f failures without acked-data loss needs acks=all, minISR >= f+1, unclean=false.",
+  "in_this_project": "`ClusterConfig.unclean_leader_election`, `PartitionMeta.min_insync_replicas`, `Cluster.produce` acks handling; SYSTEM_DESIGN \"Durability knobs\" table; tests prove each corner (acks=1 loss, min ISR reject, offline, unclean loss).",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::produce",
+   "projects/05-mini-kafka/minikafka/cluster/config.py::ClusterConfig",
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md",
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/DEPLOYMENT.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Per-topic choice of guarantees",
+   "Every corner proven by a test"
+  ],
+  "disadvantages": [
+   "Easy to misconfigure into weaker guarantees than believed"
+  ],
+  "common_mistakes": [
+   "min ISR = rf",
+   "acks=1 with rf=3 and assuming durability",
+   "Unclean on for critical topics"
+  ],
+  "follow_up_questions": [
+   "What guarantees do you get with rf=3, minISR=2, acks=all?",
+   "When is availability-first acceptable?",
+   "How do you enforce these settings org-wide?"
+  ],
+  "concepts": [
+   "durability",
+   "availability",
+   "CAP",
+   "configuration"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har knob latency, availability aur durability ke beech slide karta hai; koi universal default nahi.",
+   "failure_scenarios": "Misconfig sabse bada risk: ek team ne acks=1 set kiya aur broker failure pe orders gaye.",
+   "alternatives": "Quorum-based systems (Raft) jahan durability-availability fixed (majority); Kafka zyada flexible.",
+   "scale_10x_100x": "Bade org mein topic configs ko policy (create-topic policies) se enforce karna padta hai.",
+   "production_improvements": "Broker-side defaults durable rakho, topic creation policy, config drift audit."
+  }
+ },
+ {
+  "id": "MKFK-080",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Beginner",
+  "question": "What is the trade-off of keeping a long-lived read handle per segment?",
+  "answer_hinglish": "Fix ka core: har `Segment` ek `_reader` file handle lazily kholta hai aur phir baar baar `seek` + `read` ke liye reuse karta hai, har fetch pe `open()` nahi. Profiling ne dikhaya tha ki Windows pe just-written file kholna ~3.1ms le raha tha (65% time); fix se acks=all 8,702 -> 73,795 msg/s (7.7x).\n\nCost: har segment ek extra open file descriptor (plus append ke liye `_log` aur `_idx` already open hain -- toh active segment pe 3). Partitions x segments bahut ho jaayein toh OS ki fd limit (`ulimit -n`) hit ho sakti hai. Kafka bhi saare segment files open rakhta hai aur indexes mmap karta hai -- isliye Kafka brokers pe fd limit 100k+ set karte hain.\n\nCorrectness care: handle stale na ho. `truncate_to` aur `close` `_close_reader` call karte hain; `delete` close karta hai. Read se pehle `_log.flush()` taaki buffered appends file mein dikhein.\n\nBetter alternative at scale: open handles ka LRU cache (sirf recently read segments ke handles), kyunki purane segments rarely read hote hain. TRADEOFFS #10.",
+  "why_needed": "Performance fixes ki hidden costs bata paana maturity dikhata hai.",
+  "real_world_analogy": "Rozana use hone wali almari ka taala khula rakhna (fast) -- lekin har almari ka taala khula rakhoge toh chaabi/guard (fds) ki limit aa jayegi.",
+  "how_it_works": "Lazy open, reuse, close on truncate/close/delete.",
+  "in_this_project": "`Segment.read`, `Segment._close_reader`, `Segment.truncate_to`, TRADEOFFS #10.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/segment.py::read",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::_close_reader",
+   "projects/05-mini-kafka/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "7.7x throughput",
+   "Simple change"
+  ],
+  "disadvantages": [
+   "fd per segment",
+   "Must invalidate on truncation"
+  ],
+  "common_mistakes": [
+   "Truncate ke baad purana handle use karna",
+   "fd limits monitor na karna"
+  ],
+  "follow_up_questions": [
+   "How would you bound the number of open handles?",
+   "Why flush before reading?",
+   "What does Kafka mmap?"
+  ],
+  "concepts": [
+   "file descriptors",
+   "resource trade-off"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-081",
+  "project_slug": "p05-mini-kafka",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Kafka vs RabbitMQ: when would you use which?",
+  "answer_hinglish": "Kafka: distributed log. Messages retention tak rehte hain, consumers offsets khud track karte hain, replay possible, ordering per partition, consumer groups partitions tak scale karte hain, bahut high throughput (sequential I/O, batching). Many independent consumers same stream padhte hain bina copies ke.\n\nRabbitMQ: smart broker, queues. Broker per-message state rakhta hai (delivered, acked), ack hone pe message gone. Flexible routing via exchanges (direct, topic, fanout, headers), per-message TTL, priorities, delayed messages (plugin), dead-letter exchanges, per-message redelivery. Competing consumers ek queue pe naturally scale (partition limit nahi). Lower throughput typically, lekin low latency per message.\n\nKafka choose karo: event streaming, event sourcing, CDC, analytics pipelines, log aggregation, jab multiple teams same events consume karti hain, jab replay chahiye, jab per-key ordering + high volume chahiye.\n\nRabbitMQ choose karo: task/job queues (send email, generate PDF), complex routing rules, per-message retry/priority/delay, request-reply patterns, jab message ek baar process hoke gone hona chahiye aur volume moderate hai.\n\nGotchas: Kafka mein per-message retry ek poison message pe partition ko atka deta hai (retry topics / DLQ khud banane padte hain); RabbitMQ mein replay nahi aur bade backlog pe performance girti hai (RabbitMQ Streams ab log-like feature deta hai).\n\nMera portfolio: Project 3 (job queue) RabbitMQ-style task semantics hai, Project 5 Kafka-style log -- dono ka contrast main interview mein use karta hoon.",
+  "why_needed": "Technology choice justify karna system design ka standard part hai.",
+  "real_world_analogy": "Kafka = CCTV recording: sab record hota hai, koi bhi kabhi bhi rewind karke dekh sakta hai. RabbitMQ = courier service: parcel deliver hua, signature liya, khatam -- lekin courier rasta smartly choose karta hai.",
+  "how_it_works": "Log + consumer-managed offsets vs broker-managed queues + per-message acks.",
+  "in_this_project": "SYSTEM_DESIGN.md \"Kafka vs RabbitMQ (when asked)\"; LEARNING_GUIDE step 1.",
+  "implementation_files": [
+   "projects/05-mini-kafka/SYSTEM_DESIGN.md",
+   "projects/05-mini-kafka/LEARNING_GUIDE.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Kafka: replay, fan-out, throughput, ordering",
+   "RabbitMQ: routing, per-message semantics, priorities"
+  ],
+  "disadvantages": [
+   "Kafka: no per-message retry/priority, partition-limited parallelism",
+   "RabbitMQ: no replay, backlog pain"
+  ],
+  "common_mistakes": [
+   "Kafka ko task queue banana bina retry design",
+   "RabbitMQ pe event sourcing"
+  ],
+  "follow_up_questions": [
+   "How do you implement retries and DLQ in Kafka?",
+   "How does RabbitMQ scale consumers?",
+   "What are RabbitMQ Streams?"
+  ],
+  "concepts": [
+   "kafka vs rabbitmq",
+   "message brokers",
+   "technology choice"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Dumb broker / smart consumer (Kafka) vs smart broker / dumb consumer (RabbitMQ).",
+   "failure_scenarios": "Kafka: poison message blocks partition; RabbitMQ: huge backlog memory pressure, flow control blocks publishers.",
+   "alternatives": "SQS/SNS, Pulsar (dono semantics), Redis Streams, NATS JetStream.",
+   "scale_10x_100x": "Kafka horizontally partitions se scale; RabbitMQ queues ek node pe (quorum queues replicate) -- bahut high volume pe Kafka.",
+   "production_improvements": "Use case per choose karo; dono saath bhi common (Kafka backbone, RabbitMQ for task fan-out)."
+  }
+ },
+ {
+  "id": "MKFK-082",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "Bug #1: newly created topics were not replicating. How was it found and fixed?",
+  "answer_hinglish": "Symptom: cluster start hone ke BAAD jo topics bane, unpe acks=all produce `request_timed_out` deta tha (ya HW aage nahi badhta tha), followers ka LEO 0 rehta tha. Startup se pehle wale topics theek the.\n\nInvestigate: `/metadata` pe `replica_leo` dekho -- leader LEO badh raha, followers 0. Matlab follower fetch ho hi nahi raha. Follower fetch kaun karta hai? `_replicate` task. Woh kahan bante hain? `_start_broker_tasks` mein -- `b.tasks += [create_task(self._replicate(b, tp)) for tp in b.replicas]` -- yaani sirf us waqt existing replicas ke liye.\n\nCause: `create_topic` naye `Replica` objects broker pe add karta tha, lekin unke liye replication loops start nahi karta tha. Tests jo cluster start ke baad topic banate the (zyadatar) followers ke bina chal rahe the.\n\nFix: `create_topic` mein `if self._started:` -- har naye replica ke liye alive broker pe `_replicate` task create aur `broker.tasks` mein append (taaki kill pe cancel ho). TESTING.md bug #1.\n\nLesson: jab system mein \"per-entity background workers\" hon, toh entity creation path aur startup path dono ko worker spawn karna chahiye -- ya ek reconcile loop ho jo desired vs running workers compare kare (controller pattern).",
+  "why_needed": "Real bug story with symptom -> investigation -> fix structure.",
+  "real_world_analogy": "Naya employee join hua lekin uska ID card system mein activate nahi hua kyunki activation sirf saal ke shuru mein hota tha.",
+  "how_it_works": "Background tasks started at boot only; new entities missed them.",
+  "in_this_project": "`Cluster.create_topic` (`if self._started` block), `Cluster._start_broker_tasks`, TESTING.md bug list.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::create_topic",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_start_broker_tasks",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real: cluster.py create_topic\nif self._started:\n    # Brokers already running: start a follower fetch loop for every new replica.\n    for meta in metas:\n        for b in meta.replicas:\n            broker = self.brokers[b]\n            if broker.alive:\n                broker.tasks.append(asyncio.create_task(self._replicate(broker, (name, meta.partition))))",
+  "code_language": "python",
+  "advantages": [
+   "Simple targeted fix"
+  ],
+  "disadvantages": [
+   "Two spawn paths to keep in sync (reconcile loop would be more robust)"
+  ],
+  "common_mistakes": [
+   "Sirf startup path test karna",
+   "Background task ko broker.tasks mein track na karna (kill pe leak)"
+  ],
+  "follow_up_questions": [
+   "How would a reconcile loop prevent this class of bug?",
+   "Which metric would have caught it in production?",
+   "Why did old topics work?"
+  ],
+  "concepts": [
+   "debugging",
+   "background tasks",
+   "bug story"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-083",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "Bug #2: logs were closed twice at shutdown. What happened and why make close idempotent?",
+  "answer_hinglish": "Symptom: tests jo broker kill karte the, unke teardown (`cluster.stop()`) pe errors: closed file pe flush (`ValueError: I/O operation on closed file`).\n\nCause: `kill_broker` broker ke saare replica logs close karta hai (process crash simulate). Baad mein `Cluster.stop()` har broker ke har replica ka `r.log.close()` phir se call karta hai -- killed broker ke liye yeh doosri baar. `Segment.close` pehle `flush()` karta tha jo already-closed file pe fail hota.\n\nFix: `Segment.close` idempotent -- `if self._log.closed: return`. Comment: \"idempotent: a killed broker's logs are closed again on cluster shutdown\". TESTING.md bug #2.\n\nKyun idempotent close sahi pattern hai (vs \"stop() ko pata ho ki kaun killed hai\")? Cleanup code multiple paths se aata hai (kill, stop, delete, truncate); har caller ko state track karwana fragile hai. Python files, sockets, `asyncio` resources -- sab ka close idempotent hai, same convention follow karna. Distributed systems mein bhi \"idempotent operations\" retries aur duplicate signals ko safe banate hain -- yeh uska chhota local version hai.",
+  "why_needed": "Small bug lekin cleanup/resource lifecycle design ka achha example.",
+  "real_world_analogy": "Ghar se nikalte waqt do log alag alag taala lagane aaye -- doosre ko 'already locked' pe error nahi dena chahiye, bas aage badh jaana chahiye.",
+  "how_it_works": "Guard clause on closed state; close safe to call any number of times.",
+  "in_this_project": "`storage/segment.py::Segment.close`, `Cluster.kill_broker`, `Cluster.stop`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/segment.py::close",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::kill_broker",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::stop",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real: storage/segment.py\ndef close(self) -> None:\n    if self._log.closed:\n        return  # idempotent: a killed broker's logs are closed again on cluster shutdown\n    self.flush()\n    self._log.close()\n    self._idx.close()\n    self._close_reader()",
+  "code_language": "python",
+  "advantages": [
+   "Robust cleanup from any path"
+  ],
+  "disadvantages": [
+   "Can hide genuine double-close logic bugs"
+  ],
+  "common_mistakes": [
+   "Har caller pe 'is it closed?' checks bikherna",
+   "Close mein exceptions swallow karke real errors chhupana"
+  ],
+  "follow_up_questions": [
+   "Where else should operations be idempotent in this system?",
+   "How would you detect resource leaks?",
+   "What does Python's file.close do when called twice?"
+  ],
+  "concepts": [
+   "idempotency",
+   "resource cleanup",
+   "bug story"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-084",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Bug #5: the e2e test deadlocked during rebalances. Diagnose it.",
+  "answer_hinglish": "Symptom: e2e test jisme do consumers the, hang ho jaata tha / timeout -- group kabhi Stable nahi hota tha.\n\nSetup: test ek hi loop mein `await a.poll(); await b.poll()` sequentially chala raha tha.\n\nDiagnose: `/groups/billing` dekho -- state `PreparingRebalance` mein atka. Kaun join pe wait kar raha hai? B ne join kiya -> coordinator rebalance start -> B ka `join` HTTP request tab tak block jab tak A bhi re-join na kare (ya delay khatam). A ko rebalance ka pata uske heartbeat se chalta hai aur re-join uske NEXT `poll()` mein hota hai. Lekin A ka next poll tabhi chalega jab B ka `await b.poll()` return kare -- jo A ke re-join ka wait kar raha hai. Circular wait = deadlock (delay ke baad A kick hota, phir A re-join karta -> naya rebalance -> B ka cycle... group thrash karta).\n\nRoot cause: test harness bug, system bug nahi. Real consumers alag processes / threads mein concurrently chalte hain.\n\nFix: `drain()` helper har consumer ko apne `asyncio` task mein chalata hai (comment: \"Polling them one after another from a single loop deadlocks rebalances\"), aur `stable()` helper wait karta hai jab tak group Stable ho aur har consumer ki generation group generation ke barabar ho. TESTING.md bug #5.\n\nLesson: blocking barrier protocols (join) + single-threaded driver = deadlock risk. Tests ko production concurrency model mimic karna chahiye.",
+  "why_needed": "Distributed protocol + test harness deadlock ko reason karna.",
+  "real_world_analogy": "Do log ek hi phone line pe: A kehta hai 'B bolega tab main bolunga', B kehta hai 'A bolega tab' -- line pe sannata.",
+  "how_it_works": "Join is a barrier; sequential driving of barrier participants = circular wait.",
+  "in_this_project": "`tests/test_e2e_api.py::drain` aur `stable`, `GroupCoordinator.join`/`_complete_rebalance`, TESTING.md bug #5.",
+  "implementation_files": [
+   "projects/05-mini-kafka/tests/test_e2e_api.py::drain",
+   "projects/05-mini-kafka/tests/test_e2e_api.py::stable",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::join",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: tests/test_e2e_api.py drain\nasync def run(c):\n    while not done.is_set():\n        batch = await c.poll(wait_ms=50)\n        got.extend(batch)\n        if batch:\n            await c.commit()\n        ...\ntasks = [asyncio.create_task(run(c)) for c in consumers]",
+  "code_language": "python",
+  "advantages": [
+   "Test now mirrors real concurrency"
+  ],
+  "disadvantages": [
+   "Barrier protocol inherently sensitive to slow participants"
+  ],
+  "common_mistakes": [
+   "Distributed protocol ko single loop se sequential test karna",
+   "Timeout badha ke deadlock 'fix' karna"
+  ],
+  "follow_up_questions": [
+   "How would you detect this in a live system?",
+   "Why didn't the rebalance delay resolve it?",
+   "How does Kafka's poll loop avoid this?"
+  ],
+  "concepts": [
+   "deadlock",
+   "test harness",
+   "rebalance"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-085",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Consumer lag keeps growing on a group. How do you investigate?",
+  "answer_hinglish": "Step 1 -- scope: `GET /groups/{g}` (ya dashboard) se per-partition lag dekho. Sab partitions pe badh raha ya ek pe?\n\nCase A, sab partitions pe: consumers overall slow / kam. Check: members count aur assignment (`members[].assignment`), kya rebalances baar baar ho rahe hain (`rebalances` counter aur `generation` tezi se badh rahi?) -- rebalance storm har baar processing pause karta hai. Cause: session timeout chhota, consumers flapping, deploys. Agar stable hai toh processing throughput < produce rate: profile consumer, batch DB writes, scale consumers (partitions tak).\n\nCase B, ek partition pe: hot partition (key skew -- `/metadata` pe us partition ka LEO baaki se tezi se badh raha) ya us partition ka consumer atka hua (poison message pe crash-retry loop, ya commit fail ho raha). Consumer logs mein `commit_rejected` warnings dekho -- fenced commits matlab woh member stale generation pe hai.\n\nCase C, lag constant lekin bada / committed offset hil hi nahi raha: commits nahi ho rahe (app commit call hi nahi karti), ya partition offline (`/metadata` leader null -> fetch `leader_not_available`), ya ISR issue se HW atka (lag HW se compute hota hai, toh HW atka toh lag kam dikh sakta hai -- misleading!).\n\nCase D: lag achanak drop / jump: `offset_out_of_range` reset -- retention ne data delete kiya aur consumer log start pe kood gaya (data skip!). Retention vs lag compare karo.\n\nFix accordingly; alert lag trend pe, aur lag ko retention se kaafi pehle.",
+  "why_needed": "Production Kafka ka number one ticket.",
+  "real_world_analogy": "Restaurant mein orders pile up: kya saare chefs slow hain, ya sirf tandoor wala (hot partition), ya koi chef chhutti pe aur uske orders kisi ko diye hi nahi (offline / stuck)?",
+  "how_it_works": "lag = HW - committed per partition; symptoms partition-wise isolate root cause.",
+  "in_this_project": "`/groups/{g}` (`describe_group` = `GroupCoordinator.describe` + `Cluster.group_lag`), `/metadata`, `/events`, consumer `commit_rejected` log in `Consumer.commit`, dashboard groups table.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/api/app.py::describe_group",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::group_lag",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::describe",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::commit",
+   "projects/05-mini-kafka/minikafka/api/dashboard.html"
+  ],
+  "code_example": "# bash: quick investigation against a running server\ncurl -s localhost:8005/groups/billing | python -m json.tool     # state, generation, members, lag\ncurl -s localhost:8005/metadata | python -m json.tool           # leader, ISR, HW, LEO per partition\ncurl -s localhost:8005/events                                    # elections, ISR changes",
+  "code_language": "bash",
+  "advantages": [
+   "Per-partition data isolates causes quickly"
+  ],
+  "disadvantages": [
+   "No time-based lag (age of oldest message)",
+   "No consumer-side metrics exported"
+  ],
+  "common_mistakes": [
+   "Sirf total lag dekhna",
+   "Consumers add karna jab problem hot partition hai"
+  ],
+  "follow_up_questions": [
+   "How do you detect a rebalance storm?",
+   "What if lag looks fine but data is skipped?",
+   "How would you add time-lag?"
+  ],
+  "concepts": [
+   "consumer lag",
+   "troubleshooting",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lag-based alerting simple hai lekin context-free; time-lag better reflect karta hai business impact.",
+   "failure_scenarios": "Poison message crash loop, rebalance storms, retention-skip, offline partitions -- sab lag ke alag patterns dikhate hain.",
+   "alternatives": "Burrow-style lag evaluation (trend based), consumer-side metrics (records processed/sec), DLQ for poison messages.",
+   "scale_10x_100x": "Hazaron partitions pe per-partition lag dashboards heavy; aggregate + top-N worst partitions.",
+   "production_improvements": "Export lag as Prometheus metric, time-lag via record timestamps, alert on offset_out_of_range resets."
+  }
+ },
+ {
+  "id": "MKFK-086",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "acks=all producers suddenly see high latency and request_timed_out. How do you debug it?",
+  "answer_hinglish": "acks=all latency = append + time until HW >= batch end. HW ISR ke slowest member pe atka hota hai. Toh pehla suspect: ek ISR follower peeche hai.\n\nStep 1: `/metadata` -- us partition ke `replica_leo` dekho. Leader LEO 5000, ek follower 4200 aur ISR mein abhi bhi hai? Wahi culprit. `seconds_since_heartbeat` brokers ka -- koi broker heartbeat late hai?\n\nStep 2: `/events` -- \"removed from ISR (lagging)\" / \"rejoined ISR\" baar baar? ISR flapping: follower thoda peeche girta, nikalta, catch up, wapas -- har baar wapas aane pe acks=all phir uska wait karta hai.\n\nStep 3: config check: `replica_lag_max_ms` (1000) vs `request_timeout_ms` (3000). Agar lag max timeout se bada hota (test `test_acks_all_times_out_when_follower_stalls_inside_isr` 60s vs 300ms), toh stalled follower ISR mein rehte hue har write timeout karata.\n\nStep 4: broker health: is in-process cluster mein sab ek event loop pe hain -- blocking I/O (fsync, bada read) ya CPU saturation follower loops ko late karta hai. Real Kafka mein: follower broker ki disk/network, GC pauses, replica fetcher threads.\n\nStep 5: client side: batch sizes bade? Bade batches replicate hone mein zyada time.\n\nFixes: slow broker ko fix/replace, `replica_lag_max_ms` tune (chhota = jaldi shrink = latency recover, lekin redundancy kam), producers idempotent rakho taaki timeout retries safe hon, min ISR se floor.",
+  "why_needed": "acks=all latency incident -- replication internals ka practical use.",
+  "real_world_analogy": "Teen signature wali file: ek officer slow hai toh poori file atki. Ya toh officer ko jaldi karwao, ya rule: 10 min mein sign nahi kiya toh list se hatao.",
+  "how_it_works": "Latency bound by slowest ISR follower until ISR shrink; timeouts when lag max > request timeout.",
+  "in_this_project": "`/metadata` (`Cluster.describe` with `replica_leo`), `/events` (`Cluster._event`), `ClusterConfig` timeouts, `Cluster._check_isr`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::describe",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_check_isr",
+   "projects/05-mini-kafka/minikafka/cluster/config.py::ClusterConfig",
+   "projects/05-mini-kafka/tests/test_replication.py::test_acks_all_times_out_when_follower_stalls_inside_isr"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Metadata exposes per-replica LEO -- direct evidence"
+  ],
+  "disadvantages": [
+   "No latency histograms per stage",
+   "Events are text, not metrics"
+  ],
+  "common_mistakes": [
+   "Timeout badha dena bina root cause",
+   "Non-idempotent producer ke saath timeouts retry karna"
+  ],
+  "follow_up_questions": [
+   "What is ISR flapping and how do you stop it?",
+   "How do replica_lag_max_ms and request_timeout_ms interact?",
+   "Which Kafka metrics would you watch?"
+  ],
+  "concepts": [
+   "latency debugging",
+   "ISR",
+   "acks=all"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lag max chhota = latency stable, durability kam during incidents; bada = durability, latency spikes.",
+   "failure_scenarios": "Gray failure (slow disk on one broker) sabse mushkil -- broker alive, heartbeats OK, lekin replication slow.",
+   "alternatives": "Follower fetch from closest replica, hedged writes, quorum acks (Raft majority -- slowest node ignore).",
+   "scale_10x_100x": "Bade clusters mein kuch broker hamesha slow; quorum-based commit (majority) tail latency better handle karta hai.",
+   "production_improvements": "Per-partition replication lag metric, UnderReplicatedPartitions alert, ISR shrink/expand rate metric, produce latency histogram."
+  }
+ },
+ {
+  "id": "MKFK-087",
+  "project_slug": "p05-mini-kafka",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The dashboard shows under-replicated partitions after a broker restart that never recover. How do you investigate?",
+  "answer_hinglish": "Under-replicated = ISR replicas se chhota (dashboard ISR column warn color). Restart ke baad normal flow: broker follower banke catch up karta hai aur `_maybe_expand_isr` use wapas add karta hai. Agar nahi ho raha:\n\n1. `/metadata` `replica_leo`: restarted broker ka LEO badh raha hai? Agar 0 pe atka -- uska `_replicate` task chal hi nahi raha ya har iteration exception (generic `except Exception: sleep`) -- review se pehle yeh silently swallow hota tha; ab unexpected exceptions `replication_error` ke saath log hote hain (sirf `BrokerUnavailable` expected maana jaata hai), toh logs check karo. Check broker `alive` aur `reachable` (isolated toh nahi?).\n2. LEO badh raha lekin leader tak nahi pahunchta: produce rate follower fetch rate se zyada (follower 1MB per fetch padhta hai) -- follower kabhi \"exactly caught up\" nahi hota. Expand condition `follower_leo >= leader.leo` strict hai; heavy continuous traffic mein yeh rare ho sakta hai. Kafka bhi caught-up LEO >= HW pe expand karta hai, LEO pe nahi.\n3. Partition offline (leader None) hai? Tab koi expand nahi -- review mein mila tha ki last ISR member ke marne pe ISR empty set ho jaata tha, isliye wapas aaya broker bhi leader nahi banta tha. Fix ho chuka: `_elect` offline hone pe ISR ko as-is rakhta hai (`test_offline_partition_recovers_when_last_isr_member_returns`).\n4. Retention: follower bahut peeche tha aur leader ne segments delete kar diye -> follower `truncate_to(0)` karke log start se re-fetch. Bahut data ho toh time lagega.\n5. `/events` mein \"rejoined ISR\" aaya hi nahi, ya \"truncating\" baar baar aa raha (epoch confusion)?\n\nImprovement: `_replicate` ke except branch mein exception log karo -- debugging ka sabse bada blind spot yahi hai.",
+  "why_needed": "Replication health debugging; aur ek real code gap identify karna.",
+  "real_world_analogy": "Chhutti se wapas aaya employee team mein add nahi ho raha: kya woh kaam pe aa bhi raha hai, kya woh pace pakad nahi pa raha, ya HR ki list hi khaali ho gayi?",
+  "how_it_works": "ISR expand requires follower LEO >= leader LEO and >= HW; unexpected failures in the fetch loop are logged (replication_error), expected BrokerUnavailable is retried quietly.",
+  "in_this_project": "`Cluster._maybe_expand_isr`, `Cluster._replicate` (logs replication_error), `Cluster._elect` (keeps last ISR member on offline), `Cluster.describe`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_maybe_expand_isr",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_replicate",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_elect",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::describe",
+   "projects/05-mini-kafka/minikafka/api/dashboard.html"
+  ],
+  "code_example": "# real: cluster.py _replicate (the blind spot)\nexcept asyncio.CancelledError:\n    raise\nexcept Exception:\n    await asyncio.sleep(self.cfg.replica_fetch_wait_ms / 1000)",
+  "code_language": "python",
+  "advantages": [
+   "Per-replica LEO visible on dashboard"
+  ],
+  "disadvantages": [
+   "Replication errors are logged but there is no metric/alert on them yet",
+   "Strict expand condition"
+  ],
+  "common_mistakes": [
+   "Logs na milne ko 'kuch galat nahi' samajhna",
+   "Under-replicated alert ignore karna (next failure = offline)"
+  ],
+  "follow_up_questions": [
+   "Why might a follower never be exactly caught up?",
+   "What should the except branch log?",
+   "Offline partitions pe ISR ke baare mein review mein kya mila aur kaise fix hua?"
+  ],
+  "concepts": [
+   "under-replicated partitions",
+   "ISR expand",
+   "observability gap"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict expand (LEO == leader LEO) safer lekin heavy traffic mein slow rejoin; Kafka HW-based condition use karta hai.",
+   "failure_scenarios": "Under-replicated chalta raha aur ek aur broker gaya -> min ISR violation ya offline partition.",
+   "alternatives": "Expand when follower LEO >= HW (Kafka), throttled replication for catch-up (replication quotas).",
+   "scale_10x_100x": "Bahut partitions restart pe ek saath catch up karein toh network saturate; replication quotas zaroori.",
+   "production_improvements": "Done: log replication errors, keep last ISR member on offline. Next: rate-limited error metrics, UnderReplicatedPartitions metric."
+  }
+ }
+]

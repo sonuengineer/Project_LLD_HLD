@@ -1,0 +1,184 @@
+{
+ "project_slug": "p06-saas",
+ "project": "Multi-Tenant SaaS Backend",
+ "source_dir": "projects/06-saas",
+ "summary": "Production-style multi-tenant SaaS foundation in FastAPI + Postgres + Redis: users, tenants, memberships and invitations, RBAC with one ABAC rule, plans with entitlements, per-tenant token-bucket rate limits and monthly quotas, usage metering in Redis flushed to Postgres, hashed scoped API keys bounded by the creator's current role, an append-only audit log, a billing provider abstraction with signed idempotent webhooks, platform admin suspension, tenant-aware caching and background jobs -- with Postgres row-level security (ENABLE + FORCE, non-owner NOBYPASSRLS app role, SET LOCAL via set_config) as the isolation backstop. 31 tests (9 SQL-level RLS tests, 13 HTTP tests, 9 security-review regression tests) plus an RLS/index benchmark.",
+ "pitch": {
+  "intro_30s": "Maine ek multi-tenant SaaS backend banaya hai -- FastAPI, Postgres aur Redis pe. Ek hi database mein bahut saari companies (tenants) ka data hai, aur isolation Postgres row-level security se enforce hoti hai: agar koi developer WHERE tenant_id bhool bhi jaye, database khud doosre tenant ki rows chhupa deta hai. Upar se RBAC, plans aur quotas, hashed API keys, append-only audit log, signed idempotent billing webhooks, aur tenant-aware cache aur background jobs. 31 tests isolation ko SQL level pe prove karte hain, aur ek security review ke 9 regression tests bhi hain.",
+  "explain_2min": "Problem simple hai: ek SaaS mein Acme aur Globex dono same app use karte hain, aur Acme ka data Globex ko kabhi nahi dikhna chahiye. Maine \"pooled\" model choose kiya -- shared database, shared schema, har tenant table mein tenant_id column. Yeh sabse sasta aur common model hai, lekin risk yeh hai ki ek bhooli hui WHERE clause poora data leak kar de.\n\nIsliye maine Postgres row-level security ko backstop banaya. Har tenant table pe ENABLE aur FORCE ROW LEVEL SECURITY hai, aur policy kehti hai tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid. Har request `tenant_tx()` mein chalti hai jo transaction ke start mein set_config('app.tenant_id', ..., true) karta hai -- yeh SET LOCAL ke barabar hai, toh connection pool pe context next request ko leak nahi hota. Context set nahi hai toh NULL, matlab zero rows -- fail closed. App ek alag role `saas_app` se connect karta hai jo superuser nahi, owner nahi, NOBYPASSRLS hai, kyunki superuser RLS ko ignore kar deta hai -- ek test yeh demonstrate bhi karta hai.\n\nUske upar authorization: request ka pipeline hai authenticate (JWT ya sk_ API key) -> URL se tenant -> membership -> role/scopes -> suspension -> rate limit -> quota -> permission -> entitlement. RBAC mein viewer/member/admin/owner hain, plus ek ABAC rule: member apna banaya hua project delete kar sakta hai. Plans code mein hain; project limit ek tenant row lock (FOR UPDATE) ke andar check hoti hai taaki 10 concurrent requests mein exactly 3 hi pass hon -- test se proven.\n\nSabse achhi story ek real bug hai jo test ne pakda: memberships policy mein ek OR tha jisse Bob, jo sirf Globex ka owner tha, Acme ka owner treat ho gaya. Migration 0003 ne policy strict ki aur cross-tenant lookup ko SECURITY DEFINER function mein daala.",
+  "deep_5min": "Main ek request ka lifecycle walk karta hoon: GET /t/acme/projects with a Bearer token.\n\nPehle `api/deps.py::tenant_principal` chalta hai. Woh slug se tenant load karta hai -- `global_tx` mein, aur result Redis cache mein `saas:cache:_global:tenant-slug:acme` key pe 60 second TTL ke saath. Phir token dekhta hai. Agar token `sk_` se start hota hai toh yeh API key hai: main uska sha256 nikalta hoon aur `resolve_api_key()` call karta hoon. Yeh SECURITY DEFINER function hai kyunki is waqt tak hume tenant pata nahi aur RLS api_keys ki row chhupa dega. Function exact hash pe lookup karta hai aur sirf key_id, tenant_id, scopes, created_by return karta hai. Agar key kisi aur tenant ki hai toh main 404 deta hoon, 403 nahi -- taaki foreign key holder ko yeh bhi pata na chale ki tenant exist karta hai. Key ki effective permissions = scopes INTERSECT creator ka CURRENT role -- creator demote ya remove hua toh key turant kamzor ho jati hai.\n\nAgar JWT hai toh `decode_access_token` HS256 verify karta hai, typ=access check karta hai, aur phir memberships se role nikalta hoon -- RLS ke andar, aur explicit `WHERE tenant_id = :t AND user_id = :u` ke saath bhi. Yeh explicit filter us bug ka lesson hai. Role nahi mila toh 404. Phir suspension check (403), phir Redis Lua token bucket per tenant plan ke rps aur burst ke saath (429 + Retry-After), phir monthly usage INCR (429 quota_exceeded). Dono Redis down hone pe fail open hote hain -- deliberate choice.\n\nAb route `p.require(P.PROJECT_READ)` karta hai aur `tenant_tx(sm, tenant_id, user_id)` kholta hai: BEGIN, `SELECT set_config('app.tenant_id', :t, true), set_config('app.user_id', :u, true)`, query, COMMIT. Parameterised set_config isliye ki string-built SET mein SQL injection ka risk hai. List query `ORDER BY created_at DESC LIMIT` hai aur index `(tenant_id, created_at DESC)` pe chalti hai -- benchmark mein RLS predicate seedha Index Cond ban gaya: 0.148 ms vs bina index 2.938 ms. Lekin end-to-end p50 ~11 ms dono cases mein tha kyunki teen round trips Docker Desktop ke port proxy se jaate the -- latency round trips ne dominate ki, RLS ne nahi.\n\nWrites mein do hard decisions the. Pehla, plan limits race-safe kaise karein: `create_project` tenant row pe `SELECT ... FOR UPDATE` leta hai, phir count karta hai, phir insert. Concurrent creates serialize ho jaate hain; `test_concurrent_creates_cannot_exceed_plan_limit` 10 parallel requests bhejta hai aur exactly 3 succeed hoti hain. Doosra, audit: `audit.record` usi transaction mein insert karta hai jisme action hai, toh rollback hua toh audit row bhi gayi, aur grants level pe saas_app ke paas audit_logs pe sirf SELECT aur INSERT hai -- compromised app bhi history mita nahi sakta.\n\nAuth side: bcrypt cost 12, login mein unknown email pe bhi same-cost dummy hash (`dummy_hash(bcrypt_rounds)`) ke against bcrypt chalta hai taaki timing se emails enumerate na hon -- review mein pakda ki pehle dummy cost 4 tha, real 12. Access token 15 minute ka; refresh token opaque, hashed, single-use, family_id ke saath. Purana refresh token dobara aaya toh poori family revoke -- attacker aur victim dono logout.\n\nBilling: app sirf `BillingProvider` protocol jaanta hai; mock provider Stripe-style `t=...,v1=...` HMAC signature bhejta hai, main 300 second tolerance aur compare_digest se verify karta hoon, aur `billing_events.id` primary key se idempotency -- duplicate delivery ek baar hi apply hoti hai.\n\nAur sabse important story: shuru mein memberships policy mein `OR user_id = app.user_id` tha taaki user apne saare workspaces dekh sake. Role lookup sirf `WHERE user_id = :u` tha. Bob ne /t/acme khola, RLS ne OR ki wajah se Bob ki Globex wali owner row dikha di, aur Bob Acme ka owner ban gaya. `test_tenant_isolation_over_http` ne 404 expect kiya, 200 mila. Fix migration 0003: policy strict, `user_tenants()` SECURITY DEFINER function, explicit tenant filters, aur SQL-level regression test. Lesson: policy mein OR daala toh invariant \"unfiltered query bhi safe hai\" toot jaata hai.",
+  "architecture_walkthrough": "`saas/main.py` app factory hai: lifespan mein async engine (saas_app role), Redis BlockingConnectionPool, TenantCache, TenantLimits aur MockBillingProvider `app.state` pe rakhta hai. `api/deps.py` authentication aur authorization context banata hai -- `current_user_id` user-only routes ke liye, `tenant_principal` /t/{slug} routes ke liye, `platform_admin` admin routes ke liye. `api/routes.py` mein paanch routers hain: auth, me, t, billing, admin. `core/` pure logic hai: `security.py` (bcrypt, JWT, opaque tokens, sha256), `rbac.py` (P enum, ROLE_PERMISSIONS, can_delete_project, can_assign_role), `plans.py` (frozen Plan dataclass, PLANS dict), `principal.py` (Principal with require/require_feature). `db/session.py` mein `tenant_tx` aur `global_tx` hain -- poore isolation ka entry point. `services/` mein business logic: tenancy (tenants, members, invitations, projects, API keys), auth (register/login/refresh/logout), audit, limits (Lua token bucket, metering, flush), cache (tenant-namespaced), billing (protocol, mock, apply_event), jobs (Redis list queue + handlers). `worker.py` jobs process karta hai aur har 60 second usage flush. `migrations/` teen revisions: 0001 schema + saas_app role + RLS + grants + resolve_api_key, 0002 accept_invitation_lookup, 0003 strict memberships policy + user_tenants. Tests real saas_app role se connect karte hain, owner sirf truncate ke liye.",
+  "difficult_decisions": [
+   "Pooled model (shared schema + tenant_id + RLS) vs schema/DB per tenant: sasta aur ek migration, lekin isolation logical hai -- isliye RLS backstop aur non-owner NOBYPASSRLS app role zaroori the.",
+   "SET LOCAL (set_config(..., true)) vs SET: transaction-scoped context pool aur PgBouncer transaction mode ke saath safe hai, cost yeh ki har tenant query transaction ke andar chalni chahiye.",
+   "Policies mein koi OR nahi: cross-tenant reads (API key resolve, invitation accept, my workspaces) narrow SECURITY DEFINER functions se -- thoda zyada code, par invariant intact.",
+   "Rate limit aur quota fail open: Redis blip pe paying customers kaam karte rahein; abuse protection temporarily off -- monitoring se cover karna padta hai.",
+   "Plan limits ke liye tenant row pe FOR UPDATE: simple aur correct serialization, cost yeh ki ek tenant ke concurrent creates line mein lagte hain.",
+   "Stateless 15-min JWT + rotating refresh tokens: har request pe auth DB hit nahi, lekin access token expiry se pehle revoke nahi ho sakta -- membership per request check hone se window tenant level pe narrow ho jati hai."
+  ],
+  "biggest_challenges": [
+   "Cross-tenant privilege escalation: memberships policy ka OR user_id = app.user_id + user-only role lookup = Bob Acme ka owner. test_tenant_isolation_over_http ne pakda (404 expected, 200 mila); migration 0003 se fix + regression test.",
+   "asyncpg ek bind parameter ka ek hi type infer karta hai: :t ko uuid aur text dono jagah reuse kiya toh fail hua -- alag :tt param banana pada (create_tenant mein comment hai).",
+   "asyncpg extended protocol ek execute mein multiple statements nahi chalata: migration fail hui, isliye 0001 mein run() helper ';\\n' pe split karta hai.",
+   "Benchmark interpret karna: server pe index 20x fark deta hai (0.148 vs 2.938 ms) lekin end-to-end p50 dono ~11 ms -- samajhna pada ki Windows Docker Desktop proxy ke through teen round trips latency dominate kar rahe the."
+  ],
+  "failure_scenarios": [
+   "Developer WHERE tenant_id bhool gaya: RLS sirf current tenant ki rows deta hai (test_unfiltered_query_sees_only_current_tenant).",
+   "Code path ne tenant context set hi nahi kiya: nullif -> NULL -> zero rows, fail closed (test_no_tenant_context_sees_nothing).",
+   "Pooled connection pe pichhle request ka context: SET LOCAL commit pe khatam (test_context_does_not_leak_between_transactions).",
+   "Refresh token chori hokar replay hua: family revoke, dono sessions logout (test_auth_flow_and_refresh_rotation_with_reuse_detection).",
+   "Billing provider same webhook dobara bhejta hai: billing_events PK se ek hi baar apply; forged body pe HMAC mismatch 401.",
+   "Redis down: cache bypass, rate limit aur quota fail open, API serve karta rehta hai; unflushed usage counts lose ho sakte hain."
+  ],
+  "improvements": [
+   "Review mein last-owner aur member-limit races mili thi -- ab change_role/remove_member/invite/accept sab tenant row lock (`_lock_tenant`) ke andar hain. Aage: `lock_timeout` aur lock wait metric.",
+   "Billing apply_event ab ek transaction (savepoint dedupe) aur `provider_event_at` ordering guard ke saath hai (review fix). Aage: provider se state re-fetch reconciliation job aur provider-prefixed event ids.",
+   "Access token revocation: short denylist (jti) Redis mein ya token version per user; MFA/SSO (enterprise plan mein 'sso' feature flag pehle se hai par implement nahi).",
+   "Reliable job queue (BRPOPLPUSH/visibility timeout ya Project 3 wala queue) -- abhi worker crash pe job lose ho sakti hai.",
+   "Scale: PgBouncer transaction mode, tenant_id hash partitioning ya Citus, bade tenants ko silo mein, per-tenant statement timeouts.",
+   "Quota ko Redis loss ke baad Postgres usage_counters se re-seed karna, taaki Redis restart quota reset na kare."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Multi-tenancy models",
+   "steps": [
+    "1. Concept: tenant = ek customer organisation; isolation models -- shared schema + tenant_id, schema per tenant, DB per tenant, hybrid silo.",
+    "2. Kyun: is project ko bahut saare chhote tenants sasta serve karne hain, isliye pooled model.",
+    "3. API: saare tenant routes /t/{slug}/... pe hain; tenant URL se resolve hota hai (api/deps.py::_tenant_by_slug).",
+    "4. Implementation: 0001_initial.py mein har tenant table pe tenant_id NOT NULL REFERENCES tenants ON DELETE CASCADE.",
+    "5. Demo: python seed.py chalao -- 'bob sees acme? 404' print hota hai.",
+    "6. Interviewer next: kab schema-per-tenant ya silo pe shift karoge? (SYSTEM_DESIGN.md table)"
+   ],
+   "files": [
+    "projects/06-saas/SYSTEM_DESIGN.md",
+    "projects/06-saas/migrations/versions/0001_initial.py",
+    "projects/06-saas/seed.py"
+   ]
+  },
+  {
+   "concept": "Postgres row-level security",
+   "steps": [
+    "1. Concept: RLS policy har row pe predicate lagati hai; USING reads/updates/deletes ke liye, WITH CHECK naye/badle rows ke liye.",
+    "2. Kyun: bhooli hui WHERE clause leak na kare -- defence in depth.",
+    "3. API: CREATE POLICY tenant_isolation ... USING (tenant_id = nullif(current_setting('app.tenant_id', true), '')::uuid).",
+    "4. Implementation: ENABLE + FORCE ROW LEVEL SECURITY har TENANT_TABLES pe; saas_app NOSUPERUSER NOBYPASSRLS.",
+    "5. Demo: pytest -q tests/test_rls.py -- 9 tests, khaas kar test_superuser_would_bypass_rls aur test_cannot_write_into_another_tenant.",
+    "6. Interviewer next: superuser/owner bypass, FORCE kya karta hai, RLS ki performance cost?"
+   ],
+   "files": [
+    "projects/06-saas/migrations/versions/0001_initial.py",
+    "projects/06-saas/tests/test_rls.py"
+   ]
+  },
+  {
+   "concept": "Transaction-scoped tenant context",
+   "steps": [
+    "1. Concept: SET LOCAL sirf current transaction tak; SET poore session (connection) tak.",
+    "2. Kyun: connection pool pe ek connection kai requests mein reuse hota hai.",
+    "3. API: tenant_tx(sm, tenant_id, user_id) aur global_tx(sm).",
+    "4. Implementation: SELECT set_config('app.tenant_id', :t, true) -- parameterised, injection-safe.",
+    "5. Demo: test_context_does_not_leak_between_transactions.",
+    "6. Interviewer next: PgBouncer transaction mode ke saath kya chalega aur kya nahi?"
+   ],
+   "files": [
+    "projects/06-saas/saas/db/session.py::tenant_tx",
+    "projects/06-saas/tests/test_rls.py::test_context_does_not_leak_between_transactions"
+   ]
+  },
+  {
+   "concept": "The memberships escalation bug",
+   "steps": [
+    "1. Concept: RLS policy mein OR = permissive escape hatch; unfiltered query ab tenant-safe nahi.",
+    "2. Kyun: 'my workspaces' list ke liye OR daala gaya tha.",
+    "3. API: GET /t/acme/projects as Bob (sirf Globex owner) -> 200 aa gaya.",
+    "4. Implementation: 0003_strict_memberships_policy.py -- strict policy + user_tenants() SECURITY DEFINER; deps.py mein explicit tenant filter.",
+    "5. Demo: test_unfiltered_membership_query_cannot_return_other_tenant_roles aur test_tenant_isolation_over_http.",
+    "6. Interviewer next: SECURITY DEFINER functions ke risks kya hain?"
+   ],
+   "files": [
+    "projects/06-saas/migrations/versions/0003_strict_memberships_policy.py",
+    "projects/06-saas/saas/api/deps.py::tenant_principal",
+    "projects/06-saas/TESTING.md"
+   ]
+  },
+  {
+   "concept": "RBAC + ABAC + escalation guards",
+   "steps": [
+    "1. Concept: RBAC role -> permissions; ABAC attributes pe rule.",
+    "2. Kyun: 'member apna project delete kar sake' RBAC se express nahi hota.",
+    "3. API: Principal.require(P.X), can_delete_project, can_assign_role.",
+    "4. Implementation: ROLE_PERMISSIONS nested sets; ROLE_RANK se escalation guard; _owner_count se last-owner protection.",
+    "5. Demo: test_rbac_and_abac, test_no_privilege_escalation_and_last_owner_protection.",
+    "6. Interviewer next: OPA/Cedar kab chahiye? Custom roles kaise?"
+   ],
+   "files": [
+    "projects/06-saas/saas/core/rbac.py",
+    "projects/06-saas/saas/services/tenancy.py::change_role",
+    "projects/06-saas/tests/test_api.py::test_rbac_and_abac"
+   ]
+  },
+  {
+   "concept": "Auth: bcrypt, JWT, refresh rotation",
+   "steps": [
+    "1. Concept: short-lived stateless access token + long-lived single-use refresh token.",
+    "2. Kyun: har request pe DB hit bachana, aur chori hue refresh token ko detect karna.",
+    "3. API: /auth/login, /auth/refresh, /auth/logout.",
+    "4. Implementation: AuthService.refresh FOR UPDATE se row lock, revoked token reuse pe poori family revoke + commit before raise; login with an unknown email verifies against dummy_hash(bcrypt_rounds) -- same cost as real hashes (review fix: it used to be cost 4).",
+    "5. Demo: test_auth_flow_and_refresh_rotation_with_reuse_detection.",
+    "6. Interviewer next: access token ko 15 min se pehle kaise revoke karoge?"
+   ],
+   "files": [
+    "projects/06-saas/saas/services/auth.py::AuthService",
+    "projects/06-saas/saas/core/security.py::dummy_hash"
+   ]
+  },
+  {
+   "concept": "Plans, race-safe limits, rate limit vs quota",
+   "steps": [
+    "1. Concept: entitlement = plan kya allow karta hai (limits + features); rate limit per second, quota per month.",
+    "2. Kyun: monetisation aur noisy-neighbour protection.",
+    "3. API: 403 plan_limit_reached, 403 feature_not_in_plan, 429 rate_limited, 429 quota_exceeded.",
+    "4. Implementation: create_project mein SELECT 1 FROM tenants WHERE id = :t FOR UPDATE; limits.py mein Lua token bucket aur INCR meter.",
+    "5. Demo: test_concurrent_creates_cannot_exceed_plan_limit (exactly 3 of 10), test_tenant_rate_limit_and_quota.",
+    "6. Interviewer next: Redis down ho toh? Usage billing ke liye accurate kaise?"
+   ],
+   "files": [
+    "projects/06-saas/saas/core/plans.py",
+    "projects/06-saas/saas/services/tenancy.py::create_project",
+    "projects/06-saas/saas/services/limits.py::TenantLimits"
+   ]
+  },
+  {
+   "concept": "Billing webhooks: signature + idempotency",
+   "steps": [
+    "1. Concept: provider at-least-once deliver karta hai; HMAC se authenticity, timestamp se replay window.",
+    "2. Kyun: fake 'upgrade to enterprise' webhook = free enterprise plan.",
+    "3. API: POST /billing/webhook with x-billing-signature: t=...,v1=....",
+    "4. Implementation: MockBillingProvider.verify_and_parse (compare_digest, tolerance 300), apply_event (billing_events PK).",
+    "5. Demo: test_plan_entitlements_and_upgrade_via_billing_webhook -- duplicate True, forged 401.",
+    "6. Interviewer next: out-of-order events (provider_event_at guard kaise kaam karta hai)? Real Stripe pe kya badlega?"
+   ],
+   "files": [
+    "projects/06-saas/saas/services/billing.py::apply_event",
+    "projects/06-saas/saas/services/billing.py::MockBillingProvider"
+   ]
+  },
+  {
+   "concept": "Tenant-awareness beyond SQL: cache, jobs, admin, indexes",
+   "steps": [
+    "1. Concept: RLS sirf DB queries ko bachata hai; cache, queues, admin tools alag leak vectors hain.",
+    "2. Kyun: cache hit pe DB poocha hi nahi jaata, toh RLS kuch nahi kar sakta.",
+    "3. API: TenantCache.key -> saas:cache:{tenant}:{name}; jobs.enqueue(redis, tenant_id, ...).",
+    "4. Implementation: process_one handler ko tenant_tx(msg['tenant_id']) mein chalata hai; admin suspension tenant ke audit log mein.",
+    "5. Demo: test_tenant_aware_cache_never_crosses_tenants, test_tenant_aware_background_job, python bench/rls_bench.py.",
+    "6. Interviewer next: index tenant_id se kyun start hona chahiye? 100x pe kya karoge?"
+   ],
+   "files": [
+    "projects/06-saas/saas/services/cache.py::TenantCache",
+    "projects/06-saas/saas/services/jobs.py::process_one",
+    "projects/06-saas/bench/rls_bench.py"
+   ]
+  }
+ ]
+}

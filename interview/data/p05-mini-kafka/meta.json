@@ -1,0 +1,202 @@
+{
+ "project_slug": "p05-mini-kafka",
+ "project": "minikafka -- Simplified Distributed Event Streaming Platform",
+ "source_dir": "projects/05-mini-kafka",
+ "summary": "A Kafka-like event streaming platform built from scratch in Python: a real segmented commit log on disk (CRC per record, sparse offset index, segment rolling, retention, torn-tail recovery, truncation), partitioned topics, an in-process multi-broker cluster with a simulated network (follower-pull replication, LEO/HW/ISR, acks 0/1/all, min.insync.replicas, controller heartbeats, clean/unclean leader election, leader epochs, HW checkpoints), consumer groups (generations, range/roundrobin assignors, rebalancing, commit fencing, offsets in an internal __consumer_offsets log), an idempotent producer, an HTTP API, Python clients and a dashboard. 40 tests prove the guarantees (including acks=1 data loss on failover) and benchmarks document a profiling-driven 7.7x acks=all speedup and an 87x gain from producer batching.",
+ "pitch": {
+  "intro_30s": "Maine minikafka banaya -- Kafka jaisa event streaming platform, scratch se, Python mein. Disk pe real segmented commit log hai with CRC, sparse index aur crash recovery; topics partitions mein bante hain; teen brokers ka cluster follower-pull replication, high watermark, ISR, acks=all aur leader election karta hai; aur consumer groups rebalancing aur commit fencing ke saath. Cluster in-process hai with simulated network, isliye failure tests deterministic hain -- aur ek test literally prove karta hai ki acks=1 acknowledged message lose kar sakta hai.",
+  "explain_2min": "Kafka ko samajhne ka best tareeka mujhe laga ki uske core guarantees khud implement karke unhe tests se prove karun. minikafka mein teen layers hain.\n\nStorage layer real hai: har partition replica disk pe ek folder hai jisme segment files hain -- `.log` file records ke saath (har record pe size, CRC32, offset, timestamp, key, value) aur ek sparse `.index` jo har 4KB pe ek entry rakhta hai. Offset dhoondhna = segment pe binary search, index pe binary search, aur max 4KB scan. Crash ke baad startup pe CRC check karke torn tail kaat deta hoon. Retention poore purane segments delete karta hai.\n\nCluster layer mein teen brokers ek process ke andar hain -- yeh honest simplification hai, network ek flag hai. Lekin replication real hai: followers leader se records FETCH karke apni disk pe likhte hain, aur fetch offset hi unka acknowledgement hai. Leader HW = ISR ke min LEO rakhta hai; consumers sirf HW ke neeche padhte hain. acks=all HW ka wait karta hai, min.insync.replicas chhote ISR pe writes refuse karta hai. Controller heartbeats se dead broker pakadta hai aur ISR se naya leader chunta hai, epoch +1.\n\nConsumer groups ke liye coordinator join/heartbeat/leave handle karta hai, generations badhata hai, range ya round-robin se partitions baantta hai, aur purani generation ke zombie ka commit reject karta hai. Offsets ek internal log mein jaate hain jo restart pe replay hota hai.\n\nUpar se FastAPI REST API, Python producer (batching, linger, idempotent retries) aur consumer client, aur dashboard jahan se broker kill/isolate karke failover live dekh sakte ho. Benchmarks bhi hain: batching ne HTTP producer ko 376 se 32,841 msg/s kiya, aur ek profiling investigation ne acks=all ko 8.7k se 73.8k msg/s.",
+  "deep_5min": "Main ek produce request ki journey se explain karta hoon, kyunki usme saare hard decisions aa jaate hain.\n\nProducer client `send(topic, value, key)` pe partition choose karta hai: `crc32(key) % partitions` -- Kafka murmur2 use karta hai, crc32 stand-in hai, important sirf yeh hai ki hash stable ho taaki same key same partition mein jaaye aur per-key order bane. Record ek per-partition queue mein jaata hai; batch_size ya linger_ms pe ek HTTP request mein batch jaata hai. Ek partition pe ek hi request in flight hoti hai taaki retry kabhi baad wale batch ko overtake na kare. Idempotent producer har batch ke saath producer id aur base sequence bhejta hai; retry same sequence ke saath jaata hai.\n\nLeader pe pehle min.insync.replicas check hota hai -- ISR chhota hai toh write se PEHLE `not_enough_replicas`, kyunki acks=all ka matlab \"saare ISR\" hai aur ISR sirf leader reh gaya toh acks=all chupchaap acks=1 ban jata. Phir sequence check: same (seq, count) recent window mein hai toh duplicate -- original offset return. Phir append: log offsets assign karta hai, records encode hote hain CRC ke saath, active segment bhar gaya toh roll.\n\nacks=all ke liye producer ek asyncio Condition pe wait karta hai jab tak HW batch ke end tak na aaye. HW kaise badhta hai? Har follower ka ek loop leader se fetch karta hai; fetch offset follower ka LEO hai, toh leader us call se jaanta hai ki follower kahan tak hai, HW = min ISR LEO recompute karke waiters ko notify karta hai. Isme ek extra round trip hai -- follower copy karta hai, phir agle fetch pe naya LEO report -- yahi pull replication ki latency cost hai.\n\nHardest part failures thi. Leader marta hai: controller heartbeats se 600ms mein detect karta hai, ISR mein se pehla live replica naya leader, epoch +1. Followers naya epoch dekh ke apne HW tak truncate karte hain -- yeh pre-KIP-101 Kafka jaisa hai; main honestly bolta hoon ki rapid successive failovers mein leader-epoch truncation zyada safe hai. Ek test isolate karke leader pe ek acks=1 record likhta hai, leader kill karta hai, aur dikhata hai ki naye leader pe woh record hai hi nahi -- offset 3 dusre record ko mil jata hai, aur purana leader wapas aake divergent record truncate karta hai. Wahi test acks=all ke saath 100 ke 100 records bacha leta hai.\n\nTesting mein paanch real bugs mile: naye topics replicate hi nahi ho rahe the kyunki follower loops sirf startup pe bante the; killed brokers ke logs do baar close hote the; failover ke baad naya leader producer ko nahi jaanta tha aur uske sequence reject karke production rok deta tha -- fix mein unknown producer accept kiya, jiski keemat ek documented dedupe gap hai; restart pe HW 0 tha jo poora log truncate kar deta -- HW checkpoint file add ki; aur test harness ek loop se consumers poll karke rebalance deadlock kar raha tha.\n\nPerformance story: acks=all sirf 8.7k msg/s tha. Do hypotheses -- fetch wait timeouts aur slow reads -- data se reject hui. cProfile ne dikhaya `io.open` 65% time, ~3.1ms per call: Windows pe abhi-abhi likhi file kholna mehenga hai. Har segment ka reusable read handle aur bounded reads -> 73.8k msg/s, 7.7x. Phir bhi 8 partitions parallel se throughput nahi badha -- poora cluster ek Python process mein CPU-bound hai. Real Kafka mein brokers alag machines hain; scaling path mein separate processes, KRaft quorum, zero-copy, compression aur tiered storage aate hain.",
+  "architecture_walkthrough": "Storage (`minikafka/storage/`): `record.py` frame format aur CRC; `segment.py` ek `.log` + sparse `.index`, `_recover` torn tails kaatta hai aur index rebuild karta hai, reusable read handle; `log.py` segments ki list, LEO, log start offset, leader `append` vs follower `append_records`, `apply_retention`, `truncate_to`.\n\nCluster (`minikafka/cluster/`): `partition.py` mein `Replica` (LEO, HW, follower LEOs, producer sequence state, `changed` Condition) aur `PartitionMeta` (replicas, leader, ISR, epoch, min ISR). `cluster.py` mein `Broker` objects (alive/reachable), `create_topic` round-robin placement, `produce`/`fetch`, `_replicate` follower loops, `_advance_hw`, `_check_isr`/`_maybe_expand_isr`, `_controller_loop` heartbeats aur `_elect`, HW checkpoints, `metadata.json`, fault injection (kill/restart/isolate). `groups.py` group coordinator: join (future-based barrier), `_complete_rebalance`, heartbeat, leave, session expiry, fenced `commit`, `__consumer_offsets` log replay. `assignors.py` range aur roundrobin.\n\nAPI (`api/app.py`): FastAPI REST proxy -- topics, metadata, offsets, producers, produce, long-poll fetch, groups, events, admin fault injection with constant-time token check, dashboard.\n\nClients (`client/`): Producer partitioner + batching + idempotent retries with backoff; Consumer join, heartbeat loop, parallel poll, commit, seek, on_revoke/on_assign.\n\nOps: `bench/bench.py` storage/cluster/HTTP benchmarks, `demo.py` kill-leader demo, Docker single-process deployment, shared `bpcommon` for logging and metrics.",
+  "difficult_decisions": [
+   "In-process cluster with simulated network vs real multi-process brokers: maine deterministic failure tests chune (exact moment pe isolate/kill) aur storage + replication logic real rakha; cost -- ek CPU, aur split brain / stale metadata model nahi hote.",
+   "HW-based follower truncation (pre-KIP-101) vs leader-epoch truncation: simple aur single failover ke liye correct; rapid successive failovers ka theoretical gap README mein documented.",
+   "Unknown idempotent producer ko accept karna (bug #3 fix): production failover ke baad chalti rehti hai, lekin failover cross karne wala retry dedupe nahi hota -- availability chuni, gap documented.",
+   "Offsets ko internal log mein replay karna vs compaction: same durability as data, simple; startup time log ke saath badhta hai.",
+   "Coordinator-side assignment vs Kafka ka client-side leader assignment: ek round trip kam; new strategy ke liye server change chahiye.",
+   "Per-record CRC vs per-batch CRC: readable format aur precise recovery; cost bytes, CPU aur no compression."
+  ],
+  "biggest_challenges": [
+   "acks=all sirf 8.7k msg/s tha: do hypotheses (fetch wait timeouts, slow reads) measurement se reject hui; cProfile ne `io.open` ko 65% time (just-written file open on Windows) dikhaya; reusable read handle se 73.8k msg/s (7.7x).",
+   "Bug #1: cluster start ke baad bane topics replicate nahi ho rahe the kyunki follower fetch loops sirf startup pe bante the -- `create_topic` mein naye replicas ke loops start kiye.",
+   "Bug #3: failover ke baad naya leader producer ke sequence ko out-of-order maan ke production rok deta tha -- unknown producers accept kiye (Kafka UNKNOWN_PRODUCER_ID jaisa) aur dedupe gap document kiya.",
+   "Bug #4: restart pe HW 0 tha, toh stale-epoch truncation poora log hata deti -- per-broker `hw-checkpoint.json` har 100ms.",
+   "Bug #5 (test harness): ek loop se consumers sequentially poll karne pe rebalance barrier deadlock -- har consumer apne task mein, jaise real processes."
+  ],
+  "failure_scenarios": [
+   "Leader broker dies: controller 600ms session timeout ke baad ISR se naya leader chunta hai (epoch+1); acks=all committed data intact (`test_leader_failover_keeps_committed_data`), producer retries naye leader pe continue.",
+   "acks=1 write acknowledged, leader dies before followers copy: record lost aur offset reuse; purana leader wapas aake truncate karta hai (`test_acks_1_can_lose_acknowledged_write_on_failover`).",
+   "ISR below min.insync.replicas: acks=all `not_enough_replicas` before writing, acks=1 still accepted; follower lagging beyond replica_lag_max_ms is dropped from ISR and rejoins after catch-up.",
+   "acks=all request_timed_out: data leader pe likha ja chuka hai -- blind retry duplicate karega, idempotent retry safe (same leader).",
+   "Every ISR member down: partition OFFLINE with clean election; unclean election on karo toh available but data loss (test proves both). Clean case mein last ISR member ISR mein yaad rehta hai, toh woh wapas aate hi leader ban jaata hai (review fix, test_offline_partition_recovers_when_last_isr_member_returns).",
+   "Consumer crash before commit: session expiry -> rebalance -> redelivery (at-least-once); zombie consumer ka late commit generation/ownership se fenced."
+  ],
+  "improvements": [
+   "Brokers ko alag processes banana with a binary RPC layer aur epoch on every request, in-memory transport tests ke liye rakhte hue.",
+   "Leader-epoch based truncation (KIP-101) aur idempotent producer state ko batch headers mein store karke replicate karna (failover dedupe gap close).",
+   "Review gaps already fixed (test_review_fixes.py): last ISR member kept on offline partitions, NOT_ENOUGH_REPLICAS_AFTER_APPEND after the acks=all wait, notify on ISR shrink, rf=1 HW after restart, fetch always returns at least one record (KIP-74), producer identity reset after a failed batch, replication errors logged. Next: per-record size limit on produce and an ack-timeout/stuck-partition alert.",
+   "Log compaction for __consumer_offsets, offsets ko N partitions mein baant ke partitioned coordinators.",
+   "Batch format with per-batch CRC + compression, zero-copy serving, aur cooperative sticky rebalancing.",
+   "Security: TLS, SASL/OAuth principals, ACLs, per-client quotas."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Log vs queue and the on-disk commit log",
+   "steps": [
+    "1. Concept: log append-only hai, consume pe delete nahi hota; har consumer group apna offset rakhta hai -- replay aur multiple independent readers possible.",
+    "2. Why here: poora system (retention, replay, consumer groups) is ek abstraction pe khada hai.",
+    "3. API/code: `Log.append` offsets assign karta hai, `Log.read(offset, max_bytes, max_offset)` HW tak padhta hai.",
+    "4. Implementation: `record.py` frame (size, crc, offset, ts, key, value), `segment.py` sparse index every 4KB, `_recover` torn tail cut, `apply_retention` whole segments.",
+    "5. Demonstrate: `pytest tests/test_storage.py -q` -- `test_recovery_truncates_torn_tail`, `test_segments_roll_and_reads_cross_segments`, `test_retention_by_time_and_size`.",
+    "6. Interviewer next: sparse vs dense index, why retention is per segment, what CRC does not protect."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/storage/record.py",
+    "projects/05-mini-kafka/minikafka/storage/segment.py",
+    "projects/05-mini-kafka/minikafka/storage/log.py",
+    "projects/05-mini-kafka/tests/test_storage.py",
+    "projects/05-mini-kafka/DATABASE_DESIGN.md"
+   ]
+  },
+  {
+   "concept": "Partitions, keys and ordering",
+   "steps": [
+    "1. Concept: partition = unit of parallelism aur ordering; same key -> same partition -> per-key order.",
+    "2. Why here: producer aur consumer group dono ka scaling partitions pe hai.",
+    "3. API/code: `Producer.send` mein `zlib.crc32(key.encode()) % n`; API `default_partition` fallback.",
+    "4. Implementation: per-partition queues in producer, one in-flight request per partition, assignors give each partition to one member.",
+    "5. Demonstrate: `test_key_ordering_and_group_consumption`; `demo.py` 5 keys / 3 partitions -> 36/12/12 skew.",
+    "6. Interviewer next: hot partitions, adding partitions breaks mapping, murmur2 vs crc32."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/client/producer.py",
+    "projects/05-mini-kafka/minikafka/api/app.py",
+    "projects/05-mini-kafka/demo.py",
+    "projects/05-mini-kafka/tests/test_e2e_api.py",
+    "projects/05-mini-kafka/SYSTEM_DESIGN.md"
+   ]
+  },
+  {
+   "concept": "Replication: LEO, HW, ISR and pull-based fetch",
+   "steps": [
+    "1. Concept: LEO = next offset, HW = min LEO across ISR = committed, ISR = caught-up replicas.",
+    "2. Why here: consumers sirf committed data dekhein aur acks=all ka matlab precise ho.",
+    "3. API/code: `Cluster._replicate` follower loop, `_advance_hw`, `_check_isr`, `_maybe_expand_isr`.",
+    "4. Implementation: fetch offset doubles as ack; follower HW = min(leader HW, own LEO); ISR shrink after replica_lag_max_ms.",
+    "5. Demonstrate: `test_consumers_never_see_uncommitted_records`, `test_isr_shrinks_on_lag_and_expands_after_heal`; dashboard pe replica LEOs dekho.",
+    "6. Interviewer next: why pull not push, extra round trip latency, ISR measured in time not messages."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/cluster/cluster.py",
+    "projects/05-mini-kafka/minikafka/cluster/partition.py",
+    "projects/05-mini-kafka/tests/test_replication.py",
+    "projects/05-mini-kafka/ARCHITECTURE.md"
+   ]
+  },
+  {
+   "concept": "acks, min.insync.replicas and data loss",
+   "steps": [
+    "1. Concept: acks=0/1/all durability knob; min ISR acks=all ko meaningful banata hai.",
+    "2. Why here: project ka sabse important proof -- acks=1 acknowledged write lose kar sakta hai.",
+    "3. API/code: `Cluster.produce` -- min ISR pre-check, append, HW wait with request_timeout_ms.",
+    "4. Implementation: `RequestTimedOut` ambiguity (data already on leader), `NotEnoughReplicas` before writing.",
+    "5. Demonstrate: `test_acks_1_can_lose_acknowledged_write_on_failover` vs `test_leader_failover_keeps_committed_data`, `test_min_insync_replicas_rejects_writes`, `test_acks_all_times_out_when_follower_stalls_inside_isr`.",
+    "6. Interviewer next: rf=3 + min ISR 2 + acks=all guarantees, what request_timed_out means, NOT_ENOUGH_REPLICAS_AFTER_APPEND."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/cluster/cluster.py",
+    "projects/05-mini-kafka/minikafka/cluster/errors.py",
+    "projects/05-mini-kafka/tests/test_replication.py",
+    "projects/05-mini-kafka/LEARNING_GUIDE.md"
+   ]
+  },
+  {
+   "concept": "Leader election, epochs and truncation",
+   "steps": [
+    "1. Concept: controller dead broker detect karke ISR se leader chunta hai; epoch har election pe +1.",
+    "2. Why here: failover ke baad replicas consistent hone chahiye bina committed data khoye.",
+    "3. API/code: `_controller_loop`, `_handle_broker_failure`, `_elect`, `restart_broker`, `_checkpoint_loop`.",
+    "4. Implementation: clean vs unclean election, follower stale epoch -> truncate to HW (pre-KIP-101), HW checkpoint per broker.",
+    "5. Demonstrate: `test_partition_offline_without_isr_and_unclean_election`; demo.py kills orders-0 leader and prints new leader/epoch.",
+    "6. Interviewer next: KIP-101 leader-epoch truncation, split brain, controller failover (KRaft)."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/cluster/cluster.py",
+    "projects/05-mini-kafka/minikafka/cluster/config.py",
+    "projects/05-mini-kafka/tests/test_replication.py",
+    "projects/05-mini-kafka/FAILURE_SCENARIOS.md",
+    "projects/05-mini-kafka/demo.py"
+   ]
+  },
+  {
+   "concept": "Idempotent producer and retries",
+   "steps": [
+    "1. Concept: producer id + sequence se broker retry duplicates pehchaanta hai.",
+    "2. Why here: retries ke bina transient errors pe loss, idempotence ke bina retries pe duplicates.",
+    "3. API/code: `POST /producers`, `Replica.check_sequence`, `record_sequence`, client `_send_batch` with backoff.",
+    "4. Implementation: last 5 batches window, gap -> out_of_order_sequence_number, unknown producer accepted (bug #3 fix).",
+    "5. Demonstrate: `test_idempotent_producer_dedupes_retries`, `test_idempotent_produce_over_http`, `test_producer_survives_leader_failure`.",
+    "6. Interviewer next: why state lost on failover, how Kafka persists it, 5 in-flight requests with ordering."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/cluster/partition.py",
+    "projects/05-mini-kafka/minikafka/client/producer.py",
+    "projects/05-mini-kafka/tests/test_replication.py",
+    "projects/05-mini-kafka/tests/test_e2e_api.py",
+    "projects/05-mini-kafka/TESTING.md"
+   ]
+  },
+  {
+   "concept": "Consumer groups, rebalancing and fencing",
+   "steps": [
+    "1. Concept: group mein har partition ek member ko; membership change -> rebalance -> generation+1.",
+    "2. Why here: scale-out consumption aur crash failover bina offsets corrupt kiye.",
+    "3. API/code: `GroupCoordinator.join/heartbeat/leave/commit`, `_complete_rebalance`, assignors.",
+    "4. Implementation: future-based join barrier, stragglers kicked after rebalance delay, commit fenced by generation + ownership, offsets log replay.",
+    "5. Demonstrate: `tests/test_groups.py` -- `test_join_split_rebalance_and_failover`, `test_commit_fencing_and_ownership`, `test_range_vs_roundrobin_with_many_topics`.",
+    "6. Interviewer next: cooperative rebalancing / KIP-848, static membership, compaction of __consumer_offsets."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/cluster/groups.py",
+    "projects/05-mini-kafka/minikafka/cluster/assignors.py",
+    "projects/05-mini-kafka/minikafka/client/consumer.py",
+    "projects/05-mini-kafka/tests/test_groups.py"
+   ]
+  },
+  {
+   "concept": "Delivery semantics and replay",
+   "steps": [
+    "1. Concept: commit after processing = at-least-once, before = at-most-once, exactly-once needs atomic result + offset.",
+    "2. Why here: client ka commit timing hi guarantee decide karta hai.",
+    "3. API/code: `Consumer.poll`, `Consumer.commit`, `Consumer.seek`.",
+    "4. Implementation: positions = next offset, offset_out_of_range reset to log start, no transactions.",
+    "5. Demonstrate: `test_at_least_once_redelivery_after_consumer_crash`, `test_replay_with_seek`.",
+    "6. Interviewer next: idempotent consumers, Kafka transactions and their limits outside Kafka, outbox pattern."
+   ],
+   "files": [
+    "projects/05-mini-kafka/minikafka/client/consumer.py",
+    "projects/05-mini-kafka/tests/test_e2e_api.py",
+    "projects/05-mini-kafka/SYSTEM_DESIGN.md"
+   ]
+  },
+  {
+   "concept": "Performance: batching and profiling",
+   "steps": [
+    "1. Concept: fixed per-request cost amortize karna (batching); measure before fixing (profiling).",
+    "2. Why here: HTTP producer 376 -> 32,841 msg/s; acks=all 8.7k -> 73.8k msg/s.",
+    "3. API/code: `Producer(batch_size, linger_ms)`, `bench/bench.py storage|cluster|http`.",
+    "4. Implementation: reusable read handle per segment + bounded reads in `Segment.read`; whole cluster CPU-bound in one process.",
+    "5. Demonstrate: `python bench/bench.py` and compare with TESTING.md (Windows 11 laptop numbers).",
+    "6. Interviewer next: why Kafka is fast (sequential I/O, page cache, zero-copy, compression), concurrency vs parallelism."
+   ],
+   "files": [
+    "projects/05-mini-kafka/bench/bench.py",
+    "projects/05-mini-kafka/minikafka/storage/segment.py",
+    "projects/05-mini-kafka/minikafka/client/producer.py",
+    "projects/05-mini-kafka/TESTING.md",
+    "projects/05-mini-kafka/TRADEOFFS.md"
+   ]
+  }
+ ]
+}

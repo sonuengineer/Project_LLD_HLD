@@ -1,0 +1,982 @@
+[
+ {
+  "id": "MKFK-023",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "What is real and what is simulated in minikafka's cluster?",
+  "answer_hinglish": "Real: har broker ka har replica ek real segmented log hai disk pe (`data/broker-N/topic-P/*.log, *.index`). Follower sach mein leader ke log se records READ karke apne log mein APPEND karta hai -- yeh actual byte copy hai, sirf ek flag nahi. HW, ISR, leader epoch aur election ke rules Kafka jaise hain. HW checkpoint files, `metadata.json`, aur `__consumer_offsets` log disk pe hain aur restart pe reload hote hain. Consumer group protocol (join, heartbeat, generations, fencing) bhi real hai.\n\nSimulated: (1) Network. Saare brokers ek Python process ke andar objects hain; follower ka \"fetch\" ek direct method call (`leader.log.read(...)`) hai. Network failure = `Broker.reachable = False`, jisse calls `BrokerUnavailable` raise karti hain. (2) Broker processes. Kill = broker ke asyncio tasks cancel + files close; restart = files reopen (recovery chalti hai) + tasks dobara start. OS-level crash nahi hota, isliye unflushed OS buffers bach jaate hain.\n\nKyun aisa? Failure tests deterministic chahiye the: \"leader ko exactly us moment pe isolate karo jab usne acks=1 write ack kiya lekin followers ne copy nahi kiya\". Real processes aur sockets ke saath yeh flaky hota. Cost: real network partitions, split brain, multi-machine throughput, aur partial failures (slow disk, GC pause) model nahi hote, aur saare brokers ek CPU share karte hain.",
+  "why_needed": "Interviewer ke 'yeh distributed kaise hai?' sawal ka honest, precise answer.",
+  "real_world_analogy": "Flight simulator: cockpit ke instruments aur pilot ke decisions real hain, lekin hawa aur mausam software se simulate ho rahe hain.",
+  "how_it_works": "`Broker.up = alive and reachable`. `_leader_replica` aur `_replicate` har call pe `up` check karte hain. `kill_broker` -> `alive=False`, tasks cancel, `log.close()`. `restart_broker` -> naye `Replica` objects + `_open_log` (recovery) + HW from checkpoint.",
+  "in_this_project": "`cluster/cluster.py` module docstring aur README ka \"What is real vs simulated\" table. Fault injection HTTP endpoints `/admin/brokers/{id}/kill|restart|isolate|heal` (`api/app.py::broker_action`) dashboard buttons se bhi chalte hain.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::Broker",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::kill_broker",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::restart_broker",
+   "projects/05-mini-kafka/minikafka/api/app.py::broker_action",
+   "projects/05-mini-kafka/README.md"
+  ],
+  "code_example": "# real: cluster.py\n@dataclass\nclass Broker:\n    id: int\n    alive: bool = True            # process running\n    reachable: bool = True        # network (False = isolated / partitioned)\n    ...\n    @property\n    def up(self) -> bool:\n        return self.alive and self.reachable",
+  "code_language": "python",
+  "advantages": [
+   "Deterministic failure tests",
+   "Real storage behaviour (recovery, truncation) test hota hai"
+  ],
+  "disadvantages": [
+   "No real network partition / split brain",
+   "One CPU for all brokers"
+  ],
+  "common_mistakes": [
+   "Simulated cluster ki throughput ko real Kafka se compare karna",
+   "'Distributed' claim bina caveat"
+  ],
+  "follow_up_questions": [
+   "How would you run brokers as separate processes?",
+   "What failure modes can't you test this way?",
+   "How does isolate differ from kill?"
+  ],
+  "concepts": [
+   "simulation",
+   "fault injection",
+   "in-process cluster"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-024",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does Segment._recover handle a torn tail after a crash?",
+  "answer_hinglish": "Crash ke time last record aadha likha reh sakta hai (\"torn write\"). Segment khulte hi `_recover` poori `.log` file padhta hai aur shuru se `decode_at` se record by record decode karta hai. `decode_at` teen cases deta hai: poora valid record -> (record, next_pos); buffer record ke beech khatam -> `None` (torn); CRC mismatch -> `CorruptRecord` (jise bhi None ki tarah treat karte hain). Pehla invalid point milte hi loop rukta hai, `last_good` = last valid record ka end.\n\nPhir agar file `last_good` se badi hai, `f.truncate(last_good)` -- aadha record kaat diya. In-memory state bhi isi scan se rebuild hoti hai: `next_offset`, `max_timestamp`, `size`, aur sparse index. Index file ko bhi dobara likhte hain kyunki \"Index is derived data ... may be stale after a crash\".\n\nTruncate kyun, repair kyun nahi? Kyunki aadhe record ka data hai hi nahi -- producer ko uska ack mila hi nahi hoga (acks=1 mein bhi append flush ke baad ack hota hai; torn = woh write complete nahi hui). Agar record replicated tha, toh follower fetch se dobara aa jayega.\n\n`test_recovery_truncates_torn_tail`: 10 records likho, close, file mein ek record ke 7 bytes kam append karo. Reopen -> `recovered_truncated_bytes > 0`, LEO 10, aur next append offset 10 pe clean jaata hai.\n\nNote: Kafka sirf last clean flush ke baad wale segments recover karta hai; yahan har segment har open pe full scan hota hai -- simple, lekin bade logs pe startup slow.",
+  "why_needed": "Crash ke baad log ko consistent state mein laana -- bina iske appends garbage ke baad hote.",
+  "real_world_analogy": "Diary mein aakhri line aadhi likhi reh gayi jab bijli gayi -- aap woh aadhi line kaat dete ho aur agli line saaf jagah se shuru karte ho.",
+  "how_it_works": "Loop: decode -> index entry agar `since >= interval` -> next_offset, max_timestamp update -> pos = last_good = nxt. End pe truncate + index rewrite.",
+  "in_this_project": "`Segment._recover` constructor mein `_log` kholne se pehle chalta hai. `Log.recovered_truncated_bytes` saare segments ka sum expose karta hai. FAILURE_SCENARIOS #8.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/segment.py::_recover",
+   "projects/05-mini-kafka/minikafka/storage/record.py::decode_at",
+   "projects/05-mini-kafka/tests/test_storage.py::test_recovery_truncates_torn_tail",
+   "projects/05-mini-kafka/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, trimmed: storage/segment.py _recover\nwhile True:\n    try:\n        res = decode_at(data, pos)\n    except CorruptRecord:\n        res = None\n    if res is None:\n        break\n    rec, nxt = res\n    ...\n    pos = last_good = nxt\ntruncated = len(data) - last_good\nif truncated:\n    with open(self.log_path, \"r+b\") as f:\n        f.truncate(last_good)",
+  "code_language": "python",
+  "advantages": [
+   "Simple, provably consistent tail",
+   "Index hamesha log se consistent"
+  ],
+  "disadvantages": [
+   "Har open pe full segment scan",
+   "Corruption ke baad ka saara valid data bhi kat jata hai"
+  ],
+  "common_mistakes": [
+   "Torn record ko skip karke aage padhna (offset gap)",
+   "Recovery ke baad stale index use karna"
+  ],
+  "follow_up_questions": [
+   "What if corruption is in the middle, not the tail?",
+   "How does Kafka avoid scanning every segment?",
+   "Why is fsync relevant here?"
+  ],
+  "concepts": [
+   "crash recovery",
+   "torn write",
+   "truncation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-025",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What happens on bit rot in the middle of a segment, and why drop everything after the bad record?",
+  "answer_hinglish": "Agar segment ke beech mein koi byte flip ho jaye, toh us record ka CRC match nahi karega aur `decode_at` `CorruptRecord` raise karega. `_recover` isse torn tail jaisa treat karta hai: wahin ruk jata hai aur file ko us record ke start pe truncate kar deta hai -- matlab corrupt record AUR uske baad ke saare (valid) records bhi hat jaate hain. `test_recovery_stops_at_corrupted_record` file ke beech ek byte flip karta hai aur assert karta hai `0 < log_end_offset < 10`.\n\nSkip karke aage kyun nahi badhte? Teen reasons. (1) Agar corrupt byte `size` field mein hai, toh agle record ki boundary hi galat hogi -- aage ka parse bharose layak nahi. (2) Log ke offsets dense hone chahiye; beech ka record hata ke baaki rakhoge toh offset gap ban jayega jo `append_records` ke contiguity check aur consumers ki expectations todta hai. (3) Replicated system mein sahi fix hai \"local tail kaat do, leader se dobara fetch karo\" -- truncate ke baad follower ka LEO kam hai, toh `_replicate` missing records leader se wapas copy kar leta hai.\n\nLekin dhyan do: agar yeh broker leader tha aur ISR mein koi aur nahi, toh corrupt se aage ka data permanently gaya. Real Kafka yahan bhi similar karta hai (recovery pe invalid batch se truncate) aur isliye rf>1 zaroori hai.",
+  "why_needed": "CRC sirf detect karta hai; detect hone ke baad kya karna hai woh design decision hai.",
+  "real_world_analogy": "Train ke dibbe chain mein jude hain; beech ka coupling toot gaya toh peeche ke dibbe engine ke saath nahi chal sakte -- unhe doosre engine (leader) se dobara jodna padta hai.",
+  "how_it_works": "CorruptRecord -> res None -> break -> truncate at last_good. Replication path: follower LEO < leader LEO -> fetch.",
+  "in_this_project": "`decode_at` CRC check: `if zlib.crc32(payload) != crc: raise CorruptRecord`. `Segment._recover` usse pakadta hai. FAILURE_SCENARIOS #9 \"Bit rot inside a segment -- CRC mismatch; recovery drops the bad record and everything after it\".",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/record.py::CorruptRecord",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::_recover",
+   "projects/05-mini-kafka/tests/test_storage.py::test_recovery_stops_at_corrupted_record",
+   "projects/05-mini-kafka/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real: tests/test_storage.py\ndata = bytearray(seg.read_bytes())\ndata[len(data) // 2] ^= 0xFF                 # bit rot in the middle\nseg.write_bytes(bytes(data))\nlog2 = Log(tmp_path)\nassert 0 < log2.log_end_offset < 10          # everything after the bad record dropped",
+  "code_language": "python",
+  "advantages": [
+   "Dense offsets maintained",
+   "Replication se self-heal"
+  ],
+  "disadvantages": [
+   "Valid data bhi drop hota hai",
+   "Single replica pe permanent loss"
+  ],
+  "common_mistakes": [
+   "CRC ko error correction samajhna",
+   "Corrupt record skip karke offsets mein gap banana"
+  ],
+  "follow_up_questions": [
+   "Would you ever skip a corrupt record?",
+   "How would you alert on recovery truncations?",
+   "How does the follower refill the dropped records?"
+  ],
+  "concepts": [
+   "CRC",
+   "bit rot",
+   "data integrity"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-026",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What is the difference between Log.append and Log.append_records?",
+  "answer_hinglish": "Do write paths hain kyunki leader aur follower ke role alag hain.\n\n`Log.append(items)` LEADER path hai: items sirf (key, value) hain; log khud offsets assign karta hai -- `base = self.log_end_offset`, phir `Record(base + i, ts, k, v)`. Timestamp bhi yahi lagata hai (ya caller deta hai). Return base offset, jo producer ko ack mein milta hai.\n\n`Log.append_records(records)` FOLLOWER path hai: records leader se pehle se offsets aur timestamps ke saath aate hain, aur unhe bilkul waise hi copy karna hai. Isliye strict check: `records[0].offset != self.log_end_offset` -> `ValueError(\"non-contiguous append\")`. Follower ka log leader ka exact prefix hona chahiye; agar gap ya overlap hai toh kuch galat hai (truncation miss hua, ya galat leader se fetch).\n\nLeader ka `append` bhi andar `append_records` hi call karta hai, toh segment roll aur flush logic ek jagah hai: active segment `>= segment_bytes` ho toh `_roll`, phir `segments[-1].append(records)` aur `flush(fsync=self.fsync_every_append)`.\n\nRecords verbatim copy hone ka fayda: offsets aur timestamps saare replicas pe identical, isliye failover ke baad consumer ka committed offset naye leader pe bhi same record ko point karta hai.",
+  "why_needed": "Replica consistency ka matlab hai har replica pe same offset = same record; yeh API split usi ko enforce karta hai.",
+  "real_world_analogy": "Head office invoice number deta hai (leader), branch office sirf wahi invoice number ke saath copy file karta hai (follower) -- branch apna number nahi bana sakti.",
+  "how_it_works": "Leader: produce -> `r.log.append(items)`. Follower: `_replicate` -> `recs = leader.log.read(fetch_offset, 1MB)` -> `me.log.append_records(recs)`.",
+  "in_this_project": "`storage/log.py` docstring: \"Offsets are dense and assigned here (leader) or copied from the leader (follower)\". `_replicate` append se pehle `if me.leo > leader.leo: truncate_to(leader.leo)` karta hai taaki contiguity bani rahe.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/log.py::append",
+   "projects/05-mini-kafka/minikafka/storage/log.py::append_records",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_replicate"
+  ],
+  "code_example": "# real: storage/log.py\ndef append_records(self, records):\n    # Follower path: offsets come from the leader and must continue our log exactly.\n    if not records:\n        return\n    if records[0].offset != self.log_end_offset:\n        raise ValueError(f\"non-contiguous append: expected {self.log_end_offset}, got {records[0].offset}\")\n    if self.segments[-1].size >= self.segment_bytes:\n        self._roll()\n    self.segments[-1].append(records)\n    self.segments[-1].flush(fsync=self.fsync_every_append)",
+  "code_language": "python",
+  "advantages": [
+   "Same offset = same record on every replica",
+   "Bugs (gaps) fail fast"
+  ],
+  "disadvantages": [
+   "Contiguity error replication loop mein retry hota hai (ab `replication_error` log hota hai -- pehle swallow hota tha)",
+   "Ek hi batch segments mein split nahi hota"
+  ],
+  "common_mistakes": [
+   "Follower pe offsets dobara assign karna",
+   "Contiguity check skip karna"
+  ],
+  "follow_up_questions": [
+   "What happens if the follower has records the leader doesn't?",
+   "Why must timestamps be copied too?",
+   "Where is fsync decided?"
+  ],
+  "concepts": [
+   "leader path",
+   "follower path",
+   "offset assignment"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-027",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Walk through the follower fetch loop (_replicate) step by step.",
+  "answer_hinglish": "Har broker pe har replica ke liye ek asyncio task `_replicate(broker, tp)` chalta hai. Ek iteration:\n\n1. Metadata padho. Agar main leader hoon, ya partition ka koi leader nahi, ya leader main hi hoon -> `replica_fetch_wait_ms` sleep, continue.\n2. Network check: `broker.up and leader_b.up` nahi toh `BrokerUnavailable` (simulated network failure) -> except mein sleep.\n3. Epoch check: agar mera `leader_epoch < meta.leader_epoch`, toh naya leader aaya hai. Main apne HW ke upar ka sab truncate karta hoon (pre-KIP-101 behaviour), aur apna epoch update.\n4. Agar mera LEO leader ke LEO se zyada hai -> leader ke LEO tak truncate.\n5. `fetch_offset = me.leo`. Yahi mera \"ack\" hai: `leader.follower_leo[me] = fetch_offset`; agar `>= leader.leo` toh `follower_caught_up_at = now`. Phir `_maybe_expand_isr`, `_advance_hw`, aur `leader.changed.notify_all()` taaki acks=all waiters jaag jaayein.\n6. Agar fetch_offset leader ke log start se neeche (retention) -> `truncate_to(0)` reset.\n7. `leader.log.read(fetch_offset, 1MB)` -> records hain toh `append_records`; nahi hain toh leader ke `changed` condition pe `replica_fetch_wait_ms` tak long-poll wait.\n8. `me.high_watermark = min(leader.high_watermark, me.leo)` -- follower HW leader se seekhta hai.\n\nImportant subtlety: ack (step 5) records copy karne SE PEHLE hota hai, aur us LEO ko report karta hai jo follower ke paas already hai. Isliye batch N commit hone ke liye follower ko ek aur fetch karna padta hai (jo naya LEO report kare) -- yahi \"extra round trip\" hai jo TRADEOFFS #2 mein acks=all latency ki cost ke roop mein likha hai. Kafka mein bhi bilkul yahi hai.",
+  "why_needed": "Replication ka core yahi loop hai -- HW, ISR, truncation sab yahin se drive hote hain.",
+  "real_world_analogy": "Branch office ka clerk har thodi der head office phone karta hai: 'mere paas invoice 120 tak hai, aage ka bhejo'. Head office us call se hi jaan leta hai ki branch 120 tak hai.",
+  "how_it_works": "Pull model, fetch offset = acknowledgement, long-poll via `asyncio.Condition`, generic `except Exception` -> backoff sleep, `CancelledError` re-raise taaki kill/stop kaam kare.",
+  "in_this_project": "`Cluster._replicate` (cluster.py). Tasks `_start_broker_tasks` mein bante hain aur naye topics ke liye `create_topic` mein (`if self._started`) -- TESTING.md bug #1 yahi tha. ARCHITECTURE.md ka \"Produce with acks=all\" sequence diagram yahi flow dikhata hai.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_replicate",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_maybe_expand_isr",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_advance_hw",
+   "projects/05-mini-kafka/ARCHITECTURE.md",
+   "projects/05-mini-kafka/TRADEOFFS.md"
+  ],
+  "code_example": "# real, trimmed: cluster.py _replicate\nfetch_offset = me.leo\n# The fetch itself tells the leader our LEO (that's how Kafka followers \"ack\").\nleader.follower_leo[broker.id] = fetch_offset\nif fetch_offset >= leader.leo:\n    leader.follower_caught_up_at[broker.id] = time.monotonic()\nself._maybe_expand_isr(meta, leader, broker.id)\nself._advance_hw(meta, leader)\n...\nrecs = leader.log.read(fetch_offset, 1024 * 1024) if fetch_offset < leader.leo else []\nif recs:\n    me.log.append_records(recs)\n...\nme.high_watermark = min(leader.high_watermark, me.leo)",
+  "code_language": "python",
+  "advantages": [
+   "Ek hi code path catch-up aur steady state ke liye",
+   "Follower apni pace control karta hai"
+  ],
+  "disadvantages": [
+   "HW advance ke liye extra round trip",
+   "Generic except bugs ko chhupa sakta hai (sirf sleep)"
+  ],
+  "common_mistakes": [
+   "Sochna ki leader followers ko push karta hai",
+   "Follower HW ko leader HW ke barabar maan lena"
+  ],
+  "follow_up_questions": [
+   "Why is there an extra round trip before HW advances?",
+   "What happens when the follower is ahead of the leader?",
+   "How would this look over a real network?"
+  ],
+  "concepts": [
+   "follower fetch",
+   "pull replication",
+   "long poll"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pull model: follower backpressure khud handle karta hai aur catch-up = normal fetch. Push model mein leader ko har follower ki state aur flow control manage karna padta. Cost: commit latency ~ ek extra fetch.",
+   "failure_scenarios": "Leader isolated -> `BrokerUnavailable` -> follower sleep loop; controller session timeout ke baad naya leader chunta hai aur follower naye epoch pe truncate karta hai. Contiguity ValueError pehle silently swallow hota tha (review observation); ab `BrokerUnavailable` jaise expected faults ignore hote hain aur baaki `log.exception('replication_error')` se log.",
+   "alternatives": "Push replication (Raft AppendEntries leader se push hota hai), chain replication, quorum writes (Cassandra).",
+   "scale_10x_100x": "Real network pe 1MB fetch size, fetch wait, aur number of replica fetcher threads tune hote hain; 1000s partitions pe Kafka ek fetch request mein saare partitions batch karta hai (per-broker fetcher), per-partition loops nahi.",
+   "production_improvements": "Per-broker batched fetch requests, error logging in except branch, fetch sessions (KIP-227) to avoid resending all partitions."
+  }
+ },
+ {
+  "id": "MKFK-028",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does produce() with acks=all wait for replication, and how is the waiter woken up?",
+  "answer_hinglish": "`produce` leader pe append karne ke baad `end = base + len(items)` compute karta hai aur `r.changed` (ek `asyncio.Condition`) pe `wait_for(lambda: r.high_watermark >= end)` karta hai, `asyncio.wait_for` ke saath `request_timeout_ms` (3s default) timeout.\n\n`Condition.wait_for` predicate check karta hai, false ho toh lock chhod ke sleep karta hai jab tak koi `notify_all` na kare, phir predicate dobara check. Notify kaun karta hai? (1) `produce` khud append ke baad (single-replica ISR mein HW turant aage badh jata hai -- `_advance_hw` call append ke baad hai). (2) Har follower fetch `_replicate` mein `_advance_hw` ke baad `leader.changed.notify_all()`. Toh jaise hi aakhri ISR follower ka LEO end tak pahunchta hai aur woh agla fetch karta hai, HW >= end hota hai aur producer jaag jata hai.\n\nSame condition consumer long-poll (`fetch` with wait_ms, predicate `high_watermark > offset`) aur follower long-poll (`leader.leo > me.leo`) bhi use karte hain -- ek notify sabko jagaata hai, sab apna predicate check karte hain. Simple, lekin bahut waiters ho toh thundering herd.\n\nTimeout pe `RequestTimedOut` -- par data leader pe likha ja chuka hai! Yeh ambiguity alag sawal hai (idempotent retry se solve). Dedupe case mein bhi (duplicate batch) code same HW wait karta hai, taaki retry ka ack bhi tabhi aaye jab original replicate ho chuka ho.",
+  "why_needed": "acks=all ka mechanics -- 'wait for replication' actually kaise implement hota hai.",
+  "real_world_analogy": "Restaurant mein order ready hone ka buzzer: aap baith ke wait karte ho, kitchen (followers) jab bhi kuch complete karta hai buzzer bajata hai, aap check karte ho 'mera order ready hai?'.",
+  "how_it_works": "asyncio.Condition = lock + waiters list. `notify_all` sab waiters ko wake karta hai; `wait_for` predicate loop. `asyncio.wait_for` timeout pe task cancel karta hai aur TimeoutError deta hai.",
+  "in_this_project": "`Cluster.produce`, `Replica.changed` (comment: \"notified on append and on HW movement (long polls / acks=all)\"), `_replicate` ka notify. Test `test_acks_all_replicates_to_every_isr_member` HW 10 aur har replica LEO 10 check karta hai.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::produce",
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::Replica",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_replicate",
+   "projects/05-mini-kafka/tests/test_replication.py::test_acks_all_replicates_to_every_isr_member"
+  ],
+  "code_example": "# real, trimmed: cluster.py produce\nbase = r.log.append(items)\nr.record_sequence(producer_id, base_sequence, len(items), base)\nself._advance_hw(meta, r)   # single-replica ISR commits immediately\nasync with r.changed:\n    r.changed.notify_all()\nif all_acks:\n    end = base + len(items)\n    async with r.changed:\n        await asyncio.wait_for(r.changed.wait_for(lambda: r.high_watermark >= end), timeout=...)",
+  "code_language": "python",
+  "advantages": [
+   "No busy polling; event driven wakeups",
+   "Ek primitive teen use cases cover karta hai"
+  ],
+  "disadvantages": [
+   "notify_all thundering herd",
+   "Timeout != failure (ambiguous outcome)"
+  ],
+  "common_mistakes": [
+   "Timeout ko 'write failed' samajhna",
+   "Condition ke bahar predicate check karke race banana"
+  ],
+  "follow_up_questions": [
+   "What happens if the leader changes while a producer waits?",
+   "Why use a Condition instead of polling?",
+   "How does Kafka implement this (purgatory)?"
+  ],
+  "concepts": [
+   "acks=all",
+   "asyncio.Condition",
+   "high watermark"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Shared condition simple hai; Kafka ka DelayedProduce \"purgatory\" per-key watchers rakhta hai taaki sirf relevant requests check hon. Yahan scale chhota hai isliye notify_all OK.",
+   "failure_scenarios": "Leader wait ke beech kill hua -> waiter timeout (ya task cancel) -> producer ko retriable error -> new leader pe retry; agar records new leader tak replicate ho chuke the toh idempotence gap ke wajah se duplicate possible.",
+   "alternatives": "Per-offset futures (heap of waiters keyed by end offset), Kafka purgatory timing wheel.",
+   "scale_10x_100x": "Hazaron concurrent acks=all requests per partition -> har follower fetch pe O(waiters) predicate checks; per-end-offset min-heap better.",
+   "production_improvements": "Leadership change pe pending waiters ko turant NotLeader error dena; ISR shrink below min ISR pe NOT_ENOUGH_REPLICAS_AFTER_APPEND aur shrink pe waiters ko notify (dono review ke baad add ho chuke)."
+  }
+ },
+ {
+  "id": "MKFK-029",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does the idempotent producer dedupe work internally (check_sequence / record_sequence)?",
+  "answer_hinglish": "Producer `POST /producers` se ek producer id (pid) leta hai, aur har partition ke liye sequence counter rakhta hai. Har batch ke saath `producer_id` aur `base_sequence` jaata hai; batch ke records ke sequences base..base+count-1 hain.\n\nLeader replica `producers: dict[pid, ProducerState]` rakhta hai, jisme `last_seq` aur `recent` -- last 5 batches ka deque `(base_seq, count, base_offset)`. `check_sequence`:\n- pid/seq None -> non-idempotent request, None return (normal append).\n- Unknown pid -> accept, tracking shuru (`last_seq = base_seq - 1`). Yeh bug #3 ka fix hai.\n- Agar (base_seq, count) `recent` mein hai -> DUPLICATE: original base_offset return; produce append nahi karta aur response mein `duplicate: true`.\n- `base_seq != last_seq + 1` -> `OutOfOrderSequence` (gap = kuch batch miss hua).\n- Warna None -> append, phir `record_sequence` `last_seq` aur `recent` update karta hai.\n\nKyun 5? Kafka `max.in.flight.requests.per.connection <= 5` allow karta hai idempotence ke saath, toh broker last 5 batches yaad rakhta hai. Hamara client ek time pe ek hi request per partition bhejta hai, toh 5 kaafi se zyada hai.\n\nTests: `test_idempotent_producer_dedupes_retries` (same seq 0 retry -> duplicate with same base_offset; seq 3 -> offset 3; seq 9 -> OutOfOrderSequence) aur HTTP version `test_idempotent_produce_over_http` (409 `out_of_order_sequence_number`). Limitation: yeh state sirf leader ki memory mein hai; `become_leader` `self.producers = {}` reset karta hai.",
+  "why_needed": "Retries ko safe banana bina duplicates ke -- at-least-once producer ko 'exactly-once per partition' banata hai (ek leader ke liye).",
+  "real_world_analogy": "Cheque number: bank ek hi cheque number dobara aaye toh pehli entry dikha deta hai, naya debit nahi karta; agar number beech mein skip hua toh alarm.",
+  "how_it_works": "Sequence per (pid, partition). Duplicate detection = exact (base_seq, count) match in recent window. Ordering check = contiguous sequence.",
+  "in_this_project": "`cluster/partition.py::ProducerState`, `Replica.check_sequence`, `Replica.record_sequence`; `Cluster.produce` dup branch; client `Producer._drain` `q.next_seq += len(batch)` aur `_send_batch` retries mein same `base_sequence` bhejta hai.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::check_sequence",
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::record_sequence",
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::ProducerState",
+   "projects/05-mini-kafka/tests/test_replication.py::test_idempotent_producer_dedupes_retries",
+   "projects/05-mini-kafka/tests/test_e2e_api.py::test_idempotent_produce_over_http"
+  ],
+  "code_example": "# real, trimmed: cluster/partition.py check_sequence\nst = self.producers[producer_id]\nfor b_seq, b_count, b_off in st.recent:\n    if b_seq == base_seq and b_count == count:\n        return b_off            # a retry of a batch we already wrote: same offsets, no duplicate\nif base_seq != st.last_seq + 1:\n    raise OutOfOrderSequence(f\"producer {producer_id}: expected seq {st.last_seq + 1}, got {base_seq}\")\nreturn None",
+  "code_language": "python",
+  "advantages": [
+   "Retry duplicates bina client-side coordination",
+   "Ordering gaps detect hote hain"
+  ],
+  "disadvantages": [
+   "State replicated nahi -> failover pe gap",
+   "Producer restart = naya pid, purane retries dedupe nahi"
+  ],
+  "common_mistakes": [
+   "Idempotent producer ko exactly-once end-to-end samajhna",
+   "Retry pe naya sequence assign karna"
+  ],
+  "follow_up_questions": [
+   "Why remember the last 5 batches?",
+   "What happens to this state on leader failover?",
+   "How does Kafka persist producer state?"
+  ],
+  "concepts": [
+   "idempotent producer",
+   "sequence numbers",
+   "deduplication"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-030",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How do Log.truncate_to and Segment.truncate_to work, and when are they used?",
+  "answer_hinglish": "Truncation follower ka woh data hatata hai jo naye leader ke paas nahi hai. Teen jagah use hota hai `_replicate` mein: (1) naye epoch pe HW tak truncate, (2) agar follower LEO leader LEO se aage hai toh leader LEO tak, (3) retention ki wajah se follower leader ke log start se peeche gir gaya toh `truncate_to(0)`.\n\n`Log.truncate_to(offset)`: pehle peeche se poore segments hatao jinka base_offset >= offset (`segments.pop().delete()`), lekin kam se kam ek segment rakhna. Phir agar last segment mein offset se aage records hain, `Segment.truncate_to(max(offset, base))`.\n\n`Segment.truncate_to(offset)`: flush, segment ke saare records padho, offset se pehle wale records ke encoded size jod ke `keep_end` nikaalo. Phir write handles aur read handle close, file `truncate(keep_end)`, `next_offset = base` reset karke `_recover()` -- jo bachi hui file scan karke next_offset, size aur index dobara banata hai -- phir append handles reopen.\n\nDesign choice: position nikalne ke liye `len(r.encode())` dobara compute karte hain instead of tracking positions -- simple, kyunki encode deterministic hai. Cost: poora segment padhna aur re-encode; truncation rare hai (sirf leader change pe), isliye theek.\n\nEdge: truncate_to(0) jab first segment base 0 hai -> last segment empty file ban jata hai. `test_truncate_to_for_follower_divergence`: 100 records, truncate 37 -> LEO 37, offset 36 readable, next append 37; truncate 0 -> LEO 0.",
+  "why_needed": "Leader change ke baad replicas ko consistent banana bina truncation possible nahi.",
+  "real_world_analogy": "Branch ne galti se kuch invoices likh liye jo head office ke register mein nahi hain -- branch un pages ko phaad ke head office se dobara copy karti hai.",
+  "how_it_works": "Whole-segment deletion for tail segments + partial truncate of the last one + recover to rebuild derived state.",
+  "in_this_project": "`storage/log.py::Log.truncate_to`, `storage/segment.py::Segment.truncate_to`, aur `_replicate` mein teen call sites. Controller event \"broker X truncating topic-p LEO -> HW\" `/events` pe dikhta hai.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/log.py::truncate_to",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::truncate_to",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_replicate",
+   "projects/05-mini-kafka/tests/test_storage.py::test_truncate_to_for_follower_divergence"
+  ],
+  "code_example": "# real: storage/log.py\ndef truncate_to(self, offset: int) -> None:\n    # Remove everything >= offset (a follower discarding records the new leader does not have).\n    while len(self.segments) > 1 and self.segments[-1].base_offset >= offset:\n        self.segments.pop().delete()\n    if offset < self.segments[-1].next_offset:\n        self.segments[-1].truncate_to(max(offset, self.segments[-1].base_offset))",
+  "code_language": "python",
+  "advantages": [
+   "Reuses recovery code for derived state",
+   "Correct across segment boundaries"
+  ],
+  "disadvantages": [
+   "Full segment read + re-encode",
+   "Not crash-atomic across multiple segment deletes"
+  ],
+  "common_mistakes": [
+   "Truncate ke baad index rebuild bhoolna",
+   "Leader pe truncate karna (committed data loss)"
+  ],
+  "follow_up_questions": [
+   "Why truncate to HW and not to the leader's LEO?",
+   "What if the broker crashes mid-truncation?",
+   "Can truncation ever delete committed data?"
+  ],
+  "concepts": [
+   "truncation",
+   "log divergence",
+   "follower recovery"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "HW tak truncate safe-side hai (committed data kabhi HW ke upar nahi hota), lekin kabhi kabhi valid uncommitted records bhi hata deta hai jo naye leader ke paas the -- woh dobara fetch hote hain. Leader-epoch based truncation zyada precise hai.",
+   "failure_scenarios": "Agar follower ka HW stale hai (checkpoint purana) toh woh kam truncate karega aur divergent records reh sakte hain -- rapid successive failovers mein HW-based truncation ka known weakness (KIP-101 motivation).",
+   "alternatives": "KIP-101: follower naye leader se `OffsetsForLeaderEpoch` poochta hai -- \"mere last epoch ka end offset kya hai tumhare hisaab se?\" -- aur exact wahan truncate karta hai.",
+   "scale_10x_100x": "Bade segments pe full read+re-encode slow; position-indexed truncation (index se position nikal ke) better.",
+   "production_improvements": "Leader epoch cache file per partition (Kafka: leader-epoch-checkpoint), truncation by epoch boundary, truncation events ko metric banana."
+  }
+ },
+ {
+  "id": "MKFK-031",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does the group coordinator's join() block until the rebalance completes?",
+  "answer_hinglish": "`GroupCoordinator.join` ek async method hai jo turant return nahi karta. Steps: topics validate (unknown topic -> error), group `setdefault` se banao, member id na ho toh `consumer-<uuid8>` generate karke `Member` add karo (session timeout `max(requested, min_session)`). Member ki topics aur last_heartbeat update. Phir ek `asyncio.Future` banao aur `g.pending[member_id] = fut` -- agar is member ka purana pending future hai toh cancel. `_start_rebalance` call aur `return await fut`.\n\nFuture tab resolve hota hai jab `_complete_rebalance` task assignment compute karke `fut.set_result({\"generation\", \"member_id\", \"leader\", \"assignment\"})` karta hai. Matlab HTTP `POST /groups/{g}/join` request rebalance complete hone tak open rehti hai -- Kafka ka JoinGroup bhi aisa hi long-blocking request hai.\n\n`_start_rebalance` idempotent hai: agar state pehle se `PreparingRebalance` hai toh naya task nahi banata -- isliye 3 members ek saath join karein toh ek hi rebalance hota hai aur sabko same generation milti hai (`test_join_split_rebalance_and_failover`: a.gen == b.gen == 1).\n\nExisting members ko kaise pata chalta hai? Unke next heartbeat pe `RebalanceInProgress` milta hai, toh woh bhi join call karte hain. Isi wajah se TESTING.md bug #5 hua: test ek hi loop se consumers ko sequentially poll kar raha tha -- B ka join A ke re-join ka wait kar raha tha aur A ka loop B ke call ke return hone ka. Fix: har consumer apne task mein (`drain` helper).",
+  "why_needed": "Rebalance ek barrier hai -- sab members ek saath naya assignment lete hain; yeh future-based barrier se implement hai.",
+  "real_world_analogy": "Team meeting: jab tak sab log room mein nahi aate (ya time khatam nahi hota), kaam ka batwara announce nahi hota. Jo pehle aa gaye woh wait karte hain.",
+  "how_it_works": "Future per pending member; ek background task barrier complete karta hai; heartbeat channel se rebalance ka signal.",
+  "in_this_project": "`cluster/groups.py::GroupCoordinator.join`, `_start_rebalance`, `_complete_rebalance`; HTTP `api/app.py::join`; client `Consumer._join`. Test helper `MemberSim` in `tests/test_groups.py`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::join",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::_start_rebalance",
+   "projects/05-mini-kafka/tests/test_groups.py::MemberSim",
+   "projects/05-mini-kafka/tests/test_e2e_api.py::drain",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: cluster/groups.py join\nfut = asyncio.get_running_loop().create_future()\nold = g.pending.pop(member_id, None)\nif old and not old.done():\n    old.cancel()\ng.pending[member_id] = fut\nself._start_rebalance(g, reason=f\"{member_id} joined\")\nreturn await fut",
+  "code_language": "python",
+  "advantages": [
+   "Ek hi rebalance mein saare joiners",
+   "Simple barrier semantics"
+  ],
+  "disadvantages": [
+   "Long-held HTTP requests",
+   "Slow member poore group ko rokta hai (delay tak)"
+  ],
+  "common_mistakes": [
+   "Consumers ko ek hi thread/loop se sequentially drive karna (deadlock)",
+   "Join ko non-blocking samajhna"
+  ],
+  "follow_up_questions": [
+   "What happens to members that don't re-join in time?",
+   "Why does the first join of an empty group still wait?",
+   "How does Kafka's SyncGroup fit in?"
+  ],
+  "concepts": [
+   "group coordinator",
+   "rebalance barrier",
+   "asyncio futures"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-032",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What does _complete_rebalance do, and how are stragglers handled?",
+  "answer_hinglish": "`_complete_rebalance` har rebalance ke liye ek background task hai. Steps:\n\n1. Deadline = now + `rebalance_delay_ms` (300ms default). Jab tak deadline nahi aayi AUR saare known members pending (re-joined) nahi hain, `check_interval` (50ms) sleep karte raho.\n2. `await asyncio.sleep(0)` -- ek tick do taaki simultaneously aane wale joiners land kar jaayein.\n3. Jo members `pending` mein nahi hain (time pe re-join nahi kiya) unhe `g.members` se delete -- out of the group.\n4. `generation += 1`, `rebalances += 1`.\n5. Subscriptions aur partition counts nikaal ke `ASSIGNORS[g.strategy]` se assignment compute.\n6. State = Stable (ya Empty agar koi member nahi), leader = `min(g.members)` (sirf informational).\n7. Har pending future ko result do: generation, member_id, leader, assignment; member ka `joined_generation` aur `last_heartbeat` set; `pending.clear()`.\n\nStragglers: jo member delay ke andar re-join nahi karta, woh nikaal diya jata hai. Agar woh baad mein (purani generation ke saath) heartbeat ya commit kare toh `UnknownMemberId` milta hai -- client `member_id = None` karke naye member ki tarah join karta hai.\n\nKafka mein yeh `rebalance.timeout.ms` (aksar max.poll.interval) hota hai aur ek `group.initial.rebalance.delay.ms` bhi -- naye group ke liye thoda wait taaki saare starting consumers ek hi rebalance mein aa jaayein. Yahan ek hi delay dono kaam karta hai.",
+  "why_needed": "Rebalance ki correctness (koi partition do members ko na mile) aur liveness (ek dead member forever na roke) dono yahin decide hote hain.",
+  "real_world_analogy": "Bus driver 5 minute wait karta hai; jo time pe aa gaya woh bus mein, jo nahi aaya uski seat kisi aur ko.",
+  "how_it_works": "Barrier with timeout; membership pruning; deterministic assignment; future completion.",
+  "in_this_project": "`cluster/groups.py::_complete_rebalance`; config `group_rebalance_delay_ms` (`cluster/config.py`), tests mein 100ms (`conftest.fast_config`). `test_join_split_rebalance_and_failover` mein crash hua member b session expiry ke baad nikal jata hai aur gen 3 pe a + c3 4 partitions baant lete hain.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::_complete_rebalance",
+   "projects/05-mini-kafka/minikafka/cluster/config.py::ClusterConfig",
+   "projects/05-mini-kafka/minikafka/cluster/assignors.py::ASSIGNORS",
+   "projects/05-mini-kafka/tests/test_groups.py::test_join_split_rebalance_and_failover"
+  ],
+  "code_example": "# real, trimmed: cluster/groups.py _complete_rebalance\nwhile loop.time() < deadline and set(g.pending) != set(g.members):\n    await asyncio.sleep(self.check_interval)\nawait asyncio.sleep(0)  # let simultaneous joiners land\nfor mid in [m for m in g.members if m not in g.pending]:\n    del g.members[mid]       # didn't re-join in time: out of the group\ng.generation += 1\nassignment = ASSIGNORS[g.strategy](subs, parts) if subs else {}",
+  "code_language": "python",
+  "advantages": [
+   "Dead members rebalance ko forever nahi rokte",
+   "Deterministic assignment"
+  ],
+  "disadvantages": [
+   "Slow-but-alive member bhi nikal sakta hai",
+   "Delay har rebalance ki minimum latency"
+  ],
+  "common_mistakes": [
+   "Delay bahut chhota rakhna (healthy consumers kick)",
+   "Delay bahut bada (har rebalance slow)"
+  ],
+  "follow_up_questions": [
+   "What is group.initial.rebalance.delay.ms for?",
+   "What does the group leader do in real Kafka?",
+   "How do you avoid rebalances on rolling restarts?"
+  ],
+  "concepts": [
+   "rebalance",
+   "generation",
+   "membership"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-033",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "How does create_topic place replicas and leaders across brokers?",
+  "answer_hinglish": "`create_topic` pehle validate karta hai: topic already hai -> `TopicAlreadyExists`; rf live brokers se zyada ya < 1 -> `InvalidReplicationFactor`; min ISR [1, rf] ke bahar -> error. Phir live brokers ki sorted list leta hai aur har partition p ke liye replicas `[live[(p + i) % len(live)] for i in range(rf)]`. Pehla replica leader, ISR = saare replicas, epoch 0.\n\nExample: 3 brokers, rf 3: p0 -> [0,1,2], p1 -> [1,2,0], p2 -> [2,0,1], p3 -> [0,1,2]... Leaders 0,1,2,0,1,2 -- har broker barabar partitions lead karta hai. `test_topic_placement_spreads_leaders` 6 partitions pe sorted leaders `[0,0,1,1,2,2]` check karta hai aur har partition ke 3 distinct replicas.\n\nHar replica broker pe `Replica(b, name, p, self._open_log(...))` banta hai, `_apply_leadership` roles set karta hai, aur agar cluster already running hai toh har replica ke liye `_replicate` task start hota hai -- yeh TESTING.md bug #1 ka fix hai (pehle follower loops sirf startup pe existing replicas ke liye bante the, isliye naye topics replicate hi nahi hote the). Last mein `metadata.json` persist aur controller event.\n\nReal Kafka bhi similar round-robin karta hai, plus rack awareness (replicas alag racks/AZs mein) aur random starting offset. Yahan rack awareness nahi hai.",
+  "why_needed": "Leader load aur replicas ka spread throughput aur fault tolerance decide karta hai.",
+  "real_world_analogy": "Teen chefs aur kai dishes: har dish ka head chef rotate hota hai taaki kisi ek pe saara load na aaye, aur har dish ki recipe teeno ke paas copy.",
+  "how_it_works": "Modular rotation; leader = first replica (\"preferred leader\"); live-broker list se hi placement.",
+  "in_this_project": "`Cluster.create_topic` in cluster.py; HTTP `POST /topics` (`TopicCreate`: partitions 1..256, rf 1..10, name regex).",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::create_topic",
+   "projects/05-mini-kafka/minikafka/api/app.py::TopicCreate",
+   "projects/05-mini-kafka/tests/test_replication.py::test_topic_placement_spreads_leaders",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: cluster.py create_topic (bug #1 fix)\nif self._started:\n    # Brokers already running: start a follower fetch loop for every new replica.\n    for meta in metas:\n        for b in meta.replicas:\n            broker = self.brokers[b]\n            if broker.alive:\n                broker.tasks.append(asyncio.create_task(self._replicate(broker, (name, meta.partition))))",
+  "code_language": "python",
+  "advantages": [
+   "Even leader distribution",
+   "Deterministic, testable"
+  ],
+  "disadvantages": [
+   "No rack awareness",
+   "Only live brokers considered; dead broker excluded permanently for that topic"
+  ],
+  "common_mistakes": [
+   "Saare leaders ek broker pe",
+   "rf > broker count"
+  ],
+  "follow_up_questions": [
+   "What is a preferred leader and leader rebalancing?",
+   "How would you add rack awareness?",
+   "What was bug #1 and how was it found?"
+  ],
+  "concepts": [
+   "replica placement",
+   "leader distribution"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-034",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Walk through the producer's batching code: batch_size, linger_ms and the per-partition lock.",
+  "answer_hinglish": "`Producer.send` record ko turant nahi bhejta. Partition decide karke `_queues[(topic, partition)]` (ek `_PartitionQueue`: records list, next_seq, lock, timer) mein `_Pending(key, value, future)` daalta hai aur future return karta hai jo `(partition, offset)` pe resolve hoga.\n\nDo triggers: agar queue `batch_size` (default 500) tak pahunch gayi toh `asyncio.create_task(self._drain(...))` turant. Warna agar timer nahi chal raha toh `_linger_then_drain` task: `linger_ms` (default 5ms) sleep karke drain. Linger ka matlab: \"thoda ruk jao, shayad aur records aa jaayein aur ek hi request mein jaayein\".\n\n`_drain` `async with q.lock` lekar loop karta hai: `batch_size` records nikaalo, `base_seq = q.next_seq; q.next_seq += len(batch)`, `_send_batch` (retries ke saath), success pe har future ko `(partition, base_offset + i)` do, failure pe exception set karo. Lock ka matlab: ek partition ke liye ek time pe ek hi in-flight request -- isliye retry kabhi baad wale batch ko overtake nahi kar sakta, ordering safe.\n\n`flush` saare queues ko drain karta hai, `close` flush + http client close.\n\nNumbers (TESTING.md, ASGI in-process, acks=all, rf=3, 4 partitions): batch 1 / 0ms = 376 msg/s, 100 / 5ms = 13,400, 1000 / 10ms = 32,841 -- 87x.\n\nReview mein mila bug (fixed): agar ek batch retries ke baad fail ho jaye, `next_seq` already aage badh chuka hota, toh agla batch leader pe sequence gap dikhata aur har baad wala batch `out_of_order_sequence_number` (non-retriable) se reject hota. Fix: failed batch ke baad `Producer._reset_identity()` -- naya producer_id aur saari queues ka `next_seq = 0`, leader use naya producer maanta hai (Kafka bhi epoch bump/reset karta hai). Test: `test_producer_resets_identity_after_failed_batch`.",
+  "why_needed": "Batching producer throughput ka sabse bada lever hai; interviewer code-level detail poochta hai.",
+  "real_world_analogy": "Lift operator 5 second rukta hai ya lift bhar jaye toh chal deta hai -- har ek aadmi ke liye alag trip nahi.",
+  "how_it_works": "Accumulator per partition + size trigger + time trigger + single in-flight per partition + futures for per-record results.",
+  "in_this_project": "`client/producer.py`: `Producer.send`, `_linger_then_drain`, `_drain`, `_send_batch`, `flush`. Bench: `bench/bench.py::http_producer`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/client/producer.py::send",
+   "projects/05-mini-kafka/minikafka/client/producer.py::_drain",
+   "projects/05-mini-kafka/minikafka/client/producer.py::_PartitionQueue",
+   "projects/05-mini-kafka/bench/bench.py::http_producer",
+   "projects/05-mini-kafka/TESTING.md",
+   "projects/05-mini-kafka/minikafka/client/producer.py::_reset_identity",
+   "projects/05-mini-kafka/tests/test_review_fixes.py::test_producer_resets_identity_after_failed_batch"
+  ],
+  "code_example": "# real, trimmed: client/producer.py\nq.records.append(_Pending(key, value, fut))\nif len(q.records) >= self.batch_size:\n    asyncio.create_task(self._drain(topic, partition))\nelif q.timer is None or q.timer.done():\n    q.timer = asyncio.create_task(self._linger_then_drain(topic, partition))\n\nasync def _drain(self, topic, partition):\n    q = self._queues[(topic, partition)]\n    async with q.lock:                      # one in-flight request per partition (ordering)\n        while q.records:\n            batch, q.records = q.records[:self.batch_size], q.records[self.batch_size:]\n            base_seq = q.next_seq\n            q.next_seq += len(batch)\n            ...",
+  "code_language": "python",
+  "advantages": [
+   "Bahut kam round trips",
+   "Ordering safe per partition",
+   "Per-record futures"
+  ],
+  "disadvantages": [
+   "Linger = added latency",
+   "Ek in-flight request = pipeline nahi"
+  ],
+  "common_mistakes": [
+   "linger 0 aur batch 1 production mein",
+   "send() ke future ko await na karna (errors miss)"
+  ],
+  "follow_up_questions": [
+   "Why one in-flight request per partition?",
+   "What does Kafka allow with idempotence (5 in flight)?",
+   "What happens to next_seq when a batch fails?"
+  ],
+  "concepts": [
+   "batching",
+   "linger",
+   "producer"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-035",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does Consumer.poll track positions and handle offset_out_of_range?",
+  "answer_hinglish": "`poll(wait_ms)` pehle check karta hai `_needs_rejoin` -- true ho toh `_join()` (naya assignment + positions). Assignment empty ho toh `wait_ms` sleep karke `[]`.\n\nPhir har assigned partition ke liye ek inner coroutine `one(tp)`: `GET /topics/{t}/partitions/{p}/fetch?offset=positions[tp]&max_bytes=..&wait_ms=..`. Sab partitions `asyncio.gather` se parallel fetch hote hain. Records milne pe `positions[tp] = recs[-1].offset + 1` -- position hamesha NEXT offset hai, isliye `commit()` bina args ke `dict(self.positions)` bhej deta hai aur woh sahi committed-offset convention hai.\n\nError pe: agar code `offset_out_of_range` hai (retention ne woh offset delete kar diya), toh `/offsets` se `log_start_offset` lekar position wahan set karta hai -- Kafka ka `auto.offset.reset=earliest` behaviour. Baaki errors (leader not available etc.) pe bas `[]` return; agla poll retry karega.\n\nPositions kahan se shuru hote hain? `_join` mein: committed offset ho toh wahi, warna `auto_offset_reset` -- \"earliest\" -> log_start_offset, else -> high_watermark (latest).\n\nImportant: poll position aage badha deta hai chahe aapne process kiya ho ya nahi. Isliye commit process ke baad karna hai (at-least-once). Agar process fail hua aur aap bina commit kiye dobara poll karoge toh wahi records nahi milenge -- crash/rejoin ke baad hi milenge. Observation: `offset_out_of_range` reset silently records skip karta hai; koi log/metric emit nahi hota.",
+  "why_needed": "Consumer client ki correctness positions aur commit convention pe tiki hai.",
+  "real_world_analogy": "Book mein bookmark: har chapter padhne ke baad bookmark agle page pe rakh dete ho. Agar woh page ab book mein hai hi nahi (phat gaya), toh jo pehla page bacha hai wahan se.",
+  "how_it_works": "positions dict per TP, parallel long-poll fetches, next-offset convention, reset policy on out-of-range.",
+  "in_this_project": "`client/consumer.py::Consumer.poll`, `_join` (reset policy), `commit` (default current positions), `seek`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/client/consumer.py::poll",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::_join",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::commit"
+  ],
+  "code_example": "# real, trimmed: client/consumer.py poll.one\nif r.status_code != 200:\n    err = r.json()[\"error\"]\n    if err[\"code\"] == \"offset_out_of_range\":     # deleted by retention -> jump to log start\n        o = (await self.http.get(f\"/topics/{tp[0]}/partitions/{tp[1]}/offsets\")).json()\n        self.positions[tp] = o[\"log_start_offset\"]\n    return []\nrecs = [ConsumerRecord(tp[0], tp[1], x[\"offset\"], x[\"timestamp\"], x[\"key\"], x[\"value\"])\n        for x in r.json()[\"records\"]]\nif recs:\n    self.positions[tp] = recs[-1].offset + 1",
+  "code_language": "python",
+  "advantages": [
+   "Parallel fetch across partitions",
+   "Simple next-offset convention"
+  ],
+  "disadvantages": [
+   "Silent skip on out-of-range",
+   "Positions process status nahi jaante"
+  ],
+  "common_mistakes": [
+   "Last processed offset commit karna (off-by-one -> reprocess one record)",
+   "Commit before process (at-most-once by accident)"
+  ],
+  "follow_up_questions": [
+   "What does auto_offset_reset=latest risk?",
+   "How would you commit only processed records?",
+   "What if the leader moves mid-poll?"
+  ],
+  "concepts": [
+   "consumer",
+   "offsets",
+   "auto offset reset"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-036",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How is the error model designed (KafkaError, retriable flag, HTTP mapping)?",
+  "answer_hinglish": "Saare domain errors `KafkaError` subclass hain jinke paas `code` (string) aur `retriable` (bool) class attributes hain -- Kafka protocol ke error codes jaisa. Example: `NotLeaderForPartition`, `LeaderNotAvailable`, `BrokerUnavailable`, `NotEnoughReplicas`, `RequestTimedOut`, `RebalanceInProgress` retriable hain; `OutOfOrderSequence`, `OffsetOutOfRangeError`, `UnknownMemberId`, `IllegalGeneration`, `TopicAlreadyExists` non-retriable.\n\nAPI layer ek exception handler se mapping karta hai: `STATUS` dict mein specific codes (unknown topic 404, already exists 409, invalid rf 422, out-of-order / out-of-range / unknown member / illegal generation 409). Baaki: retriable -> 503, warna 400. Body `{\"error\": {\"code\", \"message\", \"retriable\"}}`.\n\nClient ko kya fayda? Producer ka `RETRIABLE` set exactly retriable codes hai (+ `network_error`) -- woh exponential backoff (100ms se 2s cap) ke saath retry karta hai, baaki pe turant `ProduceError`. Consumer heartbeat 503 `rebalance_in_progress` aur 409 `illegal_generation` / `unknown_member_id` pe rejoin flag set karta hai.\n\nDesign point: retriable flag server pe decide hota hai, client ko har code ka matlab hardcode karne ki zaroorat kam. `RequestTimedOut` retriable hai lekin uska docstring warning deta hai: \"retry only with an idempotent producer, otherwise you risk a duplicate\". `test_error_mapping` 404, 403 (admin), aur 503 not_enough_replicas retriable=True verify karta hai.",
+  "why_needed": "Distributed system mein client ko pata hona chahiye ki retry karna safe/useful hai ya nahi.",
+  "real_world_analogy": "Hospital triage tags: laal = turant handle, peela = thodi der baad dobara try. Tag lagane wala decide karta hai, har doctor ko khud diagnose nahi karna padta.",
+  "how_it_works": "Class attributes as metadata; one FastAPI exception handler; status from explicit map or retriable flag.",
+  "in_this_project": "`cluster/errors.py` (saari classes), `api/app.py` `STATUS` aur `_kafka_error` handler, `client/producer.py::RETRIABLE`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/errors.py::KafkaError",
+   "projects/05-mini-kafka/minikafka/cluster/errors.py::RequestTimedOut",
+   "projects/05-mini-kafka/minikafka/api/app.py::STATUS",
+   "projects/05-mini-kafka/minikafka/client/producer.py::RETRIABLE",
+   "projects/05-mini-kafka/tests/test_e2e_api.py::test_error_mapping"
+  ],
+  "code_example": "# real: api/app.py\n@app.exception_handler(KafkaError)\nasync def _kafka_error(_: Request, exc: KafkaError):\n    status = STATUS.get(exc.code, 503 if exc.retriable else 400)\n    return JSONResponse({\"error\": {\"code\": exc.code, \"message\": str(exc), \"retriable\": exc.retriable}},\n                        status_code=status)",
+  "code_language": "python",
+  "advantages": [
+   "Machine-readable, stable error codes",
+   "Retry policy server-driven"
+  ],
+  "disadvantages": [
+   "Producer ka RETRIABLE set duplicate hardcode hai (response ka retriable flag use nahi karta)",
+   "503 ka matlab 'server down' bhi lag sakta hai monitoring mein"
+  ],
+  "common_mistakes": [
+   "Har error pe blind retry",
+   "HTTP status pe hi retry decide karna bina code dekhe"
+  ],
+  "follow_up_questions": [
+   "Which errors are retriable and why?",
+   "Why is request_timed_out dangerous to retry?",
+   "How does the consumer react to illegal_generation?"
+  ],
+  "concepts": [
+   "error handling",
+   "retriable errors",
+   "API design"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-037",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does the producer's retry loop work, and why is it only safe with idempotence?",
+  "answer_hinglish": "`_send_batch` body banata hai (records, partition, acks, aur idempotent ho toh `producer_id` + `base_sequence`). Phir `retries + 1` attempts tak loop: POST karo; `httpx.TransportError` -> code `network_error`; 200 -> return JSON; warna error code parse. Agar code retriable nahi hai (aur network_error nahi), ya last attempt hai -> `ProduceError` raise. Warna `sleep(delay)` aur `delay = min(delay * 2, 2.0)` -- exponential backoff starting `retry_backoff_ms` (100ms), cap 2s.\n\nRetry kab duplicate banata hai? Jab request server tak pahunchi aur LIKHI gayi, lekin response nahi aaya ya error aaya jo \"maybe written\" hai: network timeout after write, ya `request_timed_out` (acks=all mein data leader pe likha ja chuka hai, sirf replicate time pe nahi hua). Blind retry = same records dobara append = duplicate.\n\nIdempotence yahan bachaata hai: retry SAME `base_sequence` bhejta hai (sequence `_drain` mein ek baar assign hota hai, retries mein nahi badalta). Leader `check_sequence` mein (base_seq, count) `recent` mein dekh ke original offsets return karta hai -- `duplicate: true`. Code comment exactly yahi kehta hai: \"Retrying is only safe because the same base_sequence is re-sent (idempotence)\".\n\n`test_producer_survives_leader_failure`: leader kill hota hai, pehle sends `broker_unavailable` / `leader_not_available` paate hain, retry hote hain, naye leader pe chalte hain, aur consumer exactly before0..19 + after0..19 order mein dekhta hai. Limitation: retry jo failover cross kare, woh dedupe nahi hota (naye leader pe producer state nahi).",
+  "why_needed": "Retries ke bina transient failures pe data loss; retries ke saath bina idempotence duplicates.",
+  "real_world_analogy": "ATM transaction timeout: dobara try karne se pehle bank ko transaction reference (sequence) chahiye, warna do baar paisa kat sakta hai.",
+  "how_it_works": "Bounded retries + exponential backoff with cap + fixed sequence across retries.",
+  "in_this_project": "`client/producer.py::_send_batch`, `RETRIABLE` set; demo `Producer(BASE, retries=30, retry_backoff_ms=100)` leader kill survive karne ke liye.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/client/producer.py::_send_batch",
+   "projects/05-mini-kafka/minikafka/client/producer.py::RETRIABLE",
+   "projects/05-mini-kafka/minikafka/cluster/partition.py::check_sequence",
+   "projects/05-mini-kafka/tests/test_e2e_api.py::test_producer_survives_leader_failure",
+   "projects/05-mini-kafka/demo.py"
+  ],
+  "code_example": "# real, trimmed: client/producer.py _send_batch\nfor attempt in range(self.retries + 1):\n    try:\n        r = await self.http.post(f\"/topics/{topic}/produce\", json=body)\n    except httpx.TransportError as exc:\n        code, msg = \"network_error\", str(exc)\n    else:\n        if r.status_code == 200:\n            return r.json()\n        ...\n    # Retrying is only safe because the same base_sequence is re-sent (idempotence).\n    if code not in RETRIABLE and code != \"network_error\" or attempt == self.retries:\n        raise ProduceError(code, msg)\n    await asyncio.sleep(delay)\n    delay = min(delay * 2, 2.0)",
+  "code_language": "python",
+  "advantages": [
+   "Transient failures transparent",
+   "Backoff cluster ko overload nahi karta"
+  ],
+  "disadvantages": [
+   "No jitter (synchronised retries)",
+   "Failover-straddling retry duplicate kar sakta hai"
+  ],
+  "common_mistakes": [
+   "Retry pe naya sequence",
+   "Non-idempotent producer ke saath request_timed_out retry"
+  ],
+  "follow_up_questions": [
+   "Why add jitter to backoff?",
+   "What is delivery.timeout.ms in Kafka?",
+   "What happens after retries are exhausted?"
+  ],
+  "concepts": [
+   "retries",
+   "exponential backoff",
+   "idempotence"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-038",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Explain Segment.read: the reusable read handle and 'read only what can exist'.",
+  "answer_hinglish": "`Segment.read(offset, max_bytes, max_offset)` pehle `_log.flush()` karta hai (taaki append buffer mein pada data file mein dikhe), phir `position_for(offset)` se sparse index ki position. Phir:\n\n1. Reusable handle: `if self._reader is None or self._reader.closed: self._reader = open(self.log_path, \"rb\")`. Ek baar khola, baar baar `seek` + `read`. Pehle har fetch pe `open()` hota tha.\n2. \"Read only what can exist\": `want = min(max(max_bytes, 1) + self.index_interval + 4096, self.size - start)`. Target offset indexed position se max ~index_interval aage ho sakta hai, toh max_bytes + interval + thoda slack padhna kaafi hai; aur file size se zyada padhne ka matlab nahi. Pehle code poori file tak padh sakta tha.\n3. Buffer ko `decode_at` se decode: `max_offset` (HW) tak, `offset` se pehle wale skip, aur `max_bytes` budget -- lekin pehla record hamesha include (`if out and used + ... > max_bytes`).\n\nYeh dono changes profiling story ka fix the: cProfile mein `io.open` 65% time le raha tha (239 calls, 0.75s, ~3.1ms each) -- Windows pe abhi-abhi likhi gayi file kholna idle file se kaafi mehenga hai. Fix ke baad acks=all sequential 8,702 -> 73,795 msg/s (7.7x). Cost: har segment ek open file handle (TRADEOFFS #10); `truncate_to`, `close` aur `delete` handle close karte hain.\n\nObservation: agar ek single record `max_bytes + interval + 4096` se bada ho, toh buffer mein poora record nahi aata, `decode_at` None deta aur read `[]` return karta -- consumer us offset pe hamesha atka rehta. Yeh review mein mila aur fix hua: agar kuch decode nahi hua aur file mein aur data hai, `Segment.read` baaki segment padh ke `first_only=True` scan karta hai -- Kafka (KIP-74) jaisa kam se kam ek poora record. Test: `test_record_larger_than_max_bytes_is_still_returned`.",
+  "why_needed": "Yeh code performance fix ka centre hai aur iske edge cases interviewer ko impress karte hain.",
+  "real_world_analogy": "Har baar dukaan ka shutter khol-band karne ke bajaye shutter khula rakho aur sirf counter pe saaman lo -- lekin bahut bada saaman counter se nahi niklega.",
+  "how_it_works": "flush -> index position -> cached file handle seek -> bounded read -> decode loop with offset/HW/budget filters.",
+  "in_this_project": "`storage/segment.py::Segment.read` (comment mein profiling result), `_close_reader`. TESTING.md \"Investigation of the slow acks=all\".",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/storage/segment.py::read",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::_close_reader",
+   "projects/05-mini-kafka/TESTING.md",
+   "projects/05-mini-kafka/TRADEOFFS.md",
+   "projects/05-mini-kafka/tests/test_review_fixes.py::test_record_larger_than_max_bytes_is_still_returned"
+  ],
+  "code_example": "# real, trimmed: storage/segment.py read\nself._log.flush()\nstart = self.position_for(offset)\n# One long-lived read handle per segment. Opening the file per fetch cost ~3ms on Windows\n# for a file that was just written (profiled: 65% of acks=all latency), vs ~0.01ms to seek+read.\nif self._reader is None or self._reader.closed:\n    self._reader = open(self.log_path, \"rb\")\nself._reader.seek(start)\nwant = min(max(max_bytes, 1) + self.index_interval + 4096, self.size - start)\ndata = self._reader.read(max(want, 0))",
+  "code_language": "python",
+  "advantages": [
+   "7.7x acks=all throughput",
+   "Bounded reads"
+  ],
+  "disadvantages": [
+   "Open fd per segment",
+   "Oversized records can stall a reader (observation)"
+  ],
+  "common_mistakes": [
+   "Har request pe file open karna",
+   "Unbounded read till EOF"
+  ],
+  "follow_up_questions": [
+   "Why was opening a just-written file slow on Windows?",
+   "How does Kafka serve reads (page cache, sendfile)?",
+   "How would you guarantee progress for huge records?"
+  ],
+  "concepts": [
+   "file handles",
+   "read path",
+   "profiling"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Long-lived handles fast hain lekin fd budget khaate hain; Kafka bhi segment files open rakhta hai aur `ulimit -n` bahut bada set karte hain. Bounded read memory aur syscalls bachata hai.",
+   "failure_scenarios": "Fd exhaustion with thousands of segments; stale handle after truncation (isliye truncate_to `_close_reader` karta hai); oversized record stall.",
+   "alternatives": "mmap, sendfile/zero-copy (data user space mein aaye bina socket pe), OS page cache reliance.",
+   "scale_10x_100x": "100x partitions x segments = lakhon fds; LRU of open handles ya sirf active + recently read segments ke handles rakhna.",
+   "production_improvements": "Minimum-one-record guarantee, handle LRU, read metrics (bytes read vs returned), sendfile for real network serving."
+  }
+ },
+ {
+  "id": "MKFK-039",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "Walk through the range assignor code.",
+  "answer_hinglish": "`range_assign(members, partitions)` input: `members = {member_id: [topics]}`, `partitions = {topic: count}`. Output: `{member_id: [(topic, partition)]}`.\n\nSteps: har member ke liye empty list. Phir `by_topic` banao -- har topic ke subscribers. Har topic ke liye subscribers sort karo (deterministic), `per, extra = divmod(n, len(subs))`. Har member i ko `per + (1 if i < extra else 0)` contiguous partitions milte hain, `start` se aage.\n\nExample (`test_range_assignor`): 7 partitions, 3 members -> per=2, extra=1 -> c1 [0,1,2], c2 [3,4], c3 [5,6].\n\nProblem jo interviewer poochta hai: per topic calculation hai, aur sort order har topic mein same. Toh agar bahut topics hain aur har topic mein remainder hai, toh HAR topic ka extra partition pehle member (c1) ko jata hai. `test_range_vs_roundrobin_with_many_topics`: 3 topics x 3 partitions, 2 members -> range c1=6, c2=3; roundrobin 5/4 balanced.\n\nRange ka fayda: co-partitioned topics (same partition count, same key) ka partition i same member ko milta hai -- joins ke liye useful (orders-3 aur payments-3 same consumer pe). Yeh code mein `sorted(subs)` aur contiguous ranges se hota hai.",
+  "why_needed": "Assignment strategy directly consumer load balance decide karti hai.",
+  "real_world_analogy": "Mithai ke 7 dabbe 3 logon mein: har ko 2, aur bacha hua 1 pehle wale ko. Agar 10 alag mithaiyan hain toh pehla banda har baar extra le jayega.",
+  "how_it_works": "Per-topic divmod + contiguous ranges over sorted members.",
+  "in_this_project": "`cluster/assignors.py::range_assign`, docstring trade-off explain karta hai; `ASSIGNORS` dict se coordinator strategy pick karta hai; `JoinIn.strategy` regex `range|roundrobin`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/assignors.py::range_assign",
+   "projects/05-mini-kafka/tests/test_groups.py::test_range_assignor",
+   "projects/05-mini-kafka/tests/test_groups.py::test_range_vs_roundrobin_with_many_topics"
+  ],
+  "code_example": "# real: cluster/assignors.py\nfor topic, subs in by_topic.items():\n    subs = sorted(subs)\n    n = partitions.get(topic, 0)\n    per, extra = divmod(n, len(subs))\n    start = 0\n    for i, m in enumerate(subs):\n        count = per + (1 if i < extra else 0)\n        out[m] += [(topic, p) for p in range(start, start + count)]\n        start += count",
+  "code_language": "python",
+  "advantages": [
+   "Co-partitioning for joins",
+   "Simple, deterministic"
+  ],
+  "disadvantages": [
+   "Skew with many topics",
+   "Not sticky -- har rebalance pe sab move ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Many small topics ke saath range use karke first consumer overload",
+   "Assignment ko stable samajhna"
+  ],
+  "follow_up_questions": [
+   "When is range better than roundrobin?",
+   "What is the sticky assignor?",
+   "How would you test an assignor?"
+  ],
+  "concepts": [
+   "range assignor",
+   "partition assignment"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-040",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does the long-poll fetch (wait_ms) work for consumers?",
+  "answer_hinglish": "Consumer fetch `GET .../fetch?offset=X&wait_ms=W`. `Cluster.fetch` mein: agar `wait_ms` diya hai aur `offset >= high_watermark` (yaani abhi padhne ko kuch committed nahi), toh `r.changed.wait_for(lambda: r.high_watermark > offset)` with timeout `wait_ms/1000`. Timeout pe chupchaap aage (empty result). Phir `log.read(offset, max_bytes, max_offset=r.high_watermark)`.\n\nLong-poll kyun? Short polling mein consumer har 10ms request maarta -- CPU/network waste, ya har 1s -- latency kharab. Long-poll mein request server pe ruk jati hai jab tak data na aaye ya timeout ho: low latency AUR kam requests. Kafka ka `fetch.max.wait.ms` + `fetch.min.bytes` yahi hai.\n\nWakeup: HW move hone pe `notify_all` -- produce (single replica ISR) aur follower fetch (`_replicate`) dono notify karte hain. Dhyan do predicate HW pe hai, LEO pe nahi -- consumer ko sirf committed data chahiye, toh leader pe append hone se nahi, commit hone se jaagta hai.\n\nAPI side `wait_ms` 0..30000 validate hota hai. Client `poll(wait_ms=200)` default bhejta hai aur saare partitions parallel long-poll karta hai. Response mein `high_watermark` aur `log_start_offset` bhi aate hain.",
+  "why_needed": "Low-latency consumption bina busy polling ke.",
+  "real_world_analogy": "Pizza shop pe phone pe hold: 'ready hote hi bata deta hoon, ya 30 sec mein wapas aata hoon' -- baar baar call nahi karna padta.",
+  "how_it_works": "Condition wait with predicate + timeout; read bounded by HW.",
+  "in_this_project": "`Cluster.fetch` aur API `fetch` endpoint (`wait_ms: int = Query(0, ge=0, le=30_000)`); followers ka apna long-poll `_replicate` mein `leader.leo > me.leo` pe.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::fetch",
+   "projects/05-mini-kafka/minikafka/api/app.py::fetch",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::poll"
+  ],
+  "code_example": "# real: cluster.py fetch\nmeta, r = self._leader_replica(topic, partition)\nif wait_ms and offset >= r.high_watermark:\n    try:\n        async with r.changed:\n            await asyncio.wait_for(r.changed.wait_for(lambda: r.high_watermark > offset), wait_ms / 1000)\n    except asyncio.TimeoutError:\n        pass\nrecs = r.log.read(offset, max_bytes, max_offset=r.high_watermark)",
+  "code_language": "python",
+  "advantages": [
+   "Low latency with few requests",
+   "No uncommitted reads"
+  ],
+  "disadvantages": [
+   "Server pe open connections/tasks",
+   "One poll waits on each partition separately"
+  ],
+  "common_mistakes": [
+   "Predicate LEO pe rakhna (uncommitted wakeups)",
+   "wait_ms ko client HTTP timeout se bada rakhna"
+  ],
+  "follow_up_questions": [
+   "What does fetch.min.bytes add?",
+   "How many concurrent long polls can a server hold?",
+   "Why wake on HW and not LEO?"
+  ],
+  "concepts": [
+   "long polling",
+   "fetch",
+   "latency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-041",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does the consumer's heartbeat loop drive rebalances?",
+  "answer_hinglish": "`_join` ke baad ek background task `_heartbeat_loop` start hota hai: har `heartbeat_interval_ms` (default 1000ms) `POST /groups/{g}/heartbeat` with member_id aur generation. Coordinator `heartbeat` member ka `last_heartbeat` update karta hai, aur:\n- group `PreparingRebalance` mein hai -> `RebalanceInProgress` (503): \"re-join karo\".\n- generation match nahi -> `IllegalGeneration` (409).\n- member exist nahi karta -> `UnknownMemberId` (409).\n\nClient teeno pe `_needs_rejoin = True` set karta hai; unknown_member pe `member_id = None` bhi (hum kick ho chuke hain, naye member ki tarah aao). Agla `poll()` `_join` call karega -- aur `_join` mein agar purana assignment hai aur `on_revoke` callback diya hai, toh pehle woh chalta hai (e.g. commit current positions) -- phir join.\n\nTransport errors ignore -- agar coordinator tak pahunch hi nahi rahe toh session timeout pe server khud nikaal dega.\n\nSession timeout vs heartbeat interval: session (default 10s client, min 300ms server) ke andar heartbeat nahi aaya toh `_expire_members` (sirf Stable groups pe) member hata ke rebalance start karta hai. Rule of thumb: interval <= session/3.\n\nKafka ka extra: heartbeats background thread pe hain aur `max.poll.interval.ms` alag se check karta hai ki app `poll` bhi kar raha hai ya nahi (stuck processing detect). minikafka mein yeh nahi -- heartbeat task chalta rahega chahe processing atki ho; observation.",
+  "why_needed": "Liveness detection aur rebalance signalling dono heartbeat channel se hote hain.",
+  "real_world_analogy": "Security guard ka har ghante 'all OK' call; call nahi aaya toh supervisor naya guard bhej deta hai. Aur supervisor kehta hai 'shift change hai, office aao' toh guard report karta hai.",
+  "how_it_works": "Periodic task; error code -> rejoin flag; actual rejoin lazily next poll pe.",
+  "in_this_project": "`client/consumer.py::_heartbeat_loop`, `_join` (on_revoke), server `cluster/groups.py::heartbeat` aur `_expire_members`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/client/consumer.py::_heartbeat_loop",
+   "projects/05-mini-kafka/minikafka/client/consumer.py::_join",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::heartbeat",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::_expire_members"
+  ],
+  "code_example": "# real, trimmed: client/consumer.py\nif r.status_code != 200:\n    code = r.json()[\"error\"][\"code\"]\n    if code in (\"rebalance_in_progress\", \"illegal_generation\", \"unknown_member_id\"):\n        if code == \"unknown_member_id\":\n            self.member_id = None           # we were kicked out (e.g. paused too long)\n        self._needs_rejoin = True",
+  "code_language": "python",
+  "advantages": [
+   "Fast failure detection",
+   "Rebalance signal piggybacks on heartbeat"
+  ],
+  "disadvantages": [
+   "Stuck processing undetected (no max.poll.interval)",
+   "Rejoin only on next poll -- slow poll loop delays rebalance"
+  ],
+  "common_mistakes": [
+   "Heartbeat interval ~ session timeout",
+   "Long processing in poll loop without heartbeats (Kafka old clients)"
+  ],
+  "follow_up_questions": [
+   "What is max.poll.interval.ms?",
+   "Why must the consumer re-join instead of continuing?",
+   "What does on_revoke typically do?"
+  ],
+  "concepts": [
+   "heartbeats",
+   "session timeout",
+   "rebalance"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-042",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does the controller elect a new leader (_elect), and what state changes?",
+  "answer_hinglish": "`_elect(meta, exclude)` controller ka election function hai. Candidates = replicas list order mein woh brokers jo ISR mein hain, exclude mein nahi, aur `up` hain. Agar koi nahi aur `unclean_leader_election` on hai -> candidates = koi bhi live replica (ISR ho ya na ho), `unclean = True`.\n\nKoi candidate nahi -> `meta.leader = None`, ISR se excluded hatao, event \"OFFLINE (no in-sync replica alive)\". Partition ab produce/fetch pe `LeaderNotAvailable` dega.\n\nCandidate mila -> `leader = candidates[0]` (replica order mein pehla -- Kafka bhi assignment order mein pehla live ISR member chunta hai), `leader_epoch += 1`, ISR = purana ISR minus excluded plus naya leader. `_apply_leadership` sab replicas pe become_leader / become_follower call karta hai -- naye leader pe `follower_leo` reset, grace period, aur producer state `{}`. Naye leader ka HW = `min(new.high_watermark, new.leo)` -- woh HW jo usne follower ke roop mein seekha tha. HW aur LEO ke beech ke records rakhe jaate hain; jab naya ISR unhe copy kar lega tab committed honge.\n\nKab chalta hai? `_handle_broker_failure` (session expired broker jo leader tha) aur `_elect_offline_partitions` (koi broker wapas aaya, offline partitions retry). Caller `_persist_topics` karta hai. Event mein \"UNCLEAN: possible data loss\" mark hota hai.\n\nEpoch increment hi followers ko batata hai ki leader badla -- unka `_replicate` stale epoch dekh ke truncation karta hai.",
+  "why_needed": "Failover correctness = sahi candidate + epoch bump + consistent state transitions.",
+  "real_world_analogy": "Captain injured: vice-captain list mein se pehla jo fit hai aur team ke saath practice mein tha (ISR) captain banta hai; koi nahi toh match ruk jata hai -- ya rule relax karke koi bhi bench player (unclean).",
+  "how_it_works": "Candidate filtering -> epoch bump -> ISR update -> role application -> HW clamp -> event + persist.",
+  "in_this_project": "`Cluster._elect`, `_handle_broker_failure`, `_elect_offline_partitions`; `test_leader_failover_keeps_committed_data` asserts `leader_epoch == 1` aur old leader ISR mein nahi.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_elect",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_handle_broker_failure",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_elect_offline_partitions",
+   "projects/05-mini-kafka/tests/test_replication.py::test_leader_failover_keeps_committed_data"
+  ],
+  "code_example": "# real, trimmed: cluster.py _elect\ncandidates = [b for b in meta.replicas if b in meta.isr and b not in exclude and self.brokers[b].up]\nunclean = False\nif not candidates and self.cfg.unclean_leader_election:\n    candidates = [b for b in meta.replicas if b not in exclude and self.brokers[b].up]\n    unclean = True\n...\nmeta.leader = candidates[0]\nmeta.leader_epoch += 1\nmeta.isr = {b for b in meta.isr if b not in exclude} | {meta.leader}\nself._apply_leadership(meta)\nnew.high_watermark = min(new.high_watermark, new.leo)",
+  "code_language": "python",
+  "advantages": [
+   "Clean election never loses committed data",
+   "Epoch makes leadership changes explicit"
+  ],
+  "disadvantages": [
+   "candidates[0] ignores which ISR member has highest LEO",
+   "Single controller decides (SPOF in real life)"
+  ],
+  "common_mistakes": [
+   "Non-ISR replica ko clean election mein chunna",
+   "Epoch bump bhoolna"
+  ],
+  "follow_up_questions": [
+   "Why not pick the replica with the highest LEO?",
+   "What happens to records between new leader's HW and LEO?",
+   "How does unclean election lose data?"
+  ],
+  "concepts": [
+   "leader election",
+   "leader epoch",
+   "controller"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "ISR-only election committed data safe rakhta hai lekin availability kam karta hai jab ISR khaali ho. Pehla candidate choose karna simple hai; highest-LEO choose karne se kam uncommitted data truncate hota lekin ISR membership hi guarantee deti hai, isliye Kafka bhi order pe chalta hai.",
+   "failure_scenarios": "Controller khud mar jaye toh election hi nahi hogi (yahan controller process ke saath hi marta hai). ISR stale ho (metadata lag) toh galat candidate.",
+   "alternatives": "Raft-style voting (candidate with most up-to-date log wins), ZooKeeper-based controller (old Kafka), KRaft quorum controller.",
+   "scale_10x_100x": "Hazaron partitions per broker failure = hazaron elections; Kafka batch mein karta hai aur metadata propagation (LeaderAndIsr) bottleneck hota tha -- KRaft ne yeh improve kiya.",
+   "production_improvements": "Controller ko quorum (Raft) pe le jao, preferred leader rebalancing add karo, elections batch karo."
+  }
+ },
+ {
+  "id": "MKFK-043",
+  "project_slug": "p05-mini-kafka",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "How does the roundrobin assignor differ from range in code?",
+  "answer_hinglish": "`roundrobin_assign` saare subscribed topics ke saare partitions ek sorted list `all_tps` mein daalta hai (topic, partition sort order). Members sorted `order` mein. Phir har TP ke liye ek global counter `i` se agla member chunta hai jo us topic ko subscribe karta ho -- `for _ in range(len(order))` loop ensure karta hai ki non-subscriber skip ho aur infinite loop na bane.\n\nRange per-topic baantta hai aur har topic ka remainder hamesha pehle sorted member ko deta hai. Round-robin topics ke boundaries ke paar ek hi counter chalata hai, isliye remainders spread ho jaate hain. `test_range_vs_roundrobin_with_many_topics`: 3 topics x 3 partitions, 2 members -> range (6, 3), round-robin [4, 5]; aur dono ka union same set of TPs.\n\nTrade-offs: round-robin even hai, lekin co-partitioning guarantee nahi deta (orders-3 aur payments-3 alag members pe ja sakte hain). Aur jab members alag topics subscribe karte hain toh round-robin bhi uneven ho sakta hai. Dono non-sticky hain: rebalance pe assignment pura recompute -- partitions move hote hain, local state / caches lose. Kafka ka StickyAssignor aur CooperativeStickyAssignor movement minimize karte hain.\n\nStrategy group ke first join pe fix hoti hai (`Group(group, strategy)` via setdefault) -- observation: baad mein koi member alag strategy bheje toh ignore hoti hai; Kafka protocol members ke common supported strategy pe agree karta hai.",
+  "why_needed": "Load balance ke liye sahi assignor choose karna aur unka difference code se samjhana.",
+  "real_world_analogy": "Taash ke patte baantna: ek ek karke sabko -- sabko lagbhag barabar milte hain (round-robin). Range = har suit alag se baanto, aur har suit ka extra patta pehle khiladi ko.",
+  "how_it_works": "Global ordering of TPs + cyclic member pointer skipping non-subscribers.",
+  "in_this_project": "`cluster/assignors.py::roundrobin_assign`; client `Consumer(strategy=\"roundrobin\")` -> `JoinIn.strategy`.",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/assignors.py::roundrobin_assign",
+   "projects/05-mini-kafka/tests/test_groups.py::test_range_vs_roundrobin_with_many_topics",
+   "projects/05-mini-kafka/minikafka/cluster/groups.py::Group"
+  ],
+  "code_example": "# real: cluster/assignors.py\norder = sorted(members)\nall_tps = sorted((t, p) for t in {t for ts in members.values() for t in ts} for p in range(partitions.get(t, 0)))\ni = 0\nfor tp in all_tps:\n    for _ in range(len(order)):\n        m = order[i % len(order)]\n        i += 1\n        if tp[0] in members[m]:\n            out[m].append(tp)\n            break",
+  "code_language": "python",
+  "advantages": [
+   "Even distribution across topics",
+   "Simple"
+  ],
+  "disadvantages": [
+   "No co-partitioning",
+   "Not sticky"
+  ],
+  "common_mistakes": [
+   "Sochna ki round-robin hamesha perfectly even hai (heterogeneous subscriptions)",
+   "Assignor change ko free samajhna"
+  ],
+  "follow_up_questions": [
+   "What does the sticky assignor optimise?",
+   "When do you need co-partitioning?",
+   "How would you weight partitions by load?"
+  ],
+  "concepts": [
+   "roundrobin assignor",
+   "load balancing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MKFK-044",
+  "project_slug": "p05-mini-kafka",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does a killed broker restart, and what happens to its replicas?",
+  "answer_hinglish": "`kill_broker`: `alive = False`, broker ke saare tasks (heartbeat, replicate loops, retention, checkpoint) cancel aur await, saare replica logs `close()`. Controller ko heartbeats milna band -> `broker_session_timeout_ms` (600ms) baad \"session expired\" -> `_handle_broker_failure` -> partitions jahan yeh leader tha unka election, aur ISR se removal.\n\n`restart_broker`: pehle `_read_checkpoint` se HW file padho. Har replica ke liye naya `Replica` object with `_open_log` -- Log kholte waqt har segment `_recover` chalata hai (torn tails cut). Replica `become_follower(-1)` -- epoch -1 jaan bujh ke, taaki pehle fetch pe \"stale epoch\" path chale aur truncation ho. HW = `min(checkpoint, leo)`. Special case: agar metadata ke hisaab se yeh broker hi abhi leader hai (offline partition jiska koi aur ISR member nahi tha), toh `become_leader` aur HW = LEO. Phir `alive = True` aur tasks restart.\n\nUske baad `_replicate`: epoch stale -> HW ke upar truncate (divergent / uncommitted records hatao), phir leader se missing records fetch. Fully caught up hone pe `_maybe_expand_isr` ISR mein wapas. Controller \"broker X is back\" event aur `_elect_offline_partitions`.\n\nTESTING.md bug #4: pehle restart pe HW 0 tha -> truncation \"HW ke upar sab\" = poora log delete! HW checkpoint file isi ka fix hai. Bug #2: killed broker ke logs shutdown pe dobara close hote the -> `Segment.close` idempotent banaya.",
+  "why_needed": "Broker restart Kafka mein routine hai (deploys); restart path galat ho toh data loss.",
+  "real_world_analogy": "Chhutti se wapas aaya employee: pehle apni diary ke unverified notes hata deta hai (last confirmed point tak), phir office register se jo miss hua copy karta hai, phir team mein wapas.",
+  "how_it_works": "Process-crash simulation -> session expiry -> failover; restart -> recovery -> checkpointed HW -> stale-epoch truncation -> catch-up -> ISR expand.",
+  "in_this_project": "`Cluster.kill_broker`, `Cluster.restart_broker`, `_read_checkpoint`, `Segment.close` (idempotent guard). Tests: `test_acks_1_can_lose_acknowledged_write_on_failover` (restart + resync), `test_min_insync_replicas_rejects_writes` (restart -> ISR 2).",
+  "implementation_files": [
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::restart_broker",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::kill_broker",
+   "projects/05-mini-kafka/minikafka/cluster/cluster.py::_read_checkpoint",
+   "projects/05-mini-kafka/minikafka/storage/segment.py::close",
+   "projects/05-mini-kafka/TESTING.md"
+  ],
+  "code_example": "# real, trimmed: cluster.py restart_broker\ncheckpoint = self._read_checkpoint(broker_id)\nfor tp in list(b.replicas):\n    b.replicas[tp] = Replica(broker_id, tp[0], tp[1], self._open_log(broker_id, *tp))\n    b.replicas[tp].become_follower(-1)\n    b.replicas[tp].high_watermark = min(checkpoint.get(tp, 0), b.replicas[tp].leo)",
+  "code_language": "python",
+  "advantages": [
+   "Restart = same code path as normal replication",
+   "Divergence resolved automatically"
+  ],
+  "disadvantages": [
+   "Full recovery scan on every open",
+   "Checkpoint up to 100ms stale"
+  ],
+  "common_mistakes": [
+   "Restart pe HW 0 assume karna (bug #4)",
+   "Restarted broker ko turant ISR mein daalna"
+  ],
+  "follow_up_questions": [
+   "Why become_follower(-1)?",
+   "What if the checkpoint is older than the real HW?",
+   "What is controlled shutdown in Kafka?"
+  ],
+  "concepts": [
+   "broker restart",
+   "recovery",
+   "HW checkpoint"
+  ],
+  "advanced": null
+ }
+]

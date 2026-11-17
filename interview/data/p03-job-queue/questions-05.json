@@ -1,0 +1,1246 @@
+[
+ {
+  "id": "JOBQ-088",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Tell me about the heartbeat TTL bug the tests found. How did you find and fix it?",
+  "answer_hinglish": "TESTING.md \"Bugs found by tests\" #1: \"Heartbeat TTL computed as `int(interval * 3)` = 0 for sub-second intervals -> Redis rejected `SET ... EX 0` and the heartbeat loop crashed. Now `px=` in milliseconds.\"\n\n**Symptom**: worker tests `heartbeat_interval=0.2` use karte hain (fast tests ke liye). `int(0.2 * 3)` = `int(0.6)` = 0. Redis `SET key 1 EX 0` ko reject karta hai (\"invalid expire time\") -- TTL positive hona chahiye. Heartbeat loop exception pe crash ho gaya, toh alive key kabhi set nahi hui. `test_heartbeat_and_graceful_shutdown` ka assert `await q.r.exists(f\"{q.p}worker:hb-1:alive\")` fail hua.\n\n**Investigation**: test failure -> worker log mein heartbeat exception -> Redis error message \"invalid expire time in 'set' command\" -> TTL calculation dekhi -> integer truncation.\n\n**Root cause**: seconds-granularity API (`ex=`) ke saath fractional seconds ka `int()` truncation. Production default 5s pe bug kabhi nahi dikhta (int(15) = 15) -- sirf chhote intervals pe. Classic \"works in prod config, breaks in edge config\".\n\n**Fix**: milliseconds use karo aur lower bound lagao: `pipe.set(key, 1, px=max(int(self.heartbeat_interval * 3000), 1))`. Plus loop ab `try/except Exception: log.exception(\"heartbeat_failed\")` mein hai, toh ek failure poore loop ko nahi maarta.\n\nLesson: units explicit rakho (ms everywhere, jaise baaki system), aur background loops ko kabhi unguarded mat chhodo.",
+  "why_needed": "Real bug story -- symptom, root cause, fix, lesson -- interview mein credibility deta hai.",
+  "real_world_analogy": "Recipe mein '0.5 chammach' ko machine ne integer bana diya '0 chammach' -- namak gayab. Fix: grams mein naapo.",
+  "how_it_works": "Integer truncation of fractional seconds; Redis requires positive TTL; use px with a floor.",
+  "in_this_project": "`Worker._heartbeat_loop` current code, `TESTING.md` bugs section, test `test_heartbeat_and_graceful_shutdown`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_heartbeat_loop",
+   "projects/03-job-queue/TESTING.md",
+   "projects/03-job-queue/tests/test_worker.py::test_heartbeat_and_graceful_shutdown"
+  ],
+  "code_example": "# before (bug, from TESTING.md description)\npipe.set(key, 1, ex=int(self.heartbeat_interval * 3))        # 0.2 -> 0 -> Redis error\n# after (real: jobqueue/worker/worker.py)\npipe.set(f\"{self.q.p}worker:{self.id}:alive\", 1, px=max(int(self.heartbeat_interval * 3000), 1))",
+  "code_language": "python",
+  "advantages": [
+   "Found by tests, not production",
+   "Fix also hardened the loop"
+  ],
+  "disadvantages": [
+   "Bug only appears with non-default config"
+  ],
+  "common_mistakes": [
+   "Mixing seconds and ms",
+   "Background asyncio tasks without try/except (silent death)"
+  ],
+  "follow_up_questions": [
+   "How would you detect a dead background task in production?",
+   "Why did prod defaults hide this bug?"
+  ],
+  "concepts": [
+   "debugging",
+   "units",
+   "TTL",
+   "background tasks"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-089",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "The cross-queue priority test was flaky. What was wrong with the test and how was it fixed?",
+  "answer_hinglish": "TESTING.md bug #2 (test bug, code bug nahi): \"cross-queue priority was asserted by counting completions at a polling instant; the correct assertion compares `started_at`.\"\n\nTest `test_queue_priority_across_queues`: 5 jobs `default` queue mein, phir 1 `critical` mein (last enqueued). Worker `[\"critical\", \"default\"]` ke saath, concurrency 1. Expectation: critical pehle chale.\n\nPurana assertion: kisi polling instant pe check karo ki critical complete hai aur defaults abhi pending hain. Problem: jobs `seconds: 0` ki hain -- bahut fast. Polling loop jab tak dekhta, tab tak critical aur kuch defaults sab complete ho chuke hote -- ya timing ke hisaab se kabhi pass, kabhi fail. Test ordering prove karne ki jagah timing measure kar raha tha.\n\nFix: har job ka `started_at` (claim.lua mein Redis time pe set hota hai) compare karo: `assert all(c.started_at < d.started_at for d in ds)`. Yeh deterministic hai -- order ka direct evidence, chahe kitni bhi fast jobs hon ya polling kab ho.\n\nLesson jo main bolta hoon: async systems ke tests mein \"state at an instant\" assert mat karo; recorded facts (timestamps, sequence numbers, event logs) assert karo. Aur flaky test ko retry decorator se chhupao mat -- root cause dhoondo.",
+  "why_needed": "Flaky tests async systems mein common hain; sahi fix assertion design hai, retries nahi.",
+  "real_world_analogy": "Race ka winner decide karne ke liye finish line pe random time pe photo lena vs har runner ka start/finish time record karna.",
+  "how_it_works": "Assert on recorded ordering evidence instead of sampled state.",
+  "in_this_project": "`tests/test_worker.py::test_queue_priority_across_queues`, `claim.lua` sets `started_at`.",
+  "implementation_files": [
+   "projects/03-job-queue/tests/test_worker.py::test_queue_priority_across_queues",
+   "projects/03-job-queue/TESTING.md",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua"
+  ],
+  "code_example": "# real: tests/test_worker.py\nc = await wait_status(q, crit, JobStatus.SUCCEEDED)\nds = [await wait_status(q, d, JobStatus.SUCCEEDED) for d in defaults]\n# enqueued LAST but started FIRST\nassert all(c.started_at < d.started_at for d in ds)",
+  "code_language": "python",
+  "advantages": [
+   "Deterministic",
+   "Tests the actual property"
+  ],
+  "disadvantages": [
+   "Relies on Redis TIME resolution (ms) -- same-ms starts would tie (concurrency 1 avoids)"
+  ],
+  "common_mistakes": [
+   "Sleeping longer to 'fix' flakiness",
+   "Asserting counts at a polling instant"
+  ],
+  "follow_up_questions": [
+   "What if two jobs start in the same millisecond?",
+   "How else could you test ordering?"
+  ],
+  "concepts": [
+   "flaky tests",
+   "test design",
+   "ordering"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-090",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "In production, stale_acks is rising on some workers. How do you investigate?",
+  "answer_hinglish": "`stale_acks` tab badhta hai jab handler succeed hua lekin `ack.lua` ne 0 return kiya -- matlab job ab is worker ki nahi thi: lease expire hui aur redeliver ho gayi (ya job already kisi aur ne finish ki). Har case ek potential duplicate execution hai. DEPLOYMENT #5 isko alert banane ko kehta hai: \"stale_acks > 0 (leases too short or blocked loops)\".\n\nInvestigation steps:\n1. **Kahan**: `GET /workers` -- har worker ka `stale_acks`, `running`, `alive`. Sab workers pe ya kuch pe? Kuch pe -> specific host/handler issue.\n2. **Logs**: `stale_ack_rejected` warnings (`job_id`, `attempt`). Un job ids ko `GET /jobs/{id}` -- errors list mein `reason: lease_expired` entries, `worker` field (naya owner).\n3. **Job types**: kaunse types affected? CPU-heavy ya sync library use karne wale -> blocked event loop (`demo.cpu_block` pattern).\n4. **Correlate**: same time pe worker `alive` flapping? (heartbeat bhi block hota hai) -> event loop block confirm. Reaper logs `reaped_expired_leases` doosre workers pe.\n5. **Infra**: GC pauses, CPU throttling (container CPU limits!), Redis latency spikes (extensions late), network.\n\nLikely causes & fixes:\n- Blocking code in handler -> `asyncio.to_thread` / process pool.\n- Concurrency too high for CPU -> lower `--concurrency`.\n- Container CPU throttled -> raise limits.\n- Lease too tight (`max_lease_ms` + grace) relative to observed loop lag -> increase grace.\n- Redis latency -> check `SLOWLOG`, big Lua scripts.\n\nVerify impact: idempotent handlers ke result mein `duplicate: true` count -- actual duplicates prevented.",
+  "why_needed": "Stale acks duplicate execution ka leading indicator hain.",
+  "real_world_analogy": "Delivery boy pahuncha toh customer bolta hai 'doosra boy de gaya' -- dekho kyun pehla boy itna late tha: traffic (Redis latency), bike kharab (CPU), ya raste mein ruk gaya (blocking).",
+  "how_it_works": "Lease expiry while handler running -> re-claim by another worker -> original ack rejected by fencing.",
+  "in_this_project": "`WorkerStats.stale_acks`, `_execute` stale branch log, `/workers` endpoint, dashboard workers table shows stale_acks column.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::WorkerStats",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/jobqueue/api/routes.py::workers",
+   "projects/03-job-queue/DEPLOYMENT.md"
+  ],
+  "code_example": "# real: jobqueue/worker/worker.py\nelse:\n    # Our lease expired and someone else owns the job now. Our side effects may have\n    # happened twice -> idempotent handlers make that harmless.\n    self.stats.stale_acks += 1\n    log.warning(\"stale_ack_rejected\", extra={\"job_id\": job.id, \"attempt\": token})",
+  "code_language": "python",
+  "advantages": [
+   "Metric exists per worker",
+   "Logs carry job id + attempt"
+  ],
+  "disadvantages": [
+   "Counter is in-memory per process (reset on restart), not Prometheus"
+  ],
+  "common_mistakes": [
+   "Increasing lease blindly without finding the blocker",
+   "Ignoring it because 'idempotency handles it'"
+  ],
+  "follow_up_questions": [
+   "How would you measure event-loop lag?",
+   "How would you export these stats to Prometheus?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "stale ack",
+   "event loop lag",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Bigger leases hide symptoms and slow crash recovery; fixing blocking code is the real fix.",
+   "failure_scenarios": "Silent duplicates for non-idempotent handlers; flapping workers; reaper churn.",
+   "alternatives": "Cancel handler on lease loss; loop-lag watchdog that logs stack of the blocking task.",
+   "scale_10x_100x": "At scale, per-worker counters need aggregation -- Prometheus counter with worker label.",
+   "production_improvements": "Export stale_acks/reaped as metrics, alert on rate, add asyncio debug slow-callback logging in staging."
+  }
+ },
+ {
+  "id": "JOBQ-091",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "The DLQ count jumped right after a deploy. How do you troubleshoot and recover?",
+  "answer_hinglish": "Step-by-step:\n\n1. **Confirm & scope**: `GET /queues` -- `dead` aur `counters.dead` kis queue mein badh raha. Dashboard pe DLQ table.\n2. **Kaunse jobs**: `GET /dlq?queue=X&limit=50` -- job types, `attempts/max_attempts`, `last_error`, `last_failure_reason`.\n3. **Classify by reason**:\n   - `permanent` + \"no handler registered for job type\" -> rolling deploy issue: new type on old workers, ya type rename/typo. Fix deploy order.\n   - `permanent` from handler (PermanentError) -> naya validation logic galat? payload contract badla (producer naya field nahi bhej raha)?\n   - `error` with same exception for all -> code bug in new release (poison message wave). `errors` list mein attempt-wise history.\n   - `timeout` -> naya code slow, ya dependency slow.\n   - `lease_expired` -> workers crash-loop kar rahe (OOM? startup error?) -- `reaped` counter aur `/workers` alive flags.\n4. **Logs**: `job_failed` warnings `type`, `reason`, `outcome`, error (300 chars).\n5. **Mitigate**: rollback deploy ya hotfix. DLQ mein jobs safe hain -- urgency ko kam karta hai.\n6. **Recover**: fix deploy hone ke baad `POST /dlq/requeue-all?queue=X&type=Y` (type filter se sirf affected jobs). Attempts reset hote hain. Pehle ek job `POST /dlq/{id}/requeue` se canary karo.\n7. Note: idempotent handlers ki wajah se replay safe hai -- jo jobs ne partially effect kiya tha (ledger row) woh duplicate report karengi.\n\nPost-mortem: DLQ rate alert, canary deploy for workers, contract tests between producer payload and handler.",
+  "why_needed": "DLQ spike after deploy is the most common queue incident.",
+  "real_world_analogy": "Factory mein naya machine part lagaya aur rejected items ka dher lag gaya -- reject tag padho (reason), part rollback karo, phir rejected items dobara line pe.",
+  "how_it_works": "Classify by failure reason -> root cause -> fix -> targeted replay.",
+  "in_this_project": "`api/routes.py::dlq`, `requeue`, `requeue_all` (type filter), `fail.lua` `last_failure_reason`, `Worker._fail` log.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/api/routes.py::dlq",
+   "projects/03-job-queue/jobqueue/api/routes.py::requeue_all",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_fail",
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua"
+  ],
+  "code_example": "# illustrative ops commands\ncurl -H \"Authorization: Bearer $T\" \"http://127.0.0.1:8003/dlq?queue=default&limit=20\"\ncurl -X POST -H \"Authorization: Bearer $T\" \"http://127.0.0.1:8003/dlq/<job_id>/requeue\"       # canary one\ncurl -X POST -H \"Authorization: Bearer $T\" \"http://127.0.0.1:8003/dlq/requeue-all?queue=default&type=email.send\"",
+  "code_language": "bash",
+  "advantages": [
+   "DLQ preserves jobs and reasons",
+   "Type-filtered replay"
+  ],
+  "disadvantages": [
+   "requeue-all is unthrottled and N+1 round trips"
+  ],
+  "common_mistakes": [
+   "Replaying before fixing",
+   "Replaying all types when only one was broken"
+  ],
+  "follow_up_questions": [
+   "How would you throttle the replay?",
+   "How do you prevent this class of incident?"
+  ],
+  "concepts": [
+   "DLQ",
+   "incident response",
+   "replay"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-092",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Jobs are sitting in 'delayed' (or 'queued') forever even though workers are alive. What could cause it?",
+  "answer_hinglish": "Checklist, most likely first:\n\n1. **Koi worker us queue ko sun hi nahi raha**: workers `--queues critical,default,low` ke saath chalte hain. Agar producer `queue: \"reports\"` bhejta hai, koi claim nahi karega. Aur important: delayed -> ready **promotion bhi claim.lua ke andar hai**, toh delayed jobs bhi kabhi promote nahi hongi. `GET /queues` mein queue dikhegi (`jq:queues` SADD), ready/delayed badhte hue, active 0. Fix: worker queues list update ya producer queue fix.\n2. **Strict priority starvation**: higher queue mein sustained load -- `_claim_next` slots kabhi `low` tak nahi pahunchte. `critical` ka active = capacity. Fix: dedicated pool for low / weighted claiming.\n3. **Slots full with stuck jobs**: worker `running` list full (dashboard), jobs lambe timeout pe atke (timeout 3600s) -> naye claims nahi. Leases extend ho rahi hain toh reaper bhi nahi chhuega.\n4. **Claim failing**: worker logs `claim_failed` -- Redis errors, corrupt hash pe ab poora batch fail nahi hota -- review fix ke baad woh job DLQ mein 'corrupt job record' error ke saath jaati hai, toh dead zset bhi check karo.\n5. **Delayed with far-future run_at**: retry backoff max 600s default, ya client ne `run_at_ms` seconds mein bheja (ms ki jagah) -> 1970 ke paas time = immediately due; ya ms*1000 -> saal 50,000 mein due! `GET /jobs/{id}` -> `run_at` check.\n6. **Clock**: Redis host clock galat.\n\nCommands: `ZRANGE jq:q:X:delayed 0 5 WITHSCORES` (scores vs `TIME`), `ZCARD`, `HGETALL jq:job:{id}`, `/workers` queues column.",
+  "why_needed": "Stuck jobs common support ticket hai; promotion-in-claim ka subtle consequence samajhna zaroori.",
+  "real_world_analogy": "Parcel godown mein pada hai kyunki us route ka koi delivery boy assigned hi nahi -- aur 'kal deliver karna' wale parcels ko bhi wahi boy shelf se uthata hai.",
+  "how_it_works": "Promotion is lazy (done by claimers); unclaimed queues never promote or drain.",
+  "in_this_project": "`claim.lua` promotion, `Worker._claim_next` queue iteration, `api/routes.py::workers` (queues per worker), `JobQueue.queue_stats`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_claim_next",
+   "projects/03-job-queue/jobqueue/core/queue.py::queue_stats",
+   "projects/03-job-queue/jobqueue/api/routes.py::workers"
+  ],
+  "code_example": "# illustrative redis-cli investigation\nredis-cli ZRANGE jq:q:reports:delayed 0 4 WITHSCORES\nredis-cli TIME\nredis-cli HGET jq:job:<id> run_at\nredis-cli SMEMBERS jq:queues",
+  "code_language": "bash",
+  "advantages": [
+   "Queue stats make it visible quickly"
+  ],
+  "disadvantages": [
+   "No alert for 'queue without consumers'",
+   "Lazy promotion couples scheduling to claiming"
+  ],
+  "common_mistakes": [
+   "Assuming a separate scheduler promotes delayed jobs",
+   "Seconds vs ms in run_at_ms"
+  ],
+  "follow_up_questions": [
+   "How would you alert on a queue with no consumers?",
+   "Should promotion be decoupled from claim?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "stuck jobs",
+   "lazy promotion"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lazy promotion avoids a separate scheduler process but means promotion depends on consumers existing for that queue.",
+   "failure_scenarios": "Producer typo in queue name creates a silently-orphaned queue; starvation looks identical to 'stuck'.",
+   "alternatives": "Dedicated promoter loop per known queue, enqueue-time validation of queue names against an allow-list.",
+   "scale_10x_100x": "Many queues: per-queue consumer tracking (which workers serve which queue) needed for alerting.",
+   "production_improvements": "Alert: oldest ready job age per queue; reject unknown queue names; consumers-per-queue in /queues output."
+  }
+ },
+ {
+  "id": "JOBQ-093",
+  "project_slug": "p03-job-queue",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The 'reaped' counter is climbing steadily. What does it mean and how do you find the cause?",
+  "answer_hinglish": "`reaped` counter (`jq:q:{queue}:stats`) `fail.lua` mein tab badhta hai jab reason `lease_expired` ho -- matlab reaper ne kisi job ko recover kiya kyunki uski lease expire ho gayi. Dashboard queues table mein `reaped` column hai. Healthy system mein yeh almost 0 hona chahiye -- sirf genuine crashes/deploys pe badhe. Steady climb = lagataar workers jobs \"kho\" rahe hain.\n\nPossible causes:\n1. **Worker crashes / OOM kills**: container restarts (`docker compose ps`, restart count), kernel OOM logs. Batch claim ki wajah se har crash N jobs reap karwata hai.\n2. **Blocked event loops**: lease extensions miss -> reaped, saath mein `stale_acks` badhega (worker zinda tha). `reaped` up + `stale_acks` up = blocking. `reaped` up + `stale_acks` flat = actual crashes.\n3. **Ungraceful deploys**: `stop_grace_period` chhota, ya SIGKILL -- har deploy pe spike (correlate with deploy times).\n4. **Redis latency**: extend calls slow/fail -> `_keep_lease` ab exception pe log karke agle tick pe retry karta hai (review fix; pehle task mar jaata tha), lekin 2+ consecutive ticks fail hon toh lease expire -> reaped. Worker logs mein `lease_extension_failed` warnings.\n5. **Lease too short for a job type**: `timeout_seconds` chhota set kiya + grace kam, aur extension cadence lease/3 -- loop lag > lease/3 x 2 hua toh miss.\n\nInvestigation: job errors list (`reason: lease_expired`, message mein old worker id: \"lease expired (worker X crashed or stalled)\") -> kaunse workers -> unke logs/metrics. Pattern by job type, by worker, by time.",
+  "why_needed": "Reaped rate silent infra problems (OOM, throttling, deploy issues) ka best signal hai.",
+  "real_world_analogy": "Library mein 'lost books' register lagatar badh raha -- dekho kaunse members, kaunsi books, kab -- pata chalega ek branch ka scanner kharab hai.",
+  "how_it_works": "Counter incremented on lease_expired path; correlate with stale_acks and worker identity.",
+  "in_this_project": "`fail.lua` `HINCRBY KEYS[4], 'reaped', 1`, `reap_expired` error message includes worker id, `_keep_lease` logs `lease_extension_failed` and retries next tick (regression test `test_lease_keeper_survives_transient_redis_errors`).",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+   "projects/03-job-queue/jobqueue/core/queue.py::reap_expired",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_keep_lease",
+   "projects/03-job-queue/jobqueue/dashboard.html",
+   "projects/03-job-queue/tests/test_worker.py::test_lease_keeper_survives_transient_redis_errors"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Counter + per-job reason + old worker id make root-causing possible"
+  ],
+  "disadvantages": [
+   "Counters are cumulative, no rate/time dimension",
+   "Lease keeper survives single blips, but a sustained Redis slowdown still causes reaps"
+  ],
+  "common_mistakes": [
+   "Treating reaps as normal background noise",
+   "Raising max_lease_ms to hide it"
+  ],
+  "follow_up_questions": [
+   "How do you distinguish crash vs blocked loop from metrics?",
+   "_keep_lease ko retry karne ke liye kaise fix kiya, aur kitne failed ticks survivable hain?"
+  ],
+  "concepts": [
+   "reaper",
+   "observability",
+   "troubleshooting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Cumulative Redis counters are cheap but lack time series; Prometheus would give rates and per-worker labels.",
+   "failure_scenarios": "Before the review fix, a transient Redis error silently killed _keep_lease and turned a blip into a reap and a duplicate execution. Now one or two failed ticks are survivable (extend at lease/3); a longer outage still reaps.",
+   "alternatives": "Push per-event metrics to Prometheus; structured logs with job id for tracing.",
+   "scale_10x_100x": "At scale, reap rate per worker host helps identify bad nodes.",
+   "production_improvements": "export reaped rate and lease_extension_failed count, alert when reaped/succeeded ratio exceeds threshold."
+  }
+ },
+ {
+  "id": "JOBQ-094",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why Lua scripts instead of MULTI/EXEC transactions or WATCH-based optimistic locking?",
+  "answer_hinglish": "Teen options compare karta hoon claim ke example se.\n\n**MULTI/EXEC**: commands queue hote hain aur EXEC pe atomically chalte hain. Problem: MULTI ke andar reads ka result EXEC tak nahi milta. Claim ko pehle ZPOPMIN karke id chahiye, phir us id ke hash pe HINCRBY. Id pata hi nahi toh baaki commands likh nahi sakte. Conditional logic (status check, token compare) bhi impossible.\n\n**WATCH + MULTI** (optimistic): WATCH ready; ZRANGE se id padho; MULTI; ZREM; HINCRBY...; EXEC. Koi aur client ne beech mein ready badla toh EXEC fail -> retry. High contention (20 workers same queue) pe constant retries -- jitna load badhega utna wasted work. Aur har attempt multiple round trips.\n\n**Lua**: poora logic server pe ek atomic unit. Reads aur conditionals allowed (`if state[1] ~= 'active'`). Ek round trip. Contention pe koi retry nahi -- Redis bas serially chalata hai.\n\nLua ke costs: (1) script chalte waqt Redis blocked -- isliye bounded loops; (2) Lua mein errors runtime pe -- aur script beech mein error de toh pehle ke writes rollback NAHI hote (Redis scripts atomic hain isolation ke sense mein, lekin transactional rollback nahi); (3) debugging/testing mushkil -- isliye `test_queue_core.py` har script ko injected clock ke saath directly test karta hai; (4) Cluster pe saari keys same slot.\n\n`ARCHITECTURE.md` decision #1: \"One Lua script per transition -> no partial states\".",
+  "why_needed": "Redis atomicity tools ke beech sahi choice batana Redis expertise dikhata hai.",
+  "real_world_analogy": "MULTI: ek list de do 'yeh sab karo' bina dekhe. WATCH: kaam karo, beech mein kisi ne chheda toh sab dobara. Lua: ek banda andar band kamre mein poora kaam dekh-samajh ke karke nikle.",
+  "how_it_works": "Server-side atomic execution with reads and branching vs queued blind commands vs optimistic CAS retries.",
+  "in_this_project": "`jobqueue/core/lua/*`, `core/queue.py::SCRIPTS`, `ARCHITECTURE.md`.",
+  "implementation_files": [
+   "projects/03-job-queue/ARCHITECTURE.md",
+   "projects/03-job-queue/jobqueue/core/queue.py::SCRIPTS",
+   "projects/03-job-queue/jobqueue/core/lua/ack.lua"
+  ],
+  "code_example": "# illustrative: why WATCH is painful for claim\nasync with r.pipeline() as pipe:\n    while True:\n        try:\n            await pipe.watch(ready)\n            ids = await pipe.zrange(ready, 0, 0)        # read outside MULTI\n            pipe.multi()\n            pipe.zrem(ready, ids[0]); pipe.hincrby(f\"jq:job:{ids[0]}\", \"attempts\", 1)\n            await pipe.execute(); break\n        except WatchError:\n            continue                                    # contention -> retry storm",
+  "code_language": "python",
+  "advantages": [
+   "Atomic read-decide-write",
+   "One round trip",
+   "No retry storms"
+  ],
+  "disadvantages": [
+   "Blocks Redis while running",
+   "No rollback on mid-script error",
+   "Cluster key constraints"
+  ],
+  "common_mistakes": [
+   "Writing scripts that can error after partial writes",
+   "Long-running scripts"
+  ],
+  "follow_up_questions": [
+   "What happens if a Lua script errors halfway?",
+   "What are Redis Functions (Redis 7)?"
+  ],
+  "concepts": [
+   "Lua",
+   "MULTI/EXEC",
+   "WATCH",
+   "optimistic locking"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lua centralizes logic in Redis (fast, atomic) at the cost of testability and Redis CPU; WATCH keeps logic in app but suffers under contention.",
+   "failure_scenarios": "Mid-script runtime error leaves partial writes (e.g., ZPOPMIN done, HSET failed); scripts must validate inputs before writing.",
+   "alternatives": "Redis Functions (versioned, persistent libraries), Redis Streams primitives, RedisGears; or a different broker.",
+   "scale_10x_100x": "Script CPU adds up at 100x; keep scripts O(log n) and bounded.",
+   "production_improvements": "Migrate to Redis Functions for versioning, add script-level unit tests per edge case, validate ARGV types up front."
+  }
+ },
+ {
+  "id": "JOBQ-095",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Short extended leases vs long fixed leases: what did you choose and what does it cost?",
+  "answer_hinglish": "Choice (TRADEOFFS #4): **short, capped, extended leases**. Lease = `min(timeout, 30s) + 5s grace`, worker extends every lease/3.\n\nLong fixed lease alternative: lease = job timeout (say 1 hour) + margin. Simple -- koi extension traffic nahi, blocked event loop se koi problem nahi (lease hamesha bada hai). Lekin worker crash ho toh job 1 ghanta tak atki rahegi -- recovery time = timeout. Ek report job jo normally 2 minute leti hai, uske liye bhi 1h wait.\n\nShort extended: crash detection ~35s chahe job timeout 1h ho (`test_extended_lease_is_not_reaped`: 1h job ka lease T0+31s). Costs:\n1. **Extension traffic**: har long job ~har 11.7s ek Redis call. 10,000 concurrent long jobs = ~850 extends/s -- manageable lekin non-zero.\n2. **Fragility under blocking**: event loop block ho (CPU, `time.sleep`, GC) 2 extension cycles se zyada toh lease expire -> duplicate execution (`demo.cpu_block`).\n3. **Redis blip**: extension fail ho sakta hai -- review se pehle `_keep_lease` exception pe mar jaata tha aur job reap hoti thi; ab woh log karke agle tick pe retry karta hai, toh sirf lamba outage reap karata hai.\n4. **Complexity**: extension task per job, token-checked script, reaper-vs-extension race guard.\n\nKyun yeh choice sahi hai: at-least-once system mein recovery latency user-visible hai (emails late), aur duplicates already idempotency se handled hain. Fast detection ka value zyada.\n\nTuning knobs: `JQ_MAX_LEASE_MS` aur `JQ_LEASE_GRACE_MS`. Crash test 500ms + 500ms use karta hai.",
+  "why_needed": "Lease design har queue (SQS visibility timeout, Kafka session timeout) ka core trade-off hai.",
+  "real_world_analogy": "Ghar kiraye pe: 11 mahine ka fixed agreement (long lease -- kirayedaar gayab ho toh 11 mahine ghar band) vs monthly renewal (short lease -- har mahine renew karna padta hai, lekin gayab hua toh 1 mahine mein pata).",
+  "how_it_works": "Detection latency vs renewal overhead + sensitivity to pauses.",
+  "in_this_project": "`claim.lua` lease formula, `Worker._keep_lease`, `config.py` `max_lease_ms`, `lease_grace_ms`, `TRADEOFFS.md` #4.",
+  "implementation_files": [
+   "projects/03-job-queue/TRADEOFFS.md",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_keep_lease",
+   "projects/03-job-queue/tests/test_queue_core.py::test_extended_lease_is_not_reaped"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "~35s crash detection",
+   "Supports jobs up to 1h"
+  ],
+  "disadvantages": [
+   "Extension traffic",
+   "Blocked loops cause duplicates",
+   "More moving parts"
+  ],
+  "common_mistakes": [
+   "Lease = timeout for long jobs",
+   "Grace of 0"
+  ],
+  "follow_up_questions": [
+   "How would you pick max_lease_ms for your workload?",
+   "What does SQS do (ChangeMessageVisibility)?"
+  ],
+  "concepts": [
+   "lease",
+   "visibility timeout",
+   "trade-off"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fast recovery vs robustness to pauses; grace period is the buffer between the two.",
+   "failure_scenarios": "Pauses > ~2/3 lease cause redelivery; Redis errors kill the keeper task; skewed clocks on failover expire leases en masse.",
+   "alternatives": "Fixed long leases, heartbeat-per-worker with ownership transfer, SQS ChangeMessageVisibility, Kafka max.poll.interval.",
+   "scale_10x_100x": "Extension traffic grows linearly with concurrent long jobs; batch extensions per worker (one script extending all its jobs).",
+   "production_improvements": "Batch extend script, retry in keeper, per-queue lease config, loop-lag based alerting."
+  }
+ },
+ {
+  "id": "JOBQ-096",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Why use the attempt counter as the fencing token instead of a separate random or epoch token?",
+  "answer_hinglish": "TRADEOFFS #5: \"Attempt counter as fencing token. No extra state; works because attempts only grow (DLQ requeue resets it, but a zombie from before the DLQ can't hold an `active` lease any more).\"\n\nFencing token ki requirement: har naye lease pe naya, pehle wale se alag (ideally bada) value, aur har write pe compare. `attempts` already exactly yahi karta hai: `claim.lua` mein `HINCRBY attempts 1` har claim pe, aur retry logic ke liye already stored hai. Faayde: koi extra key/field nahi, worker ko attempt number handler ke liye bhi chahiye (`ctx.attempt` -- `demo.flaky` isi pe depend karta hai), aur ek hi number debugging mein meaningful (\"attempt 2 ka ack stale tha\").\n\nWeak spots:\n1. **DLQ requeue reset**: `requeue_dead.lua` attempts 0 karta hai. Requeue ke baad naya claim attempt 1 -- same as ek purane zombie ka token 1. Zombie ka ack tab accept ho sakta agar woh job ke dead hone se pehle se paused tha aur ab naye attempt 1 ke active hone ke dauraan jaage. Practically bahut unlikely (job ko pehle saare attempts fail hone the, phir DLQ, phir manual replay), lekin theoretically possible.\n2. **Redis failover rollback**: async replication mein attempts ka increment lost ho sakta hai -> do workers same token.\n\nAlternatives: (a) random UUID lease id per claim -- uniqueness guaranteed, lekin ordering nahi (resource-side \"reject lower\" check nahi kar sakte); (b) monotonic `lease_epoch` field jo kabhi reset na ho (requeue pe bhi nahi) -- best of both; attempts sirf retry budget ke liye. Main production mein (b) choose karunga -- ek field ka cost hai.",
+  "why_needed": "Fencing token design ki subtleties senior-level discussion hai.",
+  "real_world_analogy": "Hotel room key ka code: har naye guest ke liye counter +1. Lekin agar hotel register reset kar de (DLQ requeue) toh purane guest ka code phir valid ho sakta hai -- isliye code kabhi reset nahi hona chahiye.",
+  "how_it_works": "Monotonic per-job counter; reset breaks monotonicity; separate epoch restores it.",
+  "in_this_project": "`claim.lua` HINCRBY attempts, `ack.lua` token compare, `requeue_dead.lua` attempts reset, `TRADEOFFS.md` #5.",
+  "implementation_files": [
+   "projects/03-job-queue/TRADEOFFS.md",
+   "projects/03-job-queue/jobqueue/core/lua/requeue_dead.lua",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::flaky"
+  ],
+  "code_example": "-- illustrative (not in repo): separate never-reset epoch\nlocal epoch = redis.call('HINCRBY', jk, 'lease_epoch', 1)   -- in claim.lua; never reset\n-- ack/fail/extend compare ARGV token with lease_epoch instead of attempts",
+  "code_language": "lua",
+  "advantages": [
+   "Zero extra state",
+   "Doubles as attempt number"
+  ],
+  "disadvantages": [
+   "Reset on DLQ replay",
+   "Failover can roll it back"
+  ],
+  "common_mistakes": [
+   "Using worker_id as token",
+   "Non-monotonic random token when resources need ordering"
+  ],
+  "follow_up_questions": [
+   "How does Kleppmann define fencing tokens?",
+   "Would you store the epoch in Postgres too?"
+  ],
+  "concepts": [
+   "fencing token",
+   "monotonic counter",
+   "design trade-off"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Reusing attempts minimizes state; a separate epoch costs one field but removes the replay edge case.",
+   "failure_scenarios": "DLQ replay + ancient zombie; failover rolling back HINCRBY so two owners share a token.",
+   "alternatives": "Lease epoch, UUID lease ids (equality only), consensus-backed tokens (ZooKeeper zxid).",
+   "scale_10x_100x": "No scale impact; correctness edge cases become more likely as event counts grow.",
+   "production_improvements": "Add lease_epoch, keep attempts for retry budget only; include token in resource writes."
+  }
+ },
+ {
+  "id": "JOBQ-097",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why choose at-least-once over at-most-once? Are there jobs where at-most-once is better?",
+  "answer_hinglish": "TRADEOFFS #2: \"At-least-once + idempotency vs at-most-once. Never lose a job; pay with duplicate handling in every handler.\"\n\nDefault at-least-once kyun: zyada tar background jobs ka lose hona user-visible bug hai -- welcome email nahi gaya, invoice generate nahi hua, webhook deliver nahi hua. Duplicates ko engineering se harmless banaya ja sakta hai (idempotency ledger, provider idempotency keys, upserts). Lost jobs ko detect karna hi mushkil hai -- silent failure. Toh \"duplicate possible but detectable/preventable\" > \"loss possible and invisible\".\n\nCost: har handler author ko idempotency sochni padti hai. `email.send` ek reference implementation hai; `report.generate` jaise handlers naturally idempotent hain (same input, same output, overwrite).\n\nAt-most-once kab better:\n1. **Non-idempotent, low-value effects** jahan duplicate loss se bura hai -- jaise SMS marketing blast (duplicate SMS paisa aur user annoyance; ek miss ho gaya toh theek).\n2. **Time-sensitive notifications** -- \"your OTP is X\" ka duplicate confusing, aur late redelivery bekaar.\n3. **Metrics/telemetry** -- thoda loss acceptable, duplicates counts inflate karte hain.\n\nIs project mein at-most-once ka direct switch nahi hai, lekin approximate: `max_attempts=1` -- fail pe retry nahi. Lekin lease expiry pe crash recovery phir bhi redeliver karegi... nahi -- `fail.lua` attempts(1) < max(1) false -> dead. Toh max_attempts=1 se crash ke baad job DLQ, re-run nahi. Close to at-most-once, aur DLQ mein visible.",
+  "why_needed": "Delivery semantics per use case choose karna design maturity hai.",
+  "real_world_analogy": "Wedding invitation: ek aadmi ko do card mil gaye toh chalta hai (at-least-once); lekin bank se paisa transfer do baar ho jaye toh nahi chalta -- wahan idempotency ya at-most-once + manual check.",
+  "how_it_works": "Retry-until-ack vs single attempt; idempotency converts duplicates to no-ops.",
+  "in_this_project": "`TRADEOFFS.md` #2, `fail.lua` attempts check, `EnqueueRequest.max_attempts` (min 1).",
+  "implementation_files": [
+   "projects/03-job-queue/TRADEOFFS.md",
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+   "projects/03-job-queue/jobqueue/core/models.py::EnqueueRequest",
+   "projects/03-job-queue/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No silent job loss",
+   "Duplicates preventable"
+  ],
+  "disadvantages": [
+   "Every handler must be idempotent"
+  ],
+  "common_mistakes": [
+   "Assuming retries are always safe",
+   "Using at-most-once to avoid writing idempotent code"
+  ],
+  "follow_up_questions": [
+   "How would you expose a per-job delivery mode?",
+   "Is max_attempts=1 truly at-most-once here?"
+  ],
+  "concepts": [
+   "delivery semantics",
+   "trade-off",
+   "idempotency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-098",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why keep job results in Redis for only 24 hours instead of persisting full history in Postgres?",
+  "answer_hinglish": "Succeeded job ka hash `ack.lua` mein `EXPIRE retention_s` (default 86400) le leta hai, `completed` zset sirf newest 1000 ids rakhta hai. Koi long-term job history store nahi.\n\nReasons:\n1. **Redis memory**: Redis RAM mein hai. Har din lakhs jobs ka hash forever rakhoge toh memory unbounded. Queue ka kaam execution hai, archive nahi.\n2. **Use case**: clients usually job status thodi der poll karte hain (`GET /jobs/{id}`) -- result minutes mein chahiye, mahino baad nahi. 24h generous window hai.\n3. **Separation**: business-critical outcome (email sent) already Postgres mein hai (`email_outbox`, `processed_jobs`) -- woh durable source of truth hai. Job record operational metadata hai.\n4. **Simplicity**: history store add karne se ek aur write path (Redis + Postgres) aur dual-write concerns.\n\nCost: 24h baad `GET /jobs/{id}` 404 \"expired after retention\". Analytics (\"kal kitni email jobs fail hui, p95 duration kya tha\") Redis se nahi ho sakta -- sirf counters (`stats` hash) cumulative hain, time-series nahi. Debugging old incidents ke liye logs pe depend.\n\nSYSTEM_DESIGN 100x row: \"move completed-job history to Postgres/ClickHouse\". Main production mein ack ke saath ek async event (ya batch) emit karunga jo analytics store mein jaye -- queue ka hot path slow na ho.",
+  "why_needed": "Operational store vs analytical store ka separation.",
+  "real_world_analogy": "Delivery app: active orders app mein dikhte hain, 24 ghante baad 'order history' archive section (alag database) mein chale jaate hain.",
+  "how_it_works": "TTL-based retention for terminal states; capped recent index; history offloaded elsewhere if needed.",
+  "in_this_project": "`ack.lua` EXPIRE + ZREMRANGEBYRANK, `config.py` `job_retention_seconds`, `completed_cap`, `api/routes.py::get_job` 404 message.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/ack.lua",
+   "projects/03-job-queue/jobqueue/config.py::Settings",
+   "projects/03-job-queue/jobqueue/api/routes.py::get_job",
+   "projects/03-job-queue/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Bounded Redis memory",
+   "Simple hot path"
+  ],
+  "disadvantages": [
+   "No historical analytics",
+   "Status lost after 24h"
+  ],
+  "common_mistakes": [
+   "Using Redis as a permanent job log",
+   "Writing history synchronously in the ack path"
+  ],
+  "follow_up_questions": [
+   "How would you build job analytics?",
+   "What retention would you choose for dead jobs?"
+  ],
+  "concepts": [
+   "retention",
+   "operational vs analytical",
+   "trade-off"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-099",
+  "project_slug": "p03-job-queue",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "Why build this instead of using Celery, Sidekiq/BullMQ, SQS, or Temporal? When would you pick each?",
+  "answer_hinglish": "Honest answer: yeh portfolio project hai -- internals deeply samajhne ke liye banaya. Production mein main usually existing tool choose karunga, aur yeh project mujhe unke trade-offs evaluate karna sikhata hai.\n\n**Celery (Python, Redis/RabbitMQ broker)**: mature, ecosystem badi. Lekin defaults surprising hain -- `acks_late` off by default (at-most-once-ish for crashes), Redis broker pe visibility timeout behaviour, prefetch tuning. Pick when: Python team, standard background tasks.\n\n**Sidekiq / BullMQ / RQ (Redis-based)**: is project ke closest relatives -- Redis structures, retries with backoff, DLQ (\"dead set\"), scheduled jobs. BullMQ Lua scripts use karta hai exactly isi tarah. Pick when: Ruby/Node stack.\n\n**SQS**: managed, visibility timeout + ChangeMessageVisibility (lease extension), DLQ redrive built in, practically infinite scale. Limits: no priority within a queue, delay max 15 min, FIFO queues ka throughput limit, polling. Pick when: AWS, want zero ops.\n\n**Kafka**: log-based, replay, ordering per partition, huge throughput. Per-message retry/delay/priority awkward (retry topics). Pick when: event streaming, multiple consumers, replay needs.\n\n**Temporal / Step Functions**: durable workflows -- multi-step, long-running, sagas, timers months long, exactly-once-ish workflow state. Heavy infra. Pick when: business workflows with many steps and compensations.\n\n**Postgres queue (pg-boss, river, good_job)**: transactional enqueue, ek store. Pick when: moderate volume, already Postgres.\n\nIs project ke concepts (lease, fencing, idempotent consumer, jitter, DLQ) sab pe apply hote hain -- isliye inhe evaluate karna aasaan hota hai.",
+  "why_needed": "Build vs buy aur tool selection senior engineer ki daily responsibility hai.",
+  "real_world_analogy": "Ghar banane se pehle khud ek chhota model ghar banana -- taaki builder ke saath baat karte waqt pata ho ki foundation, wiring, plumbing mein kya poochna hai.",
+  "how_it_works": "Map requirements (ordering, delay, priority, durability, ops) to tool semantics.",
+  "in_this_project": "Concepts mapping: lease (`claim.lua`) = SQS visibility timeout; `extend_lease.lua` = ChangeMessageVisibility; `dead` zset = Sidekiq dead set / SQS DLQ; idempotency key = SQS FIFO dedup id.",
+  "implementation_files": [
+   "projects/03-job-queue/README.md",
+   "projects/03-job-queue/TRADEOFFS.md",
+   "projects/03-job-queue/jobqueue/core/lua/extend_lease.lua"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Deep understanding transfers to any tool",
+   "Custom fit (priority + delay + lease in one)"
+  ],
+  "disadvantages": [
+   "Maintenance burden of a custom queue",
+   "Fewer features (cron, rate limits, UI) than mature tools"
+  ],
+  "common_mistakes": [
+   "Building a custom queue in production without need",
+   "Choosing Kafka for a simple task queue"
+  ],
+  "follow_up_questions": [
+   "What are Celery's acks_late and visibility_timeout pitfalls?",
+   "When is Temporal overkill?"
+  ],
+  "concepts": [
+   "build vs buy",
+   "Celery",
+   "SQS",
+   "Kafka",
+   "Temporal"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Custom gives control and learning; managed/mature gives features and less ops. Choose by team skills, scale, and semantics needed.",
+   "failure_scenarios": "Custom queue bugs are your bugs (e.g., the heartbeat TTL bug); managed services have their own limits (SQS 15 min delay, 256KB message).",
+   "alternatives": "Celery, RQ, Dramatiq, BullMQ, Sidekiq, SQS, RabbitMQ, Kafka, Temporal, pg-boss/river.",
+   "scale_10x_100x": "At 100x, managed services (SQS) scale without sharding work; Redis-based custom needs sharding.",
+   "production_improvements": "If productionizing, either adopt a mature library or invest in metrics, admin tooling, and chaos tests for this one."
+  }
+ },
+ {
+  "id": "JOBQ-100",
+  "project_slug": "p03-job-queue",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "What metrics and alerts would you set up for this queue in production?",
+  "answer_hinglish": "DEPLOYMENT #5 ki list se start: \"`dead` count growing, `ready` backlog age, `reaped` counter (crashing/stalling workers), workers with `alive=false`, `stale_acks > 0`\".\n\nMera full set:\n**Backlog / latency** (user impact):\n- Oldest ready job age per queue (score se seq nikalna mushkil, toh `created_at` of `ZRANGE ready 0 0`) -- sabse important SLO signal.\n- Ready depth, delayed depth (`queue_stats` already deta hai: ready, delayed, active, dead).\n- Enqueue-to-start latency (`started_at - run_at`) histogram.\n**Errors**:\n- Dead rate (`counters.dead` delta), retried rate, per job type.\n- DLQ size absolute.\n**Worker health**:\n- Alive workers count vs expected (`/workers`).\n- `reaped` rate (lease expiries) -- crashes/stalls.\n- `stale_acks` rate -- blocked loops / too-short leases.\n- Slot utilization (`running` / concurrency).\n- Event loop lag.\n**Infra**: Redis memory % (noeviction pe 100% = writes fail), Redis latency/SLOWLOG, Postgres connections, `claim_failed` / `heartbeat_failed` / `reaper_failed` log rates.\n\nCurrent state honestly: API ke HTTP metrics `/metrics` pe hain (bpcommon `http_requests_total`, latency histogram with route templates -- cardinality safe). Queue counters Redis `stats` hash mein hain aur `/queues` JSON se milte hain, lekin Prometheus mein exported nahi. Worker stats in-memory. Next step: `/metrics` pe queue gauges (ready/delayed/active/dead) aur worker Prometheus exporter.",
+  "why_needed": "Queue systems silently fail; metrics hi early warning hain.",
+  "real_world_analogy": "Hospital dashboard: waiting room mein sabse purana patient kitni der se baitha hai (queue age), ICU transfers (DLQ), staff present (workers alive).",
+  "how_it_works": "Golden signals for queues: backlog age, throughput, error/DLQ rate, worker saturation.",
+  "in_this_project": "`JobQueue.queue_stats`, `api/routes.py::queues`, `workers`, `shared/bpcommon/http.py` metrics, `DEPLOYMENT.md` #5.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/queue.py::queue_stats",
+   "projects/03-job-queue/jobqueue/api/routes.py::workers",
+   "projects/03-job-queue/DEPLOYMENT.md",
+   "shared/bpcommon/http.py::setup_app"
+  ],
+  "code_example": "# illustrative (not in repo): export queue gauges on /metrics\nfrom prometheus_client import Gauge\nQUEUE_DEPTH = Gauge(\"jobqueue_depth\", \"jobs per state\", [\"queue\", \"state\"])\nasync def refresh(q):\n    for name in await q.queues():\n        s = await q.queue_stats(name)\n        for state in (\"ready\", \"delayed\", \"active\", \"dead\"):\n            QUEUE_DEPTH.labels(name, state).set(s[state])",
+  "code_language": "python",
+  "advantages": [
+   "Counters already exist in Redis",
+   "HTTP metrics already exported"
+  ],
+  "disadvantages": [
+   "Queue metrics not in Prometheus",
+   "No queue-age metric",
+   "Worker stats reset on restart"
+  ],
+  "common_mistakes": [
+   "Alerting only on depth (a deep queue draining fast is fine; age matters)",
+   "High-cardinality labels like job_id"
+  ],
+  "follow_up_questions": [
+   "Why is queue age better than queue depth?",
+   "Which alert pages someone at 3am?"
+  ],
+  "concepts": [
+   "observability",
+   "metrics",
+   "alerting",
+   "SLO"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pull metrics from Redis (cheap, central) vs push from workers (per-worker detail); usually both.",
+   "failure_scenarios": "Metrics endpoint itself hitting Redis heavily if scraped often; cache values.",
+   "alternatives": "OpenTelemetry metrics/traces with job id as trace attribute; vendor APM.",
+   "scale_10x_100x": "Many queues/types -> label cardinality; aggregate by type, not id.",
+   "production_improvements": "Queue-age gauge, per-type dead rate, worker exporter, Redis memory alert, runbooks per alert."
+  }
+ },
+ {
+  "id": "JOBQ-101",
+  "project_slug": "p03-job-queue",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A bug sent 50,000 jobs to the DLQ. The fix is deployed. How do you replay them safely?",
+  "answer_hinglish": "Main seedha `requeue-all` nahi dabaunga. Plan:\n\n1. **Verify fix**: ek job canary -- `POST /dlq/{id}/requeue`, `GET /jobs/{id}` se succeed confirm. Kuch aur types/variants ke 5-10 canaries.\n2. **Idempotency check**: kya handler idempotent hai? DLQ mein kuch jobs ne partially effect kiya ho sakta hai (ledger row ke saath commit, phir crash). `email.send` ledger se safe -- replayed job `duplicate: true` dega. Non-idempotent handlers ke liye pehle reconciliation.\n3. **Throttled replay**: current `/dlq/requeue-all?queue=&type=` limitations: (a) `list_ids(..., 10_000)` -- ek call mein max 10k, toh 50k ke liye 5 calls; (b) sab jobs turant ready mein -> 50k jobs ek saath downstream (email provider rate limit!) pe; (c) N+1 round trips, ek HTTP request mein lamba time -> timeout risk. Better: chhote batches (1000) ek script se, ya replay ko `delayed` mein spread run_at ke saath daalna (e.g. 100 jobs/s ki rate), ya dedicated low-priority queue mein requeue.\n4. **Priority**: replayed jobs naye traffic ko starve na karein -- unhe lower priority ya `low` queue mein.\n5. **Monitor**: dead rate (dobara fail?), downstream errors, queue age. Problem dikhe toh stop -- remaining jobs abhi DLQ mein safe hain.\n6. **Attempts reset**: `requeue_dead.lua` attempts 0 karta hai -- poora retry budget.\n\nPost-incident: DLQ alert jaldi lagta toh 50k tak nahi pahunchta.",
+  "why_needed": "Bulk recovery operations khud incidents cause kar sakte hain agar throttle na kiye jayein.",
+  "real_world_analogy": "Flood ke baad godown ke 50,000 parcels ek saath trucks pe daaloge toh highway jam -- batches mein, raat ke time, pehle ek truck test run.",
+  "how_it_works": "Canary -> idempotency check -> throttled, prioritized replay -> monitor -> stop switch.",
+  "in_this_project": "`api/routes.py::requeue_all` (10_000 limit, sequential loop), `requeue_dead.lua`, `handlers/builtin.py::send_email`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/api/routes.py::requeue_all",
+   "projects/03-job-queue/jobqueue/core/lua/requeue_dead.lua",
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email"
+  ],
+  "code_example": "# illustrative (not in repo): spread a replay over time via delayed run_at\nfor i, job_id in enumerate(dead_ids):\n    run_at = now_ms + (i // 100) * 1000          # 100 jobs per second\n    await requeue_dead_delayed(queue, job_id, run_at)   # variant of requeue_dead.lua writing to delayed",
+  "code_language": "python",
+  "advantages": [
+   "DLQ keeps everything recoverable",
+   "Attempts reset gives full budget"
+  ],
+  "disadvantages": [
+   "Built-in bulk replay is unthrottled and capped at 10k per call"
+  ],
+  "common_mistakes": [
+   "requeue-all on 50k at peak traffic",
+   "Replaying before verifying the fix"
+  ],
+  "follow_up_questions": [
+   "How would you implement a rate-limited requeue script?",
+   "How do you know which DLQ jobs already had side effects?"
+  ],
+  "concepts": [
+   "DLQ replay",
+   "incident recovery",
+   "throttling"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fast replay restores service sooner but risks downstream overload; throttled replay is slower but safe.",
+   "failure_scenarios": "Replay storm hitting rate limits -> more failures -> back to DLQ; non-idempotent handler duplicates.",
+   "alternatives": "Replay into a separate queue with its own worker pool; SQS-style redrive with velocity control.",
+   "scale_10x_100x": "At millions of dead jobs, replay must be a background job itself (paginated, resumable, checkpointed).",
+   "production_improvements": "Requeue script with target queue + run_at spreading, replay-job with progress, dry-run mode listing counts by type/error."
+  }
+ },
+ {
+  "id": "JOBQ-102",
+  "project_slug": "p03-job-queue",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "How do you know which workers are healthy, and what do you do with a dead worker entry?",
+  "answer_hinglish": "`GET /workers` (dashboard workers table): `jq:workers` hash se har worker ka JSON -- id (`hostname-pid-random6` default), queues, concurrency, `running` (job ids), processed/succeeded/failed/stale_acks, started_at, last_heartbeat. Plus computed: `alive` = `jq:worker:{id}:alive` key exist karti hai (TTL 3x heartbeat interval = 15s default), aur `seconds_since_heartbeat`. Dashboard `alive` ya `STALE Ns` dikhata hai.\n\nInterpretation:\n- `alive: true`, running < concurrency -> healthy, spare capacity.\n- `alive: true`, running == concurrency for long -> saturated; jobs ka timeout check.\n- `alive: false` -> heartbeat 15s+ se nahi aaya: crashed, killed, ya event loop blocked. Blocked case mein thodi der baad wapas alive ho jayega (flapping).\n- `stale_acks > 0` -> leases khoi.\n\nDead worker entry: graceful shutdown mein `_shutdown` khud `HDEL workers id` aur alive key delete karta hai. Lekin kill -9 / OOM pe entry reh jati hai, `alive: false` forever. Uski jobs ka kya? Kuch karna nahi -- leases expire ho chuki, reapers ne recover kar li (heartbeat recovery ke liye use nahi hota). Entry sirf cosmetic hai: `DELETE /workers/{worker_id}` se hata do. Test `test_workers_endpoint_reports_stale` ghost worker (60s purana heartbeat, no alive key) ke liye `alive False` aur `seconds_since_heartbeat >= 59` verify karta hai.\n\nImprovement: auto-prune entries stale > 1h; Kubernetes liveness probe based on heartbeat.",
+  "why_needed": "Operators ko clear health signal chahiye aur cleanup ka safe tareeka.",
+  "real_world_analogy": "Office attendance board: jo 15 minute se 'ping' nahi kar raha woh red; jo resign karke chala gaya uska naam board se manually hatao -- uska kaam toh pehle hi doosron ko assign ho chuka.",
+  "how_it_works": "Heartbeat info hash + TTL liveness key; cleanup by HDEL; jobs recovered independently by leases.",
+  "in_this_project": "`api/routes.py::workers`, `forget_worker`, `Worker._heartbeat_loop`, `_shutdown` cleanup.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/api/routes.py::workers",
+   "projects/03-job-queue/jobqueue/api/routes.py::forget_worker",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_shutdown",
+   "projects/03-job-queue/tests/test_api.py::test_workers_endpoint_reports_stale"
+  ],
+  "code_example": "# real: jobqueue/api/routes.py\nd = json.loads(info)\nd[\"alive\"] = bool(await q.r.exists(f\"{q.p}worker:{wid.decode()}:alive\"))\nd[\"seconds_since_heartbeat\"] = round(time.time() - d[\"last_heartbeat\"], 1)",
+  "code_language": "python",
+  "advantages": [
+   "Rich per-worker info",
+   "Safe manual cleanup"
+  ],
+  "disadvantages": [
+   "seconds_since_heartbeat uses API host clock vs worker clock (skew)",
+   "No auto-prune"
+  ],
+  "common_mistakes": [
+   "Re-queueing a dead worker's jobs manually (leases already handle it)",
+   "Panicking over stale entries after kill -9"
+  ],
+  "follow_up_questions": [
+   "Why compute alive from a TTL key rather than last_heartbeat?",
+   "How would Kubernetes probes use this?"
+  ],
+  "concepts": [
+   "worker health",
+   "heartbeat",
+   "operations"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-103",
+  "project_slug": "p03-job-queue",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "How do you safely change a job's payload format or handler behaviour with jobs already in the queue?",
+  "answer_hinglish": "Queue mein jobs hours/days purani ho sakti hain (delayed, retries, DLQ). Naya code purane payloads dekhega, aur rolling deploy ke dauraan purana code naye payloads dekhega. Dono directions compatible honi chahiye.\n\nRules jo main follow karunga:\n1. **Additive changes only** (expand/contract): naya field optional with default. Handler `p.get(\"new_field\", default)` -- jaise `send_email` already `p.get(\"subject\", \"\")`, `p.get(\"dedupe_key\", ctx.job.id)` karta hai. Purane jobs chalte rahenge.\n2. **Breaking change = new job type**: `email.send` -> `email.send.v2`. Deploy order: pehle workers jo dono types handle karein, phir producers v2 bhejna shuru, phir purane v1 jobs drain hone ka wait (ready/delayed/DLQ empty for v1), phir v1 handler remove. Is project mein unknown type `PermanentError` -> DLQ, toh order galat hua toh jobs DLQ mein jayengi (recoverable).\n3. **Payload version field**: `{\"v\": 2, ...}` aur handler branch kare -- ek type ke andar versioning.\n4. **Job hash schema** (Redis fields): `Job` pydantic model mein naye fields optional with defaults (`run_at: int | None = None` style), toh purane hashes validate hote hain. Field remove karne se pehle saare purane jobs expire hone do (retention 24h, dead jobs indefinite!).\n5. **Handler semantics change**: idempotency ledger ka meaning same rehna chahiye -- agar ledger key badli toh replays duplicate effects de sakte hain.\n6. **Postgres schema**: Alembic migration pehle (additive), code baad mein; contract step later.",
+  "why_needed": "Long-lived messages schema evolution ka sabse tricky case hain -- APIs se bhi zyada.",
+  "real_world_analogy": "Courier company naya address format laati hai, lekin godown mein purane format ke parcels pade hain -- sorting staff ko dono formats padhne aane chahiye jab tak purane khatam na hon.",
+  "how_it_works": "Backward + forward compatibility; expand/contract; versioned types; drain before removal.",
+  "in_this_project": "`handlers/builtin.py::send_email` `.get` defaults, `core/models.py::Job` optional fields, `Worker._execute` unknown type -> PermanentError, Alembic migrations.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/03-job-queue/jobqueue/core/models.py::Job",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Zero-downtime evolution",
+   "Old jobs keep working"
+  ],
+  "disadvantages": [
+   "Temporary dual code paths",
+   "Drain tracking needed"
+  ],
+  "common_mistakes": [
+   "Renaming a payload field in one deploy",
+   "Removing a handler while delayed/DLQ jobs of that type exist"
+  ],
+  "follow_up_questions": [
+   "How do you know when all v1 jobs are drained?",
+   "Would you use a schema registry for payloads?"
+  ],
+  "concepts": [
+   "schema evolution",
+   "versioning",
+   "rolling deploy",
+   "compatibility"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "New type vs version field: new type is explicit and routable; version field keeps one handler but grows branches.",
+   "failure_scenarios": "Old workers DLQ new types; new workers crash on old payload shape; DLQ replays months later hit removed handlers.",
+   "alternatives": "Schema registry (Avro/Protobuf) with compatibility checks, upcasters that transform old payloads on read.",
+   "scale_10x_100x": "Many producers/teams: contract tests in CI between producer payload and handler schema.",
+   "production_improvements": "Pydantic payload model per job type validated at enqueue and in handler; drain dashboard by type/version."
+  }
+ },
+ {
+  "id": "JOBQ-104",
+  "project_slug": "p03-job-queue",
+  "category": "Production Scenarios",
+  "difficulty": "Beginner",
+  "question": "How do you run the system locally and verify it end to end?",
+  "answer_hinglish": "README \"Run locally\":\n1. Infra: `docker compose -f ../../infra/docker-compose.yml up -d` (shared Redis on 56379, Postgres on 55432).\n2. Migrations: `alembic upgrade head` (tables `processed_jobs`, `email_outbox`).\n3. API: `uvicorn jobqueue.main:app --port 8003`.\n4. Worker(s): `python -m jobqueue.worker --queues critical,default,low --concurrency 8` -- zyada terminals = zyada workers.\n5. Seed: `python seed.py http://127.0.0.1:8003` -- 5 welcome emails, ek report `low` queue mein, ek flaky job (attempt 3 pe succeed), ek poison (3 attempts), ek critical email priority 9, ek 30s delayed report, aur `heartbeat-report` schedule har 60s.\n6. Dashboard: `http://127.0.0.1:8003/dashboard`, token `change-me-jq-token` -- queues table (ready/delayed/active/dead + counters), workers (alive, running, stale_acks), DLQ with Requeue button.\n7. Tests: `python -m pytest -q` -- 30 tests ~15s (TESTING.md), test DB ke liye alembic `-x url=...p03_job_queue_test`.\n\nDocker end-to-end (TESTING.md manual verified): `docker compose up -d --build` + `seed.py http://127.0.0.1:58003` -> ~8s mein critical email succeeded, poison dead after 3 attempts, flaky succeeded after retries, delayed job abhi delayed, schedule `low` mein fire hua, 3 workers alive.\n\nMujhe yeh seed mix pasand hai kyunki ek run mein saare paths dikh jaate hain: success, retry, DLQ, priority, delay, schedule.",
+  "why_needed": "Interviewer 'show me' bole toh 2 minute mein demo chalana aana chahiye.",
+  "real_world_analogy": "Naye restaurant ka trial run: har type ka order ek baar daalo -- normal, special, cancel, late delivery -- aur kitchen display pe dekho sab sahi jagah jaata hai.",
+  "how_it_works": "Seed script exercises every state transition; dashboard visualizes them.",
+  "in_this_project": "`README.md`, `seed.py`, `jobqueue/dashboard.html`, `TESTING.md` Docker e2e section.",
+  "implementation_files": [
+   "projects/03-job-queue/README.md",
+   "projects/03-job-queue/seed.py",
+   "projects/03-job-queue/jobqueue/dashboard.html",
+   "projects/03-job-queue/TESTING.md"
+  ],
+  "code_example": "# real: README.md (trimmed)\n../../.venv/Scripts/alembic upgrade head\n../../.venv/Scripts/uvicorn jobqueue.main:app --port 8003\n../../.venv/Scripts/python -m jobqueue.worker --queues critical,default,low --concurrency 8\n../../.venv/Scripts/python seed.py http://127.0.0.1:8003",
+  "code_language": "bash",
+  "advantages": [
+   "One-command seed covers all paths",
+   "Visual dashboard"
+  ],
+  "disadvantages": [
+   "Needs Docker infra running"
+  ],
+  "common_mistakes": [
+   "Running worker without migrations (email.send fails -> DLQ)",
+   "Forgetting the token in the dashboard"
+  ],
+  "follow_up_questions": [
+   "What would you show first in a live demo?",
+   "How would you demo a crash?"
+  ],
+  "concepts": [
+   "local development",
+   "demo",
+   "end-to-end"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-105",
+  "project_slug": "p03-job-queue",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you achieve effectively-once for a handler that calls an external payment API?",
+  "answer_hinglish": "Ledger trick tab kaam karta hai jab effect aur ledger ek DB transaction mein hon. Payment provider (Stripe-jaisa) external hai -- uske saath shared transaction nahi. Toh options:\n\n**1. Provider idempotency key** (sabse important): request ke saath `Idempotency-Key: job:{job_id}` bhejo. Provider same key ki dobara request pe original result lautata hai, dobara charge nahi karta. FAILURE_SCENARIOS bhi yahi kehta hai: \"For external effects (real email APIs), pass the job id as the provider's idempotency key.\" Job id hi stable hai across retries (attempt number nahi -- woh badalta hai!).\n\n**2. Local state machine around the call**:\n- Tx 1: `payments` row insert status `pending` with `job_id` unique (agar exist toh current status padho).\n- Provider call with idempotency key.\n- Tx 2: status `succeeded` + provider charge id + `processed_jobs` ledger.\nCrash between call and Tx 2 -> retry -> row `pending` -> provider ko same key ke saath dobara call -> provider original charge lautata hai -> Tx 2. Effect once.\n\n**3. Unknown outcome handling**: timeout pe pata nahi charge hua ya nahi -- idempotency key ke saath retry safe hai. Bina key ke: provider se `GET charge by metadata.job_id` reconcile.\n\n**4. Provider key TTL**: Stripe keys ~24h tak yaad rakhta hai. Retry window (backoff + DLQ replay) usse lamba ho toh local `pending` row se reconcile zaroori.\n\nDon't: HTTP call DB transaction ke andar (lock hold + commit fail pe duplicate). Don't: attempt-based key.",
+  "why_needed": "Real money effects interviews mein exactly-once ka asli test hain.",
+  "real_world_analogy": "Bank mein cheque ke saath unique reference number likhte ho; clerk same reference dobara aaye toh bolta hai 'yeh toh process ho chuka, yeh rahi receipt'.",
+  "how_it_works": "End-to-end idempotency key propagated to the external system + local intent record for reconciliation.",
+  "in_this_project": "Not implemented (email.send uses a DB stand-in). Pattern basis: `send_email` ledger, `JobContext.job.id`, `FAILURE_SCENARIOS.md` last paragraph.",
+  "implementation_files": [
+   "projects/03-job-queue/FAILURE_SCENARIOS.md",
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/03-job-queue/jobqueue/handlers/__init__.py::JobContext"
+  ],
+  "code_example": "# illustrative (not in repo)\n@registry.task(\"payment.charge\")\nasync def charge(ctx: JobContext):\n    p = ctx.payload\n    async with ctx.sessionmaker() as s, s.begin():\n        row = await upsert_pending(s, job_id=ctx.job.id, amount=p[\"amount\"])   # unique job_id\n        if row.status == \"succeeded\":\n            return {\"duplicate\": True, \"charge_id\": row.charge_id}\n    charge = await provider.charge(amount=p[\"amount\"], idempotency_key=f\"job:{ctx.job.id}\")\n    async with ctx.sessionmaker() as s, s.begin():\n        await mark_succeeded(s, ctx.job.id, charge.id)\n    return {\"duplicate\": False, \"charge_id\": charge.id}",
+  "code_language": "python",
+  "advantages": [
+   "Safe retries even with unknown outcomes",
+   "Reconciliation possible from local state"
+  ],
+  "disadvantages": [
+   "Depends on provider supporting idempotency keys",
+   "Two transactions + external call = more code"
+  ],
+  "common_mistakes": [
+   "Using attempt number in the idempotency key",
+   "Calling provider inside an open DB transaction",
+   "Assuming timeout = failure"
+  ],
+  "follow_up_questions": [
+   "What if the provider doesn't support idempotency keys?",
+   "How long must the local pending record live?"
+  ],
+  "concepts": [
+   "exactly-once",
+   "idempotency key",
+   "external effects",
+   "payments"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Provider idempotency is cheap and strong but provider-dependent; local intent records add reconciliation ability at the cost of complexity.",
+   "failure_scenarios": "Timeout with unknown outcome, provider key expiry before retry, zombie worker calling provider concurrently (same key -> provider dedupes).",
+   "alternatives": "Outbox + single relay to provider, saga with refund compensation, provider webhooks as source of truth.",
+   "scale_10x_100x": "High volume: reconciliation jobs comparing provider reports with local table daily.",
+   "production_improvements": "Generic `external_call(key=...)` helper, reconciliation job, alerts on long-pending records."
+  }
+ },
+ {
+  "id": "JOBQ-106",
+  "project_slug": "p03-job-queue",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you add per-tenant fairness so one tenant's flood doesn't delay everyone else?",
+  "answer_hinglish": "README limitation: \"No per-tenant fairness or rate limiting inside the queue (see Project 6 / Project 1).\" Abhi ek queue = ek zset; tenant A ne 1 lakh jobs daali toh tenant B ki job unke peeche FIFO mein (same priority).\n\nDesign options:\n1. **Per-tenant sub-queues + fair claiming**: `jq:q:{queue}:t:{tenant}:ready`. Ek `jq:q:{queue}:tenants` zset/list of active tenants. Claim script round-robin karti hai: next tenant uthao (LMOVE rotate), uski ready se ZPOPMIN, empty ho toh tenant ko active list se hatao. Har tenant ko turn milta hai -- A ka backlog B ko block nahi karta.\n2. **Weighted fair queuing / deficit round robin**: paid plans ko zyada weight (enterprise 5, free 1).\n3. **Per-tenant concurrency caps**: `jq:tenant:{t}:active` counter claim mein increment, ack/fail mein decrement; cap hit toh us tenant ko skip. Isse ek tenant saare worker slots nahi le sakta. Counter leak (crash) ko reaper path pe bhi decrement karna padega.\n4. **Admission control at enqueue**: Project 1 ke rate limiter se per-tenant enqueue rate limit / quota -> 429.\n\nTrade-offs: claim script complex aur zyada keys touch karti hai (Cluster mein tenant sub-queues ko queue hash tag ke andar rakhna); strict global FIFO khatam; bahut saare tenants pe round-robin state bada. Main start karunga #3 (simple cap) + #4 (admission), aur jab noisy-neighbor issue measurable ho tab #1.",
+  "why_needed": "Multi-tenant SaaS mein noisy neighbor sabse common fairness problem hai.",
+  "real_world_analogy": "Bank mein ek corporate client 500 cheques le aaya -- har customer ko ek counter turn milta hai (round robin), warna baaki sab ghanton wait karenge.",
+  "how_it_works": "Hierarchical scheduling: pick tenant fairly, then job within tenant by priority/FIFO; plus per-tenant concurrency caps.",
+  "in_this_project": "Not implemented. Relevant: `claim.lua` ZPOPMIN single zset, `README.md` limitation, `SYSTEM_DESIGN.md` multi-tenant row.",
+  "implementation_files": [
+   "projects/03-job-queue/README.md",
+   "projects/03-job-queue/SYSTEM_DESIGN.md",
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua"
+  ],
+  "code_example": "-- illustrative (not in repo): round-robin tenant pick inside claim\nlocal tenant = redis.call('LMOVE', KEYS[4], KEYS[4], 'LEFT', 'RIGHT')   -- rotate active tenants\nif tenant then\n  local popped = redis.call('ZPOPMIN', prefix .. 'q:' .. queue .. ':t:' .. tenant .. ':ready')\n  if #popped == 0 then redis.call('LREM', KEYS[4], 0, tenant) end\nend",
+  "code_language": "lua",
+  "advantages": [
+   "Isolation between tenants",
+   "Plan-based weights possible"
+  ],
+  "disadvantages": [
+   "Complex claim logic",
+   "Lost global FIFO",
+   "More keys per queue"
+  ],
+  "common_mistakes": [
+   "Only global rate limits (doesn't stop a tenant hogging slots)",
+   "Counters that leak on crash"
+  ],
+  "follow_up_questions": [
+   "How do you prevent tenant concurrency counters from leaking on worker crash?",
+   "How does this interact with priorities?"
+  ],
+  "concepts": [
+   "fairness",
+   "multi-tenancy",
+   "noisy neighbor",
+   "scheduling"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fairness vs throughput/simplicity: round-robin adds per-claim work and state; caps are simple but can idle capacity.",
+   "failure_scenarios": "Leaked active counters block a tenant forever; many tiny tenants make round-robin expensive.",
+   "alternatives": "Separate queues per tenant tier, Kubernetes-style quotas, Project 6 style fair scheduler.",
+   "scale_10x_100x": "100x tenants: two-level scheduling (tier then tenant), sampling instead of full rotation.",
+   "production_improvements": "Per-tenant queue-age metrics, cap counters reconciled by reaper, admission control with Project 1 limiter."
+  }
+ },
+ {
+  "id": "JOBQ-107",
+  "project_slug": "p03-job-queue",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "What happens if a Lua script fails halfway, and how do you design scripts to be safe?",
+  "answer_hinglish": "Redis scripts **isolated** hain (koi aur command beech mein nahi chalta) lekin **transactional rollback nahi** hai. Agar script line 10 pe runtime error de (`redis.call` wrong type pe, `tonumber(nil)` arithmetic, `cjson.decode` invalid JSON), toh line 1-9 ke writes apply ho chuke hain aur script wahin ruk jati hai. Client ko error milta hai.\n\nIs project mein real example (code review mein mila, fix kiya): `claim.lua` ZPOPMIN ke baad `tonumber(redis.call('HGET', jk, 'timeout_ms') or '30000')` karta tha -- agar timeout_ms garbage string ho, `tonumber` nil deta, `math.min(nil, ...)` error -> job ready se pop ho chuki lekin active mein nahi gayi -> **job lost**. Fix: `tonumber(redis.call('HGET', jk, 'timeout_ms')) or 30000` (garbage pe bhi default), aur Python side `claim_many` unparseable record ko DLQ mein bhejta hai ('corrupt job record'). Regression test `test_corrupt_job_field_does_not_lose_the_job`: healthy job serve hoti hai, corrupt wali `dead` status mein. `enqueue.lua` mein `cjson.decode(ARGV[3])` bhi pehle hai, writes se pehle -- achha order.\n\nSafe script design:\n1. **Validate first, write later**: saare reads aur conversions top pe; koi bhi failure writes se pehle ho.\n2. **Defaults for missing AND garbage fields**: `tonumber(x) or default` (not `tonumber(x or 'default')`).\n3. **Use `redis.pcall`** jahan failure expected ho aur handle karo.\n4. **Bounded loops** (`max_promote`, `max_jobs`) -- `busy-reply-threshold` (lua-time-limit, default 5s) cross hua toh Redis BUSY replies deta hai aur script sirf `SCRIPT KILL` se rukti hai agar usne abhi tak write nahi kiya; write ke baad sirf `SHUTDOWN NOSAVE`.\n5. **Tests per script with edge inputs** -- `test_queue_core.py` ab corrupt-hash case bhi cover karta hai.",
+  "why_needed": "Lua 'atomic' ka matlab samajhna -- isolation hai, rollback nahi -- common misconception hai.",
+  "real_world_analogy": "Ek banda band kamre mein kaam kar raha hai (koi disturb nahi karega), lekin beech mein behosh ho gaya toh aadha kaam ho chuka hai -- koi 'undo' button nahi.",
+  "how_it_works": "Isolation without atomic rollback; errors abort mid-way leaving prior effects.",
+  "in_this_project": "`claim.lua` defensive `tonumber(x) or default` after ZPOPMIN (review fix); `queue.py::claim_many` dead-letters records that fail validation; `enqueue.lua` decode before writes; test `test_corrupt_job_field_does_not_lose_the_job`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/claim.lua",
+   "projects/03-job-queue/jobqueue/core/lua/enqueue.lua",
+   "projects/03-job-queue/tests/test_queue_core.py",
+   "projects/03-job-queue/jobqueue/core/queue.py::claim_many",
+   "projects/03-job-queue/tests/test_queue_core.py::test_corrupt_job_field_does_not_lose_the_job"
+  ],
+  "code_example": "-- real: jobqueue/core/lua/claim.lua (after ZPOPMIN)\n-- Defensive parsing: a script that errors AFTER ZPOPMIN would lose the job, because Redis does\n-- not roll back writes a script already made. Fall back to defaults instead of raising.\nlocal timeout_ms = tonumber(redis.call('HGET', jk, 'timeout_ms')) or 30000\nlocal grace_ms = tonumber(redis.call('HGET', jk, 'lease_grace_ms')) or 5000\nlocal lease_ms = math.min(timeout_ms, tonumber(ARGV[5])) + grace_ms\nlocal attempt = redis.call('HINCRBY', jk, 'attempts', 1)",
+  "code_language": "lua",
+  "advantages": [
+   "Isolation prevents races",
+   "Defaults + Python-side dead-lettering mean a corrupt record no longer loses the job"
+  ],
+  "disadvantages": [
+   "No rollback",
+   "Script kill impossible after first write"
+  ],
+  "common_mistakes": [
+   "`tonumber(x or 'default')` still nil if x is a non-numeric string",
+   "Long scripts hitting the busy threshold"
+  ],
+  "follow_up_questions": [
+   "What's the difference between redis.call and redis.pcall?",
+   "What does SCRIPT KILL do after a write?"
+  ],
+  "concepts": [
+   "Lua",
+   "atomicity",
+   "error handling",
+   "Redis internals"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lua gives isolation cheaply; for true all-or-nothing you must structure scripts validate-then-write.",
+   "failure_scenarios": "Before the fix: corrupt hash -> job popped but not leased (lost). Now: defaults in Lua, DLQ in Python. Busy script -> all clients get BUSY errors.",
+   "alternatives": "Redis Functions with library-level validation; MULTI/EXEC (rolls back nothing either on runtime errors).",
+   "scale_10x_100x": "Higher load magnifies script runtime impact; keep O(log n) and bounded.",
+   "production_improvements": "Done: defensive tonumber-or-default and a corrupt-input test. Next: audit other scripts the same way and consider redis.pcall where partial failure is expected."
+  }
+ },
+ {
+  "id": "JOBQ-108",
+  "project_slug": "p03-job-queue",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "How would you extend this queue to support job dependencies or multi-step workflows?",
+  "answer_hinglish": "Abhi har job independent hai; dependencies implement nahi hain. Requirements typically: \"B tab chale jab A succeed ho\", fan-out/fan-in (\"10 thumbnails banao, phir sab complete hone pe zip\"), aur failure handling (A dead toh B cancel).\n\n**Simple approach -- chaining in handler**: A ka handler end pe B enqueue kare. Problem: A ne effect kiya, B enqueue se pehle crash -> retry pe A duplicate (ledger skip karega) lekin B enqueue hoga? Agar enqueue ledger check ke baad hai toh duplicate path pe bhi enqueue karna chahiye, `idempotency_key = f\"{A.id}:next\"` ke saath -- tab safe. Simple pipelines ke liye kaafi.\n\n**Queue-native dependencies**:\n- Job hash mein `pending_deps` count aur `jq:job:{id}:dependents` set.\n- Enqueue with deps -> status `waiting` (naya state), kisi ready zset mein nahi.\n- `ack.lua` extend: `SMEMBERS dependents` -> har ek ka `HINCRBY pending_deps -1` -> 0 hua toh ready zset mein ZADD. Atomic in the same script.\n- A dead -> dependents ko `cancelled`/`dead` propagate (fail.lua dead branch mein).\n- Fan-in = dependent with N deps.\nProblem: Cluster mein dependents alag queues/slots mein ho sakte hain; DLQ replay semantics (A replay hua toh B?); cycles detection at enqueue.\n\n**Workflow engine**: complex flows (sagas, human approval, timers days long) ke liye Temporal/Step Functions jaisa durable workflow better -- har step ka state persisted, retries per step, compensations. Main queue ko \"activity executor\" rakh ke workflow state Postgres mein rakhta.\n\nRule: 2-3 step linear chains -> handler chaining with idempotency keys; DAGs -> deps in queue; long business processes -> workflow engine.",
+  "why_needed": "Real systems mein jobs rarely isolated hoti hain; extension design senior signal hai.",
+  "real_world_analogy": "Ghar banane mein: neev ke baad deewar, deewar ke baad chhat -- har kaam ka contractor pichhle ke 'done' certificate ka wait karta hai.",
+  "how_it_works": "Dependency counters decremented atomically on ack; waiting state; failure propagation.",
+  "in_this_project": "Not implemented. Extension points: `ack.lua` (on success hook), `fail.lua` dead branch, `JobStatus` enum, `enqueue.lua` idempotency for safe chaining.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/ack.lua",
+   "projects/03-job-queue/jobqueue/core/lua/fail.lua",
+   "projects/03-job-queue/jobqueue/core/models.py::JobStatus",
+   "projects/03-job-queue/jobqueue/core/lua/enqueue.lua"
+  ],
+  "code_example": "# illustrative (not in repo): safe chaining from a handler\nawait queue.enqueue(EnqueueRequest(type=\"report.email\", payload={\"report_id\": rid},\n                                   idempotency_key=f\"{ctx.job.id}:next\"))   # duplicate runs enqueue once",
+  "code_language": "python",
+  "advantages": [
+   "Chaining needs no queue changes",
+   "Native deps give atomic release"
+  ],
+  "disadvantages": [
+   "New states and failure propagation complexity",
+   "Cross-queue deps hard on Cluster"
+  ],
+  "common_mistakes": [
+   "Chaining without idempotency keys (duplicate downstream jobs)",
+   "No cycle detection"
+  ],
+  "follow_up_questions": [
+   "How do you handle a dependency that goes to the DLQ?",
+   "When would you adopt Temporal?"
+  ],
+  "concepts": [
+   "workflows",
+   "DAG",
+   "dependencies",
+   "orchestration"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Choreography (handlers enqueue next) is simple but logic is scattered; orchestration (engine/DAG) is visible but heavier.",
+   "failure_scenarios": "Parent succeeds but child enqueue lost; parent replayed from DLQ re-triggers children; partial fan-in after a child dies.",
+   "alternatives": "Temporal, Airflow (batch DAGs), Celery canvas (chains/chords), Step Functions.",
+   "scale_10x_100x": "Large fan-outs (10k children) need batched dependency updates and counters, not per-child scripts.",
+   "production_improvements": "Start with idempotent chaining helper; add `waiting` state + deps only when fan-in is needed."
+  }
+ },
+ {
+  "id": "JOBQ-109",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a test proving that a delayed job can be cancelled and is never claimed afterwards.",
+  "answer_hinglish": "Approach: injected clock use karo (`now_ms`) taaki test deterministic ho aur sleep na karna pade. Steps: delayed job enqueue (10s delay), status DELAYED check, cancel, status CANCELLED check, phir clock ko due time ke aage le jao aur claim -- None aana chahiye (claim.lua promotion delayed zset se karti hai, aur cancel.lua ne id wahan se hata di). Saath mein stats: delayed count 0.\n\nYeh test do cheezein verify karta hai: (1) `cancel.lua` delayed zset se bhi ZREM karta hai, sirf ready se nahi; (2) promotion cancelled job ko resurrect nahi karti -- kyunki promotion zset membership pe based hai, status field pe nahi.\n\nExisting `test_cancel_only_before_start` sirf ready job cancel aur active job reject test karta hai; delayed path untested hai -- isliye yeh useful addition hai. Ek aur assertion jo add kar sakte ho: double cancel 0 return kare (`cancel` False) -- API pe 409 ka basis.\n\nFixtures: `q` (JobQueue with `jqt:` prefix aur flushdb), `T0` from conftest. `req()` helper `test_queue_core.py` mein already hai (default type `demo.sleep`).",
+  "why_needed": "Coding exercises interview mein practical test-writing skill dikhate hain.",
+  "real_world_analogy": "Post-dated cheque cancel kiya -- date aane pe bank ko woh cheque tray mein milna hi nahi chahiye.",
+  "how_it_works": "Injected clock + state assertions + negative assertion (no claim).",
+  "in_this_project": "Add to `tests/test_queue_core.py` using `q` fixture and `T0`; exercises `cancel.lua` KEYS[2] (delayed) path.",
+  "implementation_files": [
+   "projects/03-job-queue/tests/test_queue_core.py::test_cancel_only_before_start",
+   "projects/03-job-queue/jobqueue/core/lua/cancel.lua",
+   "projects/03-job-queue/tests/conftest.py::q"
+  ],
+  "code_example": "# solution: add to tests/test_queue_core.py\nasync def test_cancel_delayed_job_is_never_promoted(q):\n    jid, _ = await q.enqueue(req(delay_seconds=10), now_ms=T0)\n    job = await q.get(jid)\n    assert job.status == JobStatus.DELAYED\n    assert await q.cancel(job) is True\n    assert (await q.get(jid)).status == JobStatus.CANCELLED\n    assert (await q.queue_stats(\"default\"))[\"delayed\"] == 0\n    # well past the original run_at: promotion must not resurrect it\n    assert await q.claim(\"default\", \"w\", now_ms=T0 + 60_000) is None\n    assert await q.cancel(job) is False          # second cancel -> nothing to remove (API 409)",
+  "code_language": "python",
+  "advantages": [
+   "Deterministic, fast",
+   "Covers an untested path"
+  ],
+  "disadvantages": [
+   "Needs Redis running (fixture skips otherwise)"
+  ],
+  "common_mistakes": [
+   "Using real sleep(10)",
+   "Asserting only status, not zset membership / claimability"
+  ],
+  "follow_up_questions": [
+   "How would you test the API-level 409 for this?",
+   "What other untested paths would you cover next?"
+  ],
+  "concepts": [
+   "testing",
+   "cancel",
+   "injected clock"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-110",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Write a release script so that jobs cancelled during graceful shutdown go back to the queue immediately instead of waiting for lease expiry.",
+  "answer_hinglish": "Problem: `_shutdown` grace ke baad pending tasks cancel karta hai, aur `_execute` CancelledError pe kuch nahi karta -- job active mein rehti hai ~35s (lease) tak, phir reaper retry karta hai backoff ke saath aur ek attempt burn hota hai. Deploys pe yeh unnecessary delay hai.\n\nSolution: `release.lua` -- token-checked (sirf current owner release kar sake), job ko active se hata ke ready mein wapas daalo **attempts decrement karke** (kyunki attempt worker ki galti se interrupt hua, job ki nahi), status queued, nayi seq ke saath priority score. Lease field delete.\n\nWorker side: `_shutdown` mein cancel ke baad, ya `_execute` ke CancelledError branch mein -- lekin cancellation ke andar await karna tricky hai (task already cancelled). Clean approach: `_shutdown` pending tasks ki list se (job, token) pairs rakhe aur cancel ke baad unke liye release call kare. Isliye `running` mein job aur token bhi store karne padenge.\n\nCaveat: handler cancel hone se pehle partial effect kar chuka ho sakta hai -- release ke baad turant doosra worker chalayega -> idempotency phir bhi zaroori. Aur attempts decrement: agar handler hamesha shutdown pe atakta hai toh infinite loop? Practically shutdowns rare hain, lekin ek `releases` counter rakh ke limit lagana safe hai.",
+  "why_needed": "Graceful shutdown ko faster aur attempt-budget-friendly banana.",
+  "real_world_analogy": "Shift khatam -- adhoora order kitchen counter pe wapas rakh do 'pending' tag ke saath, taaki agla chef turant utha le, 35 minute baad nahi.",
+  "how_it_works": "Token-checked transition active -> ready with attempt refund.",
+  "in_this_project": "New file `jobqueue/core/lua/release.lua` + add to `SCRIPTS`; based on `requeue_dead.lua` and `ack.lua` patterns; hook in `Worker._shutdown`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_shutdown",
+   "projects/03-job-queue/jobqueue/core/lua/requeue_dead.lua",
+   "projects/03-job-queue/jobqueue/core/lua/ack.lua",
+   "projects/03-job-queue/jobqueue/core/queue.py::SCRIPTS"
+  ],
+  "code_example": "-- solution: jobqueue/core/lua/release.lua (new)\n-- KEYS[1]=active KEYS[2]=ready ARGV: 1 prefix, 2 job_id, 3 token\nlocal jk = ARGV[1] .. 'job:' .. ARGV[2]\nlocal s = redis.call('HMGET', jk, 'status', 'attempts', 'priority')\nif s[1] ~= 'active' or s[2] ~= ARGV[3] then return 0 end\nredis.call('ZREM', KEYS[1], ARGV[2])\nredis.call('HDEL', jk, 'lease_until')\nredis.call('HINCRBY', jk, 'attempts', -1)            -- refund: shutdown is not the job's fault\nredis.call('HINCRBY', jk, 'releases', 1)\nlocal seq = redis.call('INCR', ARGV[1] .. 'seq')\nredis.call('HSET', jk, 'status', 'queued')\nredis.call('ZADD', KEYS[2], (9 - tonumber(s[3] or '5')) * 1e13 + seq, ARGV[2])\nreturn 1\n\n# python (JobQueue)\nasync def release(self, job: Job, token: int) -> bool:\n    return bool(await self._s[\"release\"](keys=[self.k(job.queue, \"active\"), self.k(job.queue, \"ready\")],\n                                         args=[self.p, job.id, token]))\n# Worker._shutdown, after cancelling pending tasks:\nfor job, token in self._inflight_for(pending):\n    await self.q.release(job, token)",
+  "code_language": "lua",
+  "advantages": [
+   "Deploy-time jobs resume in ms not ~35s",
+   "No attempt burned"
+  ],
+  "disadvantages": [
+   "Refunding attempts could loop a job that always hangs at shutdown (hence releases counter)",
+   "Token decrement weakens fencing monotonicity -- next claim reuses the number"
+  ],
+  "common_mistakes": [
+   "Releasing without token check (could steal a re-delivered job)",
+   "Awaiting Redis inside a cancelled task"
+  ],
+  "follow_up_questions": [
+   "Is refunding the attempt compatible with using attempts as the fencing token?",
+   "How would you test this?"
+  ],
+  "concepts": [
+   "graceful shutdown",
+   "Lua",
+   "lease release"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Refund keeps retry budget fair but re-issues the same token number on next claim -- pair with a lease_epoch to keep fencing strict.",
+   "failure_scenarios": "Release fails (Redis down during shutdown) -> falls back to lease expiry, which is fine.",
+   "alternatives": "Don't refund attempts (simpler, keeps token monotonic); or SQS-style ChangeMessageVisibility to 0.",
+   "scale_10x_100x": "Large fleets deploying often benefit most; fewer reaped jobs per deploy.",
+   "production_improvements": "Add test: worker with long job, stop() with tiny grace, assert job queued and attempts unchanged within 1s."
+  }
+ },
+ {
+  "id": "JOBQ-111",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Modify the worker so that when a lease is lost, the running handler is cancelled instead of continuing.",
+  "answer_hinglish": "Abhi `_keep_lease` extension False aane pe bas `return` karta hai -- handler chalta rehta hai, effect karta hai, aur ack stale hota hai. Better: lease gayi toh handler cancel karo -- duplicate overlap window chhota, resources free.\n\nDesign:\n1. `_execute` mein handler ko alag task banao (`handler_task = asyncio.create_task(handler(ctx))`) taaki use cancel kar sakein, aur `wait_for(handler_task, timeout)` ya `asyncio.timeout` use karo.\n2. `_keep_lease` ko handler task pass karo; extension False -> `handler_task.cancel()` aur ek flag `lease_lost = True`.\n3. `_execute` mein CancelledError do source se aa sakti hai: shutdown (outer task cancel) ya lease loss (inner task cancel). Inner case mein outer task cancelled nahi hai, toh `except asyncio.CancelledError` ko distinguish karna padega: `if lease_lost: log + stats.lease_lost += 1; return` (no ack, no fail -- job already kisi aur ki hai; fail stale aata) warna `raise`.\n\nCaveats: cancellation sirf await points pe kaam karti hai -- blocking handler (cpu_block) cancel nahi hoga jab tak block khatam na ho. Aur Postgres transaction cancel pe rollback hota hai (async with block exit) -- safe. Extension exception (Redis down) pe lease lost maanna galat hoga -- sirf explicit False pe cancel karo, exceptions pe retry.",
+  "why_needed": "Zombie window ko actively chhota karna; production-grade workers yeh karte hain.",
+  "real_world_analogy": "Agar manager ne tumhara task kisi aur ko de diya hai, toh kaam wahin rok do -- dono ek hi deewar paint karte rahenge toh paint aur time waste.",
+  "how_it_works": "Lease-loss signal cancels the inner handler task; outer task distinguishes cause.",
+  "in_this_project": "Changes in `Worker._execute` and `Worker._keep_lease`; `extend_lease.lua` already returns 0 on lost lease.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_execute",
+   "projects/03-job-queue/jobqueue/worker/worker.py::_keep_lease",
+   "projects/03-job-queue/jobqueue/core/lua/extend_lease.lua"
+  ],
+  "code_example": "# solution sketch: jobqueue/worker/worker.py\nasync def _keep_lease(self, job, token, handler_task, state):\n    lease = min(job.timeout_ms, self.max_lease_ms) + self.q.lease_grace_ms\n    while True:\n        await asyncio.sleep(lease / 3000)\n        try:\n            ok = await self.q.extend_lease(job, token, lease)\n        except Exception:\n            log.exception(\"extend_failed\"); continue          # transient: try again next tick\n        if not ok:\n            state[\"lease_lost\"] = True\n            handler_task.cancel()\n            return\n\nasync def _execute(self, job, token):\n    state = {\"lease_lost\": False}\n    handler_task = asyncio.create_task(handler(ctx))\n    lease_task = asyncio.create_task(self._keep_lease(job, token, handler_task, state))\n    try:\n        result = await asyncio.wait_for(handler_task, timeout=job.timeout_ms / 1000)\n    except asyncio.CancelledError:\n        if state[\"lease_lost\"] and not asyncio.current_task().cancelling():\n            self.stats.stale_acks += 1\n            log.warning(\"lease_lost_handler_cancelled\", extra={\"job_id\": job.id, \"attempt\": token})\n            return\n        handler_task.cancel(); raise\n    ...  # existing TimeoutError / PermanentError / Exception / ack branches\n    finally:\n        lease_task.cancel()",
+  "code_language": "python",
+  "advantages": [
+   "Shrinks duplicate-execution window",
+   "Frees slot sooner",
+   "Also fixes keeper dying on transient errors"
+  ],
+  "disadvantages": [
+   "More complex cancellation logic",
+   "Doesn't help blocking handlers"
+  ],
+  "common_mistakes": [
+   "Treating a Redis exception as lease loss",
+   "Swallowing the outer (shutdown) CancelledError"
+  ],
+  "follow_up_questions": [
+   "What does Task.cancelling() tell you (Python 3.11+)?",
+   "How would you test lease-loss cancellation deterministically?"
+  ],
+  "concepts": [
+   "asyncio cancellation",
+   "lease",
+   "zombie"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Cancelling on lease loss trades handler simplicity for a smaller overlap window; handlers must be cancellation-safe.",
+   "failure_scenarios": "Handler cancelled mid-HTTP call: external effect may have happened; idempotency still required.",
+   "alternatives": "Process-per-job with kill on lease loss (stronger, heavier).",
+   "scale_10x_100x": "Fleet-wide, fewer duplicate executions and wasted downstream calls.",
+   "production_improvements": "Test with tiny max_lease_ms and a handler that awaits a long sleep, then force-expire the lease via reaper with injected time."
+  }
+ },
+ {
+  "id": "JOBQ-112",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a new idempotent handler 'invoice.create' using the same ledger pattern as email.send.",
+  "answer_hinglish": "Pattern copy karo: (1) payload validate -> PermanentError for bad input, (2) ek transaction mein ledger insert `ON CONFLICT DO NOTHING RETURNING`, (3) conflict -> existing result lookup aur `duplicate: True`, (4) warna effect insert, (5) commit, return JSON-serializable result.\n\nIske liye ek `invoices` table chahiye (Alembic migration 0002) with `job_id` indexed aur ek business unique key (`order_id` UNIQUE) -- defence in depth jaise `email_outbox.dedupe_key`. Agar producer galti se do alag jobs same order ke liye bhej de, ledger dono ko pass karega lekin `order_id` unique doosre ko rokega. Main yahan unique conflict ko bhi gracefully handle karunga (`on_conflict_do_nothing` on order_id) taaki job DLQ mein na jaye.\n\nNote: `ctx.attempt` ledger mein store hota hai debugging ke liye. Result mein `invoice_id` -- ack ise job hash mein `result` field mein JSON store karega, `GET /jobs/{id}` pe dikhega.\n\nTesting: `test_worker.py` jaisa in-process worker test with `crash_after_commit` style hook, ya simpler: handler ko seedha `JobContext` ke saath do baar call karo aur assert karo ki doosri call `duplicate: True` aur invoices count 1.",
+  "why_needed": "Reusable pattern ko naye handler pe apply karna real-world task hai.",
+  "real_world_analogy": "Naye counter pe bhi wahi register system lagao jo purane counter pe kaam kar raha hai.",
+  "how_it_works": "Ledger PK + business unique key, same transaction, duplicate returns original result.",
+  "in_this_project": "Model after `handlers/builtin.py::send_email`; tables in `db/models.py`; migration alongside `migrations/versions/0001_initial.py`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/handlers/builtin.py::send_email",
+   "projects/03-job-queue/jobqueue/db/models.py::ProcessedJob",
+   "projects/03-job-queue/migrations/versions/0001_initial.py"
+  ],
+  "code_example": "# solution: jobqueue/db/models.py\nclass Invoice(Base):\n    __tablename__ = \"invoices\"\n    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)\n    order_id: Mapped[str] = mapped_column(String(64), unique=True)\n    job_id: Mapped[str] = mapped_column(String(64), index=True)\n    amount_cents: Mapped[int] = mapped_column(Integer)\n\n# jobqueue/handlers/builtin.py\n@registry.task(\"invoice.create\")\nasync def create_invoice(ctx: JobContext):\n    p = ctx.payload\n    if not p.get(\"order_id\") or int(p.get(\"amount_cents\", 0)) <= 0:\n        raise PermanentError(f\"bad invoice payload {p!r}\")\n    async with ctx.sessionmaker() as session, session.begin():\n        claimed = await session.execute(\n            insert(ProcessedJob).values(job_id=ctx.job.id, job_type=ctx.job.type, attempt=ctx.attempt)\n            .on_conflict_do_nothing(index_elements=[\"job_id\"]).returning(ProcessedJob.job_id))\n        if claimed.scalar_one_or_none() is None:\n            existing = await session.scalar(select(Invoice.id).where(Invoice.job_id == ctx.job.id))\n            return {\"duplicate\": True, \"invoice_id\": existing}\n        res = await session.execute(\n            insert(Invoice).values(order_id=p[\"order_id\"], job_id=ctx.job.id, amount_cents=int(p[\"amount_cents\"]))\n            .on_conflict_do_nothing(index_elements=[\"order_id\"]).returning(Invoice.id))\n        invoice_id = res.scalar_one_or_none()\n    return {\"duplicate\": invoice_id is None, \"invoice_id\": invoice_id}",
+  "code_language": "python",
+  "advantages": [
+   "Same proven pattern",
+   "Business-key dedupe without DLQ noise"
+  ],
+  "disadvantages": [
+   "Needs a migration",
+   "Duplicate-by-order returns no id (could look it up)"
+  ],
+  "common_mistakes": [
+   "Forgetting PermanentError for bad payload (5 wasted retries)",
+   "Ledger insert outside the transaction"
+  ],
+  "follow_up_questions": [
+   "How would you extract this pattern into a decorator?",
+   "Write the Alembic migration for invoices."
+  ],
+  "concepts": [
+   "idempotent handler",
+   "coding",
+   "SQLAlchemy"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "JOBQ-113",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Replace strict cross-queue priority in _claim_next with weighted round-robin to prevent starvation.",
+  "answer_hinglish": "Requirement: queues ko weights do, jaise `critical:6,default:3,low:1`. Har claim cycle mein free slots ko weights ke proportion mein baanto; agar kisi queue ne apna share poora nahi liya (khaali thi), toh bache slots strict order mein baaki queues se fill karo -- taaki capacity waste na ho. Isse low ko bhi har cycle mein kam se kam kuch slots milte hain jab uske paas kaam ho, aur critical abhi bhi majority leta hai.\n\nEdge cases: (1) `n` chhota ho (1 slot) toh proportion se sabka share 0 ho sakta hai -- isliye ek rotating offset rakho jo har cycle starting queue badle, ya largest-remainder rounding. (2) Exceptions: existing behaviour (log + sleep 0.5 + return) rakho. (3) Strict priority wala test (`test_queue_priority_across_queues`, concurrency 1) -- weights ke saath critical pehle aayega agar rotation critical se start ho; test ko weights-aware banana padega, ya default config strict rakho aur weights opt-in.\n\nCLI: `--queues critical:6,default:3,low:1`; bina weight ke weight 1. Backward compatible: sab weights equal na ho tab bhi parse.\n\nMain solution mein deficit-style allocation karunga: `share = n * w / total` floor, remainder rotating offset se, phir leftover fill pass.",
+  "why_needed": "Starvation fix ka practical implementation -- design discussion ko code mein convert karna.",
+  "real_world_analogy": "Teen counters pe ek hi cashier: 6 customer VIP line se, 3 normal se, 1 senior line se -- har round mein; koi line khaali toh uske slot doosri line ko.",
+  "how_it_works": "Proportional slot allocation per cycle + leftover redistribution + rotation for small n.",
+  "in_this_project": "Replace `Worker._claim_next`; parse weights in `worker/__main__.py`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/worker/worker.py::_claim_next",
+   "projects/03-job-queue/jobqueue/worker/__main__.py::main",
+   "projects/03-job-queue/tests/test_worker.py::test_queue_priority_across_queues"
+  ],
+  "code_example": "# solution: jobqueue/worker/worker.py\ndef _shares(self, n: int) -> list[tuple[str, int]]:\n    total = sum(w for _, w in self.weighted)\n    base = [(q, n * w // total) for q, w in self.weighted]\n    left = n - sum(s for _, s in base)\n    k = len(base)\n    for i in range(left):                                  # rotating remainder -> no permanent 0 share\n        idx = (self._rr + i) % k\n        base[idx] = (base[idx][0], base[idx][1] + 1)\n    self._rr = (self._rr + 1) % k\n    return base\n\nasync def _claim_next(self, n: int) -> list[tuple[Job, int]]:\n    out: list[tuple[Job, int]] = []\n    try:\n        for qname, share in self._shares(n):               # pass 1: fair shares\n            if share:\n                out += await self.q.claim_many(qname, self.id, share, max_lease_ms=self.max_lease_ms)\n        for qname, _ in self.weighted:                     # pass 2: fill leftovers in priority order\n            if len(out) >= n:\n                break\n            out += await self.q.claim_many(qname, self.id, n - len(out), max_lease_ms=self.max_lease_ms)\n    except Exception:\n        log.exception(\"claim_failed\")\n        await asyncio.sleep(0.5)\n    return out\n\n# __main__: --queues critical:6,default:3,low:1\nweighted = [(p.split(\":\")[0], int(p.split(\":\")[1]) if \":\" in p else 1) for p in a.queues.split(\",\")]",
+  "code_language": "python",
+  "advantages": [
+   "Bounded starvation",
+   "No wasted capacity (leftover pass)"
+  ],
+  "disadvantages": [
+   "More claim calls per cycle (one per queue with share)",
+   "Critical latency slightly worse under load"
+  ],
+  "common_mistakes": [
+   "Pure proportional with floor (n=1 gives everyone 0)",
+   "Dropping the leftover pass (idle slots while work exists)"
+  ],
+  "follow_up_questions": [
+   "How would you test fairness deterministically?",
+   "Could this be done inside one Lua script?"
+  ],
+  "concepts": [
+   "weighted round robin",
+   "starvation",
+   "scheduling",
+   "coding"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Weights bound unfairness but reduce strict-priority latency guarantees; combine with a dedicated critical pool if latency is contractual.",
+   "failure_scenarios": "Misconfigured weights (critical:1, low:10) invert priorities; claim error mid-pass returns partial batch (acceptable).",
+   "alternatives": "Dedicated pools per queue, lottery scheduling, deficit round robin with persistent deficits.",
+   "scale_10x_100x": "Many queues -> many round trips per cycle; move selection into a single Lua script taking weights.",
+   "production_improvements": "Unit-test _shares with table-driven cases; integration test enqueuing to all queues and asserting low gets started within K cycles."
+  }
+ },
+ {
+  "id": "JOBQ-114",
+  "project_slug": "p03-job-queue",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Add backpressure: make enqueue reject new jobs when a queue's ready backlog exceeds a configured limit.",
+  "answer_hinglish": "Kyun: abhi enqueue unbounded hai -- downstream outage ya flood mein ready zset lakhon tak badh sakta hai, Redis memory bhar sakti hai (noeviction pe writes fail = saari queue ruk jaati). Backpressure producer ko early signal deta hai: HTTP 429 with Retry-After, producer slow down kare ya local buffer kare.\n\nImplementation:\n1. `enqueue.lua` mein idempotency check ke **baad** (taaki replay of existing job kabhi reject na ho) aur writes se **pehle** (validate-then-write): `ZCARD ready` (O(1)); `>= max_ready` toh special return `{'', -1}`. Delayed jobs pe bhi limit chahiye to `ZCARD delayed` bhi add.\n2. Idempotency key ka `SET` ab tak ho chuka hota -- isliye SET ko limit check ke baad move karo, warna rejected request ki key 24h tak \"existing job\" point karegi ek non-existent job id pe. Order: GET idem -> limit check -> SET idem -> writes.\n3. Python `JobQueue.enqueue`: -1 pe custom `QueueFull` exception.\n4. API: `QueueFull` -> bpcommon `TooManyRequests` (429). `max_ready` config `JQ_MAX_READY` (0 = unlimited).\n\nTrade-off: limit per queue hai, global memory nahi; aur race-free hai kyunki check + insert ek script mein.",
+  "why_needed": "Queues absorb spikes, lekin unbounded queues failures ko memory exhaustion mein badal dete hain.",
+  "real_world_analogy": "Restaurant waiting list full: host naya naam likhna band karke bolta hai '20 minute baad aana' -- warna andar bhagdad.",
+  "how_it_works": "Atomic depth check inside the enqueue script; explicit 429 to producers.",
+  "in_this_project": "Modify `enqueue.lua`, `JobQueue.enqueue`, `api/routes.py::enqueue`; `TooManyRequests` exists in `shared/bpcommon/errors.py`.",
+  "implementation_files": [
+   "projects/03-job-queue/jobqueue/core/lua/enqueue.lua",
+   "projects/03-job-queue/jobqueue/core/queue.py::enqueue",
+   "projects/03-job-queue/jobqueue/api/routes.py::enqueue",
+   "shared/bpcommon/errors.py::TooManyRequests"
+  ],
+  "code_example": "-- solution: jobqueue/core/lua/enqueue.lua (top part; ARGV[8] = max_ready, 0 = unlimited)\nif KEYS[4] ~= '' then\n  local existing = redis.call('GET', KEYS[4])\n  if existing then return {existing, 0} end\nend\nlocal max_ready = tonumber(ARGV[8] or '0')\nif max_ready > 0 and redis.call('ZCARD', KEYS[1]) >= max_ready then\n  return {'', -1}                                   -- backpressure: nothing written\nend\nif KEYS[4] ~= '' then redis.call('SET', KEYS[4], ARGV[2], 'EX', tonumber(ARGV[7])) end\n-- ... unchanged HSET / ZADD ...\n\n# python: jobqueue/core/queue.py\nclass QueueFull(Exception): ...\njid, created = await self._s[\"enqueue\"](keys=[...], args=[..., self.idem_ttl, self.max_ready])\nif int(created) == -1:\n    raise QueueFull(req.queue)\n\n# api/routes.py\ntry:\n    job_id, created = await _q(request).enqueue(body)\nexcept QueueFull:\n    raise TooManyRequests(\"queue is full, retry later\")",
+  "code_language": "lua",
+  "advantages": [
+   "Protects Redis memory",
+   "Clear producer signal",
+   "Atomic check"
+  ],
+  "disadvantages": [
+   "Producers must handle 429",
+   "Per-queue limit, not per-tenant"
+  ],
+  "common_mistakes": [
+   "Checking depth in Python before calling the script (race)",
+   "Setting the idempotency key before the limit check"
+  ],
+  "follow_up_questions": [
+   "Should delayed jobs count toward the limit?",
+   "How would producers react to 429 -- drop, buffer, or retry?"
+  ],
+  "concepts": [
+   "backpressure",
+   "flow control",
+   "Lua",
+   "429"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Rejecting at enqueue keeps the system healthy but pushes complexity to producers; accepting everything risks total outage.",
+   "failure_scenarios": "Producers retrying 429 without jitter create a thundering herd at the limit boundary.",
+   "alternatives": "Per-tenant quotas, token-bucket admission (Project 1), shedding low-priority jobs only.",
+   "scale_10x_100x": "At scale, limits per queue x tenant and Retry-After computed from drain rate.",
+   "production_improvements": "Return Retry-After based on current drain rate, metric for rejections, separate limit for delayed zset."
+  }
+ }
+]

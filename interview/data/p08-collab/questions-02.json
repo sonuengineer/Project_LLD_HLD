@@ -1,0 +1,960 @@
+[
+ {
+  "id": "COLB-021",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Walk through service.submit step by step. What happens inside the transaction?",
+  "answer_hinglish": "`submit()` is system ka dil hai -- har edit, chahe WebSocket se aaye ya restore endpoint se, yahin se guzarta hai.\n\nTransaction ke BAHAR: raw JSON ko `TextOp.from_json` se parse karte hain (invalid component -> `InvalidOperation` 400). Phir `len(op.ops) > settings.max_op_components` (10,000) check -- bahut bade op ko lock lene se pehle hi reject.\n\nTransaction ke ANDAR (`async with sm() as s, s.begin()`):\n1. Lock: `SELECT content, rev FROM documents WHERE id = :d FOR UPDATE`. Ab is document ke liye koi aur submit (kisi bhi server se) yahan wait karega. Doc nahi mila -> NotFound.\n2. Dedupe: `SELECT rev FROM operations WHERE document_id AND client_id AND client_seq`. Mila toh `Applied(dup, op, duplicate=True)` -- kuch naya nahi likhte. Yeh lost-ack resend ko safe banata hai.\n3. base_rev validate: `[0, doc.rev]` ke bahar -> InvalidOperation.\n4. History: `rev > base_rev ORDER BY rev`, aur op ko EK-EK karke transform.\n5. `apply(doc.content, op)` -- length mismatch ho toh OTError -> InvalidOperation 'operation does not apply at revision'. Phir `max_document_chars` (1,000,000) check.\n6. `rev = doc.rev + 1`; INSERT op (transformed, jsonb) ; UPDATE documents content + rev; agar `rev % snapshot_every == 0` toh snapshot INSERT.\n7. Commit (context manager exit) -> lock release.\n\nReturn `Applied(rev, op)`. Caller (`api.py`) commit ke BAAD Redis pe publish karta hai: `{type: op, rev, op, user_id, client_id, client_seq}`. Publish transaction ke bahar hai -- isliye agar publish fail/crash ho, toh op durable hai aur doosre servers ka gap fill Postgres se recover karega.",
+  "why_needed": "Interviewer 'request lifecycle' zaroor poochega; submit ka har step ek design decision hai.",
+  "real_world_analogy": "Bank ka single-window cashier: token (lock) lo, check karo yeh cheque pehle toh jama nahi hua (dedupe), pichle transactions ke hisaab se balance adjust karo (transform), entry likho (insert), passbook update (content), window chhodo.",
+  "how_it_works": "Row lock serialises per-document; dedupe + validate + transform + apply + persist sab ek atomic transaction mein; publish after commit.",
+  "in_this_project": "`collab/service.py::submit` (module docstring 4 steps). Caller `collab/api.py::ws_endpoint` op branch aur `restore`. Config `max_op_components`, `max_document_chars`, `snapshot_every` in `collab/config.py`.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/collab/config.py::Settings"
+  ],
+  "code_example": "# real, collab/service.py (trimmed)\nasync with sm() as s, s.begin():\n    doc = (await s.execute(text(\"SELECT content, rev FROM documents WHERE id = :d FOR UPDATE\"), {\"d\": doc_id})).first()\n    dup = await s.scalar(text(\"SELECT rev FROM operations WHERE document_id = :d AND client_id = :c AND client_seq = :q\"), ...)\n    if dup is not None:\n        return Applied(dup, op, duplicate=True)\n    ...\n    rev = doc.rev + 1\n    await s.execute(text(\"INSERT INTO operations (...) VALUES (:d, :r, CAST(:o AS jsonb), :u, :c, :q)\"), ...)\n    await s.execute(text(\"UPDATE documents SET content = :c, rev = :r, updated_at = now() WHERE id = :d\"), ...)\n    if rev % settings.snapshot_every == 0:\n        await s.execute(text(\"INSERT INTO snapshots (document_id, rev, content) VALUES (:d, :r, :c)\"), ...)",
+  "code_language": "python",
+  "advantages": [
+   "Ek atomic transaction -- partial state impossible",
+   "Koi bhi server sequence kar sakta hai",
+   "Durable before ack"
+  ],
+  "disadvantages": [
+   "~5 statements per op lock ke andar -> per-doc throughput bounded",
+   "Har op pe poora content UPDATE (write amplification)"
+  ],
+  "common_mistakes": [
+   "Publish ko transaction ke andar karna (rollback pe ghost message)",
+   "Dedupe check lock ke bahar karna (race)"
+  ],
+  "follow_up_questions": [
+   "Lock ke andar kitne round trips hain aur kaise kam karoge?",
+   "Publish fail ho jaye toh?",
+   "Duplicate pe kya return karte ho aur kyun?"
+  ],
+  "concepts": [
+   "sequencer",
+   "SELECT FOR UPDATE",
+   "transaction",
+   "dedupe",
+   "publish after commit"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-022",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Explain the internals of the transform() loop: the _iter sentinel, chunking with min(), and why inserts are handled first.",
+  "answer_hinglish": "`transform` ek merge-style two-pointer walk hai do ops pe.\n\n`_iter(op)` generator pehle saare components yield karta hai, phir hamesha `None`. Isse loop ko \"khatam ho gaya\" ke liye alag index checks nahi chahiye -- `None` sentinel hai. Loop tab return karta hai jab dono `None` hon.\n\nOrder of checks important hai:\n1. `if is_insert(o1)` -> `ap.insert(o1)`, `bp.retain(len(o1))`. a ka insert b ke liye 'naya text' hai jise b ko skip karna hai.\n2. `if is_insert(o2)` -> mirror.\nInserts pehle kyun? Insert input document ka koi character consume nahi karta (base length 0). Toh unhe kisi aur component se pair karne ki zarurat nahi -- seedha emit. Aur yeh order hi tie-break hai (a pehle).\n3. Ab dono non-insert hain. Agar ek `None` aur doosra nahi -> lengths mismatch -> OTError (yeh `base_length` check ke baad bhi defensive hai).\n4. Baaki char-consuming pairs: retain/retain, delete/delete, delete/retain, retain/delete. Har case mein `m = min(...)` -- dono components ka chhota wala poora consume hota hai, bada wala 'remainder' ke saath aage chalta hai.\n\nIdiom `o1 = (o1 - m) or next(i1)`: agar remainder 0 hai (falsy) toh next component, warna remainder. Delete negative hai isliye `(o1 + m)`. Compact hai, par subtle -- 0 falsy hona isme load-bearing hai.\n\nComplexity O(len(a.ops) + len(b.ops)) -- components ki count pe linear, document length pe nahi. 'unreachable state' branch defensive hai; agar builders sahi normalise karein toh kabhi hit nahi hota.",
+  "why_needed": "Internals pe deep-dive interviewer ko dikhata hai tumne code khud likha/samjha hai, sirf library call nahi ki.",
+  "real_world_analogy": "Do log ek hi road ke do alag maps padh rahe hain, step by step: 'tum kitne km seedha?' 'main 3' 'main 5' -> dono 3 chalo, ek ke 2 baaki. Jo naya mod (insert) kisi ke map mein hai, woh pehle note karo.",
+  "how_it_works": "Two iterators, sentinel None, inserts first, then consume min of the pair, carry remainders.",
+  "in_this_project": "`collab/ot.py::_iter` aur `collab/ot.py::transform`. Property test `test_property_transform_converges` random ops (`random_op`) se saare branches exercise karta hai.",
+  "implementation_files": [
+   "projects/08-collab/collab/ot.py::_iter",
+   "projects/08-collab/collab/ot.py::transform",
+   "projects/08-collab/tests/test_ot.py::random_op"
+  ],
+  "code_example": "# real, collab/ot.py\ndef _iter(op: TextOp) -> Iterator[Component | None]:\n    yield from op.ops\n    while True:\n        yield None\n...\nif is_retain(o1) and is_retain(o2):\n    m = min(o1, o2)\n    ap.retain(m)\n    bp.retain(m)\n    o1, o2 = (o1 - m) or next(i1), (o2 - m) or next(i2)",
+  "code_language": "python",
+  "advantages": [
+   "Linear time, no allocations per char",
+   "Sentinel se loop simple"
+  ],
+  "disadvantages": [
+   "`or next()` idiom readable nahi for newcomers",
+   "Exceptions se error reporting -- caller ko OTError handle karna padta hai"
+  ],
+  "common_mistakes": [
+   "Inserts ko char-consuming pairs ke saath mix karna",
+   "Remainder carry bhool jana -> lengths drift"
+  ],
+  "follow_up_questions": [
+   "Agar insert-check order swap karo toh kya badlega?",
+   "Complexity document length pe depend karti hai kya?",
+   "Kaunsa branch 'unreachable' hai aur kyun?"
+  ],
+  "concepts": [
+   "two-pointer walk",
+   "sentinel",
+   "transform internals"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Compact Python idioms vs readability; port to JS (`editor.html`) mein same logic duplicate hai -- do implementations sync rakhna risk hai.",
+   "failure_scenarios": "JS aur Python transform mein ek bhi branch alag hua toh browser clients server se diverge karenge; abhi JS port ke liye automated cross-test nahi hai.",
+   "alternatives": "Shared implementation (Python ko WASM ya JS ko server pe Node), ya ek shared JSON test-vector suite jo dono run karein.",
+   "scale_10x_100x": "Ops ke components count pe linear hai; 10x bade docs se fark nahi padta, 10x bade ops (paste) se padta hai -- `max_op_components` guard karta hai.",
+   "production_improvements": "Cross-language golden test vectors: Python property test se random (doc, a, b, expected) generate karke JS mein replay."
+  }
+ },
+ {
+  "id": "COLB-023",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does compose() work internally, especially the insert-then-delete and retain-then-delete cases?",
+  "answer_hinglish": "`compose(a, b)` mein a ka OUTPUT b ka INPUT hai. Toh walk karte waqt a ke 'output side' components (retain, insert) ko b ke 'input side' components (retain, delete) ke saath pair karte hain.\n\nPehle do free moves:\n- a ka delete (`is_delete(o1)`): yeh characters a ne hata diye, b ne kabhi dekhe hi nahi -> seedha output mein delete.\n- b ka insert (`is_insert(o2)`): b ka naya text, a ke output ka koi char consume nahi karta -> seedha output mein insert.\n\nPhir pairs:\n- retain/retain -> retain min.\n- a insert + b delete -> CANCEL. a ne text daala, b ne turant hata diya; composed op mein kuch nahi. Teen sub-cases: insert lamba (bacha hua insert carry), barabar (dono next), delete lamba (bacha hua delete carry).\n- a insert + b retain -> insert (b ne use rakha), lengths ke hisaab se split.\n- a retain + b delete -> delete (original char jo a ne rakha tha, b ne hataya).\n\nEdge: a retain / b delete branch mein `o1 > -o2` pe `o1 + o2` remainder (o2 negative hai). Code mein signs pe dhyan dena padta hai.\n\nKahan matter karta hai: client buffer mein typing + backspace -- \"abc\" type kiya, phir backspace -- compose 'c' insert aur delete cancel kar deta hai, server ko sirf \"ab\" jata hai. Correctness `test_property_compose_equals_sequential_apply` (2000 cases) se.\n\nAur normalisation: output builder insert-before-delete rakhta hai -- yahi `compose(s1, s2) == [3, \"2\", -1]` mein dikhta hai jo non-distributivity finding ka root hai.",
+  "why_needed": "compose ke cancel cases samajhna dikhata hai ki tum op algebra samajhte ho, sirf transform nahi.",
+  "real_world_analogy": "Do edit instructions ek ke baad ek: 'yahan likho ABC' aur phir 'yahan se 3 akshar mitao' -- dono milke 'kuch mat karo'.",
+  "how_it_works": "a-delete aur b-insert free; baaki pairs a-output vs b-input; insert+delete cancel, insert+retain insert, retain+delete delete.",
+  "in_this_project": "`collab/ot.py::compose`. Precondition `a.target_length != b.base_length` -> OTError. Used in `client.py::edit` and `editor.html` input handler.",
+  "implementation_files": [
+   "projects/08-collab/collab/ot.py::compose",
+   "projects/08-collab/tests/test_ot.py::test_property_compose_equals_sequential_apply"
+  ],
+  "code_example": "# real, collab/ot.py (excerpt)\nelif is_insert(o1) and is_delete(o2):\n    if len(o1) > -o2:\n        o1, o2 = o1[-o2:], next(i2)\n    elif len(o1) == -o2:\n        o1, o2 = next(i1), next(i2)\n    else:\n        o2, o1 = o2 + len(o1), next(i1)",
+  "code_language": "python",
+  "advantages": [
+   "Typing+backspace cancel ho jaata hai -> chhote ops",
+   "Linear time"
+  ],
+  "disadvantages": [
+   "Composed op mein intermediate history lost",
+   "Sign arithmetic error-prone"
+  ],
+  "common_mistakes": [
+   "a ke delete ko b ke components se pair karne ki koshish",
+   "Insert split karte waqt slicing ka direction galat (o1[-o2:] remainder hai)"
+  ],
+  "follow_up_questions": [
+   "compose associative hai kya?",
+   "Undo stack ke liye compose kaise use karoge?",
+   "compose ka output normalised kyun hai?"
+  ],
+  "concepts": [
+   "compose",
+   "op algebra",
+   "cancellation"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Composing buffer client side pe server load ghatata hai par fine-grained history (keystroke-level) chali jaati hai.",
+   "failure_scenarios": "compose bug -> client ka local doc aur sent op mismatch -> server pe 'operation does not apply' error ya silent divergence.",
+   "alternatives": "Har keystroke alag op bhejna (simple, zyada load); ya compose sirf time-window ke andar.",
+   "scale_10x_100x": "Bade pastes/composes ke saath op components badhte hain; 10x pe `max_op_components` aur JSON size limits relevant.",
+   "production_improvements": "Compose ka property test JS port pe bhi; op size metrics."
+  }
+ },
+ {
+  "id": "COLB-024",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What does Hub.join do when a client connects, including the reconnect (last_rev) path?",
+  "answer_hinglish": "`Hub.join(conn, doc_id, last_rev)` teen kaam karta hai: room mein register, client ko starting state dena, aur presence announce.\n\n1. Room lock: `while True: room = self.rooms.setdefault(...); await room.lock.acquire(); if self.rooms.get(doc_id) is room: break; room.lock.release()`. Identity check isliye ki lock ka wait karte waqt concurrent `leave()` ne yeh room dict se hata diya ho sakta hai -- tab naya room lo. (Yeh join/leave race ka fix hai.)\n\n2. Lock ke andar `service.snapshot()` se current `content` aur `rev` (head). Agar room mein koi conn nahi tha (pehla local connection), toh `room.next_rev = head + 1` aur buffer se `<= head` wale entries hata do -- ordered stream exactly snapshot ke baad se shuru.\n\n3. Do paths:\n   - Fresh join (`last_rev` None): `joined` message with `content`, `title`, `rev`, `catchup: False`, presence.\n   - Reconnect (`0 <= last_rev <= head`): `ops_between(last_rev, head)` ke saare ops bhejo -- `_for()` se: client ke apne ops ACK ban ke, baaki `op` ban ke. Phir `joined` with `catchup: True` (content nahi). Client ki local pending edits valid rehti hain kyunki usko sirf missed ops milte hain.\n\n4. `conn.base_rev = head`; `room.conns[conn_id] = conn`. Lock release. Kyunki registration aur snapshot dono lock ke andar hain, aur `_deliver_ordered` bhi same lock leta hai, beech mein aaya koi op ya toh snapshot mein hai ya baad mein forwarder se aayega -- miss nahi hoga. `_flush` mein `if m['rev'] > c.base_rev` duplicate rokta hai.\n\n5. Lock ke bahar: Redis presence hash `hset` aur `presence join` publish.",
+  "why_needed": "Join hi woh jagah hai jahan snapshot aur live stream stitch hote hain -- yahan gap ya duplicate classic bug hai.",
+  "real_world_analogy": "Live cricket match join karna: ya toh scorecard dekh ke live commentary se jud jao (fresh), ya 'main 15th over tak dekh chuka tha' bolo aur sirf highlights 16 se ab tak dekho (catch-up).",
+  "how_it_works": "Room lock -> snapshot -> init next_rev if first -> catch-up ops or full content -> register with base_rev=head -> unlock -> presence.",
+  "in_this_project": "`collab/realtime.py::join`; `service.snapshot`, `service.ops_between`; `_for` ack/op conversion. Test `test_lost_ack_resend_is_deduplicated` reconnect path pe ack receive check karta hai.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::join",
+   "projects/08-collab/collab/service.py::ops_between",
+   "projects/08-collab/tests/test_realtime.py::test_lost_ack_resend_is_deduplicated"
+  ],
+  "code_example": "# real, collab/realtime.py (trimmed)\nif last_rev is not None and 0 <= last_rev <= head:\n    # Reconnect: send only what the client missed (keeps its pending local edits valid).\n    for o in await service.ops_between(self.sm, doc_id, last_rev, head):\n        conn.send(self._for(conn, {**o, \"type\": \"op\"}))\n    conn.send({\"type\": \"joined\", \"rev\": head, \"catchup\": True, \"conn_id\": conn.conn_id,\n               \"presence\": await self.presence(doc_id)})\nelse:\n    conn.send({\"type\": \"joined\", \"rev\": head, \"content\": snap[\"content\"], \"title\": snap[\"title\"],\n               \"catchup\": False, \"conn_id\": conn.conn_id, \"presence\": await self.presence(doc_id)})\nconn.base_rev = head\nroom.conns[conn.conn_id] = conn",
+  "code_language": "python",
+  "advantages": [
+   "No gap/no duplicate between snapshot and live stream",
+   "Reconnect cheap (sirf missed ops)"
+  ],
+  "disadvantages": [
+   "DB reads room lock ke andar -- us doc ke live forwarding ko thodi der block",
+   "Bahut purana last_rev -> bahut saare ops ek saath"
+  ],
+  "common_mistakes": [
+   "Snapshot lock ke bahar padhna aur register baad mein -- beech ka op miss",
+   "Reconnect pe full content bhejna -- client ke pending edits invalid ho jaate"
+  ],
+  "follow_up_questions": [
+   "last_rev > head ho toh kya hota hai?",
+   "Catch-up ops bahut zyada hon toh kya karoge?",
+   "Room lock ke andar DB call ka cost?"
+  ],
+  "concepts": [
+   "join",
+   "catch-up",
+   "snapshot stitching",
+   "reconnect"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-025",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does the per-room ordered forwarder work (_deliver_ordered, _flush, _fill_gap_later)?",
+  "answer_hinglish": "Har server ke har room ka ek ordered forwarder hai jo guarantee karta hai: local connections ko ops STRICTLY revision order mein, bina gap ke, bina duplicate ke milein. Redis pub/sub yeh guarantee nahi deta, isliye yeh layer hai.\n\nState: `room.next_rev` (agla expected rev) aur `room.buffer: dict[rev -> message]`.\n\n`_deliver_ordered(room, m)` (room.lock ke andar):\n- `rev < next_rev` ya already buffer mein -> duplicate, `stats['duplicates_ignored'] += 1`, ignore.\n- Warna `buffer[rev] = m`, phir `_flush`.\n- Flush ke baad bhi buffer non-empty hai (matlab koi gap hai) aur gap task nahi chal raha -> `gap_task = create_task(_fill_gap_later(room))`.\n\n`_flush(room)`: `while next_rev in buffer`: message pop karo, har local conn ko bhejo (agar `m['rev'] > c.base_rev` -- join ke waqt snapshot mein aa chuka ho toh skip), `_for()` se author ko ack aur baaki ko op. Send fail (queue full) -> `slow_disconnects` stat. `next_rev += 1`.\n\n`_fill_gap_later(room)`: `gap_fill_delay_ms` (300ms) sleep -- shayad message bas late hai. Phir lock lo; buffer ab bhi non-empty -> `upto = min(buffer) - 1`, `ops_between(next_rev - 1, upto)` Postgres se padho, `buffer.setdefault` se daalo, flush. `stats['gap_fills'] += 1` aur `gap_fill` warning log.\n\nExample: rev 5 ka message lost, rev 6 aaya. 6 buffer mein, next_rev 5. 300ms baad DB se rev 5 -> flush 5, 6.\n\nReview mein ek gap mila tha: gap tabhi detect hota hai jab koi LATER rev aaye. Agar last message hi lost ho (tail loss) aur koi naya edit na aaye, toh clients stale rehte aur author ko ack kabhi nahi milta. Fix: `_tail_loop` har `tail_check_ms` (1s) `check_tails()` chalata hai -- server ke saare active rooms ke DB heads ek query (`service.heads`) mein, aur jahan `head >= next_rev` wahan room.lock ke andar `ops_between` -> buffer -> `_flush`. Regression test: `test_lost_last_message_is_recovered_by_tail_check` (saare op publishes drop karke bhi author settle hota hai, `tail_fills >= 1`).",
+  "why_needed": "Pub/sub ko reliable ordered stream mein badalna is project ka sabse 'distributed systems' wala hissa hai.",
+  "real_world_analogy": "Post office jahan letters number wale hain: letter 6 pehle aa gaya toh rakh lo, 5 ka wait karo; 5 thodi der mein na aaye toh head office (Postgres) se copy mangwa lo.",
+  "how_it_works": "Reorder buffer keyed by rev + next expected rev + delayed repair from durable source.",
+  "in_this_project": "`collab/realtime.py`: `_deliver_ordered`, `_flush`, `_fill_gap_later`; config `gap_fill_delay_ms = 300`; `check_tails` + config `tail_check_ms = 1000` (tail loss); `/stats` mein `gap_fills`, `tail_fills`, `duplicates_ignored`, `slow_disconnects`. `ARCHITECTURE.md` mein flowchart 'Ordered forwarder'.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_deliver_ordered",
+   "projects/08-collab/collab/realtime.py::_flush",
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/collab/config.py::gap_fill_delay_ms",
+   "projects/08-collab/collab/realtime.py::check_tails",
+   "projects/08-collab/tests/test_realtime.py::test_lost_last_message_is_recovered_by_tail_check"
+  ],
+  "code_example": "# real, collab/realtime.py\nasync def _deliver_ordered(self, room: Room, m: dict) -> None:\n    async with room.lock:\n        rev = m[\"rev\"]\n        if rev < room.next_rev or rev in room.buffer:\n            self.stats[\"duplicates_ignored\"] += 1\n            return\n        room.buffer[rev] = m\n        self._flush(room)\n        if room.buffer and (room.gap_task is None or room.gap_task.done()):\n            room.gap_task = asyncio.create_task(self._fill_gap_later(room))",
+  "code_language": "python",
+  "advantages": [
+   "Pub/sub ki speed + Postgres ki reliability",
+   "Duplicates aur reordering dono handle",
+   "Observable via /stats"
+  ],
+  "disadvantages": [
+   "Tail loss ab sirf tail_check_ms (1s) tak bounded hai, zero nahi; plus ek DB query per server per second",
+   "Gap fill ke dauraan 300ms+ latency spike",
+   "DB read room lock ke andar"
+  ],
+  "common_mistakes": [
+   "Out-of-order message ko turant forward kar dena",
+   "Gap pe turant DB hit (har reorder pe DB load) -- delay isliye hai"
+  ],
+  "follow_up_questions": [
+   "Tail check ka interval 1s kyun, aur 1000 rooms pe query kaise batch hoti hai?",
+   "300ms delay kaise choose kiya?",
+   "Ek gap fill ke dauraan aur gaps aa jayein toh?"
+  ],
+  "concepts": [
+   "ordered delivery",
+   "reorder buffer",
+   "gap fill",
+   "at-most-once"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Low-latency non-durable bus + durable repair path; cost hai complexity aur gap time pe latency spike.",
+   "failure_scenarios": "Redis down -> sab messages lost -> har room gap tabhi fill karega jab naya op aaye; agar Postgres bhi slow ho toh gap fill slow aur room lock hold.",
+   "alternatives": "Redis Streams (XREAD with last ID) ya Kafka: offsets se replay, gap detection built-in; ya har server periodically head rev poll kare.",
+   "scale_10x_100x": "100x docs pe har server sab channels receive karta hai (psubscribe *) -- forwarder irrelevant messages pe bhi `rooms.get` karta hai; per-doc subscribe ya sharded channels chahiye.",
+   "production_improvements": "Tail-loss heartbeat ab hai (`check_tails`); aage: subscriber reconnect ke turant baad ek check, gap fill latency histogram aur per-room lag metric."
+  }
+ },
+ {
+  "id": "COLB-026",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does a single pub/sub message become an 'ack' for the author and an 'op' for everyone else?",
+  "answer_hinglish": "Server alag se ack nahi bhejta. Commit ke baad ek hi message Redis pe publish hota hai: `{type: 'op', rev, op, user_id, client_id, client_seq, doc_id, server}`. Har server ka forwarder isko apne local conns ko deliver karta hai, aur `Hub._for(conn, m)` decide karta hai har conn ko kya dikhe:\n\n- Agar `m['client_id'] == conn.client_id` -> yeh is client ka apna op hai -> `{type: 'ack', rev, client_seq}`. Op body nahi bhejte, client ke paas already hai (local apply ho chuka).\n- Warna -> `{type: 'op', rev, op, user_id, client_id}`.\n\nMatching `client_id` pe hai, `user_id` pe nahi. Kyun? Ek hi user do tabs mein same doc khol sakta hai -- dono tabs alag `client_id` (UUID) rakhte hain. Tab A ka op tab B ke liye 'op' hai, ack nahi. Fuzz test mein bhi saare 6 clients same user hain, alag client_ids.\n\nFayda: ack usi ordered stream se aata hai, apni revision ki position pe. Agar rev 9 kisi aur ka aur rev 10 mera, toh mujhe pehle op 9 milega phir ack 10 -- client state machine correct rehta hai (outstanding op 9 ke against transform hota hai, phir ack). Agar ack seedha submit ke baad bhejte, toh woh op 9 se pehle pahunch sakta tha (op 9 pub/sub mein late) -- client sochta \"mera op rev 10 pe hai\" aur `rev = 10` set kar deta, phir op 9 aata... state corrupt.\n\nSame `_for` reconnect catch-up mein bhi use hota hai -- lost ack wala op catch-up mein ack ban ke aata hai.\n\nSecurity note (review fix): `client_id` broadcast hota hai, toh pehle koi doosra editor victim ka client_id copy karke uske acks chura sakta tha. Ab `ws_endpoint` isko `<user_id>:<client_id>` namespace karta hai, toh match sirf same user ke client pe hota hai (`test_client_id_of_another_user_cannot_be_hijacked`).",
+  "why_needed": "Ack ordering correctness ka subtle part hai; ek function mein simple implementation interview mein achha lagta hai.",
+  "real_world_analogy": "Class mein teacher sabke answers ek-ek karke padhti hai; jab tumhara answer padha jata hai woh tumhare liye 'haan, tumhara mil gaya' hai aur baaki ke liye naya answer.",
+  "how_it_works": "Single broadcast message; per-connection projection based on client_id equality.",
+  "in_this_project": "`collab/realtime.py::_for`; `api.py` publish payload includes `client_id` and `client_seq`. `TRADEOFFS.md` #4 'Acks through the ordered stream'.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_for",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/TRADEOFFS.md"
+  ],
+  "code_example": "# real, collab/realtime.py\ndef _for(self, conn: Conn, m: dict) -> dict:\n    if m.get(\"client_id\") == conn.client_id:\n        return {\"type\": \"ack\", \"rev\": m[\"rev\"], \"client_seq\": m.get(\"client_seq\")}\n    return {\"type\": \"op\", \"rev\": m[\"rev\"], \"op\": m[\"op\"], \"user_id\": m.get(\"user_id\"), \"client_id\": m.get(\"client_id\")}",
+  "code_language": "python",
+  "advantages": [
+   "Ack ordering automatically correct",
+   "Ek publish, koi special path nahi",
+   "Multi-tab same user handled"
+  ],
+  "disadvantages": [
+   "Author ka ack ek pub/sub round trip late aata hai",
+   "client_id client-chosen hai -- isliye server usko user_id se namespace karta hai (review fix); raw id ab bhi broadcast hota hai"
+  ],
+  "common_mistakes": [
+   "user_id pe ack match karna (multi-tab bug)",
+   "Ack ko submit ke turant baad direct socket pe bhejna"
+  ],
+  "follow_up_questions": [
+   "Ack aur op ka order kyun matter karta hai?",
+   "client_id kaun generate karta hai?",
+   "Ack ka extra latency kitna hai?"
+  ],
+  "concepts": [
+   "ack",
+   "ordered stream",
+   "client_id",
+   "fan-out projection"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-027",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does the client process incoming messages: joined, op, ack? Explain _handle and _server_op.",
+  "answer_hinglish": "`CollabClient._read_loop` har message ko `_handle` ko deta hai:\n\n`joined`: agar `catchup` False (fresh join) toh `self.doc, self.rev = content, rev`. Catch-up mein content nahi aata -- doc already sahi hai kyunki missed ops pehle hi `op`/`ack` messages ke roop mein process ho chuke. Phir `joined` event set. Phir resend logic: agar `outstanding` hai toh SAME client_seq ke saath dobara bhejo (server dedupe karega agar pehle apply ho chuka); warna agar buffer hai (offline edits) toh `_flush_buffer`.\n\n`op` (kisi aur ka): `_server_op(rev, op)`:\n```\nif outstanding: out, op = transform(out, op)\nif buffer:      buffer, op = transform(buffer, op)\ndoc = apply(doc, op); rev = rev\n```\nPehle outstanding ke against transform, phir uska output (S') buffer ke against. Final S'' local doc pe -- jo already outstanding + buffer apply kar chuka hai. Isliye pending edits 'upar' rehte hain.\n\n`ack`: `_ack(rev)`: `outstanding = None`, `rev = ack.rev`. Phir `_flush_buffer` -- buffer hai toh naya outstanding.\n\nImportant detail: `if self.buffer:` check `outstanding` se INDEPENDENT hai. Original ot.js model mein buffer sirf outstanding ke saath exist karta hai, toh code `if outstanding: ...; if buffer: ...` nested tha. Offline client ke paas buffer tha par outstanding nahi -- catch-up ops buffer ke against transform hi nahi hue -> length mismatch. Fuzz test ne pakda, comment code mein hai.\n\n`error` -> `self.errors` list mein; aur agar error ka `client_seq` outstanding op ka hai (aur code `access_revoked` nahi) toh `resync()` -- pending edits discard, fresh join. Yeh review fix hai: pehle aisa client hamesha ke liye atak jaata tha (`test_rejected_op_makes_client_resync_instead_of_stalling`). `presence` -> `presence_events`.",
+  "why_needed": "Client ka message handling server ke ordering guarantees ka consumer hai; dono saath samjhaane chahiye.",
+  "real_world_analogy": "Tumhare paas draft letter hai (pending). Boss ka correction aata hai -> pehle apne draft ko correction ke hisaab se adjust karo, phir correction ko apne draft ke hisaab se lagao.",
+  "how_it_works": "op: transform chain outstanding -> buffer -> apply. ack: clear outstanding, set rev, flush buffer. joined: init or catch-up done, then resend.",
+  "in_this_project": "`collab/client.py::_handle`, `_server_op`, `_ack`, `resync`. Comment in `_server_op`: 'Transforming against the buffer only when an op was outstanding corrupted offline clients on reconnect (found by the fuzz test).'",
+  "implementation_files": [
+   "projects/08-collab/collab/client.py::_handle",
+   "projects/08-collab/collab/client.py::_server_op",
+   "projects/08-collab/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# real, collab/client.py\ndef _server_op(self, rev: int, op: TextOp) -> None:\n    self.received_ops += 1\n    if self.outstanding:\n        seq, out = self.outstanding\n        out, op = transform(out, op)\n        self.outstanding = (seq, out)\n    if self.buffer:\n        self.buffer, op = transform(self.buffer, op)\n    self.doc = apply(self.doc, op)\n    self.rev = rev",
+  "code_language": "python",
+  "advantages": [
+   "Pending edits concurrent ops ke upar consistent rehte hain",
+   "Same logic Python aur JS mein"
+  ],
+  "disadvantages": [
+   "Rejected op pe resync pending edits discard karta hai (stall nahi, par user ke unsent edits jaate hain)"
+  ],
+  "common_mistakes": [
+   "Buffer transform ko outstanding ke andar nest karna (real bug)",
+   "Server op ko pehle apply karna phir pending ko transform karna (order galat)"
+  ],
+  "follow_up_questions": [
+   "Catch-up ke dauraan apne ops ack kyun bante hain?",
+   "Error aane pe client ko kya karna chahiye?",
+   "joined ke baad resend safe kyun hai?"
+  ],
+  "concepts": [
+   "client message handling",
+   "transform chain",
+   "resend",
+   "catch-up"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-028",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Why does each connection have its own asyncio.Queue and writer task instead of sending directly to the socket?",
+  "answer_hinglish": "Har `Conn` mein `queue: asyncio.Queue(maxsize=1000)` hai aur `ws_endpoint` ek `write_loop` task chalata hai jo queue se message nikal ke `ws.send_text` karta hai. Fan-out code (`_flush`, `_on_message`) kabhi socket pe direct `await` nahi karta -- sirf `conn.send(msg)` jo `put_nowait` hai.\n\nKyun?\n1. Slow client room ko block na kare: `_flush` room.lock ke andar chalta hai aur saare conns ko loop karta hai. Agar ek client ka TCP buffer bhara hai aur hum `await ws.send_text` karte, toh poora loop (aur lock) us client pe atak jaata -- room ke baaki users ko bhi delay. Queue ke saath enqueue O(1) non-blocking hai.\n2. Backpressure policy explicit: queue full (1000 messages) -> `QueueFull` -> `conn.kick(1013, 'client too slow; reconnect and catch up')`, `send` False return, `slow_disconnects` stat. `kick` `closed = True` set karta hai aur endpoint ka `on_kick` callback turant `ws.close` task bana deta hai. Client reconnect karke `last_rev` se catch up kar lega -- kuch lost nahi, kyunki Postgres source of truth hai.\n3. Ordering: ek connection ke saare messages ek hi queue -> ek hi writer -> socket pe order preserved.\n4. Concurrency safety: ek WebSocket pe do coroutines ek saath `send` karein toh frames interleave/errors ho sakte hain; single writer avoid karta hai.\n\nReview fix: pehle sirf `conn.closed = True` set hota tha aur close tabhi hota jab receive loop ka `await ws.receive_text()` return kare -- yani client kuch bheje. Ek silent slow client der tak half-alive rehta aur messages drop hote. Ab `Conn.kick` socket turant close karta hai, client reconnect + catch-up karta hai.",
+  "why_needed": "Slow consumer handling WebSocket servers mein classic production issue hai.",
+  "real_world_analogy": "Restaurant mein waiter har table ke liye order slip ek tray mein rakhta hai (queue) aur ek runner deliver karta hai; agar ek table ki tray overflow ho jaye toh us table ko 'please dobara order karo' bol dete hain, baaki tables nahi rukti.",
+  "how_it_works": "Producer: put_nowait (non-blocking). Consumer: dedicated writer task per socket. Overflow -> mark closed -> close 1013.",
+  "in_this_project": "`collab/realtime.py::Conn.send` (docstring explains drop policy), `collab/api.py::ws_endpoint` `write_loop`, `if conn.closed: await ws.close(code=1013, ...)`. `FAILURE_SCENARIOS.md` #9.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::Conn",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/collab/realtime.py::kick"
+  ],
+  "code_example": "# real, collab/realtime.py\ndef send(self, msg: dict) -> bool:\n    \"\"\"Non-blocking enqueue. A full queue = the client can't keep up: drop it (it will reconnect and\n    catch up from its last revision) instead of letting one slow client block the room.\"\"\"\n    try:\n        self.queue.put_nowait(msg)\n        return True\n    except asyncio.QueueFull:\n        self.kick(1013, \"client too slow; reconnect and catch up\")\n        return False\n\ndef kick(self, code: int, reason: str) -> None:\n    \"\"\"Close the connection immediately (not when the client next sends something).\"\"\"\n    if self.closed:\n        return\n    self.closed = True\n    if self.on_kick:\n        self.on_kick(code, reason)",
+  "code_language": "python",
+  "advantages": [
+   "Room fan-out kabhi block nahi hota",
+   "Bounded memory per connection",
+   "Per-connection ordering"
+  ],
+  "disadvantages": [
+   "Har connection ek extra task",
+   "Slow-close detection receive loop pe depend"
+  ],
+  "common_mistakes": [
+   "Fan-out loop mein `await ws.send()` -- head-of-line blocking",
+   "Unbounded queue -- memory leak with slow clients"
+  ],
+  "follow_up_questions": [
+   "Queue size 1000 kaise choose kiya?",
+   "Pehle silent slow client der se close hota tha -- `Conn.kick` ne yeh kaise fix kiya?",
+   "Drop ke bajaye coalescing kar sakte ho?"
+  ],
+  "concepts": [
+   "backpressure",
+   "bounded queue",
+   "writer task",
+   "slow consumer"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-029",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does the Redis subscriber loop work, and what happens when the subscription is lost?",
+  "answer_hinglish": "`Hub.start()` ek background task `_subscriber()` chalata hai. Infinite loop:\n1. `pubsub = self.redis.pubsub()`; `await pubsub.psubscribe('collab:doc:*')` -- PATTERN subscribe, yani is server ko har document ke channel ka message milta hai.\n2. `async for m in pubsub.listen()`: sirf `pmessage` type process; `stats['received'] += 1`; JSON parse karke `_on_message`. Ek message ka exception log hota hai (`pubsub_message_failed`) par loop nahi tootta.\n3. `CancelledError` (shutdown) -> pubsub close, re-raise.\n4. Koi aur exception (Redis restart, network) -> `log.exception('pubsub_disconnected')`, 0.5s sleep, loop dobara subscribe karta hai.\n\nDisconnect window mein publish hue messages is server ke liye HAMESHA ke liye lost hain -- pub/sub mein no replay. Comment kehta hai: 'the ordered forwarder's gap fill recovers them from Postgres on the next revision that arrives.' Yani agla op aayega, forwarder gap dekhega, 300ms baad DB se fill.\n\n`_on_message`: `rooms.get(doc_id)`; room nahi toh drop (is server pe koi us doc ko nahi dekh raha). `op` -> `_deliver_ordered`; `presence`/`cursor` -> seedha room ke doosre conns ko (sender conn_id skip).\n\nDesign note: psubscribe `*` simple hai (subscribe/unsubscribe room lifecycle ke saath sync nahi karna), par cost yeh hai ki N servers har message N baar receive karte hain, chahe room ho ya nahi. Chhote scale pe theek; bahut saare servers aur documents pe per-doc SUBSCRIBE ya sharded pub/sub better.\n\nEk aur subtle point: `_on_message` ko serially await karte hain -- ek gap fill ya slow lock ek message pe saare documents ke messages ko is server pe delay karega.",
+  "why_needed": "Long-lived background consumers ka resilience aur unki failure semantics production ka core topic hai.",
+  "real_world_analogy": "Radio pe news sunna: signal chala gaya toh us dauraan ki news miss; wapas aane pe newspaper (Postgres) se pichli khabar padh lo.",
+  "how_it_works": "Pattern subscription + reconnect loop with backoff; lost window recovered lazily by gap fill.",
+  "in_this_project": "`collab/realtime.py::_subscriber`, `_on_message`, `publish`; `CHANNEL = 'collab:doc:{}'`. `DEPLOYMENT.md`: 'Redis can be restarted (forwarders gap-fill from Postgres).'",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_subscriber",
+   "projects/08-collab/collab/realtime.py::_on_message",
+   "projects/08-collab/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, collab/realtime.py (trimmed)\nasync def _subscriber(self) -> None:\n    while True:\n        pubsub = self.redis.pubsub()\n        try:\n            await pubsub.psubscribe(CHANNEL.format(\"*\"))\n            async for m in pubsub.listen():\n                if m[\"type\"] != \"pmessage\":\n                    continue\n                self.stats[\"received\"] += 1\n                try:\n                    await self._on_message(json.loads(m[\"data\"]))\n                except Exception:\n                    log.exception(\"pubsub_message_failed\")\n        except asyncio.CancelledError:\n            ...\n            raise\n        except Exception:\n            log.exception(\"pubsub_disconnected\")\n            await asyncio.sleep(0.5)",
+  "code_language": "python",
+  "advantages": [
+   "Self-healing subscription",
+   "Simple wildcard subscribe",
+   "Poison message ek ko hi affect karta hai"
+  ],
+  "disadvantages": [
+   "Every server receives every doc's traffic",
+   "Serial processing -- ek slow message sabko delay",
+   "Lost window ka recovery agle op pe depend"
+  ],
+  "common_mistakes": [
+   "Subscriber exception pe task chupchaap mar jaana (no loop)",
+   "Reconnect ke baad assume karna ki kuch miss nahi hua"
+  ],
+  "follow_up_questions": [
+   "psubscribe vs subscribe per room -- trade-off?",
+   "Reconnect ke baad active rooms ko proactively gap-check kyun nahi?",
+   "Redis Cluster pe pub/sub kaise scale hota hai?"
+  ],
+  "concepts": [
+   "pub/sub",
+   "psubscribe",
+   "reconnect loop",
+   "at-most-once"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Wildcard subscribe = zero bookkeeping, par O(servers x total_ops) fan-in; per-room subscribe = efficient par subscribe/unsubscribe races.",
+   "failure_scenarios": "Redis 30s down: sab servers ke sab rooms ke messages lost; clients edits commit hote rahenge (Postgres) par doosron ko nahi dikhenge jab tak naya op gap trigger na kare.",
+   "alternatives": "Redis Streams with consumer reading from last ID (replay after reconnect), Kafka partitioned by doc_id, ya sharded pub/sub (Redis 7 SSUBSCRIBE).",
+   "scale_10x_100x": "100 servers x 10k ops/s total = har server 10k msg/s parse karega -- mostly wasted; per-doc channels ya doc->server routing zaroori.",
+   "production_improvements": "Reconnect ke baad har active room ke liye turant head-rev check + gap fill; subscriber lag metric; `_on_message` per-room tasks mein parallelise."
+  }
+ },
+ {
+  "id": "COLB-030",
+  "project_slug": "p08-collab",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does content_at reconstruct a document at an arbitrary revision?",
+  "answer_hinglish": "`content_at(doc_id, rev)` version history ka engine hai -- `GET /docs/{id}/revisions/{rev}` aur restore dono isko use karte hain.\n\nAlgorithm:\n1. Nearest snapshot <= rev: `SELECT rev, content FROM snapshots WHERE document_id = :d AND rev <= :r ORDER BY rev DESC LIMIT 1`. Snapshot rev 0 pe document create ke waqt hamesha banta hai (`create_document`), aur phir har `snapshot_every` (50) revs pe `submit` mein.\n2. Head check: `rev > head` ya snapshot missing -> NotFound('revision not found').\n3. Replay: `ops_between(snap.rev, rev)` -- snapshot ke baad se target rev tak ke ops, revision order mein, aur har op `apply` karo.\n\nKyunki stored ops already transformed hain (har op doc@rev-1 pe directly apply hota hai), replay ek simple left fold hai -- koi transform nahi chahiye. `DATABASE_DESIGN.md`: 'Stored op is the TRANSFORMED op (applies to rev-1), so history replay is a plain left fold.'\n\nCost bounded hai: max `snapshot_every - 1` ops replay. 50 pe yeh chhota hai.\n\nTest `test_history_revision_and_restore` `snapshot_every=3` ke saath server chalata hai: 5 words insert, rev 2 = 'one two ' (snapshot 0 + 2 ops), rev 4 = 'one two three four ' (snapshot@3 + 1 op).\n\nNote: yeh do alag sessions mein padhta hai (snapshot+head ek session, ops_between doosra) -- consistency issue nahi kyunki purane revs immutable hain; sirf head check aur ops read ke beech naye ops aa sakte hain, jo `rev <= :u` filter se ignore hote hain.",
+  "why_needed": "Version history = op log + snapshots ka classic event-sourcing pattern; reconstruction cost ka reasoning important hai.",
+  "real_world_analogy": "Bank statement: har mahine ka closing balance (snapshot) likha hai; kisi bhi din ka balance = pichle mahine ka closing + us din tak ke transactions.",
+  "how_it_works": "Seek snapshot <= target, fold ops (snap.rev, target] with apply.",
+  "in_this_project": "`collab/service.py::content_at`, `ops_between`, `create_document` (rev 0 snapshot), `submit` (`rev % settings.snapshot_every == 0`). Test `test_history_revision_and_restore`.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::content_at",
+   "projects/08-collab/collab/service.py::create_document",
+   "projects/08-collab/tests/test_realtime.py::test_history_revision_and_restore"
+  ],
+  "code_example": "# real, collab/service.py\nasync def content_at(sm, doc_id, rev: int) -> str:\n    \"\"\"Version history: nearest snapshot <= rev, then replay the op log.\"\"\"\n    async with sm() as s:\n        snap = (await s.execute(text(\"SELECT rev, content FROM snapshots WHERE document_id = :d AND rev <= :r \"\n                                     \"ORDER BY rev DESC LIMIT 1\"), {\"d\": doc_id, \"r\": rev})).first()\n        head = await s.scalar(text(\"SELECT rev FROM documents WHERE id = :d\"), {\"d\": doc_id})\n    if snap is None or head is None or rev > head:\n        raise NotFound(\"revision not found\")\n    content = snap.content\n    for o in await ops_between(sm, doc_id, snap.rev, rev):\n        content = apply(content, TextOp.from_json(o[\"op\"]))\n    return content",
+  "code_language": "python",
+  "advantages": [
+   "Bounded replay cost",
+   "No transform during replay",
+   "Rev 0 snapshot = always a base"
+  ],
+  "disadvantages": [
+   "Snapshots extra storage (full content each)",
+   "Replay CPU in app server"
+  ],
+  "common_mistakes": [
+   "Snapshot rev 0 na banana (purane revs reconstruct nahi honge)",
+   "Original (untransformed) ops store karke replay karna"
+  ],
+  "follow_up_questions": [
+   "snapshot_every kaise tune karoge?",
+   "Bahut bade docs ke liye snapshot ki jagah kya?",
+   "Rev ke bajaye timestamp se history kaise doge?"
+  ],
+  "concepts": [
+   "event sourcing",
+   "snapshot",
+   "replay",
+   "version history"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-031",
+  "project_slug": "p08-collab",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Walk through ws_endpoint's error handling and close codes. What does each code mean?",
+  "answer_hinglish": "`ws_endpoint` ek layered try structure hai:\n\n1. Ticket: `getdel('collab:ticket:{ticket}')`. None -> `ws.close(code=4401, 'invalid or expired ticket')` -- ACCEPT se pehle. 4xxx codes application-defined range hain (4000-4999).\n2. `ws.accept()`, phir pehla message `join{doc_id, client_id}` hona chahiye, warna `4400`. `uuid.UUID(first['doc_id'])` invalid ho toh ValueError -> outer handler -> 4400 'malformed message'.\n3. `require_role(..., 'viewer')` fail (NotFound ya Forbidden AppError) -> error JSON bhejo, phir `close(4403)`. Stranger ko 'not found' milta hai, existence leak nahi.\n4. Main loop `while not conn.closed`: `op` -> viewer ho toh `forbidden` error message (connection open rehta hai); `submit` ka AppError (invalid_operation, not found) -> error message with `client_seq`, `continue`. `cursor` -> touch + publish. `ping` -> touch + pong.\n5. Loop exit with `conn.closed` (queue full) -> `close(1013, 'client too slow; reconnect and catch up')`. 1013 standard 'Try Again Later' code hai.\n6. `except (WebSocketDisconnect, RuntimeError): pass` -- client chala gaya.\n7. `except (ValueError, KeyError, TypeError)` -> 4400. Bad JSON (`json.loads` raises ValueError), missing `client_seq` (KeyError), `int(None)` (TypeError).\n8. `finally`: writer task cancel, `hub.leave(conn)` -- room aur presence cleanup HAMESHA.\n\nDesign point: per-op errors (validation, permissions) connection nahi todte -- client ko `error` milta hai aur woh aage chal sakta hai. Protocol violations (malformed JSON) connection todte hain. Yeh distinction 'recoverable vs protocol broken' ka hai.",
+  "why_needed": "Real-time endpoints mein error contract define karna (close codes vs error messages) production quality ka sign hai.",
+  "real_world_analogy": "Club bouncer: ID nahi (4401) -> andar hi nahi; guest list mein naam nahi (4403); andar aake bad behaviour (4400) -> bahar; bar bahut slow ho raha hai tumhare liye (1013) -> 'thodi der baad aao'.",
+  "how_it_works": "Pre-accept rejection, post-accept protocol checks, per-message AppError -> error frame, exceptions -> close code, finally -> cleanup.",
+  "in_this_project": "`collab/api.py::ws_endpoint`; `API_DOCUMENTATION.md`: 'Close codes: 4401 bad ticket, 4403 no access, 4400 malformed, 1013 client too slow (reconnect).' `bpcommon.errors.AppError`.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/API_DOCUMENTATION.md",
+   "shared/bpcommon/errors.py::AppError"
+  ],
+  "code_example": "# real, collab/api.py (trimmed)\n        if conn.closed:\n            await ws.close(code=1013, reason=\"client too slow; reconnect and catch up\")\n    except (WebSocketDisconnect, RuntimeError):\n        pass\n    except (ValueError, KeyError, TypeError):\n        with contextlib.suppress(Exception):\n            await ws.close(code=4400, reason=\"malformed message\")\n    finally:\n        if writer:\n            writer.cancel()\n        if conn is not None:\n            await hub.leave(conn)",
+  "code_language": "python",
+  "advantages": [
+   "Clear contract for client reconnect logic",
+   "Cleanup guaranteed via finally",
+   "Recoverable errors don't kill session"
+  ],
+  "disadvantages": [
+   "Broad exception catches can hide bugs",
+   "Client ko ticket rejection ka reason handshake close pe hi milta hai"
+  ],
+  "common_mistakes": [
+   "finally mein leave bhool jaana -> ghost connections in rooms",
+   "Har error pe connection close karna -> reconnect storms"
+  ],
+  "follow_up_questions": [
+   "Client 4401 pe kya kare vs 1013 pe?",
+   "RuntimeError kyun catch kiya?",
+   "Invalid op ke baad client ki state kya hai?"
+  ],
+  "concepts": [
+   "close codes",
+   "error handling",
+   "WebSocket protocol",
+   "cleanup"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-032",
+  "project_slug": "p08-collab",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "How does TextOp.from_json validate untrusted input, and what does it not catch?",
+  "answer_hinglish": "Client se aaya op untrusted JSON hai. `TextOp.from_json(data)`:\n1. `isinstance(data, list)` nahi -> `OTError('operation must be a list')` ('not a list' string reject).\n2. Constructor har component ko classify karta hai: `is_retain` (int > 0), `is_insert` (str), `is_delete` (int < 0). Kuch aur (float 2.5, dict, None, nested list, 0) -> `OTError('invalid component ...')`. `test_rejects_malformed` `[1, 2.5]` aur `'not a list'` check karta hai.\n3. Builders se pass hone ki wajah se op normalised ho jaata hai aur `base_length`/`target_length` compute hote hain.\n\nBaaki validation `submit` mein: `max_op_components` (10,000), `apply` ka base length match (galat length -> 'operation does not apply'), `max_document_chars` (1,000,000). `test_invalid_operation_rejected` `[10, 'x']` on 'abc' bhejta hai -> `invalid_operation` aur rev 0 hi rehta hai.\n\nKya nahi pakadta (observation):\n- Python mein `bool` `int` ka subclass hai: `True` JSON `true` -> `isinstance(True, int) and True > 0` -> retain(1). Harmless-ish (1 char retain), par strict validation mein `type(c) is int` better hoga.\n- Ek component ka size limit nahi: ek single insert string 1MB ho sakti hai -- `max_document_chars` doc total pe check karta hai, toh bounded hai, lekin per-op byte limit nahi. WebSocket frame size bhi server side explicitly cap nahi kiya.\n- Huge ints: `retain(10**18)` parse ho jayega; `apply` length mismatch pe reject karega, toh safe.\n\nOverall: parse -> structural check -> semantic check (applies exactly) -> size checks. Defence in depth.",
+  "why_needed": "Untrusted input validation security aur correctness dono ka basic hai.",
+  "real_world_analogy": "Airport security: pehle bag ka shape check (list hai?), phir har item scan (valid component?), phir weight limit (size), phir boarding pass match (length match).",
+  "how_it_works": "Type checks per component in constructor; semantic checks (lengths, sizes) in submit.",
+  "in_this_project": "`collab/ot.py::from_json`, `TextOp.__init__`; `collab/service.py::submit`; tests `test_rejects_malformed`, `test_invalid_operation_rejected`. `SECURITY.md` 'Malicious ops' row.",
+  "implementation_files": [
+   "projects/08-collab/collab/ot.py::from_json",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/tests/test_ot.py::test_rejects_malformed",
+   "projects/08-collab/SECURITY.md"
+  ],
+  "code_example": "# real, collab/ot.py\nfor c in ops or []:\n    if is_retain(c):\n        self.retain(c)\n    elif is_insert(c):\n        self.insert(c)\n    elif is_delete(c):\n        self.delete(-c)\n    else:\n        raise OTError(f\"invalid component {c!r}\")",
+  "code_language": "python",
+  "advantages": [
+   "Malformed input lock lene se pehle reject",
+   "Exact-apply check strongest validation hai"
+  ],
+  "disadvantages": [
+   "bool-as-int edge case",
+   "Per-op byte size limit nahi"
+  ],
+  "common_mistakes": [
+   "Sirf JSON schema validate karna, apply-check nahi",
+   "Validation ke liye exceptions ko 500 banne dena"
+  ],
+  "follow_up_questions": [
+   "Strict typing kaise karoge?",
+   "Per-user op rate limit kahan lagaoge?",
+   "WebSocket max message size kahan set hota?"
+  ],
+  "concepts": [
+   "input validation",
+   "untrusted input",
+   "defence in depth"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-033",
+  "project_slug": "p08-collab",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "How does the history endpoint compute per-revision stats and paginate?",
+  "answer_hinglish": "`GET /docs/{id}/history?limit=&before=` -> `service.history(sm, doc_id, limit, before)`.\n\nQuery: `operations o JOIN users u ON u.id = o.user_id WHERE o.document_id = :d [AND o.rev < :b] ORDER BY o.rev DESC LIMIT :l`. Newest first. Pagination keyset-style hai: next page ke liye pichli page ka sabse chhota rev `before` mein bhejo. Offset pagination nahi -- toh deep pages bhi `(document_id, rev)` primary key index pe range scan hain, aur naye ops aane se pages shift nahi hote.\n\nHar row ke liye op parse karke stats:\n- `chars_inserted = sum(len(c) for c in op.ops if isinstance(c, str))`\n- `chars_deleted = -sum(c for c in op.ops if isinstance(c, int) and c < 0)`\nSaath mein `rev`, `at` (created_at), `user` (name), `client_id`.\n\n`limit` API layer pe `Query(100, ge=1, le=1000)` se bounded. Role check `require_role(..., 'viewer')`.\n\nTest: `test_history_revision_and_restore` -- 5 inserts ke baad `[h['rev'] for h in hist] == [5, 4, 3, 2, 1]` aur `hist[0]['chars_inserted'] == 4` ('five').\n\nNote: stats TRANSFORMED op pe hain. Aam taur pe insert/delete counts transform se nahi badalte, except overlapping deletes -- agar do users ne same text delete kiya, toh jo baad mein commit hua uska transformed op mein woh delete nahi hai, toh history usse 0 chars deleted dikhayegi. Intent ka exact record nahi, effect ka record hai (`TRADEOFFS.md` #5).",
+  "why_needed": "History API design (keyset pagination, derived stats) common backend question hai.",
+  "real_world_analogy": "WhatsApp chat scroll: 'is message se pehle ke 100 dikhao' -- page number nahi, last-seen message ID.",
+  "how_it_works": "Keyset pagination on rev DESC; per-row derived counts from op components.",
+  "in_this_project": "`collab/service.py::history`, `collab/api.py::doc_history` (`limit: int = Query(100, ge=1, le=1000), before: int | None = None`).",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::history",
+   "projects/08-collab/collab/api.py::doc_history",
+   "projects/08-collab/tests/test_realtime.py::test_history_revision_and_restore"
+  ],
+  "code_example": "# real, collab/service.py (trimmed)\nq = (\"SELECT o.rev, o.created_at, o.client_id, u.name AS user_name, o.op FROM operations o JOIN users u ON u.id = o.user_id \"\n     \"WHERE o.document_id = :d\")\nif before is not None:\n    q += \" AND o.rev < :b\"\nrows = (await s.execute(text(q + \" ORDER BY o.rev DESC LIMIT :l\"), params)).mappings().all()",
+  "code_language": "python",
+  "advantages": [
+   "Keyset pagination stable aur index-friendly",
+   "Stats app side pe cheap"
+  ],
+  "disadvantages": [
+   "Har keystroke-batch ek row -- history noisy (no grouping by session)",
+   "Stats transformed effect dikhate hain, intent nahi"
+  ],
+  "common_mistakes": [
+   "OFFSET pagination on growing log",
+   "limit unbounded chhodna"
+  ],
+  "follow_up_questions": [
+   "History ko 'editing sessions' mein group kaise karoge?",
+   "Deleted user ke ops ka JOIN kya karega?",
+   "Stats ko precompute karna chahiye?"
+  ],
+  "concepts": [
+   "keyset pagination",
+   "history",
+   "derived data"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-034",
+  "project_slug": "p08-collab",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Walk through the restore endpoint. Why is restore a new operation, and what happens if someone edits concurrently?",
+  "answer_hinglish": "`POST /docs/{id}/restore/{rev}`:\n1. `require_role(..., 'editor')` -- viewer restore nahi kar sakta.\n2. `old = content_at(sm, doc_id, rev)` -- purana text.\n3. `snap = snapshot(sm, doc_id)` -- current content aur head rev.\n4. `op = restore_op(snap['content'], old)` = `diff_op(current, old)`.\n5. `client_id = f'restore-{uuid4().hex[:8]}'`, `client_seq = 1`, aur `submit(..., base_rev = snap['rev'], op)`.\n6. Commit ke baad `hub.publish(...)` -- connected editors ko normal op ki tarah milta hai.\n7. Return `{restored_from, new_rev}`.\n\nKyun new op? History append-only hai. Agar hum `documents.content = old` set karke ops delete karte, toh (a) connected clients ke pending ops ka base_rev invalid ho jaata, (b) audit trail khatam, (c) 'undo the restore' impossible. Naya op sequencer se guzarta hai -- lock, transform, snapshot rules sab same -- aur live clients ise ek bade edit ki tarah dekhte hain. Test: restore ke baad `c.doc == 'one two '` live client pe aur `rev == 6`.\n\nConcurrent edit race: steps 3 aur 5 ke beech (lock ke bahar) Bob ne type kiya, head ab snap.rev+1. Koi problem nahi -- submit ka `base_rev = snap['rev']` hai, toh restore op Bob ke op ke against transform hoga. Result: purana text + Bob ka concurrent typing (agar uske insert diff ke deleted range ke andar tha toh bhi insert survive karta hai). Matlab restore ke baad doc exactly `old` nahi bhi ho sakta -- yeh OT semantics ka natural result hai, bug nahi. Agar exact restore chahiye, toh lock ke andar diff compute karna padega.\n\nObservation: restore apna client_id random banata hai, toh retried HTTP request (timeout) dobara restore apply karega (idempotency key nahi). Second restore ka diff zyada tar empty hoga, toh practical harm kam hai.",
+  "why_needed": "Restore 'history rewrite vs append' design question hai aur concurrency reasoning test karta hai.",
+  "real_world_analogy": "Git mein `git revert` (naya commit jo purane state pe le jaata hai) vs `git reset --hard` + force push (history mitana). Collaborative system mein revert hi sahi hai.",
+  "how_it_works": "diff(current -> old) as a normal op with base_rev = current head; sequencer transforms it against anything that sneaked in.",
+  "in_this_project": "`collab/api.py::restore` (docstring: 'Restore = a NEW edit ... history is never rewritten'), `service.restore_op`, `service.content_at`. Test `test_history_revision_and_restore`.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::restore",
+   "projects/08-collab/collab/service.py::restore_op",
+   "projects/08-collab/tests/test_realtime.py::test_history_revision_and_restore"
+  ],
+  "code_example": "# real, collab/api.py (trimmed)\nold = await service.content_at(sm, doc_id, rev)\nsnap = await service.snapshot(sm, doc_id)\nop = service.restore_op(snap[\"content\"], old)\nclient_id = f\"restore-{uuid.uuid4().hex[:8]}\"\napplied = await service.submit(sm, st, doc_id, user[\"id\"], client_id, 1, snap[\"rev\"], op.to_json())\nawait request.app.state.hub.publish(str(doc_id), {\"type\": \"op\", \"rev\": applied.rev, \"op\": applied.op.to_json(),\n                                                  \"user_id\": str(user[\"id\"]), \"client_id\": client_id, \"client_seq\": 1})",
+  "code_language": "python",
+  "advantages": [
+   "Append-only history, restore bhi undo-able",
+   "Live clients ko seamless update",
+   "Same validation path"
+  ],
+  "disadvantages": [
+   "Concurrent edits ke saath result exactly old nahi",
+   "HTTP retry pe non-idempotent",
+   "Bada diff -> bada op"
+  ],
+  "common_mistakes": [
+   "Restore ko content overwrite se implement karna",
+   "Publish bhool jana (live clients stale)"
+  ],
+  "follow_up_questions": [
+   "Exact restore guarantee chahiye toh?",
+   "Idempotency key kaise add karoge?",
+   "Restore ka op history mein kaise identify hoga?"
+  ],
+  "concepts": [
+   "restore",
+   "append-only",
+   "revert",
+   "concurrency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Append-only restore audit aur live consistency deta hai; exactness concurrency ke saath trade hoti hai.",
+   "failure_scenarios": "Publish fail (Redis down) -> live clients ko restore tab dikhega jab agla op gap fill trigger kare; HTTP timeout pe client retry -> double restore op.",
+   "alternatives": "Diff ko lock ke andar compute karna (exact), ya 'restore' ko special op type banana jo concurrent ops ko override kare.",
+   "scale_10x_100x": "Bade docs (1MB) pe diff_op O(n) aur ek bada insert; 10x size pe op aur pub/sub message bade -- chunking ya 'resync' message.",
+   "production_improvements": "Idempotency-Key header -> client_id derive karo taaki retry dedupe ho; restore ko history mein label karo (op metadata)."
+  }
+ },
+ {
+  "id": "COLB-035",
+  "project_slug": "p08-collab",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "What does the app lifespan in main.py set up, and why those pool settings?",
+  "answer_hinglish": "`create_app()` FastAPI lifespan context manager use karta hai -- startup pe resources banao, shutdown pe band karo:\n\n- `create_async_engine(database_url, pool_size=10, max_overflow=20, pool_pre_ping=True)` -- asyncpg ke saath SQLAlchemy async engine. 10 steady + 20 burst connections per server. `pool_pre_ping` stale connection (Postgres restart) ko checkout pe detect karta hai.\n- `Redis(connection_pool=BlockingConnectionPool.from_url(redis_url, max_connections=50, timeout=2))` -- Blocking pool: 50 se zyada concurrent Redis calls pe naya connection banane ke bajaye 2s tak wait, phir error. Isse Redis connection explosion nahi hota (har WebSocket message pe touch/publish hota hai).\n- `app.state.sm = async_sessionmaker(engine, expire_on_commit=False)`.\n- `Hub(sm, redis, settings)` aur `await hub.start()` -- subscriber task.\n- Shutdown: `hub.stop()` (subscriber cancel), `redis.aclose()`, `engine.dispose()`.\n\nSaath mein `configure_logging` aur `setup_app(app, 'collab')` shared `bpcommon` se -- common error handlers aur middleware. `/editor` route `editor.html` serve karta hai.\n\nPool sizing ka reasoning: har submit ek DB connection ko row lock ke dauraan hold karta hai. Hot doc pe kai submits lock pe wait karte hue connections hold karte hain -- 30 max per server. Agar ek doc pe 30 concurrent submits atke, toh doosre documents ke liye connection nahi bachega. Yeh ek real coupling hai: hot document doosre documents ki latency badha sakta hai same server pe. Fix: per-doc in-process queue (ek doc ke liye ek submit at a time per server) ya lock_timeout.",
+  "why_needed": "Resource lifecycle aur pool sizing production backend ka bread and butter hai.",
+  "real_world_analogy": "Restaurant khulne se pehle gas, staff, tables ready karna (startup) aur band hone pe sab off karna (shutdown); tables ki limit (pool) taaki kitchen overload na ho.",
+  "how_it_works": "Lifespan context: create engine/pool/hub -> yield -> teardown in reverse.",
+  "in_this_project": "`collab/main.py::create_app` lifespan; `shared/bpcommon/http.py::setup_app`.",
+  "implementation_files": [
+   "projects/08-collab/collab/main.py::create_app",
+   "shared/bpcommon/http.py::setup_app"
+  ],
+  "code_example": "# real, collab/main.py\nengine = create_async_engine(settings.database_url, pool_size=10, max_overflow=20, pool_pre_ping=True)\nredis = Redis(connection_pool=BlockingConnectionPool.from_url(settings.redis_url, max_connections=50, timeout=2))\napp.state.sm = async_sessionmaker(engine, expire_on_commit=False)\napp.state.hub = Hub(app.state.sm, redis, settings)\nawait app.state.hub.start()",
+  "code_language": "python",
+  "advantages": [
+   "Clean startup/shutdown",
+   "Bounded DB and Redis connections",
+   "Stale connections auto-detected"
+  ],
+  "disadvantages": [
+   "Hot doc waiters DB pool exhaust kar sakte hain",
+   "Shutdown pe open WebSockets ko graceful close message nahi"
+  ],
+  "common_mistakes": [
+   "Global module-level engine (tests mein multiple servers ek process mein chalte hain -- lifespan zaroori)",
+   "Unbounded Redis pool"
+  ],
+  "follow_up_questions": [
+   "Ek process mein do servers (tests) kaise chalte hain?",
+   "Pool exhaustion detect kaise karoge?",
+   "Graceful shutdown mein WebSockets ka kya?"
+  ],
+  "concepts": [
+   "lifespan",
+   "connection pool",
+   "resource management"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-036",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Explain the operations table design: primary key, unique constraint, and what each column is for.",
+  "answer_hinglish": "```\noperations (\n  document_id uuid REFERENCES documents ON DELETE CASCADE,\n  rev bigint,          -- the revision this op PRODUCED\n  op jsonb,            -- already transformed: applies to the doc at rev - 1\n  user_id uuid, client_id text, client_seq bigint, created_at timestamptz,\n  PRIMARY KEY (document_id, rev),\n  UNIQUE (document_id, client_id, client_seq))\n```\n\n`PRIMARY KEY (document_id, rev)` do kaam karta hai: (1) total order ko persist karta hai -- ek document mein ek rev ek hi baar; agar kabhi sequencer bug se do transactions same rev likhne ki koshish karein toh DB reject karega (defence in depth, row lock primary mechanism hai). (2) B-tree index jo saari hot queries serve karta hai: `rev > :b ORDER BY rev` (submit history, catch-up, gap fill), `rev < :b ORDER BY rev DESC LIMIT` (history pages). Sab per-document range scans hain.\n\n`UNIQUE (document_id, client_id, client_seq)`: idempotency. Client lost ack ke baad SAME client_seq se resend karta hai; `submit` pehle dedupe SELECT karta hai (yeh constraint ka index use karta hai), aur constraint backstop hai.\n\n`op jsonb`: list format natural JSON hai. jsonb isliye ki Postgres validate karta hai aur future mein queries (e.g. chars count) ho sakti hain; text bhi chal jaata.\n\n`user_id` aur `client_id` dono: user = kaun (history, audit), client_id = kaunsa tab/session (ack routing, dedupe).\n\nNote: `user_id` pe FK nahi hai (users table ka reference nahi) -- history JOIN users karta hai, toh agar user row delete ho toh us user ke ops history se gayab ho jayenge (inner join). Observation.",
+  "why_needed": "Schema design interview ka standard part hai; constraints ko design guarantees se jodna strong signal hai.",
+  "real_world_analogy": "Bank ledger: har entry ka serial number (rev) unique, aur har cheque number (client_seq) per account ek hi baar encash ho sakta hai.",
+  "how_it_works": "Composite PK = order + index; composite unique = idempotency; jsonb payload.",
+  "in_this_project": "`migrations/versions/0001_initial.py` (operations table with comments), `DATABASE_DESIGN.md`, `service.submit` dedupe query.",
+  "implementation_files": [
+   "projects/08-collab/migrations/versions/0001_initial.py",
+   "projects/08-collab/DATABASE_DESIGN.md",
+   "projects/08-collab/collab/service.py::submit"
+  ],
+  "code_example": "-- real, migrations/versions/0001_initial.py\nCREATE TABLE operations (\n  document_id uuid NOT NULL REFERENCES documents(id) ON DELETE CASCADE,\n  rev bigint NOT NULL,                    -- the revision this op PRODUCED (1, 2, 3 ...)\n  op jsonb NOT NULL,                      -- already transformed: applies to the doc at rev - 1\n  user_id uuid NOT NULL,\n  client_id text NOT NULL,\n  client_seq bigint NOT NULL,\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (document_id, rev),\n  UNIQUE (document_id, client_id, client_seq))",
+  "code_language": "sql",
+  "advantages": [
+   "Constraints design invariants enforce karte hain",
+   "Sab queries PK range scans"
+  ],
+  "disadvantages": [
+   "Do indexes per insert (PK + unique) -- write cost",
+   "user_id FK missing"
+  ],
+  "common_mistakes": [
+   "Global serial id ko order maan lena (doc-level order chahiye)",
+   "Idempotency sirf app code mein, DB constraint nahi"
+  ],
+  "follow_up_questions": [
+   "user_id pe FK kyun nahi?",
+   "Op log partition kaise karoge?",
+   "jsonb vs bytea vs text?"
+  ],
+  "concepts": [
+   "schema design",
+   "composite primary key",
+   "idempotency",
+   "jsonb"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-037",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why do you keep both documents.content and documents.rev on the documents row, and why is that row the lock?",
+  "answer_hinglish": "`documents` row current state hold karta hai: `content` (poora text) aur `rev` (head revision). Do reasons:\n\n1. Fast reads: join, `GET /docs/{id}`, restore -- sabko current text chahiye. Op log se har baar replay karna (ya snapshot + replay) mehenga hoga. Toh current state materialised hai.\n\n2. Sequencer: `SELECT content, rev FROM documents WHERE id = :d FOR UPDATE` ek hi query mein (a) lock leta hai aur (b) apply ke liye current content aur head rev deta hai. Migration comment: `rev bigint NOT NULL DEFAULT 0, -- the sequencer's counter; row lock = per-document total order`. Lock ka granularity document hai -- alag documents parallel chalte hain, ek document serial.\n\nKyun yeh row, alag 'locks' table nahi? Kyunki wahi row update bhi hoti hai -- lock aur state ek jagah, ek transaction mein consistent. Postgres row lock `FOR UPDATE` tab tak hold hota hai jab tak transaction commit/rollback na ho, aur doosra `FOR UPDATE` wait karta hai.\n\nInvariant: `documents.rev == max(operations.rev)` aur `documents.content == replay(all ops)`. Dono same transaction mein update hote hain, toh invariant hamesha hold karta hai.\n\nCost: har op pe poora `content` UPDATE hota hai. Postgres MVCC mein update = naya row version; bada text TOAST mein jaata hai aur TOAST bhi rewrite hota hai. 1MB doc pe har keystroke-batch 1MB write -- write amplification. Chhote docs ke liye theek, bade ke liye problem (Trade-offs section mein detail).",
+  "why_needed": "Materialised state vs event log, aur lock granularity -- dono DB design ke core decisions hain.",
+  "real_world_analogy": "Register ka last page (current balance) alag likha hai taaki har baar poori ledger add na karni pade; aur register ek time pe ek hi clerk ke haath mein.",
+  "how_it_works": "Row-level FOR UPDATE lock on the materialised state row; op insert + state update in same txn.",
+  "in_this_project": "`migrations/versions/0001_initial.py` documents table; `service.submit` lock + UPDATE; `service.snapshot` reads current state.",
+  "implementation_files": [
+   "projects/08-collab/migrations/versions/0001_initial.py",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/service.py::snapshot"
+  ],
+  "code_example": "-- real (from migration)\nCREATE TABLE documents (\n  id uuid PRIMARY KEY DEFAULT gen_random_uuid(),\n  title text NOT NULL,\n  owner_id uuid NOT NULL REFERENCES users(id),\n  content text NOT NULL DEFAULT '',\n  rev bigint NOT NULL DEFAULT 0,          -- the sequencer's counter; row lock = per-document total order\n  created_at timestamptz NOT NULL DEFAULT now(),\n  updated_at timestamptz NOT NULL DEFAULT now())",
+  "code_language": "sql",
+  "advantages": [
+   "Lock + state ek row mein, ek txn mein consistent",
+   "Current reads O(1)",
+   "Per-doc parallelism"
+  ],
+  "disadvantages": [
+   "Full-content rewrite per op (write amplification, WAL)",
+   "Dead tuples -> vacuum pressure on hot docs"
+  ],
+  "common_mistakes": [
+   "Lock alag table mein aur state alag -- consistency bugs",
+   "Table-level lock (saare docs serial)"
+  ],
+  "follow_up_questions": [
+   "Bade docs ke liye content kaise store karoge?",
+   "FOR UPDATE vs FOR NO KEY UPDATE?",
+   "Vacuum hot row ke saath kaise behave karega?"
+  ],
+  "concepts": [
+   "materialised state",
+   "row lock",
+   "FOR UPDATE",
+   "MVCC",
+   "write amplification"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-038",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How do snapshots work, how would you choose snapshot_every, and what about op-log retention?",
+  "answer_hinglish": "Snapshots: `snapshots (document_id, rev, content, PRIMARY KEY (document_id, rev))`. Rev 0 pe create ke waqt aur phir `submit` mein jab `rev % snapshot_every == 0` (default 50) -- usi transaction mein full content insert. `content_at(rev)` nearest snapshot <= rev + max 49 ops replay.\n\n`snapshot_every` choose karna = storage vs reconstruction time trade-off:\n- Storage: har snapshot full content. Doc size S, total revs R -> snapshot storage ~ S * R / N. 100KB doc, 100k revs, N=50 -> ~200MB sirf ek doc ke snapshots. N chhota = zyada storage.\n- Reconstruction: worst case N-1 ops apply. Har apply O(S). N=50 pe 50 x 100KB string building = trivial ms.\n- Write path: snapshot insert usi locked transaction mein -- har Nth op thoda slow (bada INSERT). Lock time badhta hai.\nPractical: N ko op count ke bajaye 'bytes of ops since last snapshot' ya time-based (har 5 min) karna better hota; bade docs ke liye N bada, chhote ke liye chhota.\n\nRetention (implemented NAHI, `DATABASE_DESIGN.md` mein documented): op log hamesha badhta hai. Options:\n1. Ops older than newest snapshot ko cold storage (S3/parquet) mein archive -- trade-off: per-edit history beyond snapshot lose (ya slow).\n2. Snapshots ko thin karna: last day ke saare, last month ke daily, older weekly -- jaise Google Docs version history 'named versions' + compaction.\n3. Partition `operations` by document hash ya time, taaki purane partitions detach/drop ho sakein.\n\nCatch-up ko bhi dhyan rakhna: agar ops archive ho gaye aur ek client bahut purane last_rev se reconnect kare, toh catch-up ke bajaye full content join dena padega.",
+  "why_needed": "Unbounded log growth har event-sourced system ki production problem hai.",
+  "real_world_analogy": "CCTV footage: har frame rakhna mehenga; isliye har ghante ka keyframe (snapshot) aur beech ke changes; purani recordings compress karke archive.",
+  "how_it_works": "Periodic full-state checkpoint inside sequencer txn; history = checkpoint + replay; retention policy offline.",
+  "in_this_project": "`collab/service.py::submit` (snapshot insert), `content_at`, `create_document`; `collab/config.py` `snapshot_every: int = 50`; `DATABASE_DESIGN.md` 'Retention / compaction (not implemented, documented)'.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::content_at",
+   "projects/08-collab/collab/config.py::snapshot_every",
+   "projects/08-collab/DATABASE_DESIGN.md"
+  ],
+  "code_example": "# real, collab/service.py\nif rev % settings.snapshot_every == 0:\n    await s.execute(text(\"INSERT INTO snapshots (document_id, rev, content) VALUES (:d, :r, :c)\"),\n                    {\"d\": doc_id, \"r\": rev, \"c\": content})",
+  "code_language": "python",
+  "advantages": [
+   "Bounded history read cost",
+   "Snapshot atomically consistent with op"
+  ],
+  "disadvantages": [
+   "Full-content snapshots storage heavy",
+   "Snapshot write lock ke andar"
+  ],
+  "common_mistakes": [
+   "Snapshot async banana bina consistency ke soche",
+   "Op log kabhi trim na karna aur phir disk full"
+  ],
+  "follow_up_questions": [
+   "Snapshot background job mein kyun nahi?",
+   "Delta snapshots kaise kaam karenge?",
+   "Archived ops ke saath catch-up?"
+  ],
+  "concepts": [
+   "snapshot",
+   "compaction",
+   "retention",
+   "event sourcing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Synchronous snapshot = consistent but slows every Nth op; async = fast but needs care (snapshot at rev must equal replay).",
+   "failure_scenarios": "Snapshot insert fail -> poora op transaction rollback -> client ko invalid op error; disk full pe sab writes fail.",
+   "alternatives": "Async snapshotter worker jo `documents` row se content+rev padhe (consistent pair) aur insert kare; content-addressed dedup snapshots.",
+   "scale_10x_100x": "100x revs pe operations table billions rows; partition by hash(document_id) aur archive by time; snapshots ko object storage mein.",
+   "production_improvements": "Retention job + metrics (ops per doc, snapshot bytes); history API mein 'archived' flag."
+  }
+ },
+ {
+  "id": "COLB-039",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Why do you store the transformed operation rather than the original one the client sent?",
+  "answer_hinglish": "Server jo op store karta hai woh history ke against transform ho chuka hai -- yaani exactly woh op jo doc@(rev-1) pe apply hua. Migration comment: 'already transformed: applies to the doc at rev - 1'.\n\nFayde:\n1. Replay = plain left fold: `content_at` mein snapshot se shuru karke ops ek-ek apply. Koi base_rev, koi transform nahi. Original ops store karte toh har replay pe har op ko uske base se aage transform karna padta -- O(n^2) aur fragile (aur non-distributivity ki wajah se exact same sequence reproduce karna padta).\n2. Fan-out: jo op store hua wahi broadcast hota hai. Doosre clients ka state head pe hai, unhe transformed op hi chahiye.\n3. Catch-up / gap fill: `ops_between` se aaye ops directly bhejne layak.\n4. Audit: har row ka effect clear.\n\nCost (`TRADEOFFS.md` #5: 'the original intent (pre-transform op) is lost'): agar kabhi debug karna ho ki client ne actually kya bheja tha (e.g. OT bug investigate), toh original nahi hai. `base_rev` bhi store nahi hota. Toh 'client ne rev 7 pe yeh bheja aur server ne rev 9 ke against transform karke yeh banaya' reconstruct nahi ho sakta.\n\nProduction improvement: `base_rev` column add karna sasta hai (8 bytes) aur debugging mein bahut useful; original op optional audit column ya sampled logging mein.",
+  "why_needed": "Event store mein 'kya store karein' ka decision downstream sab kuch simplify ya complicate karta hai.",
+  "real_world_analogy": "Translator ki final translated copy file karna (jo sab padhenge), na ki original rough notes -- padhna aasan, par original intent ka record nahi.",
+  "how_it_works": "Persist post-transform op; broadcast same; replay = fold.",
+  "in_this_project": "`migrations/versions/0001_initial.py` (op column comment), `service.submit` stores `op.to_json()` after transform loop, `content_at` plain apply loop. `DATABASE_DESIGN.md`, `TRADEOFFS.md` #5.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/service.py::content_at",
+   "projects/08-collab/TRADEOFFS.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Trivial replay",
+   "One representation for storage, fan-out, catch-up"
+  ],
+  "disadvantages": [
+   "Original intent aur base_rev lost -- OT bugs debug karna mushkil"
+  ],
+  "common_mistakes": [
+   "Original op store karke replay ko transform-based banana",
+   "base_rev ko debugging ke liye na rakhna"
+  ],
+  "follow_up_questions": [
+   "base_rev store karne se kya debug ho sakta hai?",
+   "Event sourcing mein 'command vs event' ka farak yahan kaise map hota hai?",
+   "Transformed op ko validate kaise karte ho?"
+  ],
+  "concepts": [
+   "event sourcing",
+   "transformed op",
+   "command vs event"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-040",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "How would the operations table and op log scale for millions of documents and billions of operations?",
+  "answer_hinglish": "Is project mein ek single Postgres hai aur `operations` ek plain table. Chhote se medium scale pe yeh perfectly theek hai kyunki saari queries `(document_id, rev)` PK range scans hain -- table kitni bhi badi ho, per-doc query fast.\n\nProblems billions rows pe:\n1. Index size aur cache: PK + unique index dono bade; hot docs ke pages cache mein rehte hain, cold docs ke disk se. Theek hai, par vacuum/backup heavy.\n2. Write throughput: har op = 2 index inserts + documents row update (+ TOAST). Saare documents ek primary pe likhte hain -> write capacity single node ki.\n3. Maintenance: billion-row table pe migrations, reindex, vacuum painful.\n\nKya karoge:\n- Partitioning: `PARTITION BY HASH (document_id)` (say 64 partitions) -- har partition chhota index, parallel vacuum. Ya time-based partitions archive ke liye, lekin per-doc queries phir multiple partitions pe jaati hain.\n- Sharding by document_id: kyunki ek document ka saara state (documents row, ops, snapshots, permissions) ek shard pe reh sakta hai, aur cross-document transactions nahi hain -- yeh workload naturally shardable hai. Citus ya app-level shard map (doc_id -> shard).\n- Archive: newest snapshot se purane ops cold storage mein (`DATABASE_DESIGN.md` mein documented, implemented nahi).\n- Hot documents ke liye DB sequencer hi hatao: in-memory sequencer per doc (sticky routing), ops batch mein persist.\n\nMain yeh bhi bolunga: per-document total order requirement sharding ko easy banati hai -- ek doc ek shard -- par ek doc ki throughput ek node se zyada nahi ja sakti.",
+  "why_needed": "Scale-out ka sawaal har senior backend interview mein aata hai; is workload ki natural shard key identify karna key hai.",
+  "real_world_analogy": "Ek badi library ko alag buildings mein baantna -- har kitaab (document) ka poora record ek hi building mein, taaki kisi kitaab ke liye do buildings na ghoomni padein.",
+  "how_it_works": "Shard key = document_id; per-shard partitions; archive cold ops.",
+  "in_this_project": "Current: `migrations/versions/0001_initial.py` single table, `DATABASE_DESIGN.md` retention note. Partitioning/sharding implement nahi hai.",
+  "implementation_files": [
+   "projects/08-collab/migrations/versions/0001_initial.py",
+   "projects/08-collab/DATABASE_DESIGN.md",
+   "projects/08-collab/SYSTEM_DESIGN.md"
+  ],
+  "code_example": "-- illustrative (NOT in repo): hash partitioning by document\nCREATE TABLE operations (\n  document_id uuid NOT NULL, rev bigint NOT NULL, op jsonb NOT NULL,\n  user_id uuid NOT NULL, client_id text NOT NULL, client_seq bigint NOT NULL,\n  created_at timestamptz NOT NULL DEFAULT now(),\n  PRIMARY KEY (document_id, rev),\n  UNIQUE (document_id, client_id, client_seq)\n) PARTITION BY HASH (document_id);\nCREATE TABLE operations_p0 PARTITION OF operations FOR VALUES WITH (MODULUS 64, REMAINDER 0);",
+  "code_language": "sql",
+  "advantages": [
+   "document_id natural shard key -- no cross-shard txns",
+   "PK range scans scale with table size"
+  ],
+  "disadvantages": [
+   "Single doc throughput still single node",
+   "Resharding operationally hard"
+  ],
+  "common_mistakes": [
+   "Global sequence/timestamp ko order banana",
+   "Time-partitioning se per-doc queries ko multi-partition bana dena"
+  ],
+  "follow_up_questions": [
+   "Shard rebalance ke dauraan live doc ka kya?",
+   "Citus vs app-level sharding?",
+   "Ops ko object storage mein kab move karoge?"
+  ],
+  "concepts": [
+   "partitioning",
+   "sharding",
+   "shard key",
+   "archival"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hash partition = even spread, per-doc locality; time partition = easy archival par per-doc queries spread.",
+   "failure_scenarios": "Ek shard down = uske saare docs read-only/unavailable; cross-shard user doc list (`GET /docs`) ko fan-out query chahiye.",
+   "alternatives": "Purpose-built log store (Kafka compacted topic per doc partition) + object storage for snapshots; ya CRDT state blobs (Yjs update log) per doc.",
+   "scale_10x_100x": "100x: shard map service, per-shard sequencer, archived ops; `GET /docs` permission list ko alag index/table (user -> docs) chahiye.",
+   "production_improvements": "Shard-aware routing in app (doc_id -> DSN), partition maintenance automation, op log size per doc metric."
+  }
+ },
+ {
+  "id": "COLB-041",
+  "project_slug": "p08-collab",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How are permissions modelled, and how does sharing work at the SQL level?",
+  "answer_hinglish": "`document_permissions (document_id, user_id, role CHECK IN ('owner','editor','viewer'), PRIMARY KEY (document_id, user_id))`, dono FKs `ON DELETE CASCADE`.\n\n- Composite PK: ek user ka ek document pe EK role. Lookup `role_of` exactly PK lookup hai.\n- CHECK constraint: invalid role DB level pe impossible.\n- CASCADE: document delete -> permissions, ops, snapshots sab saaf.\n\nCreate: `create_document` ek transaction mein documents row, owner permission row aur rev-0 snapshot insert karta hai -- atomic, toh 'owner-less document' kabhi nahi banta.\n\nShare: `POST /docs/{id}/share` (owner only, `require_role(..., 'owner')`):\n```\nINSERT INTO document_permissions (document_id, user_id, role) VALUES (:d, :u, :r)\nON CONFLICT (document_id, user_id) DO UPDATE SET role = EXCLUDED.role\n  WHERE document_permissions.role <> 'owner' RETURNING role\n```\nUpsert -- naya share ya existing role change ek hi statement mein, race-free. Body ka `role` pydantic pattern `^(editor|viewer)$` se restricted -- share se 'owner' nahi de sakte.\n\nRole hierarchy code mein: `ROLES = {'viewer': 0, 'editor': 1, 'owner': 2}`; `require_role` compare karta hai.\n\n'My documents' list: `documents JOIN document_permissions WHERE p.user_id = :u ORDER BY updated_at DESC`. PK `(document_id, user_id)` is query ke liye ideal nahi -- user_id leading nahi hai. Scale pe `(user_id)` index chahiye. Observation: migration mein yeh index nahi hai.\n\nReview fix: pehle owner khud ko share karke apna role 'viewer' kar sakta tha (upsert owner row overwrite karta) -> document owner-less. Ab `DO UPDATE ... WHERE role <> 'owner' RETURNING role` -- owner row pe update hota hi nahi, `RETURNING` khaali -> `409 Conflict`. Revoke ke liye `DELETE /docs/{id}/share/{user_id}` endpoint hai (owner ko revoke karna bhi 409). Test: `test_revoking_access_closes_sockets_and_sequencer_rejects`.",
+  "why_needed": "ACL modelling + upsert semantics common DB design question hai.",
+  "real_world_analogy": "Ghar ki chaabiyon ka register: har insaan ke naam ek hi entry (owner/editor/viewer); nayi chaabi do ya purani badlo, register mein ek line update.",
+  "how_it_works": "Composite PK ACL table; upsert for share; role ordering in app.",
+  "in_this_project": "`migrations/versions/0001_initial.py` document_permissions; `collab/api.py::share` (owner row guarded), `collab/api.py::unshare`; `collab/service.py::require_role`, `role_of`, `create_document`.",
+  "implementation_files": [
+   "projects/08-collab/migrations/versions/0001_initial.py",
+   "projects/08-collab/collab/api.py::share",
+   "projects/08-collab/collab/service.py::require_role",
+   "projects/08-collab/collab/api.py::unshare"
+  ],
+  "code_example": "# real, collab/api.py\nawait s.execute(text(\"INSERT INTO document_permissions (document_id, user_id, role) VALUES (:d, :u, :r) \"\n                     \"ON CONFLICT (document_id, user_id) DO UPDATE SET role = EXCLUDED.role\"),\n                {\"d\": doc_id, \"u\": body.user_id, \"r\": body.role})",
+  "code_language": "python",
+  "advantages": [
+   "DB-enforced role values",
+   "Atomic upsert",
+   "Cascade cleanup"
+  ],
+  "disadvantages": [
+   "user_id-leading index missing for 'my docs'",
+   "Owner transfer ka koi endpoint nahi (owner row share se badal hi nahi sakta)",
+   "No audit of permission changes (SECURITY.md gap)"
+  ],
+  "common_mistakes": [
+   "Role ko documents table mein array mein rakhna",
+   "Check-then-insert (race) instead of upsert"
+  ],
+  "follow_up_questions": [
+   "Revoke endpoint live connection pe kaise asar karta hai?",
+   "Group/team sharing kaise model karoge?",
+   "'Anyone with link' sharing?"
+  ],
+  "concepts": [
+   "ACL",
+   "composite key",
+   "upsert",
+   "ON CONFLICT"
+  ],
+  "advanced": null
+ }
+]

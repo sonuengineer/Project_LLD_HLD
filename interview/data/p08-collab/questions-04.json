@@ -1,0 +1,1041 @@
+[
+ {
+  "id": "COLB-064",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "Why do you use one-time WebSocket tickets instead of putting the bearer token in the WebSocket URL?",
+  "answer_hinglish": "Problem: browser ka `WebSocket` API custom headers set nahi karne deta -- `Authorization: Bearer ...` nahi bhej sakte. Common shortcut hai token ko query string mein daalna: `wss://host/ws?token=ct_...`. Par URLs leak hote hain: nginx/LB access logs, proxy logs, browser history, monitoring tools, error trackers -- sab full URL record karte hain. Long-lived bearer token wahan pahuncha = account compromise.\n\nMera solution (`api.py::ws_ticket`): page apne bearer token se HTTP `POST /ws-tickets` call karta hai (header mein, safe). Server ek random ticket banata hai `'wst_' + secrets.token_urlsafe(24)`, Redis mein `collab:ticket:{ticket}` -> `{id, name}` store karta hai with TTL `ws_ticket_ttl_seconds` = 30s. Page `ws?ticket=wst_...` se connect karta hai.\n\n`/ws` pe: `raw = await redis.getdel(f'collab:ticket:{ticket}')` -- GETDEL atomic hai: read + delete ek command. Ticket ek hi baar use ho sakta hai. Missing/expired -> close 4401.\n\nToh agar ticket log mein leak bhi ho: 30s mein expire, aur pehle connection ne already consume kar liya -- replay useless. Test `test_ws_ticket_is_single_use`: same ticket se doosra connect fail.\n\nCost (`TRADEOFFS.md` #7): har connect/reconnect pe ek extra HTTP call. Reconnect storms mein yeh double requests hain, par cheap hain.",
+  "why_needed": "WebSocket auth ka yeh pattern bahut common interview question hai, aur log aksar token-in-URL wali galti karte hain.",
+  "real_world_analogy": "Cinema mein entry: apna ID card (token) gate pe nahi chhodte; counter pe ID dikha ke ek baar use hone wala ticket lete ho jo show ke baad bekaar hai.",
+  "how_it_works": "Exchange long-lived credential (header) for short-lived single-use ticket; consume atomically with GETDEL on connect.",
+  "in_this_project": "`collab/api.py::ws_ticket` (docstring explains), `collab/api.py::ws_endpoint` (`getdel`), `collab/config.py` `ws_ticket_ttl_seconds: int = 30`, test `test_ws_ticket_is_single_use`, `SECURITY.md` row 1.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_ticket",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/tests/test_realtime.py::test_ws_ticket_is_single_use",
+   "projects/08-collab/SECURITY.md"
+  ],
+  "code_example": "# real, collab/api.py\nticket = \"wst_\" + secrets.token_urlsafe(24)\nawait request.app.state.redis.set(f\"collab:ticket:{ticket}\", json.dumps({\"id\": str(user[\"id\"]), \"name\": user[\"name\"]}),\n                                  ex=request.app.state.settings.ws_ticket_ttl_seconds)\n...\nraw = await app.state.redis.getdel(f\"collab:ticket:{ticket}\")      # one-time use\nif raw is None:\n    await ws.close(code=4401, reason=\"invalid or expired ticket\")\n    return",
+  "code_language": "python",
+  "advantages": [
+   "Long-lived token never in URL/logs",
+   "Single-use + 30s TTL limits replay",
+   "Any server can validate (Redis shared)"
+  ],
+  "disadvantages": [
+   "Extra HTTP round trip per connect",
+   "Redis dependency for auth"
+  ],
+  "common_mistakes": [
+   "GET then DEL as two commands (race: two connects with same ticket)",
+   "Long TTL tickets",
+   "Token in URL 'kyunki TLS hai' -- TLS logs ko nahi rokta"
+  ],
+  "follow_up_questions": [
+   "Cookies se WebSocket auth kyun nahi?",
+   "Sec-WebSocket-Protocol header trick kya hai?",
+   "Ticket ko user ke IP se bind karoge?"
+  ],
+  "concepts": [
+   "WebSocket auth",
+   "one-time ticket",
+   "GETDEL",
+   "token leakage"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-065",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "What is Cross-Site WebSocket Hijacking (CSWSH), and how does your design defend against it?",
+  "answer_hinglish": "CSWSH CSRF ka WebSocket version hai. WebSocket handshake ek normal GET hai, aur browsers cross-origin WebSocket connections allow karte hain (CORS WebSockets pe apply nahi hota). Agar server cookies se authenticate karta hai, toh evil.com ka JS `new WebSocket('wss://collab.example/ws')` kholega, browser victim ki cookies automatically bhej dega, server use victim samjhega -- aur attacker page victim ke documents padh/edit kar sakta hai (bidirectional, CSRF se bhi bura).\n\nStandard defenses: (1) `Origin` header check handshake pe (browser forge nahi kar sakta), (2) cookies pe SameSite, (3) auth ko ambient credentials se hata ke explicit token pe le jaana.\n\nMera design (3) karta hai (`SECURITY.md`: 'Cross-site WebSocket hijacking | tickets required (cookies alone don't authenticate)'). `/ws` ko `ticket` query param chahiye; ticket sirf `POST /ws-tickets` se milta hai jo `Authorization: Bearer` header maangta hai. Evil.com ke paas victim ka bearer token nahi hai (woh page ke JS/storage mein hai, same-origin policy evil.com ko padhne nahi deti), toh woh ticket mint nahi kar sakta. Koi cookie-based auth hai hi nahi.\n\nObservation (gap): `/ws` `Origin` header check NAHI karta. Abhi zaroori nahi kyunki auth ambient nahi hai, par defence-in-depth ke liye allowed origins list check karna chahiye -- agar future mein koi cookie session add ho, toh CSWSH turant khul jayega. Saath hi demo page token ek input box mein rakhta hai; XSS ho toh token chori ho sakta hai -- isliye `editor.html` presence names escape karta hai.",
+  "why_needed": "Real-time endpoints pe CSRF-type attacks commonly miss hote hain; interviewer security depth check karta hai.",
+  "real_world_analogy": "Agar tumhara ghar sirf 'chehra dekh ke' (cookie) khulta hai, toh koi tumhe dhakka de ke andar le jaaye aur uske saath ghus jaaye. Agar darwaza ek OTP (ticket) maangta hai jo sirf tumhare phone pe aata hai, toh yeh trick kaam nahi karti.",
+  "how_it_works": "Non-ambient credential (ticket from header-authenticated endpoint) defeats cross-origin initiation; Origin check is an additional layer.",
+  "in_this_project": "`collab/api.py::ws_endpoint` (ticket required, no Origin check), `collab/api.py::current_user` (Bearer header), `SECURITY.md`, `collab/editor.html` (name escaping `.replace(/[<&>]/g,'')`).",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/collab/api.py::current_user",
+   "projects/08-collab/SECURITY.md",
+   "projects/08-collab/collab/editor.html"
+  ],
+  "code_example": "# illustrative hardening (NOT in repo): Origin allow-list on the handshake\nALLOWED = {\"https://collab.example.com\"}\norigin = ws.headers.get(\"origin\")\nif origin not in ALLOWED:\n    await ws.close(code=4403, reason=\"origin not allowed\")\n    return",
+  "code_language": "python",
+  "advantages": [
+   "No ambient auth -> CSWSH not possible",
+   "Ticket single-use limits damage of leaks"
+  ],
+  "disadvantages": [
+   "No Origin check (defence-in-depth gap)",
+   "Token in page JS -> XSS = full compromise"
+  ],
+  "common_mistakes": [
+   "WebSockets pe CORS protection assume karna",
+   "Cookie auth + no Origin check"
+  ],
+  "follow_up_questions": [
+   "Origin header non-browser clients forge kar sakte hain -- toh kyun useful?",
+   "Token ko HttpOnly cookie mein rakhna better hai kya?",
+   "XSS se token kaise bachaoge?"
+  ],
+  "concepts": [
+   "CSWSH",
+   "Origin header",
+   "ambient authority",
+   "CSRF"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Explicit tokens kill CSRF-class attacks but expose tokens to XSS; cookies (HttpOnly) resist XSS theft but need Origin/SameSite defences.",
+   "failure_scenarios": "If someone later adds cookie sessions for convenience, CSWSH opens silently because there's no Origin check.",
+   "alternatives": "HttpOnly SameSite=strict cookie + Origin allow-list + CSRF-safe ticket endpoint.",
+   "scale_10x_100x": "Scale se farak nahi; multi-domain deployments (custom domains per tenant) Origin list ko dynamic banate hain.",
+   "production_improvements": "Origin allow-list config, CSP on editor page, short-lived access tokens with refresh."
+  }
+ },
+ {
+  "id": "COLB-066",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How does access control work for documents, both over HTTP and per WebSocket message?",
+  "answer_hinglish": "Teen roles: owner > editor > viewer (`ROLES = {'viewer': 0, 'editor': 1, 'owner': 2}`).\n\n`service.require_role(sm, doc_id, user_id, minimum)`: doc exist karta hai? user ka role (`document_permissions` PK lookup)? Role None (doc nahi ya access nahi) -> `NotFound('document not found')` -- 403 nahi, 404. Kyun? Stranger ko yeh bhi pata nahi chalna chahiye ki yeh doc ID exist karta hai (enumeration/information leak). Role hai par kam -> `Forbidden(f'requires {minimum} access')`.\n\nHTTP:\n- `GET /docs/{id}`, history, revisions, presence -> viewer.\n- `POST /docs/{id}/restore/{rev}` -> editor.\n- `POST /docs/{id}/share`, `DELETE /docs/{id}/share/{user_id}` -> owner.\n\nWebSocket:\n- Join pe `require_role(..., 'viewer')` -> fail pe error + close 4403. Role `Conn.role` mein store.\n- Har `op` message pe: `if ROLES[conn.role] < ROLES['editor']` -> `forbidden` error message, op discard, connection open (viewer padhta rahe). Per-message check isliye zaroori hai ki viewer bhi socket pe `op` frame bhej sakta hai -- UI mein button chhupana security nahi.\n- Cursor/ping viewers ke liye allowed.\n\nTest `test_viewer_cannot_edit_and_strangers_cannot_join`: viewer ka insert -> errors[0].code == 'forbidden', content unchanged 'x'; stranger ka connect raise karta hai.\n\nRole join pe `Conn.role` mein cache hota hai (fast path), par review ke baad yeh akela guard nahi: share/revoke pe `perm` event har server pe `Hub._apply_permission` se role update ya socket close karta hai, aur `service.submit` transaction ke andar role dobara check karta hai (authoritative). Details agle sawaal mein.",
+  "why_needed": "AuthZ har backend interview mein aata hai; real-time channels pe per-message authorization khaas important hai.",
+  "real_world_analogy": "Library: member card (viewer) se padh sakte ho, librarian card (editor) se kitaab mein entry, owner (head librarian) naye members bana sakta hai. Aur jo member nahi, use library ka yeh section dikhta hi nahi.",
+  "how_it_works": "Role lookup -> hierarchy compare; 404 for no-access; role cached per connection; op handler checks role each message.",
+  "in_this_project": "`collab/service.py::require_role`, `ROLES`; `collab/api.py` routes and `ws_endpoint` op branch; `service.submit` role re-check; `realtime.py::_apply_permission`; `SECURITY.md` rows 2-3.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::require_role",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/tests/test_realtime.py::test_viewer_cannot_edit_and_strangers_cannot_join",
+   "projects/08-collab/collab/service.py::submit"
+  ],
+  "code_example": "# real, collab/service.py\nasync def require_role(sm, doc_id, user_id, minimum: str) -> str:\n    async with sm() as s:\n        exists = await s.scalar(text(\"SELECT 1 FROM documents WHERE id = :d\"), {\"d\": doc_id})\n        role = await role_of(s, doc_id, user_id) if exists else None\n    if role is None:\n        raise NotFound(\"document not found\")     # don't reveal documents you can't see\n    if ROLES[role] < ROLES[minimum]:\n        raise Forbidden(f\"requires {minimum} access\", details={\"role\": role})\n    return role",
+  "code_language": "python",
+  "advantages": [
+   "Server-enforced per message",
+   "No existence leak",
+   "Simple hierarchy"
+  ],
+  "disadvantages": [
+   "Socket ka cached role pub/sub event aane tak stale (write phir bhi submit mein reject hota hai)",
+   "No audit of permission changes"
+  ],
+  "common_mistakes": [
+   "UI-only enforcement",
+   "403 for non-members (leaks existence)",
+   "Checking role only on join for writes"
+  ],
+  "follow_up_questions": [
+   "Revocation live connections pe kaise apply hota hai, aur event lost ho toh?",
+   "Comment-only role kaise add karoge?",
+   "Link sharing ka model?"
+  ],
+  "concepts": [
+   "RBAC",
+   "authorization",
+   "information leakage",
+   "per-message authorization"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-067",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "How do you validate operations and protect the server from malicious or resource-exhausting clients?",
+  "answer_hinglish": "Threats: malformed ops (crash/exception), wrong-length ops (corrupt doc), giant ops/docs (memory/CPU), op floods (DoS), slow readers (memory).\n\nDefences in code:\n1. Parse: `TextOp.from_json` -- list required, components int/str only; else `InvalidOperation`.\n2. Size before lock: `len(op.ops) > max_op_components` (10,000) -> reject; isse transform ka O(components) cost bounded, aur lock lene se pehle hi.\n3. Semantic: base_rev range check `[0, head]`; transform against history; `apply` exact base length -- galat-length op kabhi store nahi hota. Test `test_invalid_operation_rejected`: `[10, 'x']` on 'abc' -> invalid_operation, rev 0.\n4. Doc size: `len(content) > max_document_chars` (1,000,000) -> reject.\n5. HTTP: pydantic -- title <= 200, initial content <= 100,000, name <= 100, history limit <= 1000.\n6. Per-connection: `client_id[:64]` truncate; bounded send queue 1000 -> slow client dropped (1013).\n7. Malformed frames -> 4400 close.\n\nGaps (`SECURITY.md` bhi kuch list karta hai):\n- No rate limiting on ops per user/connection: ek editor 100s ops/s bhej ke doc ka sequencer (66 ops/s) saturate kar sakta hai -- doosre editors ka latency badhega. Cursor messages bhi unthrottled -- har cursor ek Redis HGET+HSET+PUBLISH.\n- No explicit WebSocket max message size config on server (uvicorn/websockets default ~1MB hota hai typically, par explicitly set nahi).\n- Single insert string ka size per op limit nahi (doc limit hi hai).\n- Transform cost with stale base_rev: attacker base_rev=0 bheje purane bade doc pe -> poori history ke against transform, lock ke andar. Max staleness limit chahiye.",
+  "why_needed": "Untrusted real-time input DoS ka bada surface hai; interviewer limits aur gaps dono sunna chahta hai.",
+  "real_world_analogy": "Club ke bouncer ki checklist: ID valid? (parse) bag ka size? (component limit) andar jagah hai? (doc size) -- par yeh nahi check kiya ki ek banda 100 baar andar-bahar kar raha hai (rate limit).",
+  "how_it_works": "Layered validation: syntax -> size -> semantics -> resulting state size; backpressure on output; gaps: input rate limiting.",
+  "in_this_project": "`collab/service.py::submit`, `collab/ot.py::from_json`, `collab/config.py` (`max_document_chars`, `max_op_components`), `collab/api.py` pydantic models, `SECURITY.md` gaps line.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/config.py::max_op_components",
+   "projects/08-collab/SECURITY.md",
+   "projects/08-collab/tests/test_realtime.py::test_invalid_operation_rejected"
+  ],
+  "code_example": "# illustrative (NOT in repo): per-connection token bucket for ops\nclass Bucket:\n    def __init__(self, rate=20, burst=40):\n        self.rate, self.tokens, self.burst, self.t = rate, burst, burst, time.monotonic()\n    def take(self) -> bool:\n        now = time.monotonic()\n        self.tokens = min(self.burst, self.tokens + (now - self.t) * self.rate); self.t = now\n        if self.tokens >= 1:\n            self.tokens -= 1; return True\n        return False",
+  "code_language": "python",
+  "advantages": [
+   "Invalid ops never persisted",
+   "Expensive work bounded before lock",
+   "Slow readers can't exhaust memory"
+  ],
+  "disadvantages": [
+   "No input rate limiting",
+   "Stale base_rev transform cost unbounded",
+   "Cursor flood possible"
+  ],
+  "common_mistakes": [
+   "Validate only JSON shape",
+   "Doing size checks after acquiring the lock"
+  ],
+  "follow_up_questions": [
+   "Max base_rev staleness kaise implement karoge?",
+   "Rate limit per user ya per doc?",
+   "Rate-limited client ko kya response doge?"
+  ],
+  "concepts": [
+   "input validation",
+   "DoS",
+   "rate limiting",
+   "resource limits"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict limits protect the sequencer but can reject legitimate large pastes/offline buffers -> client must split.",
+   "failure_scenarios": "One abusive editor saturates the per-doc lock -> all editors see latency; cursor spam saturates Redis.",
+   "alternatives": "Per-connection token bucket (cf. Project 1 rate limiter), per-doc op quota, server-side op coalescing.",
+   "scale_10x_100x": "At 100x users, abuse becomes certain; limits must be per user + per doc + global, with metrics.",
+   "production_improvements": "Add rate limiter, max staleness (`head - base_rev <= N`), explicit ws max_size, cursor throttle (10Hz)."
+  }
+ },
+ {
+  "id": "COLB-068",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "If an owner revokes a user's access, what happens to that user's open WebSocket connection? How would you fix it?",
+  "answer_hinglish": "Yeh review mein mila gap tha, aur ab fix hai -- interview mein main yahi story sunaata hoon.\n\nPehle: role `ws_endpoint` mein join pe ek baar `require_role` se aata tha aur `Conn.role` mein cache hota tha. Op handler sirf `conn.role` dekhta tha. Toh editor ko viewer banao -> open socket edits bhejta rehta; aur revoke endpoint tha hi nahi (share sirf upsert). Owner khud ko demote bhi kar sakta tha.\n\nFix (teen layers):\n1. Revoke endpoint: `DELETE /docs/{id}/share/{user_id}` (owner only; owner ko revoke ya share se demote karna -> 409).\n2. Push: share/unshare ke baad `hub.publish(doc_id, {type: 'perm', user_id, role})`. Har server ka `_on_message` -> `Hub._apply_permission`: role None -> `access_revoked` error + `Conn.kick(4403)`; warna `conn.role = role` + `{type: 'role'}` message. Isse socket turant read-only/closed ho jaata hai, kisi bhi server pe.\n3. Authoritative check: pub/sub at-most-once hai, event lost ho sakta hai. Isliye `service.submit` document row lock ke andar `role_of` dobara padhta hai -- revoked/viewer -> `Forbidden`. Event lost hua toh bhi write nahi hoga; bas socket thodi der read-only khula rahega.\n\nTest `test_revoking_access_closes_sockets_and_sequencer_rejects`: bob DOOSRE server pe, downgrade -> uska insert `forbidden`; revoke -> `access_revoked` + socket closed; HTTP 404; aur `service.submit` direct call (event bypass) bhi `forbidden`.\n\nTrade-off: per-op ek PK lookup extra, par woh pehle se lock ke andar transaction mein hai, sasta. Already-sent content 'unsee' nahi hota -- revocation forward-looking hai. Abhi bhi gap: permission changes ka audit log nahi.",
+  "why_needed": "Long-lived connections ke saath authorization staleness ek real-world security issue hai jo stateless HTTP mein nahi hota.",
+  "real_world_analogy": "Office ka access card cancel kiya, par woh insaan already andar baitha hai -- card system ko security guard ko bhi batana padega ki usse bahar le aao.",
+  "how_it_works": "Cached authorization on long-lived session; fix with push invalidation + periodic revalidation.",
+  "in_this_project": "`collab/api.py::unshare` (revoke endpoint + perm publish), `collab/api.py::share` (owner row guard, perm publish), `collab/realtime.py::_apply_permission`, `collab/realtime.py::kick`, `collab/service.py::submit` (role re-check under the row lock), test `test_revoking_access_closes_sockets_and_sequencer_rejects`. `FAILURE_SCENARIOS.md` #9c.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::unshare",
+   "projects/08-collab/collab/api.py::share",
+   "projects/08-collab/collab/realtime.py::_apply_permission",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/tests/test_realtime.py::test_revoking_access_closes_sockets_and_sequencer_rejects"
+  ],
+  "code_example": "# real, collab/realtime.py\ndef _apply_permission(self, room: Room, user_id: str, role: str | None) -> None:\n    for c in list(room.conns.values()):\n        if c.user_id != user_id:\n            continue\n        if role is None:\n            c.send({\"type\": \"error\", \"code\": \"access_revoked\", \"message\": \"your access to this document was removed\"})\n            self.stats[\"kicked\"] += 1\n            c.kick(4403, \"access revoked\")\n        else:\n            c.role = role\n            c.send({\"type\": \"role\", \"role\": role})\n\n# real, collab/service.py::submit (inside the transaction, after SELECT ... FOR UPDATE)\nrole = await role_of(s, doc_id, user_id)\nif role is None or ROLES[role] < ROLES[\"editor\"]:\n    raise Forbidden(\"requires editor access\", details={\"role\": role})",
+  "code_language": "python",
+  "advantages": [
+   "Push event: revocation reaches open sockets on every server within a pub/sub hop",
+   "Sequencer re-check: a lost event can never let a revoked user write",
+   "Owner cannot demote or revoke itself (409)"
+  ],
+  "disadvantages": [
+   "One extra PK lookup per op inside the transaction",
+   "If the perm event is lost the socket stays open (read-only in effect) until reconnect",
+   "No permission audit log yet"
+  ],
+  "common_mistakes": [
+   "Assuming HTTP-style per-request auth applies to sockets",
+   "Relying only on pub/sub event (can be lost)",
+   "Fixing only the WebSocket cache and forgetting the authoritative check in the write path"
+  ],
+  "follow_up_questions": [
+   "Event lost ho toh revoked user ka socket kab band hoga?",
+   "Per-op role check ka cost kitna hai?",
+   "Already-sent content ka kya?"
+  ],
+  "concepts": [
+   "authorization staleness",
+   "revocation",
+   "long-lived sessions"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pehle cached role (fast, stale). Ab push event (fast, best effort) + per-op check inside the sequencer transaction (authoritative): writes ke liye strong, reads/socket close ke liye best effort.",
+   "failure_scenarios": "Pehle: fired employee reconnect tak edit karta rehta (ghanton tak). Ab: write turant reject; agar perm event lost ho toh sirf read access socket pe thodi der bacha rehta hai, jab tak reconnect (join pe require_role fail).",
+   "alternatives": "Token with short expiry + forced re-auth on socket; centralized policy service with push invalidation.",
+   "scale_10x_100x": "100x connections: per-op DB auth too costly -> Redis role cache keyed (doc,user) with invalidation.",
+   "production_improvements": "Done: revoke endpoint, perm-change event, sequencer role re-check, owner guard. Next: audit table for permission changes, periodic role re-check on ping to also bound read staleness."
+  }
+ },
+ {
+  "id": "COLB-069",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Is client_id trustworthy? What could a malicious editor do by choosing someone else's client_id?",
+  "answer_hinglish": "`client_id` client khud generate karta hai (`uuid4().hex` Python client mein, `crypto.randomUUID()` browser mein) aur join message mein bhejta hai. Yeh `client_id` doosre clients ko `op` messages mein broadcast hota hai (`_for` op projection mein `client_id` field) -- matlab ek editor sabka client_id dekh sakta hai. Toh client_id trustworthy NAHI hai.\n\nReview mein yeh gap mila tha: server sirf `str(first['client_id'])[:64]` truncate karta tha, user se bind nahi karta tha. Ek authorized editor (attacker) do cheezein kar sakta tha:\n1. Ack hijack: victim ke client_id se join -> `_for` victim ke ops ko attacker ke connection pe 'ack' bana deta aur attacker ke ops victim ko 'ack' lagte -> victim ka outstanding galat clear, victim diverge.\n2. Dedupe suppression: dedupe key `(document_id, client_id, client_seq)` hai. Attacker victim ke client_id + predictable seqs (1,2,3) pe junk ops bhejta -> victim ke real ops 'duplicate' samajh ke silently drop.\n\nFix kiya: `ws_endpoint` ab `client_id = f\"{user['id']}:{str(first['client_id'])[:64]}\"` banata hai. Authenticated user_id prefix ki wajah se do alag users ka client_id kabhi same nahi ho sakta -- na ack match hoga, na dedupe collide. Schema change ki zarurat nahi padi. Regression test `test_client_id_of_another_user_cannot_be_hijacked`: alice aur mallory dono raw 'shared-id' use karte hain, dono seq 1 bhejte hain, final rev 2 aur content 'MA' -- kuch drop nahi hua.\n\nAbhi bhi improve ho sakta hai: doosron ka client_id broadcast karna band karo (conn_id kaafi hai), aur duplicate pe op body compare karo (mismatch -> error, silent ignore nahi).",
+  "why_needed": "Client-supplied identifiers pe trust ka classic security review point; khud ka code critically dekhna senior signal hai.",
+  "real_world_analogy": "Restaurant mein order token number customer khud likh ke de raha hai -- koi doosre ka token number likh de toh uska khana le jaayega aur asli customer ka order 'already served' dikhega.",
+  "how_it_works": "Identity used for routing/dedupe must be bound to authenticated principal or server-issued.",
+  "in_this_project": "`collab/api.py::ws_endpoint` (client_id namespaced as `<user_id>:<client_id>`), `collab/realtime.py::_for`, `collab/service.py::submit` dedupe query, migration `UNIQUE (document_id, client_id, client_seq)`. `SECURITY.md` row 'client_id hijacking'; test `test_client_id_of_another_user_cannot_be_hijacked`.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/collab/realtime.py::_for",
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/migrations/versions/0001_initial.py",
+   "projects/08-collab/tests/test_realtime.py::test_client_id_of_another_user_cannot_be_hijacked"
+  ],
+  "code_example": "# real, collab/api.py::ws_endpoint\n# client_id is chosen by the client and broadcast to everyone in op messages. Namespacing it with the\n# authenticated user id means nobody can reuse another user's client_id to steal their acks or make\n# their ops look like duplicates (dedupe key is (document_id, client_id, client_seq)).\nclient_id = f\"{user['id']}:{str(first['client_id'])[:64]}\"\nconn = Conn(ws, user[\"id\"], user[\"name\"], client_id, role)",
+  "code_language": "python",
+  "advantages": [
+   "Client-chosen ids still work offline/reconnect (no server round trip)",
+   "Namespacing closes ack hijack and dedupe suppression without a schema change"
+  ],
+  "disadvantages": [
+   "Raw client_id still broadcast to all collaborators",
+   "Duplicate with a different payload is still silently ignored"
+  ],
+  "common_mistakes": [
+   "Treating client-generated IDs as identity",
+   "Silent ignore on duplicate with different payload"
+  ],
+  "follow_up_questions": [
+   "Server-issued client_id reconnect pe kaise persist hoga?",
+   "Ack routing ko conn_id pe kar sakte ho?",
+   "Is attack ka detection kaise?"
+  ],
+  "concepts": [
+   "trust boundary",
+   "idempotency key scoping",
+   "spoofing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Client-chosen IDs make offline/reconnect easy (no server round trip) but must be scoped to the authenticated principal.",
+   "failure_scenarios": "Before the fix: a malicious collaborator could silently drop a victim's edits (dedupe) or desync them (ack hijack). After: their ids live in a different namespace; the remaining risk is only information (client ids visible).",
+   "alternatives": "Server-issued session IDs + resume tokens (signed), or include user_id in all routing keys.",
+   "scale_10x_100x": "More collaborators = more insiders; scale increases likelihood, not mechanics.",
+   "production_improvements": "Done: user-scoped client_id. Next: stop broadcasting client_id, compare payload on duplicate, log duplicate anomalies."
+  }
+ },
+ {
+  "id": "COLB-070",
+  "project_slug": "p08-collab",
+  "category": "Security",
+  "difficulty": "Beginner",
+  "question": "How are user tokens stored and checked, and what security gaps does the demo auth have?",
+  "answer_hinglish": "Signup `POST /users {name}` -> `service.create_user`: token `'ct_' + secrets.token_urlsafe(24)` (cryptographically random, ~192 bits). DB mein token NAHI, sirf `token_hash = sha256(token)` store hota hai (`users.token_hash UNIQUE`). Token client ko ek baar return hota hai.\n\nCheck: `current_user` dependency `Authorization: Bearer <token>` parse karta hai, `user_by_token` `sha256(token)` compute karke `WHERE token_hash = :h` lookup karta hai. Nahi mila -> `Unauthorized`.\n\nHash kyun? Agar DB leak/backup chori ho, attacker ke paas hashes hain, tokens nahi -- unhe use nahi kar sakta. Plain SHA-256 (bcrypt/argon2 nahi) kyun theek hai? Kyunki token high-entropy random hai (passwords jaise guessable nahi), toh brute force infeasible; fast hash se har request pe lookup cheap rehta hai aur index pe exact match ho jaata hai.\n\nGaps (`SECURITY.md` khud likhta hai):\n- Demo signup: password nahi, koi bhi naam se user bana sakta hai -- yeh demo hai, real auth (OAuth/SSO, sessions) nahi.\n- Tokens expire nahi hote, rotate/revoke endpoint nahi.\n- No rate limiting on ops (aur signup/ticket endpoints bhi).\n- No TLS in compose -- tokens plaintext over network locally; production mein TLS terminate karna zaroori (wss://).\n- No audit of permission changes.\n- Browser demo token ek input box mein rakhta hai -- XSS = token theft.",
+  "why_needed": "Token storage basic security hygiene hai; demo shortcuts ko honestly acknowledge karna important hai.",
+  "real_world_analogy": "Locker ki chaabi ki photocopy nahi rakhte, sirf chaabi ka 'fingerprint' -- chaabi aaye toh fingerprint match karo; register chori ho jaye toh bhi chaabi nahi banegi.",
+  "how_it_works": "Random token -> sha256 at rest -> hash lookup per request.",
+  "in_this_project": "`collab/service.py::create_user`, `token_hash`, `user_by_token`; `collab/api.py::current_user`; migration `users.token_hash text NOT NULL UNIQUE`; `SECURITY.md` gaps.",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::token_hash",
+   "projects/08-collab/collab/service.py::user_by_token",
+   "projects/08-collab/collab/api.py::current_user",
+   "projects/08-collab/SECURITY.md"
+  ],
+  "code_example": "# real, collab/service.py\ndef token_hash(token: str) -> str:\n    return hashlib.sha256(token.encode()).hexdigest()\n\nasync def create_user(sm, name: str) -> tuple[uuid.UUID, str]:\n    token = \"ct_\" + secrets.token_urlsafe(24)\n    ...",
+  "code_language": "python",
+  "advantages": [
+   "DB leak doesn't leak tokens",
+   "Cheap lookup",
+   "Prefix `ct_` helps secret scanners"
+  ],
+  "disadvantages": [
+   "No expiry/rotation",
+   "Passwordless demo signup",
+   "No TLS locally"
+  ],
+  "common_mistakes": [
+   "Storing raw tokens",
+   "Using bcrypt for high-entropy tokens unnecessarily (slow per request)",
+   "Comparing token strings in app instead of hashed lookup"
+  ],
+  "follow_up_questions": [
+   "Password ke liye sha256 kyun galat hai?",
+   "Token expiry kaise add karoge?",
+   "Real product mein auth kaise karoge?"
+  ],
+  "concepts": [
+   "token hashing",
+   "bearer token",
+   "authentication"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-071",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens when two users type at exactly the same position at the same time?",
+  "answer_hinglish": "Yeh `FAILURE_SCENARIOS.md` ka scenario #1 hai: 'deterministic tie-break, both converge' (`test_two_users_edit_concurrently_and_converge`).\n\nKya hota hai step by step: doc \"ac\", Alice aur Bob dono position 1 pe type karte hain -- Alice \"X\", Bob \"Y\". Dono apne screen pe turant dekhte hain (\"aXc\", \"aYc\") aur op bhejte hain base_rev 0 ke saath.\n\nServer pe dono submit lock pe race karte hain. Maan lo Bob ka pehle lock leta hai -> Bob ka op rev 1 (no history to transform). Phir Alice ka: history mein rev 1 (Bob ka insert) hai; `transform(alice_op, bob_op)[0]` -- dono same position pe insert, tie-break 'first argument (incoming op) wins/left' -> Alice ka \"X\" Bob ke \"Y\" ke LEFT. Alice ka op rev 2: \"aXYc\".\n\nClients:\n- Bob: rev 1 ka ack milta hai. Phir rev 2 (Alice ka transformed op) aata hai, Bob ka koi pending nahi, seedha apply -> \"aXYc\".\n- Alice: rev 1 (Bob ka op) aata hai jab Alice ka op outstanding hai. `transform(outstanding, server_op)` -- same convention, Alice ka op 'a' -> Alice's X left -> server op transformed Y ko X ke baad rakhta hai -> Alice ka doc \"aXYc\". Phir ack rev 2.\n\nDono \"aXYc\". Order kisne pehle commit kiya us pe depend nahi karta, tie-break convention pe karta hai -- aur woh client aur server pe same hai. User ko kabhi kabhi apna char doosre ke baad dikh sakta hai -- acceptable, kyunki dono ka text bacha aur sab same dekhte hain.",
+  "why_needed": "Interviewer ka favourite opening scenario; step by step trace karna confidence dikhata hai.",
+  "real_world_analogy": "Do log ek saath ek line mein khade hone aate hain; rule hai 'jo baad mein list mein naam likhwaye woh aage' -- ajeeb rule, par sab guards same rule follow karte hain toh kabhi jhagda nahi.",
+  "how_it_works": "Sequencer picks commit order; transform tie-break decides text order consistently on both server and clients.",
+  "in_this_project": "`collab/ot.py::transform` tie-break, `collab/service.py::submit`, `collab/client.py::_server_op`; tests `test_concurrent_insert_same_position_tie_break`, `test_two_users_edit_concurrently_and_converge`.",
+  "implementation_files": [
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/collab/ot.py::transform",
+   "projects/08-collab/tests/test_realtime.py::test_two_users_edit_concurrently_and_converge"
+  ],
+  "code_example": "# real, tests/test_realtime.py\nawait asyncio.gather(a.insert(0, \"Alice: \"), b.insert(11, \"!!!\"))\nawait asyncio.gather(a.delete(7, 5), b.insert(5, \",\"))   # alice deletes \"hello\"\nassert await until(lambda: a.settled and b.settled and a.rev == b.rev == 4 and a.doc == b.doc)\nassert final[\"content\"] == \"Alice: , world!!!\"",
+  "code_language": "python",
+  "advantages": [
+   "No lost text",
+   "Deterministic convergence"
+  ],
+  "disadvantages": [
+   "Order of tied inserts may surprise users slightly"
+  ],
+  "common_mistakes": [
+   "Assuming first-committed always goes first",
+   "Different tie conventions in JS vs Python client"
+  ],
+  "follow_up_questions": [
+   "Kya order user ke liye predictable hai?",
+   "Rich text mein tie ka kya?",
+   "Three users tie karein toh?"
+  ],
+  "concepts": [
+   "tie-break",
+   "concurrent insert",
+   "convergence"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-072",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "What happens if Redis restarts while users are editing?",
+  "answer_hinglish": "Redis is system mein disposable hai, toh restart pe data corruption nahi hota, sirf temporary degradation.\n\nKya tootta hai:\n1. Pub/sub: har server ka subscriber connection toot jaata hai -> `_subscriber` exception -> `pubsub_disconnected` log -> 0.5s sleep -> reconnect loop. Is window mein publish hue messages LOST.\n2. Publish: jo server is dauraan `hub.publish` kare, woh exception throw karega. `ws_endpoint` mein publish `submit` ke baad hai aur kisi try mein nahi -- exception generic handler tak jaata hai (RuntimeError ya kuch aur) -> connection close ho sakta hai. Op Postgres mein commit ho chuka hai, toh author reconnect karke catch-up se ack paayega.\n3. Presence hash aur tickets: gone (agar Redis persistence off). Clients ke agle `ping` (10s) pe `touch` presence wapas bana deta hai. Naye connects ko naya ticket chahiye -- client automatically leta hai.\n4. Acks: kyunki ack bhi pub/sub se aata hai, authors ke acks ruk jaate hain -> clients AwaitingConfirm mein, edits buffer mein jama.\n\nRecovery: Redis wapas -> subscribers re-subscribe -> naye ops aate hain -> forwarders gap dekhte hain (`next_rev` < incoming rev) -> 300ms baad Postgres se missing revs fill -> sab clients sahi order mein catch up. `/stats` mein `gap_fills` badhega.\n\nEdits ka nuksaan: zero, kyunki saare committed ops Postgres mein hain (`DEPLOYMENT.md`: 'Redis can be restarted (forwarders gap-fill from Postgres)'). Tail case (last ops ke baad koi naya op nahi): pehle yeh naye edit/reconnect tak stale rehta; ab `check_tails` har `tail_check_ms` (1s) DB heads se missing revs deliver kar deta hai.",
+  "why_needed": "Dependency failure scenarios har production interview mein poochhe jaate hain.",
+  "real_world_analogy": "Office ka PA system band ho gaya: kaam (register entries) chalta raha, bas announcements miss hue; PA wapas aane pe log register dekh ke catch up kar lete hain.",
+  "how_it_works": "Subscriber reconnect loop; gap fill from Postgres on next op; presence/tickets rebuilt by clients.",
+  "in_this_project": "`collab/realtime.py::_subscriber` comment ('Lost the subscription (Redis restart). Messages published meanwhile are LOST -- the ordered forwarder's gap fill recovers them'), `_fill_gap_later`, `touch`; `DEPLOYMENT.md`.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_subscriber",
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/DEPLOYMENT.md"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No data loss",
+   "Self-healing"
+  ],
+  "disadvantages": [
+   "Acks and live updates pause",
+   "Publish errors may drop author's socket",
+   "Tail ops ~1s (tail check) tak late"
+  ],
+  "common_mistakes": [
+   "Assuming Redis restart = data loss in this design",
+   "No reconnect loop for subscriber"
+  ],
+  "follow_up_questions": [
+   "Redis Sentinel/HA add karoge?",
+   "Publish failure pe author ko kya milna chahiye?",
+   "Gap fill thundering herd sab servers pe?"
+  ],
+  "concepts": [
+   "Redis failure",
+   "graceful degradation",
+   "gap fill"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-073",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens when Postgres is down or very slow?",
+  "answer_hinglish": "Postgres source of truth AUR sequencer hai, toh iska down hona = edits ruk jaana. Yeh conscious trade-off hai (durability > availability for writes).\n\nDown:\n- `submit` exception (connection refused) -> yeh `AppError` nahi hai, toh `ws_endpoint` ka op handler catch nahi karta -> generic exception -> agar `ValueError/KeyError/TypeError` nahi toh... asyncpg/SQLAlchemy errors `except` list mein nahi hain, toh exception bahar jaata hai, `finally` leave karta hai, connection abruptly close. Client reconnect try karega -- par join bhi `require_role` (DB) maangta hai -> fail. Clients offline mode jaise behave karte hain: local edits buffer mein.\n- HTTP endpoints 500 (ya bpcommon error handler ka response).\n- Live viewers ko kuch naya nahi milta (koi commit nahi).\n- Wapas aane pe: clients reconnect, catch-up, buffer submit -> converge. `pool_pre_ping=True` stale pool connections handle karta hai.\n\nSlow (lock contention, IO saturation, long transaction):\n- Submit latency badhti; row lock hold time badhta; per-doc throughput girta.\n- Waiters DB pool connections hold karte hain (pool_size 10 + overflow 20 per server). Hot doc ke waiters pool kha jaayein toh doosre docs ke submits aur joins bhi atak jaate hain -- cross-document impact.\n- Gap fills aur catch-up `room.lock` ke andar DB read karte hain -> slow DB = forwarding stall for that room.\n- No `statement_timeout`/`lock_timeout` set -> requests indefinitely wait kar sakte hain.\n\nImprovements: `lock_timeout` + `statement_timeout` (fail fast, client retries with same seq -- dedupe safe), DB errors ko `error{code: 'unavailable'}` message mein convert karna instead of dropping socket, circuit breaker, read replicas for history/revisions.",
+  "why_needed": "Critical dependency ke failure modes aur blast radius samjhana senior-level reliability thinking hai.",
+  "real_world_analogy": "Bank ka core banking server down: ATM se balance check bhi nahi, transfer bhi nahi; branch wale cheques jama karke rakhte hain (offline buffer) aur system aane pe process karte hain.",
+  "how_it_works": "Synchronous dependency on write path; no timeouts -> waits; pool sharing couples documents.",
+  "in_this_project": "`collab/service.py::submit`, `collab/api.py::ws_endpoint` (exception handling), `collab/main.py` (`pool_size=10, max_overflow=20, pool_pre_ping=True`), `collab/realtime.py::_fill_gap_later` (DB under room lock).",
+  "implementation_files": [
+   "projects/08-collab/collab/service.py::submit",
+   "projects/08-collab/collab/main.py::create_app",
+   "projects/08-collab/collab/api.py::ws_endpoint"
+  ],
+  "code_example": "-- illustrative hardening (NOT in repo), at the start of submit's transaction\nSET LOCAL lock_timeout = '2s';\nSET LOCAL statement_timeout = '5s';",
+  "code_language": "sql",
+  "advantages": [
+   "No edit is ever acked without durability",
+   "Clients buffer locally and recover"
+  ],
+  "disadvantages": [
+   "Writes unavailable during outage",
+   "No timeouts -> pile-ups",
+   "Pool shared across docs"
+  ],
+  "common_mistakes": [
+   "Ack before durable write to 'stay available'",
+   "Unbounded waits on locks"
+  ],
+  "follow_up_questions": [
+   "Read-only mode during DB outage kaise doge?",
+   "Failover to replica pe kya risk?",
+   "lock_timeout pe client ko kya bhejoge?"
+  ],
+  "concepts": [
+   "dependency failure",
+   "timeouts",
+   "connection pool exhaustion",
+   "availability vs durability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "CP-ish choice: correctness/durability over write availability; alternatives trade durability for availability.",
+   "failure_scenarios": "Async-replica failover may lose last committed ops that were already acked -> clients have edits the new primary lacks -> divergence; needs client resync or sync replication.",
+   "alternatives": "In-memory sequencer with WAL to Kafka (available during PG outage); per-region DB.",
+   "scale_10x_100x": "Bigger fleets amplify pool pressure: 50 servers x 30 connections = 1500 PG connections -> PgBouncer needed.",
+   "production_improvements": "Timeouts, PgBouncer, circuit breaker, explicit 'unavailable' error to clients, read replicas for history."
+  }
+ },
+ {
+  "id": "COLB-074",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "A collab server crashes. What happens to its connected clients, presence entries, and in-flight edits?",
+  "answer_hinglish": "Server crash (process kill, OOM, node down):\n\n1. Connected clients: sockets close (TCP RST ya timeout). Clients reconnect -- `editor.html` `ws.onclose` pe `setTimeout(connect, 1000)`; Python client mein caller `connect()` call karta hai. nginx round-robin unhe kisi zinda server pe bhejta hai. Naya ticket, join with `last_rev`, catch-up, resend outstanding with same seq. Koi sticky session nahi, toh koi 'home server' nahi khota.\n\n2. In-flight edits:\n   - Op submit se pehle crash -> client resend karega (outstanding), normal path.\n   - Commit ke baad, publish se pehle crash -> op durable; author catch-up mein ack paayega; doosre servers gap fill se (agle op pe).\n   - Transaction ke beech crash -> Postgres connection drop -> transaction rollback, row lock release. Client resend -> fresh apply. Dedupe ka koi issue nahi.\n\n3. Room state (in-memory rooms, buffers, next_rev): gone, par reconstructable -- naye server pe join snapshot se naya room banata hai.\n\n4. Presence: `leave()` kabhi nahi chala, toh `collab:presence:{doc}` hash mein crashed server ke conn entries padi hain. `Hub.presence()` read pe `ts` age > 30s (`presence_stale_seconds`) wale filter karta hai -> 30s mein 'ghost users' list se gayab. Lekin hash se kabhi delete nahi hote (observation -- hash grow karta hai; cleanup job ya per-entry TTL chahiye). Aur 'leave' presence event doosre clients ko nahi jaata -- unke UI mein ghost tab tak jab tak woh presence re-fetch na karein.\n\n`FAILURE_SCENARIOS.md` #8: 'clients reconnect (any server), catch up from last_rev; presence entries age out after 30s'.",
+  "why_needed": "Instance failure ka blast radius explain karna -- kya automatically heal hota hai aur kya nahi.",
+  "real_world_analogy": "Ek bank branch achanak band: customers doosri branch chale jaate hain, central ledger same hai; bas branch ke visitor register mein unke naam 'andar hai' dikhte rehte hain jab tak koi purane entries na hataye.",
+  "how_it_works": "Stateless-ish server: durable state in PG, ephemeral in Redis with staleness, clients drive recovery.",
+  "in_this_project": "`collab/editor.html` (`ws.onclose` reconnect), `collab/client.py::connect`, `collab/realtime.py::join`, `Hub.presence` stale filter, `FAILURE_SCENARIOS.md` #8.",
+  "implementation_files": [
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/collab/realtime.py::presence",
+   "projects/08-collab/collab/editor.html",
+   "projects/08-collab/collab/client.py::connect"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No data loss",
+   "Any server can take over",
+   "Presence self-heals in 30s"
+  ],
+  "disadvantages": [
+   "Ghost presence for up to 30s, hash entries never deleted",
+   "No leave event for crashed conns",
+   "Reconnect thundering herd"
+  ],
+  "common_mistakes": [
+   "Server memory mein unpersisted edits rakhna",
+   "Reconnect without backoff/jitter"
+  ],
+  "follow_up_questions": [
+   "Reconnect storm ko kaise smooth karoge?",
+   "Ghost presence entries kaise clean karoge?",
+   "Graceful shutdown mein kya alag karoge?"
+  ],
+  "concepts": [
+   "instance failure",
+   "reconnect",
+   "presence staleness",
+   "stateless servers"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-075",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What is the 'tail loss' problem in your ordered forwarder, and how did you fix it?",
+  "answer_hinglish": "Ordered forwarder gap tabhi detect karta hai jab koi LATER revision aaye: `_deliver_ordered` mein message buffer mein jaata hai aur `room.buffer` non-empty hone pe gap task schedule hota hai. Agar lost message hi last message hai -- e.g. Alice ne rev 50 type kiya, server 2 ke subscriber ne Redis blip mein woh miss kiya, aur uske baad koi kuch type nahi karta -- toh server 2 pe `buffer` khaali hai, `next_rev = 50`, koi trigger nahi. Server 2 ke saare clients rev 49 pe atke rehte hain. Unhe Alice ka last edit kabhi nahi dikhega jab tak (a) koi naya op aaye (tab gap fill 50 laayega), ya (b) client reconnect kare.\n\n`_subscriber` ka comment khud kehta hai recovery 'on the next revision that arrives' -- toh yeh documented assumption hai, par last edit typically important hota hai (jaise 'meeting notes finalize kiye aur sab chale gaye').\n\nAuthor pe bhi asar: agar author server 2 pe tha aur uska ack wala message lost hua -> author ka op committed par author ko ack nahi -> AwaitingConfirm atka; buffer badhta; uske next edits nahi jaate -- effectively author ka sync ruk gaya! Yeh zyada serious hai.\n\nYeh code review mein mila (FAILURE_SCENARIOS #7b) aur fix ho chuka hai. Options the:\n1. Periodic reconciliation (CHOSEN): har active room ke liye har ~2-5s `SELECT rev FROM documents WHERE id = ...` (ya batch for all rooms on this server); agar `head >= next_rev` aur buffer empty -> `ops_between(next_rev-1, head)` fill. Cheap: ek query per room per interval.\n2. Subscriber reconnect hook: `_subscriber` re-subscribe ke baad saare local rooms ka immediate reconciliation (Redis blip ka exactly yahi case).\n3. Client-side: ack timeout (e.g. 5s) -> reconnect with last_rev (catch-up DB se ack laayega).\n4. Durable bus with offsets (Streams/Kafka) -- loss hi nahi.\n\nImplemented: `Hub._tail_loop` har `tail_check_ms` (default 1000) `check_tails()` chalata hai: server ke saare non-empty rooms ke heads EK query mein (`service.heads`, `WHERE id::text = ANY(:ids)`), phir jis room ka `head >= next_rev` uske liye room.lock ke andar `ops_between` -> `buffer.setdefault` -> `_flush`; `stats['tail_fills']`. Idempotent hai kyunki `_deliver_ordered` ka `rev < next_rev` check duplicates drop karta hai. Regression test `test_lost_last_message_is_recovered_by_tail_check` saare op publishes drop karta hai -- phir bhi author settle hota hai aur reader 'abc!' dekhta hai.",
+  "why_needed": "Apne design ka edge-case hole khud identify karna aur fix propose karna strong senior signal hai.",
+  "real_world_analogy": "Numbered letters: agar 5 kho gaya aur 6 aaya toh pata chalta hai; par agar 5 aakhri letter tha toh tumhe kabhi pata nahi chalega ki 5 bheja gaya tha -- jab tak tum khud post office se 'latest number kya hai?' na poochho.",
+  "how_it_works": "Gap detection by sequence needs a successor; tail needs out-of-band head checks or timeouts.",
+  "in_this_project": "`collab/realtime.py::_tail_loop`, `check_tails`, `collab/service.py::heads`, `collab/config.py::tail_check_ms`; test `tests/test_realtime.py::test_lost_last_message_is_recovered_by_tail_check`. `FAILURE_SCENARIOS.md` #7b (found in review, fixed).",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::check_tails",
+   "projects/08-collab/collab/realtime.py::_tail_loop",
+   "projects/08-collab/collab/service.py::heads",
+   "projects/08-collab/collab/config.py::tail_check_ms",
+   "projects/08-collab/tests/test_realtime.py::test_lost_last_message_is_recovered_by_tail_check"
+  ],
+  "code_example": "# real, collab/realtime.py\nasync def check_tails(self) -> None:\n    \"\"\"Deliver revisions that exist in the DB but never reached this server (lost LAST message).\"\"\"\n    rooms = {d: r for d, r in self.rooms.items() if r.conns}\n    heads = await service.heads(self.sm, list(rooms))\n    for doc_id, head in heads.items():\n        room = rooms[doc_id]\n        if head < room.next_rev:\n            continue\n        async with room.lock:\n            if self.rooms.get(doc_id) is not room or head < room.next_rev:\n                continue\n            for o in await service.ops_between(self.sm, doc_id, room.next_rev - 1, head):\n                room.buffer.setdefault(o[\"rev\"], {**o, \"type\": \"op\"})\n            self.stats[\"tail_fills\"] += 1\n            self._flush(room)",
+  "code_language": "python",
+  "advantages": [
+   "Cheap: one batched query per server per tick",
+   "Bounds staleness (and the author's missing ack) to ~tail_check_ms",
+   "Reuses the idempotent buffer/flush path"
+  ],
+  "disadvantages": [
+   "Constant DB load even when nothing is lost",
+   "Staleness bounded, not zero (up to 1s)",
+   "No immediate check after a subscriber reconnect yet"
+  ],
+  "common_mistakes": [
+   "Assuming 'a later op will always come'",
+   "Only testing gaps with subsequent traffic"
+  ],
+  "follow_up_questions": [
+   "Reconciliation interval kaise choose karoge?",
+   "1000s rooms per server pe query batch kaise karoge?",
+   "Client-side ack timeout ka risk?"
+  ],
+  "concepts": [
+   "tail loss",
+   "gap detection",
+   "reconciliation",
+   "anti-entropy"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Event-driven repair (cheap, incomplete) vs periodic anti-entropy (bounded staleness, constant overhead).",
+   "failure_scenarios": "Before the fix: Redis blip right after the last edit -> some users never see it until reload, author stuck with an unacked op. Now: delivered on the next tick; if the DB is slow the check holds the room lock longer (errors are logged and the loop survives).",
+   "alternatives": "Durable log with consumer offsets; Postgres LISTEN/NOTIFY as secondary signal; client heartbeat carrying its rev and server responding with head.",
+   "scale_10x_100x": "Reconciliation query per room: batch `SELECT id, rev FROM documents WHERE id = ANY(:ids)` per server per tick.",
+   "production_improvements": "Done: tail check loop with tail_fills stat. Next: run a check immediately after resubscribe, client ack timeout, and a room-lag metric (head - next_rev + 1)."
+  }
+ },
+ {
+  "id": "COLB-076",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens to a client after the server rejects its in-flight operation (invalid_operation, document too large)?",
+  "answer_hinglish": "Server side theek hai: `submit` `InvalidOperation` raise karta hai, `ws_endpoint` `{type: 'error', code, message, client_seq}` bhejta hai aur `continue` -- nothing stored, connection open. Test `test_invalid_operation_rejected` raw socket se `[10, 'x']` bhejta hai aur `rev == 0` verify karta hai.\n\nClient side -- review mein mila gap (ab fixed): pehle `CollabClient._handle` error ko sirf `self.errors.append(m)` karta tha. Agar rejected op client ka `outstanding` tha, toh:\n- `outstanding` kabhi clear nahi hoga (ack kabhi nahi aayega).\n- `_flush_buffer` sirf tab bhejta hai jab `outstanding is None` -- toh saare future edits buffer mein jama hote rahenge, kabhi send nahi honge.\n- Local doc mein rejected edit already applied hai -> local doc server se diverge.\n- Doosron ke ops aate rahenge aur outstanding/buffer ke against transform hote rahenge -- client 'kaam karta dikhta' hai par uske edits server tak nahi jaate. Silent data loss from user's perspective.\nBrowser `editor.html` bhi bas status 'error: ...' dikhata tha, `out` clear nahi karta tha.\n\nKab hota hai legit client ke saath? `document too large` (1M chars), `operation too large` (10k components -- bada offline buffer), ya client bug. Viewer ka `forbidden` bhi isi tarah outstanding atka deta hai (test sirf error check karta hai).\n\nFix kiya: error ka `client_seq` == outstanding seq (aur code `access_revoked` nahi) -> `CollabClient.resync()`: disconnect, `outstanding = buffer = None`, `_first_join = True`, fresh connect -> server content. `editor.html` mein bhi same: `out=null; buf=null; ws.close()` -> reconnect fresh. Regression test `test_rejected_op_makes_client_resync_instead_of_stalling`: `max_document_chars=20`, bada insert reject, uske upar buffered edit, client `resyncs == 1`, doc 'short', aur uske baad naya edit save hota hai.\n\nAage ki improvements:\n- Retryable vs fatal error codes alag karo (`unavailable` retry, `invalid_operation` resync, `forbidden` read-only mode).\n- `operation too large` -> buffer ko chhote ops mein split karke bhejo.",
+  "why_needed": "Error paths pe client-server contract adhoora ho toh 'silent desync' hota hai -- yeh real production bug class hai.",
+  "real_world_analogy": "Courier ne parcel reject kar diya (size zyada) aur tumhe bas ek SMS aaya; tum us parcel ki receipt ka wait karte rahe aur baaki saare parcels bhi counter pe hi rakhte gaye.",
+  "how_it_works": "Server rejects without state change; client must reconcile its optimistic state on rejection.",
+  "in_this_project": "`collab/client.py::_handle` (error branch triggers `resync`), `collab/client.py::resync`, `collab/editor.html` error branch (drops out/buf and reconnects), `collab/api.py::ws_endpoint` error message, tests `test_invalid_operation_rejected` and `test_rejected_op_makes_client_resync_instead_of_stalling`. `FAILURE_SCENARIOS.md` #9b.",
+  "implementation_files": [
+   "projects/08-collab/collab/client.py::_handle",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/tests/test_realtime.py::test_invalid_operation_rejected",
+   "projects/08-collab/collab/editor.html",
+   "projects/08-collab/collab/client.py::resync",
+   "projects/08-collab/tests/test_realtime.py::test_rejected_op_makes_client_resync_instead_of_stalling"
+  ],
+  "code_example": "# real, collab/client.py\nelif t == \"error\":\n    self.errors.append(m)\n    if self.outstanding and m.get(\"client_seq\") == self.outstanding[0] and m.get(\"code\") != \"access_revoked\":\n        self._resync_task = asyncio.create_task(self.resync())\n\nasync def resync(self) -> None:\n    \"\"\"Discard pending local edits and reload the document (fresh join, no last_rev).\"\"\"\n    self.resyncs += 1\n    await self.disconnect()\n    self.outstanding = self.buffer = None\n    self._first_join = True\n    await self.connect()",
+  "code_language": "python",
+  "advantages": [
+   "Server never stores bad ops",
+   "Client recovers (resync) instead of silently stalling"
+  ],
+  "disadvantages": [
+   "Resync discards the rejected op AND buffered edits on top of it",
+   "No split-and-retry for 'operation too large' yet"
+  ],
+  "common_mistakes": [
+   "Optimistic UI without rollback path",
+   "Treating all errors the same"
+  ],
+  "follow_up_questions": [
+   "Resync user ke buffered edits discard karta hai -- unhe bachane ka tareeka?",
+   "Error codes ka taxonomy kaise banaoge?",
+   "Isse test kaise karoge?"
+  ],
+  "concepts": [
+   "optimistic UI rollback",
+   "error handling",
+   "client state machine"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-077",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What happens during a deploy or mass reconnect (thundering herd), and how would you make it smooth?",
+  "answer_hinglish": "Deploy pe server restart -> uske saare WebSockets close -> sab clients ek saath reconnect. `DEPLOYMENT.md`: 'Graceful deploys: clients reconnect automatically (demo page retries every 1s) and catch up from last_rev.' Correctness theek hai -- par load spike:\n\nHar reconnect ka cost: `POST /ws-tickets` (DB `user_by_token` + Redis SET), WebSocket handshake, `require_role` (2 DB queries), `Hub.join` (snapshot query + `ops_between` catch-up query under room lock + presence HSET + PUBLISH), phir outstanding/buffer resend (submit). 10k clients x ~6 DB queries ek-do second mein = DB spike, pool exhaustion (30 per server), latency badhegi, timeouts -> aur reconnects (retry storm).\n\nEditor fixed 1s retry karta hai -- koi backoff/jitter nahi. Sab clients exactly sync mein retry -> herd waves.\n\nSmooth karne ke tareeke:\n1. Client: exponential backoff with full jitter (e.g. random(0, min(30s, base*2^n))), aur close code pe dependent (1013 -> thoda wait; 4401 -> naya ticket; 4403 -> mat retry).\n2. Server graceful shutdown: SIGTERM pe naye connections band, existing ko staggered close (e.g. 30s mein spread), ek 'reconnect_hint' message ke saath. Rolling deploy (ek server at a time) -- nginx upstream se pehle drain.\n3. Admission control: per-server connect rate limit; join queue.\n4. Cheap reconnect path: ticket ko signed token banao (no Redis/DB), role cache, catch-up batch queries.\n5. DB: PgBouncer, read replica for catch-up/snapshot reads.\n6. Capacity planning: N servers pe ek server ka herd = total/N; zyada servers = chhota herd per deploy step.\n\nCurrent project mein in mein se kuch nahi hai beyond 'reconnect + catch-up correctness'.",
+  "why_needed": "Thundering herd WebSocket systems ka classic operational problem hai; interviewers production experience isi se judge karte hain.",
+  "real_world_analogy": "Cinema hall ka show khatam -- agar sab ek hi gate se ek saath niklein toh bhagdad; isliye rows ke hisaab se staggered exit.",
+  "how_it_works": "Synchronized retries amplify load; backoff+jitter decorrelates; graceful drain spreads disconnects.",
+  "in_this_project": "`collab/editor.html` (`ws.onclose=()=>{...if(online)setTimeout(connect,1000)}`), `DEPLOYMENT.md`, `collab/realtime.py::join`, `collab/api.py::ws_ticket`.",
+  "implementation_files": [
+   "projects/08-collab/DEPLOYMENT.md",
+   "projects/08-collab/collab/editor.html",
+   "projects/08-collab/collab/realtime.py::join",
+   "projects/08-collab/collab/api.py::ws_ticket"
+  ],
+  "code_example": "// illustrative (NOT in repo): reconnect with exponential backoff + full jitter\nlet attempt = 0;\nfunction scheduleReconnect() {\n  const cap = 30000, base = 500;\n  const delay = Math.random() * Math.min(cap, base * 2 ** attempt++);\n  setTimeout(connect, delay);\n}\nws.onopen = () => { attempt = 0; /* ... */ };",
+  "code_language": "javascript",
+  "advantages": [
+   "Correctness already guaranteed (catch-up + dedupe)",
+   "Any server accepts reconnects"
+  ],
+  "disadvantages": [
+   "Fixed 1s retry, no jitter",
+   "Join path DB-heavy",
+   "No graceful drain"
+  ],
+  "common_mistakes": [
+   "Fixed-interval retries",
+   "Restarting all servers at once",
+   "No connect rate limiting"
+  ],
+  "follow_up_questions": [
+   "Full jitter vs equal jitter?",
+   "Graceful drain kaise implement karoge FastAPI/uvicorn mein?",
+   "Reconnect cost kaise kam karoge?"
+  ],
+  "concepts": [
+   "thundering herd",
+   "backoff",
+   "jitter",
+   "graceful shutdown",
+   "rolling deploy"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fast reconnect (good UX) vs spread reconnect (protects backend); jitter trades a few seconds of staleness for stability.",
+   "failure_scenarios": "Retry storm: DB slow -> joins timeout -> clients retry -> more load -> outage extends (metastable failure).",
+   "alternatives": "Connection draining with server-sent 'reconnect after X ms' hints; edge gateways that survive app deploys (separate connection tier).",
+   "scale_10x_100x": "100k connections per deploy step needs admission control and cheap stateless auth.",
+   "production_improvements": "Backoff+jitter, close-code aware retry, staggered drain, connect rate metrics, PgBouncer."
+  }
+ },
+ {
+  "id": "COLB-078",
+  "project_slug": "p08-collab",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "What happens if a server loses its Redis connection but can still reach Postgres (a partial network partition)?",
+  "answer_hinglish": "Yeh interesting partial failure hai: server 1 Redis tak nahi pahunch sakta, baaki servers aur Postgres theek.\n\nServer 1 pe:\n- Subscriber: `_subscriber` exception -> 0.5s retry loop, baar baar fail. Server 1 ke rooms ko koi pub/sub message nahi milta -- na doosre servers ke ops, na apne (kyunki apne bhi pub/sub se aate hain).\n- Edits: server 1 ke clients op bhejte hain -> `submit` Postgres pe SUCCESS (commit) -> `hub.publish` fail (BlockingConnectionPool timeout 2s, phir error). Exception `ws_endpoint` ke handled list mein nahi -> socket close. Client reconnect karega -- round-robin se shayad server 2 pe, shayad phir server 1 pe.\n- Tickets: `/ws` `getdel` Redis pe -> fail -> connect fail. `POST /ws-tickets` bhi fail. Toh naye connections server 1 pe fail honge -- jo achha hai (fail fast).\n- Presence touch fail -> ping handler exception -> socket close.\n\nServer 2 ke clients: server 1 ke clients ke ops Postgres mein commit hue par publish nahi -> server 2 forwarders ko gap pata chalega jab koi server-2 client edit kare (gap fill from Postgres), aur agar sirf server 1 ke users edit kar rahe hain toh bhi server 2 ka `check_tails` har ~1s DB heads se missing revs deliver kar deta hai (yeh tail-loss fix review ke baad aaya) -- toh server 2 ke users ko updates ~1s late milte hain, missing nahi.\n\nNet: server 1 effectively unhealthy hai par health check shayad pass kar raha (agar health sirf HTTP alive check karta). LB usko traffic deta rahega -> users ka experience 'connect, disconnect, connect'.\n\nFixes: readiness probe jo Redis + Postgres dono check kare -> LB se nikaal do; publish failure ko handle karo (op committed hai -> error message 'committed but not broadcast', ya local room ko direct deliver + gap reconciliation); tail check already hai.",
+  "why_needed": "Partial failures (gray failures) real outages ka bada hissa hain; health checks aur failure handling ko jodna senior thinking hai.",
+  "real_world_analogy": "Ek branch ka phone line kat gaya par core banking chal raha hai: deposits ho rahe hain par doosri branches ko announcement nahi ja raha, aur customers confuse ho rahe hain.",
+  "how_it_works": "Write path succeeds (PG) but notification path fails (Redis); server should be marked not-ready.",
+  "in_this_project": "`collab/realtime.py::_subscriber`, `collab/realtime.py::publish`, `collab/api.py::ws_endpoint`, `collab/main.py` (`BlockingConnectionPool ... timeout=2`). Health/readiness via `bpcommon.http.setup_app` (no Redis dependency check visible in collab code).",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::publish",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/collab/main.py::create_app"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "No data loss (commits are durable)",
+   "Ticket dependency makes new connects fail fast"
+  ],
+  "disadvantages": [
+   "Server stays in LB rotation",
+   "Author sockets dropped after commit",
+   "Cross-server updates ~1s tail-check latency pe aate hain"
+  ],
+  "common_mistakes": [
+   "Liveness-only health checks",
+   "Publish failures treated as op failures (client may think op lost)"
+  ],
+  "follow_up_questions": [
+   "Readiness probe mein kya check karoge?",
+   "Publish failure ke baad client ko kya bhejoge?",
+   "Gray failure detect kaise karoge?"
+  ],
+  "concepts": [
+   "partial failure",
+   "gray failure",
+   "readiness probe",
+   "network partition"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Tight coupling to Redis for every connection makes the server unusable without it; alternative local-delivery fallback complicates ordering.",
+   "failure_scenarios": "Flapping: server alternately reaches Redis -> intermittent gaps, repeated reconnects, gap_fills spikes.",
+   "alternatives": "Fallback to Postgres LISTEN/NOTIFY when Redis unavailable; or client-visible degraded mode.",
+   "scale_10x_100x": "More servers = higher chance some have partial connectivity; automated ejection becomes necessary.",
+   "production_improvements": "Readiness endpoint checking Redis PING + DB, catch publish errors explicitly, alert on pubsub_disconnected logs."
+  }
+ },
+ {
+  "id": "COLB-079",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Tell me about the offline-buffer bug the fuzz test found: symptom, investigation, cause, fix.",
+  "answer_hinglish": "Symptom: `test_fuzz_many_clients_two_servers_with_disconnects` (6 clients, 2 servers, 25 random edits each; clients 0 and 1 go offline at step 8, reconnect at step 16) kabhi kabhi fail hota tha -- reconnecting client pe `OTError: operation base length X != document length Y` ya final docs mismatch. Normal concurrency tests (online only) pass.\n\nInvestigation:\n1. Failure sirf offline/reconnect wale clients pe -> suspect reconnect path.\n2. Seed fix karke reproduce kiya (fuzz test seeded hai -- `random.Random(seed)`, seeds 1 aur 2), failing client ki state log ki: reconnect ke waqt `outstanding = None`, `buffer = <offline edits>`.\n3. Catch-up ops `_server_op` se process hue. Code tha (ot.js style): `if self.outstanding: transform outstanding; then transform buffer` -- buffer transform outstanding ke andar nested. Outstanding None -> buffer transform skip -> server op seedha local doc pe apply, jisme offline edits already hain -> lengths mismatch.\n\nCause: ot.js state model mein 'buffer without outstanding' impossible hai (buffer sirf AwaitingWithBuffer mein). Mere offline mode ne naya state banaya: `OfflineBuffer` -- disconnected hone pe `_flush_buffer` send nahi karta, toh buffer bina outstanding ke exist karta hai. Model ka assumption tootta.\n\nFix: buffer transform ko outstanding se independent banaya:\n```\nif self.outstanding: ...transform outstanding...\nif self.buffer: self.buffer, op = transform(self.buffer, op)\n```\nCode mein comment ke saath. `ARCHITECTURE.md` state diagram mein `OfflineBuffer` state add kiya. Same fix `editor.html` mein.\n\nLesson (`LEARNING_GUIDE.md`): random testing un states tak pahunchta hai jo haath se likhe tests miss karte; aur borrowed model (ot.js) extend karte waqt uske invariants re-check karo.",
+  "why_needed": "Real bug story with reproducible investigation -- debugging questions ka best answer format.",
+  "real_world_analogy": "Recipe mein likha tha 'agar oven garam hai toh pehle tray nikaalo, phir masala daalo' -- par ek din oven band tha aur masala daalna bhi skip ho gaya, kyunki dono steps ek hi 'agar' ke andar the.",
+  "how_it_works": "State-dependent transform skipped in a new state; fix by making each pending component independently transformed.",
+  "in_this_project": "`collab/client.py::_server_op` (comment: 'Independent of outstanding: offline edits sit in buffer with NOTHING outstanding (a state ot.js doesn't have)'), `FAILURE_SCENARIOS.md` bug #1, `tests/test_realtime.py::test_fuzz_many_clients_two_servers_with_disconnects`, `ARCHITECTURE.md` state diagram.",
+  "implementation_files": [
+   "projects/08-collab/collab/client.py::_server_op",
+   "projects/08-collab/tests/test_realtime.py::test_fuzz_many_clients_two_servers_with_disconnects",
+   "projects/08-collab/FAILURE_SCENARIOS.md",
+   "projects/08-collab/ARCHITECTURE.md"
+  ],
+  "code_example": "# before (bug, ot.js shape)\nif self.outstanding:\n    seq, out = self.outstanding\n    out, op = transform(out, op)\n    self.outstanding = (seq, out)\n    if self.buffer:\n        self.buffer, op = transform(self.buffer, op)\n# after (real, collab/client.py)\nif self.outstanding:\n    ...\nif self.buffer:\n    self.buffer, op = transform(self.buffer, op)",
+  "code_language": "python",
+  "advantages": [
+   "Seeded fuzz = reproducible failures",
+   "Fix tiny and local"
+  ],
+  "disadvantages": [
+   "Fuzz only 2 seeds in CI -- rare states may still hide"
+  ],
+  "common_mistakes": [
+   "Extending a borrowed state machine without updating its invariants",
+   "Unseeded random tests (non-reproducible)"
+  ],
+  "follow_up_questions": [
+   "Fuzz test ko aur strong kaise banaoge?",
+   "JS client mein bhi same bug tha?",
+   "State machine ko formally model kar sakte ho?"
+  ],
+  "concepts": [
+   "fuzz testing",
+   "state machine bug",
+   "reproducibility",
+   "debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-080",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "A user reports: 'my edits save, but I stopped seeing other people's changes'. How do you investigate?",
+  "answer_hinglish": "Symptom ka matlab: user ka write path (submit) kaam kar raha hai, read/fan-out path (forwarder -> uska socket) nahi. Systematic investigation:\n\n1. Kaunse server pe hai? Presence (`GET /docs/{id}/presence`) mein uska entry `server` field deta hai. `GET /stats` us server pe: `rooms` -- kya is doc ka room hai aur conns count user ko include karta hai? Agar user ka socket open hai par room mein count kam hai -> orphaned connection (join/leave race jaisa bug -- `FAILURE_SCENARIOS.md` #2, ab fixed).\n2. `received` counter badh raha hai? Nahi -> us server ka subscriber dead/disconnected (`pubsub_disconnected` logs). Partial Redis partition.\n3. `gap_fills` aur `gap_fill` warning logs: room ka `next_rev` atka? Tail loss ab `tail_fills` stat se dikhta hai aur ~1s mein fill hota hai; agar phir bhi atka hai toh `tail_check_failed` / gap fill errors (DB error in `_fill_gap_later` -- log exception?).\n4. `slow_disconnects` badha? User ki queue full hui -> `Conn.kick` turant 1013 close karta hai (review fix; pehle close tabhi hota tha jab user kuch bheje, aur beech mein messages drop hote). Check client logs for 1013 aur reconnect.\n5. Client side: client `rev` vs server head (`GET /docs/{id}` rev). Client errors list (`invalid_operation` -> client ab `resync` karta hai, toh `resyncs` counter dekho -- uske rejected edits NOT saved -- double-check 'my edits save' claim DB se: `history` endpoint mein uske client_id ke recent revs).\n6. DB: `SELECT max(rev) FROM operations WHERE document_id = ...` vs room `next_rev` (debug endpoint chahiye -- abhi `/stats` next_rev nahi dikhata; improvement).\n\nLikely causes ranking: subscriber issue > slow-consumer reconnect loop > repeated resyncs on error (tail loss, stuck-on-error aur orphaned room fix ho chuke).\n\nQuick mitigation: user reconnect (reload) -> catch-up se sab theek. Root-cause fix accordingly.",
+  "why_needed": "Open-ended debugging question mein structured approach (metrics -> logs -> state) dikhana zaroori hai.",
+  "real_world_analogy": "Ghar mein newspaper aana band ho gaya par tumhare letters post ho rahe hain: pehle check karo hawker ki list mein tumhara naam hai (room), hawker ko akhbaar mil raha hai (subscriber), beech mein koi number miss (gap), ya tumhara letterbox bhara hua hai (queue full).",
+  "how_it_works": "Split write vs read path; check membership, subscription, ordering state, backpressure, client state, in that order.",
+  "in_this_project": "`collab/api.py::stats` (`server_id`, `published`, `received`, `gap_fills`, `duplicates_ignored`, `slow_disconnects`, `rooms`), `collab/realtime.py` logs (`pubsub_disconnected`, `gap_fill`), `Hub.presence` (`server` field), `DEPLOYMENT.md` monitoring note.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::stats",
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/collab/realtime.py::Conn",
+   "projects/08-collab/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, collab/api.py\n@router.get(\"/stats\", tags=[\"ops\"])\nasync def stats(request: Request):\n    hub = request.app.state.hub\n    return {\"server_id\": request.app.state.settings.server_id, **hub.stats,\n            \"rooms\": {d: len(r.conns) for d, r in hub.rooms.items()}}",
+  "code_language": "python",
+  "advantages": [
+   "/stats exposes key counters",
+   "Presence shows which server a user is on"
+  ],
+  "disadvantages": [
+   "No per-room next_rev/buffer visibility",
+   "No per-connection queue depth metric",
+   "No client rev reporting"
+  ],
+  "common_mistakes": [
+   "Jumping to 'Redis is broken' without checking room membership",
+   "Asking user to reload and never finding root cause"
+  ],
+  "follow_up_questions": [
+   "Is investigation ke liye kaunsa metric add karoge?",
+   "Per-room lag kaise expose karoge?",
+   "Client-side telemetry kya bhejega?"
+  ],
+  "concepts": [
+   "debugging",
+   "observability",
+   "fan-out path",
+   "metrics"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lightweight counters in /stats vs proper metrics (Prometheus) with per-room labels (cardinality cost).",
+   "failure_scenarios": "Each cause needs a different fix: subscriber dead (readiness probe), slow consumer (already closed immediately by Conn.kick; look at why the client is slow), repeated resyncs (find which error code rejects the op). Tail loss and stuck-on-error are already fixed in code.",
+   "alternatives": "Distributed tracing of an op (trace id from client through submit, publish, forwarder, socket write).",
+   "scale_10x_100x": "At 100x rooms, per-room metrics need aggregation (histogram of lag) not labels.",
+   "production_improvements": "Expose room lag, queue depth histogram, client-reported rev; alert on lag > N seconds."
+  }
+ },
+ {
+  "id": "COLB-081",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "How did a failing property test lead you to the 'transform does not distribute over compose' finding?",
+  "answer_hinglish": "Story (`FAILURE_SCENARIOS.md` bug #3 'False property'):\n\n1. Hypothesis: server optimisation -- history ke ops ko compose karke ek baar transform karna sasta hoga. Toh pehle property test likha: random doc, random client op c, random sequential s1, s2; assert `transform(transform(c, s1)[0], s2)[0]` applied after `s1 . s2` == `transform(c, compose(s1, s2))[0]` applied after `compose(s1,s2)`.\n2. Test FAIL hua kuch random cases pe. Pehla reaction: compose ya transform mein bug? Lekin TP1 property (2000 cases) aur compose-equals-sequential property (2000 cases) dono pass -- dono functions individually correct.\n3. Shrinking: failing case bada tha (lambi strings, kai components). Maine case ko chhota karta gaya -- doc chhota, components hatao, jab tak failure bana rahe -- minimal: doc 'heoo', s1 = `[3, -1]`, s2 = `[3, '2']`, client `['aYYbZ', -3, 1, '221']`. (Hypothesis library automatic shrinking karti hai; maine manually shrink kiya.)\n4. Minimal case pe trace: `compose(s1, s2).ops == [3, '2', -1]` -- normalisation ne s2 ka insert delete ke aage move kiya. Client ka '221' insert aur s2 ka '2' -- stepwise path mein same position pe tie (client left), composed path mein alag relative position -> 'aYYbZ2212' vs 'aYYbZ2221'.\n5. Conclusion: bug code mein nahi, PROPERTY galat thi. Optimisation unsafe. Test ko invert karke counterexample ko permanent test bana diya (`test_transform_does_not_distribute_over_compose`) aur server ko one-by-one transform pe rakha, docstrings mein reason likha.\n\nLesson: failing property test ka matlab hamesha 'code bug' nahi -- kabhi aapki mental model galat hoti hai. Minimal counterexample dono ko distinguish karne ka tool hai.",
+  "why_needed": "Property-based testing aur shrinking ka real use -- aur 'question your assumptions' wala debugging lesson.",
+  "real_world_analogy": "Maths mein socha (a+b)^2 = a^2 + b^2; calculator galat nahi tha, formula galat tha -- chhote numbers (1,1) pe try karke turant pata chal gaya.",
+  "how_it_works": "Property test -> failure -> verify component properties -> shrink -> trace minimal case -> classify (code bug vs false property).",
+  "in_this_project": "`tests/test_ot.py::test_transform_does_not_distribute_over_compose` (docstring: 'Finding (from a failed property test)... Minimal counterexample found by shrinking random cases'), `tests/test_ot.py::random_op`, `collab/service.py` module docstring.",
+  "implementation_files": [
+   "projects/08-collab/tests/test_ot.py::test_transform_does_not_distribute_over_compose",
+   "projects/08-collab/tests/test_ot.py::random_op",
+   "projects/08-collab/FAILURE_SCENARIOS.md"
+  ],
+  "code_example": "# illustrative: the property that FAILED (kept only as the inverted counterexample test)\ndef check_distributes(doc, c, s1, s2):\n    stepwise = transform(transform(c, s1)[0], s2)[0]\n    composed = transform(c, compose(s1, s2))[0]\n    return apply(apply(doc, compose(s1, s2)), stepwise) == apply(apply(doc, compose(s1, s2)), composed)",
+  "code_language": "python",
+  "advantages": [
+   "Caught an unsafe optimisation before it shipped",
+   "Counterexample frozen as regression test"
+  ],
+  "disadvantages": [
+   "Manual shrinking is slow (Hypothesis would automate)"
+  ],
+  "common_mistakes": [
+   "'Fixing' code to satisfy a false property",
+   "Not keeping the counterexample"
+  ],
+  "follow_up_questions": [
+   "Hypothesis library use karte toh kya fayda?",
+   "Kaunsi aur OT properties test karni chahiye?",
+   "Kya koi tie-break rule distributivity bachata?"
+  ],
+  "concepts": [
+   "property-based testing",
+   "shrinking",
+   "counterexample",
+   "debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Random property tests find deep issues cheaply but need shrinking to be actionable.",
+   "failure_scenarios": "Without this finding, the 'optimisation' would cause rare, unreproducible production divergence.",
+   "alternatives": "Hypothesis (automatic shrinking, stateful testing), model checking (TLA+) for the protocol.",
+   "scale_10x_100x": "More seeds/cases in nightly CI; stateful Hypothesis tests for client state machine.",
+   "production_improvements": "Adopt Hypothesis with stored failing examples database; add property tests for JS port."
+  }
+ },
+ {
+  "id": "COLB-082",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "The gap_fills counter in /stats keeps rising. What does it mean and how do you investigate?",
+  "answer_hinglish": "`gap_fills` tab badhta hai jab kisi room ke forwarder ko ek revision 300ms (`gap_fill_delay_ms`) tak nahi mila aur Postgres se padhna pada. Healthy system mein yeh almost 0 hona chahiye -- reordering usually 300ms se kam mein khud resolve ho jaata hai. `DEPLOYMENT.md`: 'Monitor /stats: gap_fills (Redis delivery problems)'.\n\nInvestigation:\n1. Scope: ek server pe ya sab pe? `/stats` har server ka alag hai (nginx round-robin -- `server_id` dekho, `demo.py` jaisa loop). Ek server -> us server ka Redis connection/subscriber issue. Sab servers -> Redis itself ya publishers.\n2. Logs: `gap_fill` warning `extra={'doc_id', 'from', 'to'}` -- kaunse docs, gap size kitna. Single-rev gaps scattered -> random drops. Bade ranges -> subscriber disconnect windows (`pubsub_disconnected` logs same time pe?).\n3. `received` vs `published`: sab servers ka `published` sum = har server ko expected messages (psubscribe * ke saath). Kisi server ka `received` kam -> woh drop kar raha.\n4. Redis side: `INFO clients` / `CLIENT LIST` -> subscriber connections ka `omem` (output buffer). `client-output-buffer-limit pubsub` hit hone pe Redis subscriber ko disconnect karta hai -- high traffic pe classic cause. Redis server log mein 'scheduled to be closed ASAP for overcoming of output buffer limits' line dikhegi.\n5. Server side: event loop lag -- subscriber serially `_on_message` await karta hai; agar room lock ya gap-fill DB read slow, subscriber backlog -> Redis buffer bharta -> disconnect -> more gaps. Positive feedback.\n6. Reordering vs loss: agar gaps fill hone pe baad mein late pub/sub message aata hai -> `duplicates_ignored` bhi badhega -> reordering > 300ms (slow publisher), loss nahi.\n\nFixes: subscriber processing fast/parallel per room, raise pubsub buffer limits, reduce cursor traffic, ya Streams.",
+  "why_needed": "Ek metric se root cause tak jaana -- production debugging ka real skill.",
+  "real_world_analogy": "Courier company ka 'missing parcel claims' counter badh raha hai: ek route pe ya sab pe? Godown overflow (buffer limit)? Ya parcels bas late aa rahe hain (duplicates)?",
+  "how_it_works": "gap_fills = delivery anomalies; correlate with received/published, duplicates_ignored, subscriber disconnect logs, Redis client buffers.",
+  "in_this_project": "`collab/realtime.py::_fill_gap_later` (`self.stats['gap_fills'] += 1`, `log.warning('gap_fill', ...)`), `Hub.stats`, `collab/api.py::stats`, `collab/config.py` `gap_fill_delay_ms`.",
+  "implementation_files": [
+   "projects/08-collab/collab/realtime.py::_fill_gap_later",
+   "projects/08-collab/collab/api.py::stats",
+   "projects/08-collab/DEPLOYMENT.md",
+   "projects/08-collab/collab/config.py::gap_fill_delay_ms"
+  ],
+  "code_example": "# real, collab/realtime.py\nupto = min(room.buffer) - 1\nmissing = await service.ops_between(self.sm, room.doc_id, room.next_rev - 1, upto)\nself.stats[\"gap_fills\"] += 1\nlog.warning(\"gap_fill\", extra={\"doc_id\": room.doc_id, \"from\": room.next_rev, \"to\": upto})",
+  "code_language": "python",
+  "advantages": [
+   "Self-healing hides the problem from users",
+   "Counter + structured log make it visible"
+  ],
+  "disadvantages": [
+   "Counters reset on restart, not exported as time series"
+  ],
+  "common_mistakes": [
+   "Ignoring gap_fills because 'it self-heals'",
+   "Lowering gap_fill_delay_ms to hide reordering (more DB load)"
+  ],
+  "follow_up_questions": [
+   "duplicates_ignored aur gap_fills saath badhein toh?",
+   "Redis output buffer limit kaise tune karoge?",
+   "Is counter pe alert threshold?"
+  ],
+  "concepts": [
+   "observability",
+   "gap fill",
+   "Redis output buffer",
+   "debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-083",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A browser client throws 'length mismatch' or users see different text. How do you debug a suspected divergence?",
+  "answer_hinglish": "`applyOp` (JS) / `apply` (Python) ka 'length mismatch' (`operation base length X != document length Y`) ka matlab: client ka local doc us op ke expected base se match nahi karta -- client already diverge ho chuka hai, ya op galat order/context mein aaya.\n\nDebug steps:\n1. Reproduce deterministically: user ki session ka sequence chahiye. Client pe ring buffer of last N messages (incoming ops with rev, acks, sent ops with client_seq/base_rev) -- error pe dump. Abhi project mein yeh telemetry nahi hai (improvement).\n2. Server ground truth: `GET /docs/{id}/history` aur `/revisions/{rev}` -- client ke reported `rev` pe server content kya tha? Client ke doc minus pending edits se compare.\n3. Ordering check: client logs mein revs consecutive aaye? Gap ya out-of-order -> server forwarder bug ya multiple writers per socket.\n4. Ack/op interleave: ack apni rev position pe aaya? Duplicate ops (same rev twice)?\n5. State machine: error ke waqt outstanding/buffer state kya thi? Offline buffer without outstanding (old bug class), error-after-reject stuck state.\n6. Language parity: JS port vs Python -- same ops ke saath dono transform same result dete hain? JS string length UTF-16 code units hai; Python `len` code points. Emoji (surrogate pair) wale text pe JS client length 2 count karega, Python server 1 -> base length mismatch! Yeh is project ka real latent risk hai (observation): editor.html se emoji type karo toh server `operation does not apply` de sakta hai.\n7. Replay offline: captured ops ko `collab/ot.py` mein replay karke divergence point dhoondo.\n\nFix depends: ordering bug -> forwarder; parity -> normalise lengths (count in UTF-16 on both sides or code points on both); state machine -> fix + regression fuzz case.",
+  "why_needed": "Divergence debugging collaborative systems ka hardest debugging; structured approach aur unicode trap batana impressive hai.",
+  "real_world_analogy": "Do log ek hi map follow kar rahe the par alag jagah pahunch gaye: dekho kisne kaunsa mod kab liya (op log), aur kya dono ke map ki scale same thi (UTF-16 vs code points).",
+  "how_it_works": "Capture message trace, compare with server history at revs, check ordering, state, and cross-language length semantics.",
+  "in_this_project": "`collab/editor.html` (`applyOp` throws 'length mismatch'), `collab/ot.py::apply`, `collab/service.py::content_at`, `collab/api.py::doc_history`.",
+  "implementation_files": [
+   "projects/08-collab/collab/editor.html",
+   "projects/08-collab/collab/ot.py::apply",
+   "projects/08-collab/collab/api.py::at_revision",
+   "projects/08-collab/collab/service.py::content_at"
+  ],
+  "code_example": "// illustrative: why emoji can break JS<->Python length agreement\n\"a\\u{1F600}b\".length        // 4 in JS (UTF-16 code units)\n// len(\"a\\U0001F600b\") == 3 in Python (code points)",
+  "code_language": "javascript",
+  "advantages": [
+   "Server history API enables ground-truth comparison",
+   "Deterministic replay possible with captured ops"
+  ],
+  "disadvantages": [
+   "No client telemetry/ring buffer",
+   "No cross-language parity tests",
+   "Unicode length semantics differ"
+  ],
+  "common_mistakes": [
+   "Blaming network before checking state machine",
+   "Ignoring unicode in OT lengths"
+  ],
+  "follow_up_questions": [
+   "Unicode issue kaise fix karoge?",
+   "Client checksum reporting design?",
+   "Divergence ke baad user ko kya dikhaoge?"
+  ],
+  "concepts": [
+   "divergence",
+   "debugging",
+   "unicode",
+   "UTF-16",
+   "replay"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-084",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "WebSocket connections drop after exactly 60 seconds of inactivity in production. What's going on?",
+  "answer_hinglish": "Exactly 60s pe drop almost hamesha proxy/load balancer ka idle timeout hota hai, app ka bug nahi. nginx ka `proxy_read_timeout` default 60s hai: agar upstream (collab server) se 60s tak koi data nahi aaya, nginx connection close kar deta hai. Editor khula hai par koi type nahi kar raha aur koi doosra edit nahi -> server kuch nahi bhejta -> 60s -> cut. AWS ALB ka default idle timeout bhi 60s hai.\n\nInvestigate:\n1. Pattern: drop time constant (60s) aur sirf idle connections pe? Haan -> timeout.\n2. Close code: client pe 1006 (abnormal, no close frame) -- proxy ne TCP band kiya, app ne nahi (app 4401/4403/4400/1013 bhejta).\n3. Bypass proxy: seedha server port pe connect karke test -> drop nahi hota -> proxy confirmed.\n4. Config check: nginx `proxy_read_timeout`, `proxy_send_timeout`; LB idle timeout; CDN/WAF timeouts.\n\nMere project mein do layers ka fix hai:\n1. `deploy/nginx.conf`: `proxy_read_timeout 3600s;  # idle WebSockets would otherwise be cut after 60s`.\n2. Application heartbeat: `editor.html` har 10s `{type: 'ping'}` bhejta hai, server `pong` bhejta hai (aur presence `touch` karta hai). Isse traffic dono directions mein hota hai, toh koi bhi intermediary idle nahi samjhega. Heartbeat dead connections bhi detect karta hai (half-open TCP).\n\nNote: sirf timeout bada karna kaafi nahi -- beech mein aur boxes (corporate proxies, mobile NAT) apne timeouts rakhte hain; heartbeat hi portable solution hai. Python `websockets` library protocol-level ping frames bhi bhejti hai by default.",
+  "why_needed": "Bahut common production issue; jaldi pehchaan lena experience dikhata hai.",
+  "real_world_analogy": "Phone call pe dono chup rahe toh operator line kaat deta hai -- isliye beech beech mein 'haan, sun raha hoon' bolte raho (heartbeat).",
+  "how_it_works": "Intermediary idle timeouts close silent connections; fix with longer timeouts and app-level heartbeats.",
+  "in_this_project": "`deploy/nginx.conf` (`proxy_read_timeout 3600s`), `collab/editor.html` (`setInterval(()=>send({type:'ping'}),10000)`), `collab/api.py::ws_endpoint` ping branch, `DEPLOYMENT.md`.",
+  "implementation_files": [
+   "projects/08-collab/deploy/nginx.conf",
+   "projects/08-collab/collab/editor.html",
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/DEPLOYMENT.md"
+  ],
+  "code_example": "# real, collab/api.py (ping branch)\nelif t == \"ping\":\n    await hub.touch(conn)\n    conn.send({\"type\": \"pong\"})",
+  "code_language": "python",
+  "advantages": [
+   "Heartbeat also refreshes presence",
+   "Works through unknown intermediaries"
+  ],
+  "disadvantages": [
+   "Heartbeats cost traffic per idle connection"
+  ],
+  "common_mistakes": [
+   "Only raising timeouts",
+   "Debugging app code first when interval is suspiciously round"
+  ],
+  "follow_up_questions": [
+   "Half-open TCP connection kaise detect hota hai?",
+   "Ping interval kaise choose karoge?",
+   "Mobile networks pe kya alag hai?"
+  ],
+  "concepts": [
+   "idle timeout",
+   "heartbeat",
+   "nginx",
+   "WebSocket debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "COLB-085",
+  "project_slug": "p08-collab",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "A client's WebSocket connect is immediately closed with code 4401 or 4403. How do you tell what went wrong?",
+  "answer_hinglish": "Close codes mere protocol mein meaningful hain (`API_DOCUMENTATION.md`), toh pehla step code padhna hai:\n\n4401 'invalid or expired ticket': `/ws` ne `GETDEL collab:ticket:{ticket}` kiya aur kuch nahi mila. Causes:\n- Ticket 30s (`ws_ticket_ttl_seconds`) se purana -- client ne ticket le ke der se connect kiya.\n- Ticket already used -- client ne reconnect pe purana ticket reuse kiya (single-use). Python client har `connect()` pe `ticket_factory()` call karta hai -- sahi; custom clients aksar ek ticket cache kar lete hain.\n- Redis flush/restart ke beech ticket gaya.\n- Galat Redis DB/URL (server A ticket issue kare ek Redis pe, server B doosre pe check kare) -- config issue multi-server mein.\nCheck: `redis-cli TTL collab:ticket:<t>` ticket issue karne ke turant baad; client logs mein ticket fetch aur connect ke beech ka time.\n\n4403: ticket valid tha, par `require_role(..., 'viewer')` fail -- user ka is document pe role nahi (ya doc exist nahi karta -- dono 'not found' dete hain by design). Close se pehle server ek `error` JSON bhejta hai `{code, message}`. Check: `GET /docs/{id}` usi user ke token se -> 404? Owner ne share kiya? doc_id sahi UUID hai?\n\n4400: pehla message `join{doc_id, client_id}` nahi tha, ya malformed JSON/UUID.\n\n1013: connection chal raha tha, client slow tha (queue full) -- reconnect karo.\n\n1006: koi close frame nahi -- network/proxy (dekho 60s timeout wala sawaal).\n\nTest references: `test_ws_ticket_is_single_use` (reuse fails), `test_viewer_cannot_edit_and_strangers_cannot_join` (stranger connect raises).",
+  "why_needed": "Clear error contracts debugging fast karte hain; codes ko causes se map karna practical skill hai.",
+  "real_world_analogy": "Event gate pe: 'pass expired/used' (4401) vs 'pass valid par tumhara naam is hall ki list mein nahi' (4403) -- dono alag counters pe solve hote hain.",
+  "how_it_works": "Close code -> layer: ticket (Redis), authorization (Postgres roles), protocol (first message), backpressure.",
+  "in_this_project": "`collab/api.py::ws_endpoint`, `collab/api.py::ws_ticket`, `API_DOCUMENTATION.md` close codes, `collab/config.py` `ws_ticket_ttl_seconds`.",
+  "implementation_files": [
+   "projects/08-collab/collab/api.py::ws_endpoint",
+   "projects/08-collab/API_DOCUMENTATION.md",
+   "projects/08-collab/tests/test_realtime.py::test_ws_ticket_is_single_use"
+  ],
+  "code_example": "# check a ticket's lifetime right after issuing it\nredis-cli -n 8 TTL collab:ticket:wst_xxxxxxxx      # ~30 right after POST /ws-tickets, -2 after use/expiry",
+  "code_language": "bash",
+  "advantages": [
+   "Distinct codes per failure layer",
+   "Error frame before 4403 explains reason"
+  ],
+  "disadvantages": [
+   "4401 reason not distinguishable (expired vs used vs never existed) by design"
+  ],
+  "common_mistakes": [
+   "Caching tickets across reconnects",
+   "Assuming 4403 means 'doc exists'"
+  ],
+  "follow_up_questions": [
+   "4401 pe client ko kya karna chahiye?",
+   "Expired vs reused ticket ko distinguish karna chahiye?",
+   "Multi-server ticket config issue kaise pakdoge?"
+  ],
+  "concepts": [
+   "close codes",
+   "WebSocket auth debugging",
+   "tickets"
+  ],
+  "advanced": null
+ }
+]
