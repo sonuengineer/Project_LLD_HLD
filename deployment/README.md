@@ -10,7 +10,8 @@ Screenshots are in `screenshots/` (kept out of git because they show the Oracle 
 | 1 | Push code to GitHub | DONE -- https://github.com/sonuengineer/Project_LLD_HLD (branch `main`) |
 | 2 | Portfolio site on Vercel | DONE -- https://portfolio-beta-two-51.vercel.app |
 | 3 | Create Oracle A1 server | IN PROGRESS -- console form hit "Out of capacity"; network created via SDK, auto-retry loop running (`05-oci-cli-auto-retry.md`) |
-| 4 | Server setup (firewall, Docker, Caddy) | Ready to run once step 3 succeeds -- `scripts/bootstrap-ubuntu.sh` |
+| 3b | Oracle micro server (1 GB, AMD) | DONE (2026-11-18) -- `portfolio-micro`, bootstrap applied and verified -- `06-oracle-micro-server.md` |
+| 4 | Server setup (firewall, Docker, Caddy) | DONE on the micro; repeat on the A1 once step 3 succeeds -- `scripts/bootstrap-ubuntu.sh` |
 | 5 | Deploy NestJS + FastAPI projects + selected demos | Planned -- layout in `04-oracle-server-setup.md` |
 
 ## Files
@@ -21,10 +22,12 @@ Screenshots are in `screenshots/` (kept out of git because they show the Oracle 
 | [02-vercel-portfolio.md](02-vercel-portfolio.md) | Deploying the portfolio site on Vercel, and how redeploys work |
 | [03-oracle-create-instance.md](03-oracle-create-instance.md) | Creating the A1 server click by click, the capacity error, and the ways around it |
 | [05-oci-cli-auto-retry.md](05-oci-cli-auto-retry.md) | OCI CLI/SDK install, API key, network creation, auto-retry loop -- every command |
+| [06-oracle-micro-server.md](06-oracle-micro-server.md) | The small free AMD micro server: why, how it was created, SSH key lesson, verify, limits |
 | [04-oracle-server-setup.md](04-oracle-server-setup.md) | After the server exists: public IP, SSH, firewall, Docker, Caddy, app layout |
 | [scripts/bootstrap-ubuntu.sh](scripts/bootstrap-ubuntu.sh) | One-time server setup script (run on the server) |
 | [scripts/Caddyfile.example](scripts/Caddyfile.example) | Reverse proxy + automatic HTTPS for several apps on one server |
 | [scripts/oci_a1_grab.py](scripts/oci_a1_grab.py) | Python SDK: create network + retry the A1 launch (the one actually used) |
+| [scripts/oci_micro_create.py](scripts/oci_micro_create.py) | Python SDK: create the free AMD micro server with our SSH key (optionally replace a hand-made one) |
 | [scripts/oci-create-network.sh](scripts/oci-create-network.sh) | CLI version of the network setup |
 | [scripts/oci-retry-launch.sh](scripts/oci-retry-launch.sh) | Optional: keep retrying the A1 launch until Oracle has capacity |
 

@@ -106,6 +106,7 @@ def main() -> None:
     ap.add_argument("--ocpus", type=float, default=4)
     ap.add_argument("--memory", type=float, default=24)
     ap.add_argument("--boot-gb", type=int, default=100)
+    ap.add_argument("--name", default=INSTANCE_NAME, help="instance display name (use a different one for a 2nd server)")
     ap.add_argument("--interval", type=int, default=180, help="seconds between attempts")
     ap.add_argument("--network-only", action="store_true")
     args = ap.parse_args()
@@ -122,7 +123,7 @@ def main() -> None:
     if args.network_only:
         return
 
-    existing = [i for i in compute.list_instances(comp, display_name=INSTANCE_NAME).data
+    existing = [i for i in compute.list_instances(comp, display_name=args.name).data
                 if i.lifecycle_state not in ("TERMINATED", "TERMINATING")]
     if existing:
         log(f"instance already exists: {existing[0].id} ({existing[0].lifecycle_state}); "
@@ -131,7 +132,7 @@ def main() -> None:
 
     ad = identity.list_availability_domains(comp).data[0].name
     details = oci.core.models.LaunchInstanceDetails(
-        compartment_id=comp, availability_domain=ad, display_name=INSTANCE_NAME, shape=SHAPE,
+        compartment_id=comp, availability_domain=ad, display_name=args.name, shape=SHAPE,
         shape_config=oci.core.models.LaunchInstanceShapeConfigDetails(ocpus=args.ocpus, memory_in_gbs=args.memory),
         source_details=oci.core.models.InstanceSourceViaImageDetails(
             image_id=find_image(compute, comp), boot_volume_size_in_gbs=args.boot_gb),
