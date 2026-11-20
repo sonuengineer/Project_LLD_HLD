@@ -1,7 +1,14 @@
 # Stage 4 plan -- run it on a real server and MEASURE it
 
-Status: PLAN ONLY. Nothing in this file has been done yet. No numbers exist; every number in the final README must come
-from a saved raw result file produced by the steps below.
+Status (2026-11-20): steps 4a-4g are DONE in single-host (loopback) mode; 4h (public URL) and two-host mode were NOT done
+on purpose. Results: `README.md` section "Measured on a real server" and `bench/reference-results/`. Server steps:
+`deployment/07-reverse-proxy-on-a2.md`. The text below is the ORIGINAL plan, kept as written; where reality differed:
+
+- E4 needed a second, raw upstream (no Keep-Alive hint) before the stale-connection race showed up.
+- E9 found a real shutdown defect; it was fixed and re-measured (4540 ms -> 1611 ms).
+- E6 only covers a closed port on the same host; `EHOSTUNREACH` across hosts was not measured.
+- The proxy's default settings were reviewed against the data and left unchanged.
+- Every number in the README comes from a saved raw result file.
 
 ## What stage 4 must deliver
 

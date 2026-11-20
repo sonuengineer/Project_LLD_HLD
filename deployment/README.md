@@ -14,6 +14,7 @@ Screenshots are in `screenshots/` (kept out of git because they show the Oracle 
 | 3b | Oracle micro server (1 GB, AMD) | DONE (2026-11-18) -- `portfolio-micro`, bootstrap applied and verified -- `06-oracle-micro-server.md` |
 | 4 | Server setup (firewall, Docker, Caddy) | DONE on the micro and on the A1 (Docker, Caddy, swap, iptables verified, port 80 answers 200) -- `scripts/bootstrap-ubuntu.sh` |
 | 5 | Deploy NestJS + FastAPI projects + selected demos | Planned -- layout in `04-oracle-server-setup.md` |
+| 6 | H11 reverse proxy on `portfolio-a2` (loopback only, measured, hardened systemd service ready) | DONE 2026-11-20 -- `07-reverse-proxy-on-a2.md`; no public exposure, no network rule changed |
 
 ## Files
 
@@ -24,6 +25,7 @@ Screenshots are in `screenshots/` (kept out of git because they show the Oracle 
 | [03-oracle-create-instance.md](03-oracle-create-instance.md) | Creating the A1 server click by click, the capacity error, and the ways around it |
 | [05-oci-cli-auto-retry.md](05-oci-cli-auto-retry.md) | OCI CLI/SDK install, API key, network creation, auto-retry loop -- every command |
 | [06-oracle-micro-server.md](06-oracle-micro-server.md) | The small free AMD micro server: why, how it was created, SSH key lesson, verify, limits |
+| [07-reverse-proxy-on-a2.md](07-reverse-proxy-on-a2.md) | Running and measuring the H11 reverse proxy on the second A1 server: Node install, tests, service, experiments |
 | [04-oracle-server-setup.md](04-oracle-server-setup.md) | After the server exists: public IP, SSH, firewall, Docker, Caddy, app layout |
 | [scripts/bootstrap-ubuntu.sh](scripts/bootstrap-ubuntu.sh) | One-time server setup script (run on the server) |
 | [scripts/Caddyfile.example](scripts/Caddyfile.example) | Reverse proxy + automatic HTTPS for several apps on one server |
