@@ -32,9 +32,17 @@ export function echoUpstream(): http.Server {
   });
 }
 
-export async function startProxy(upstreamPort: number, extra: Partial<ProxyOptions> = {}): Promise<number> {
-  const proxy = createProxy({ upstream: new URL(`http://127.0.0.1:${upstreamPort}`), ...extra });
+export async function startProxy(upstreamPort: number | number[], extra: Partial<ProxyOptions> = {}): Promise<number> {
+  const ports = Array.isArray(upstreamPort) ? upstreamPort : [upstreamPort];
+  const proxy = createProxy({ upstream: ports.map((p) => new URL(`http://127.0.0.1:${p}`)), ...extra });
   return listen(proxy);
+}
+
+/** An upstream that answers every request with its own name. */
+export function namedUpstream(name: string): http.Server {
+  return http.createServer((_req, res) => {
+    res.end(name);
+  });
 }
 
 /** A port that nothing listens on (bind, read the port, close). */

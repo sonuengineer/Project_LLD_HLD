@@ -1,5 +1,7 @@
 import http from "node:http";
 import type { IncomingMessage, OutgoingHttpHeaders, ServerResponse } from "node:http";
+import { Balancer } from "./balancer.js";
+import type { Lease, Strategy } from "./balancer.js";
 import { buildClientHeaders, buildUpstreamHeaders, hasLoop } from "./headers.js";
 
 export interface RequestLog {
@@ -9,11 +11,17 @@ export interface RequestLog {
   /** true when the client went away, or the upstream broke, before the response was complete */
   aborted: boolean;
   ms: number;
+  /** "host:port" of the upstream that served the request (absent when none was chosen, e.g. a 508) */
+  upstream?: string;
 }
 
 export interface ProxyOptions {
-  /** where requests go. Plain http only, and no path prefix ("http://127.0.0.1:3000"). */
-  upstream: URL;
+  /** where requests go: one URL or several. Plain http only, and no path prefix ("http://127.0.0.1:3000"). */
+  upstream?: URL | URL[];
+  /** how to choose between several upstreams. Default "round-robin". */
+  strategy?: Strategy;
+  /** supply your own Balancer instead of upstream/strategy (lets tests and callers inspect the counters). */
+  balancer?: Balancer;
   /** true = keep and extend an X-Forwarded-For sent by a proxy we trust (Caddy). false = overwrite it. */
   trustForwarded?: boolean;
   /** idle timeout against the upstream (connecting, waiting for headers, and between body chunks). Default 30000. */
@@ -36,9 +44,17 @@ function plain(res: ServerResponse, status: number, text: string): void {
 }
 
 export function createProxy(options: ProxyOptions): http.Server {
-  const { upstream } = options;
-  if (upstream.protocol !== "http:") throw new Error("only http:// upstreams are supported");
-  if (upstream.pathname !== "/" || upstream.search) throw new Error("upstream must not contain a path or query");
+  let balancer = options.balancer;
+  if (!balancer) {
+    if (!options.upstream) throw new Error("upstream (or balancer) is required");
+    const urls = Array.isArray(options.upstream) ? options.upstream : [options.upstream];
+    for (const upstream of urls) {
+      if (upstream.protocol !== "http:") throw new Error("only http:// upstreams are supported");
+      if (upstream.pathname !== "/" || upstream.search) throw new Error("upstream must not contain a path or query");
+    }
+    balancer = new Balancer(urls, options.strategy);
+  }
+  const lb = balancer;
 
   const trustForwarded = options.trustForwarded ?? false;
   const timeoutMs = options.upstreamTimeoutMs ?? 30_000;
@@ -48,13 +64,16 @@ export function createProxy(options: ProxyOptions): http.Server {
   function handle(req: IncomingMessage, res: ServerResponse): void {
     const started = Date.now();
     let aborted = false;
+    let lease: Lease | undefined;
     res.on("close", () => {
+      lease?.release(); // every path ends here (success, error, client abort), so the counter cannot leak
       options.log?.({
         method: req.method ?? "?",
         url: req.url ?? "?",
         status: res.statusCode,
         aborted: aborted || !res.writableFinished,
         ms: Date.now() - started,
+        upstream: lease?.target.url.host,
       });
     });
 
@@ -65,10 +84,12 @@ export function createProxy(options: ProxyOptions): http.Server {
       return;
     }
 
+    lease = lb.acquire();
+    const target = lease.target.url;
     const up = http.request({
       agent,
-      hostname: upstream.hostname,
-      port: upstream.port || 80,
+      hostname: target.hostname,
+      port: target.port || 80,
       method: req.method,
       path: req.url, // origin-form: path + query, exactly as the client sent it
       headers: buildUpstreamHeaders(
