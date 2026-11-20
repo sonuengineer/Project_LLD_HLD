@@ -1,5 +1,5 @@
-// Static portfolio facts. Every number here is copied from the project's TESTING.md (the "source" field says
-// which file); nothing is estimated. Test counts are from the last full run recorded in IMPLEMENTATION_STATUS.md.
+// Static portfolio facts. Every number here is copied from the project's own measurements (the "source" field says
+// which file; for project 11 the raw result files are in projects/12-reverse-proxy/bench/reference-results); nothing is estimated. Test counts are from the last full run recorded in IMPLEMENTATION_STATUS.md.
 
 export interface Bench {
   title: string;
@@ -22,6 +22,7 @@ export interface ProjectInfo {
   tests: string;
   run: string;
   benches: Bench[];
+  docs?: string[];           // design documents that really exist for this project (default: the usual twelve)
 }
 
 export const PROJECTS: ProjectInfo[] = [
@@ -277,6 +278,44 @@ export const PROJECTS: ProjectInfo[] = [
         { label: "4 worker processes", "workflows/s": 8.3 },
       ],
     }],
+  },
+  {
+    // num follows the H-list (H11); the folder is projects/12-reverse-proxy because projects/11 is the MCP server (A3).
+    num: 11, slug: "p12-reverse-proxy", dir: "projects/12-reverse-proxy", name: "Reverse Proxy + Load Balancer",
+    tagline: "A hand-written HTTP reverse proxy with load balancing, health checks and safe retries; measured on a real server.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "systemd", "autocannon"],
+    features: [
+      "Streams request and response bodies; a 1 GiB download raised proxy memory by about 40 MiB (measured)",
+      "Round-robin and least-connections with lease-based active counters (all back to 0 after a 30-minute soak)",
+      "Passive ejection after 3 consecutive connection failures, optional active health checks, 503 with Retry-After when nothing is healthy",
+      "Retries only for body-less GET/HEAD/OPTIONS before any response byte; never for POST or for slow (idle-timeout) upstreams",
+      "Strips hop-by-hop headers, overwrites a spoofed X-Forwarded-For, detects proxy loops (508)",
+      "Separate connect timeout, tried against a real black hole; graceful shutdown (a measured defect was found and fixed)",
+      "Runs as a hardened systemd service on an Oracle ARM server (loopback only, not public)",
+    ],
+    tests: "109 passing on Linux/arm64 (107 on Windows: the 2 tests that send a real SIGTERM only run on Linux/macOS)",
+    run: "cd projects/12-reverse-proxy && npm ci && npm run build && UPSTREAM=http://127.0.0.1:3000 node dist/index.js",
+    docs: ["README", "STAGE4_PLAN"],
+    benches: [
+      {
+        title: "What the proxy costs", unit: "req/s",
+        note: "Load generator, proxy and upstream share one 2-core Oracle ARM server; 32 connections, median of 3 runs of 15 s each. Relative comparison only, not a capacity claim.",
+        source: "projects/12-reverse-proxy/README.md", series: ["req/s"],
+        rows: [{ label: "direct to upstream", "req/s": 14953 }, { label: "through the proxy", "req/s": 3586 }, { label: "proxy, request log off", "req/s": 4044 }],
+      },
+      {
+        title: "One slow upstream (+40 ms): round-robin vs least-connections", unit: "req/s",
+        note: "Same server and method. Median latency 15 ms vs 6 ms, but p99 was 46 ms vs 49 ms: the tail did not improve.",
+        source: "projects/12-reverse-proxy/README.md", series: ["req/s"],
+        rows: [{ label: "round-robin", "req/s": 1524 }, { label: "least-connections", "req/s": 3400 }],
+      },
+      {
+        title: "Graceful shutdown: time to exit after SIGTERM", unit: "ms",
+        note: "10 requests of 2 s in flight, SIGTERM after 0.5 s; the work itself needs about 1500 ms. Before: idle keep-alive connections were never swept.",
+        source: "projects/12-reverse-proxy/README.md", series: ["ms"],
+        rows: [{ label: "before the fix", ms: 4540 }, { label: "after the fix", ms: 1611 }],
+      },
+    ],
   },
 ];
 

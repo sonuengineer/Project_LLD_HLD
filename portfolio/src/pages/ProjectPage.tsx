@@ -45,7 +45,7 @@ export default function ProjectPage({ slug }: { slug: string }) {
 
       <Section title="Design documents">
         <div className="flex flex-wrap gap-2">
-          {DOCS.map((d) => <a key={d} href={href("/source", { path: `${p.dir}/${d}.md` })}
+          {(p.docs ?? DOCS).map((d) => <a key={d} href={href("/source", { path: `${p.dir}/${d}.md` })}
             className="rounded-md border border-slate-300 px-2 py-1 font-mono text-xs hover:bg-slate-100 dark:border-slate-700 dark:hover:bg-slate-900">{d}.md</a>)}
         </div>
       </Section>

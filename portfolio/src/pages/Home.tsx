@@ -7,7 +7,7 @@ const SKILLS = [
   ["Distributed systems", "Leases and fencing tokens, replication with ISR and high watermarks, ordered fan-out, at-least-once delivery with idempotent consumers, sagas and durable workflows."],
   ["Data & storage", "Postgres (RLS, SKIP LOCKED, deferred constraint triggers, row locks), Redis Lua scripting, a segmented commit log, AOF / snapshot persistence, streaming object storage."],
   ["Reliability", "Crash tests (real kill -9), fault injection with a mock payment provider, recovery workers, reconciliation, documented failure scenarios for every project."],
-  ["Performance work", "Every benchmark on the project pages came from a measure -> hypothesis -> experiment -> fix loop; rejected hypotheses are documented in each TESTING.md."],
+  ["Performance work", "Every benchmark on the project pages came from a measure -> hypothesis -> experiment -> fix loop; rejected hypotheses are documented in each TESTING.md (project 11: in its README)."],
 ];
 
 export default function Home() {
@@ -17,11 +17,13 @@ export default function Home() {
   return (
     <div>
       <section className="py-6">
-        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Ten backend systems, built from first principles</h1>
+        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Eleven backend systems, built from first principles</h1>
         <p className="mt-4 max-w-3xl text-lg text-slate-600 dark:text-slate-400">
           Rate limiting, a Redis-compatible database, job queues, webhooks, a Kafka-style log, multi-tenant SaaS,
-          object storage, real-time collaboration, payments and a durable workflow engine. Python 3.12, FastAPI,
-          Postgres and Redis, each with tests, Docker Compose, measured benchmarks and twelve design documents.
+          object storage, real-time collaboration, payments, a durable workflow engine and a reverse proxy with a load
+          balancer. The first ten are Python 3.12, FastAPI, Postgres and Redis, each with tests, Docker Compose,
+          measured benchmarks and twelve design documents. The eleventh is TypeScript on Node with no runtime
+          dependencies, with tests and results measured on a real server.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <a href={href("/interview")} className="rounded-md bg-sky-600 px-4 py-2 text-white hover:bg-sky-700">Interview prep{total ? ` (${total} questions)` : ""}</a>
