@@ -3,15 +3,16 @@
 Every step taken to put this project online, in order, written so it can be repeated without the chat history.
 Screenshots are in `screenshots/` (kept out of git because they show the Oracle account name).
 
-## Current status (2026-11-17)
+## Current status (2026-11-20)
 
 | Step | What | Status |
 |---|---|---|
 | 1 | Push code to GitHub | DONE -- https://github.com/sonuengineer/Project_LLD_HLD (branch `main`) |
 | 2 | Portfolio site on Vercel | DONE -- https://portfolio-beta-two-51.vercel.app |
-| 3 | Create Oracle A1 server | IN PROGRESS -- console form hit "Out of capacity"; network created via SDK, auto-retry loop running (`05-oci-cli-auto-retry.md`) |
+| 3 | Create Oracle A1 server | DONE (2026-11-19) -- `portfolio-a1`, 2 OCPU / 12 GB, Ubuntu 24.04 ARM64; landed on attempt 258 of the loop running on the micro server (after many failed attempts from the PC earlier) (`05-oci-cli-auto-retry.md`, `06-oracle-micro-server.md`) |
+| 3a | Second Oracle A1 server | DONE (2026-11-20) -- `portfolio-a2`, 2 OCPU / 12 GB, 50 GB disk, Ubuntu 24.04 ARM64, bootstrap applied and verified; got it with the same retry loop (`--name portfolio-a2 --boot-gb 50`) -- `06-oracle-micro-server.md` section 6.7 |
 | 3b | Oracle micro server (1 GB, AMD) | DONE (2026-11-18) -- `portfolio-micro`, bootstrap applied and verified -- `06-oracle-micro-server.md` |
-| 4 | Server setup (firewall, Docker, Caddy) | DONE on the micro; repeat on the A1 once step 3 succeeds -- `scripts/bootstrap-ubuntu.sh` |
+| 4 | Server setup (firewall, Docker, Caddy) | DONE on the micro and on the A1 (Docker, Caddy, swap, iptables verified, port 80 answers 200) -- `scripts/bootstrap-ubuntu.sh` |
 | 5 | Deploy NestJS + FastAPI projects + selected demos | Planned -- layout in `04-oracle-server-setup.md` |
 
 ## Files
