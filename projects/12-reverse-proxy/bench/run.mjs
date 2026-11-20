@@ -2,7 +2,7 @@
 // Writes bench/results/<timestamp>-<label>/ with env.json, one eN.json per experiment, and SUMMARY.md.
 import { writeFileSync } from "node:fs";
 import path from "node:path";
-import { envInfo, makeResultsDir, save } from "./lib.mjs";
+import { cpuShare, cpuTimes, envInfo, makeResultsDir, save } from "./lib.mjs";
 import { scenarios } from "./scenarios.mjs";
 
 const args = process.argv.slice(2);
@@ -12,6 +12,8 @@ const chosen = names.length === 0 || names.includes("all") ? Object.keys(scenari
 for (const n of chosen) if (!scenarios[n]) throw new Error(`unknown experiment "${n}" (have: ${Object.keys(scenarios).join(", ")})`);
 
 const dir = makeResultsDir(label);
+const cpuStart = cpuTimes();
+const wallStart = Date.now();
 const env = envInfo();
 save(dir, "env.json", env);
 console.log(`results -> ${dir}\n${JSON.stringify(env)}\n`);
@@ -49,5 +51,16 @@ for (const name of chosen) {
     md.push(`## ${result.title}`, "", result.note, "", table(result.columns, result.rows), "", `Raw data: \`${name}.json\``, "");
   }
 }
+const share = cpuShare(cpuStart, cpuTimes());
+const seconds = Math.round((Date.now() - wallStart) / 1000);
+save(dir, "env.json", { ...env, wallSeconds: seconds, cpuShareDuringRun: share });
+md.splice(
+  4,
+  0,
+  share
+    ? `Whole run took ${seconds}s. CPU time over the run (all cores): busy ${share.busy}%, idle ${share.idle}%, iowait ${share.iowait}%, STEAL ${share.steal}% (steal is time the hypervisor gave to other tenants; high steal means noisy numbers).`
+    : `Whole run took ${seconds}s. CPU steal was not recorded (not Linux).`,
+  "",
+);
 writeFileSync(path.join(dir, "SUMMARY.md"), md.join("\n") + "\n");
 console.log(`\nSUMMARY.md written to ${dir}`);

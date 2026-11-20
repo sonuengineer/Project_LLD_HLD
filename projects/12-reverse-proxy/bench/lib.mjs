@@ -1,6 +1,6 @@
 // Shared helpers for the experiments. Everything here is plumbing: starting processes, timing, saving raw results.
 import { spawn, execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync, existsSync } from "node:fs";
+import { mkdirSync, writeFileSync, existsSync, readFileSync } from "node:fs";
 import { createServer } from "node:net";
 import os from "node:os";
 import path from "node:path";
@@ -143,6 +143,25 @@ export function load({ url, connections = 32, duration = 15, ...rest }) {
 }
 
 export const pct = (part, total) => (total ? round((part / total) * 100, 1) : null);
+
+/** Aggregate CPU time counters from /proc/stat (Linux only), or null. Used to report steal and iowait over a run. */
+export function cpuTimes() {
+  try {
+    const first = readFileSync("/proc/stat", "utf8").split("\n")[0].trim().split(/\s+/).slice(1).map(Number);
+    const [user, nice, system, idle, iowait, irq, softirq, steal] = first;
+    return { user, nice, system, idle, iowait, irq, softirq, steal: steal ?? 0, total: first.slice(0, 8).reduce((a, b) => a + b, 0) };
+  } catch {
+    return null;
+  }
+}
+
+/** Share of CPU time spent in each state between two cpuTimes() readings, in percent. */
+export function cpuShare(a, b) {
+  if (!a || !b) return null;
+  const total = b.total - a.total;
+  const share = (k) => round(((b[k] - a[k]) / total) * 100, 2);
+  return { steal: share("steal"), iowait: share("iowait"), idle: share("idle"), busy: round(100 - share("idle") - share("iowait") - share("steal"), 2) };
+}
 
 /** Resident memory of a process in KiB (Linux only). */
 export async function rssKiB(pid) {
