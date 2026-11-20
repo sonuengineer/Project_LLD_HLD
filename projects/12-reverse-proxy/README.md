@@ -9,7 +9,7 @@ code and tests that exist today.
 |---|---|---|
 | 1 | Reverse proxy to ONE upstream: streaming, headers, errors, timeouts, loop detection, graceful shutdown | DONE (29 tests) |
 | 2 | Load balancing over several upstreams: round-robin, least-connections | DONE (16 more tests, 45 in total) |
-| 3 | Health checks, passive failure detection, retries for idempotent requests | Not started |
+| 3 | Health checks (active + passive), retries for safe requests, separate connect timeout | DONE (44 more tests, 89 in total) |
 | 4 | Deploy on the Oracle servers (proxy on `portfolio-a2`, apps on `portfolio-a1`) and measure | Not started |
 
 No benchmark numbers are claimed anywhere in this project. They will be added from real measurements after stage 4.
@@ -32,8 +32,13 @@ UPSTREAM=http://127.0.0.1:3000,http://127.0.0.1:3001 STRATEGY=least-connections 
 | `PORT` / `HOST` | `8080` / `127.0.0.1` | Where the proxy listens. |
 | `TRUST_FORWARDED` | `false` | `true` only when a proxy YOU control (for example Caddy) sits in front: keep and extend its `X-Forwarded-For`. |
 | `UPSTREAM_TIMEOUT_MS` | `30000` | Idle timeout against the upstream; exceeded -> 504. |
+| `CONNECT_TIMEOUT_MS` | `3000` | Give up if the TCP connection is not made in time (retryable). |
+| `RETRIES` | `1` | Extra attempts for body-less GET/HEAD/OPTIONS that fail before any response byte. `0` turns it off. |
+| `EJECT_AFTER` / `EJECT_MS` | `3` / `10000` | Passive health: consecutive connection failures before an upstream is skipped, and for how long. |
+| `HEALTH_PATH` | unset | Turns on ACTIVE health checks: probe this path (for example `/health`) on every upstream. |
+| `HEALTH_INTERVAL_MS` | `5000` | Time between probe rounds (only with `HEALTH_PATH`). |
 
-One JSON log line is written per request: `{method, url, status, aborted, ms, upstream}` (`upstream` is the `host:port` that served it).
+One JSON log line is written per request: `{method, url, status, aborted, ms, upstream, attempts}` (`upstream` is the last one tried; `attempts` of 2 or more means it was retried). Health changes are logged as `{"msg":"health", upstream, healthy, reason}`.
 
 ## What stage 1 does (and the test that proves it)
 
@@ -67,15 +72,39 @@ and hands back a lease; `release()` gives the slot back and counts only once.
   client abort, mid-response drop). A test checks all four paths leave the counters at zero, and that the counter was
   really up while a request hung.
 - With several proxy PROCESSES each one keeps its own counters, so least-connections is per process, not global.
-- **Known limit until stage 3:** there are no health checks. A dead upstream still receives its share of traffic and
-  answers 502 (test: `still sends its share of traffic to a dead upstream`). Do not claim failover.
+- Balancing alone is not availability: on its own, a dead upstream keeps receiving its share and answers 502 (test:
+  `with retries and ejection switched off, a dead upstream still gets its share`). Stage 3 adds what is missing.
 
 Checked by breaking the code: never releasing the lease, making least-connections ignore load, and changing the tie
 rule each turned the matching tests red.
 
+## What stage 3 adds
+
+| Mechanism | Rule | Where |
+|---|---|---|
+| Passive ejection | `EJECT_AFTER` (3) consecutive connection failures on real traffic -> skipped for `EJECT_MS` (10 s). After that ONE failure ejects it again (a single trial); one success wipes the slate. | `balancer.ts` |
+| What counts as a failure | refused, reset, connect timeout, idle timeout, a response cut short by the upstream. NOT an HTTP 500: the server is reachable, the application is what is broken. NOT a client that left. | `proxy.ts` |
+| Active checks (optional) | every `HEALTH_INTERVAL_MS` request `HEALTH_PATH` on each upstream; 2xx/3xx is healthy. 2 failures in a row -> down, 2 passes in a row -> up (no flapping on one blip). | `health.ts` |
+| Nothing available | answer `503` with `Retry-After: 1` | `proxy.ts` |
+| Retries | only GET/HEAD/OPTIONS with NO body (a streamed body cannot be replayed), only before any response byte, only for connection-level errors and connect timeouts, preferring a DIFFERENT upstream. | `proxy.ts` |
+| Not retried on purpose | POST/PUT/DELETE (not safe to repeat), anything after response bytes reached the client, response-idle timeouts (slow is not unreachable; retrying doubles the wait and loads a struggling server) | `proxy.ts` |
+| Connect timeout | separate from the idle timeout: an unreachable machine fails in seconds so the retry can go elsewhere | `connect.ts` |
+
+Checked by breaking the code (each break turned the matching test red): retrying idle timeouts, retrying POST, counting a
+client abort as an upstream failure, never reporting success, retrying without avoiding the failed target, ignoring the
+probe thresholds, never expiring an ejection. One break was NOT caught at first (a body-less POST would have been
+retried); that gap is now closed by a test.
+
 ## Not implemented (on purpose, so nobody assumes it)
 
-- Health checks, failover, retries, weights, sticky sessions (stage 3 and later).
+- Weights, sticky sessions, draining, runtime config reload.
+- "Panic mode" (sending traffic anyway when everything looks down): we answer 503 instead.
+- Retry budgets and backoff. Worst case a failing request costs 1 + `RETRIES` upstream attempts; there is no global limit.
+- Slow start after an upstream comes back: it gets its full share at once.
+- Health state is per process, like the counters.
+- A real network black hole is not tested for the connect timeout: the timer helper is tested with a fake socket, and the
+  proxy wiring only with a slow-but-reachable upstream.
+- Graceful shutdown still has no test.
 - WebSocket / `Upgrade` (the `upgrade` event is not handled, so such connections are closed).
 - HTTPS upstreams and TLS termination (Caddy does TLS in front of this).
 - Request body size limits, rate limiting, caching, compression.
@@ -83,9 +112,11 @@ rule each turned the matching tests red.
 ## Files
 
 - `src/headers.ts` -- pure functions: hop-by-hop stripping, forwarded headers, Via and loop detection.
-- `src/balancer.ts` -- `Balancer`: round-robin and least-connections with leases.
+- `src/balancer.ts` -- `Balancer`: round-robin and least-connections with leases, plus health state (ejection, healthy flag).
+- `src/health.ts` -- `HealthChecker` (active probes with thresholds) and the HTTP probe.
+- `src/connect.ts` -- `watchConnect`: the connect timeout.
 - `src/proxy.ts` -- `createProxy()`: the request lifecycle, error mapping, aborts, keep-alive agent.
 - `src/index.ts` -- CLI: environment variables, JSON logging, graceful shutdown.
-- `test/` -- vitest; the proxy tests run real upstream servers on ephemeral ports.
+- `test/` -- vitest; the proxy tests run real upstream servers on ephemeral ports. Files run one at a time (`vitest.config.ts`) because the helper that makes a "dead" port frees it and could race with another file.
 
 Interview questions for this project: `interview/data/p12-reverse-proxy/`.

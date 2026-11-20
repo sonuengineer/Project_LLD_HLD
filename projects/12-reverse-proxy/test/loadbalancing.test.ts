@@ -79,7 +79,7 @@ describe("active-request accounting", () => {
     );
 
     const balancer = new Balancer([ok, dead, hang, cut].map((p) => new URL(`http://127.0.0.1:${p}`)), "round-robin");
-    const px = await startProxy([ok, dead, hang, cut], { balancer });
+    const px = await startProxy([ok, dead, hang, cut], { balancer, retries: 0 }); // retries off: this test is about one attempt per request
 
     expect((await get(px)).status).toBe(200); // ok
     expect((await get(px)).status).toBe(502); // dead
@@ -99,11 +99,11 @@ describe("active-request accounting", () => {
   });
 });
 
-describe("what stage 2 does NOT do", () => {
-  it("still sends its share of traffic to a dead upstream (health checks come in stage 3)", async () => {
+describe("balancing alone does not give availability", () => {
+  it("with retries and ejection switched off, a dead upstream still gets its share of traffic", async () => {
     const live = await listen(namedUpstream("live"));
     const dead = await deadPort();
-    const px = await startProxy([live, dead], { strategy: "round-robin" });
+    const px = await startProxy([live, dead], { strategy: "round-robin", retries: 0, ejectAfter: 1000 });
     const statuses: number[] = [];
     for (let i = 0; i < 4; i++) statuses.push((await get(px)).status);
     expect(statuses).toEqual([200, 502, 200, 502]);

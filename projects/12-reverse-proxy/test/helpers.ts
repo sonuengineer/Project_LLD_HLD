@@ -53,3 +53,22 @@ export async function deadPort(): Promise<number> {
   await new Promise<void>((resolve) => s.close(() => resolve()));
   return port;
 }
+
+/** An upstream that answers with its own name and counts how many requests reached it. */
+export function countingUpstream(name: string): { server: http.Server; hits: () => number } {
+  let count = 0;
+  const server = http.createServer((_req, res) => {
+    count++;
+    res.end(name);
+  });
+  return { server, hits: () => count };
+}
+
+/** Polls until condition() is true. Fails the test with a clear message instead of hanging. */
+export async function waitFor(condition: () => boolean, what: string, timeoutMs = 3000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!condition()) {
+    if (Date.now() > deadline) throw new Error(`timed out waiting for: ${what}`);
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
