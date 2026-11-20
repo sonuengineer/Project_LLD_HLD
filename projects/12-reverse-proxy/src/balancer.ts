@@ -63,6 +63,10 @@ export class Balancer {
 
   constructor(urls: URL[], readonly strategy: Strategy = "round-robin", options: BalancerOptions = {}) {
     if (urls.length === 0) throw new Error("at least one upstream is required");
+    for (const url of urls) {
+      if (url.protocol !== "http:") throw new Error("only http:// upstreams are supported");
+      if (url.pathname !== "/" || url.search) throw new Error("upstream must not contain a path or query");
+    }
     if (!STRATEGIES.includes(strategy)) throw new Error(`unknown strategy: ${String(strategy)}`);
     this.ejectAfter = options.ejectAfter ?? 3;
     this.ejectMs = options.ejectMs ?? 10_000;
@@ -101,6 +105,11 @@ export class Balancer {
         target.active--;
       },
     };
+  }
+
+  /** A copy of the current state of every target, for logging and debugging. */
+  snapshot(now: number = this.clock()): { upstream: string; active: number; healthy: boolean; ejected: boolean }[] {
+    return this.targets.map((t) => ({ upstream: t.url.host, active: t.active, healthy: t.healthy, ejected: now < t.ejectedUntil }));
   }
 
   /** The upstream accepted the request and answered (any HTTP status): it is reachable. */

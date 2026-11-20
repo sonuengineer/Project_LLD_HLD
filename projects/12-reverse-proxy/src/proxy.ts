@@ -18,6 +18,12 @@ export interface RequestLog {
   upstream?: string;
   /** how many upstream attempts were made (2 or more means the request was retried) */
   attempts: number;
+  /**
+   * The LAST upstream error seen while serving this request, for example "ECONNREFUSED", "ECONNRESET",
+   * "ConnectTimeoutError", "UpstreamTimeoutError" or "UPSTREAM_ABORTED" (body cut short). With attempts of 2
+   * or more and a 2xx status, it is the failure that a retry hid from the client.
+   */
+  error?: string;
 }
 
 export interface ProxyOptions {
@@ -85,6 +91,11 @@ function isReplayable(req: IncomingMessage): boolean {
   return length === undefined || length === "0";
 }
 
+function describeError(err: unknown): string {
+  const e = err as NodeJS.ErrnoException;
+  return e.code ?? e.name ?? "UNKNOWN";
+}
+
 function plain(res: ServerResponse, status: number, text: string, extra: Record<string, string> = {}): void {
   res.writeHead(status, { "content-type": "text/plain; charset=utf-8", "content-length": Buffer.byteLength(text), ...extra });
   res.end(text);
@@ -95,10 +106,6 @@ export function createProxy(options: ProxyOptions): http.Server {
   if (!balancer) {
     if (!options.upstream) throw new Error("upstream (or balancer) is required");
     const urls = Array.isArray(options.upstream) ? options.upstream : [options.upstream];
-    for (const upstream of urls) {
-      if (upstream.protocol !== "http:") throw new Error("only http:// upstreams are supported");
-      if (upstream.pathname !== "/" || upstream.search) throw new Error("upstream must not contain a path or query");
-    }
     balancer = new Balancer(urls, options.strategy, {
       ejectAfter: options.ejectAfter,
       ejectMs: options.ejectMs,
@@ -118,6 +125,7 @@ export function createProxy(options: ProxyOptions): http.Server {
     const started = Date.now();
     let aborted = false;
     let attempts = 0;
+    let lastError: string | undefined;
     let lease: Lease | undefined;
     let up: ClientRequest | undefined;
 
@@ -133,6 +141,7 @@ export function createProxy(options: ProxyOptions): http.Server {
         ms: Date.now() - started,
         upstream: lease?.target.url.host,
         attempts,
+        error: lastError,
       });
     });
 
@@ -200,6 +209,7 @@ export function createProxy(options: ProxyOptions): http.Server {
         upRes.on("close", () => {
           if (!upRes.complete) {
             if (!res.destroyed) reportFailure(); // the upstream broke it (not a client that left)
+            lastError = "UPSTREAM_ABORTED";
             aborted = true;
             res.destroy();
           }
@@ -209,6 +219,7 @@ export function createProxy(options: ProxyOptions): http.Server {
       request.on("error", (err) => {
         if (request !== up) return; // an attempt we already moved on from
         if (res.destroyed) return; // client already gone, nothing to tell it and nothing to blame on the upstream
+        lastError = describeError(err);
         reportFailure();
         if (res.headersSent) {
           aborted = true;

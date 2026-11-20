@@ -10,7 +10,7 @@ code and tests that exist today.
 | 1 | Reverse proxy to ONE upstream: streaming, headers, errors, timeouts, loop detection, graceful shutdown | DONE (29 tests) |
 | 2 | Load balancing over several upstreams: round-robin, least-connections | DONE (16 more tests, 45 in total) |
 | 3 | Health checks (active + passive), retries for safe requests, separate connect timeout | DONE (44 more tests, 89 in total) |
-| 4 | Deploy on the Oracle servers (proxy on `portfolio-a2`, apps on `portfolio-a1`) and measure | Not started |
+| 4 | Run it on `portfolio-a2` and MEASURE it (plan: `STAGE4_PLAN.md`) | IN PROGRESS: tooling and tests done (4a); server run not done yet |
 
 No benchmark numbers are claimed anywhere in this project. They will be added from real measurements after stage 4.
 
@@ -37,8 +37,10 @@ UPSTREAM=http://127.0.0.1:3000,http://127.0.0.1:3001 STRATEGY=least-connections 
 | `EJECT_AFTER` / `EJECT_MS` | `3` / `10000` | Passive health: consecutive connection failures before an upstream is skipped, and for how long. |
 | `HEALTH_PATH` | unset | Turns on ACTIVE health checks: probe this path (for example `/health`) on every upstream. |
 | `HEALTH_INTERVAL_MS` | `5000` | Time between probe rounds (only with `HEALTH_PATH`). |
+| `STATS_INTERVAL_MS` | unset | Log one `{"msg":"stats", targets:[{upstream, active, healthy, ejected}]}` line per interval (to spot counter leaks in long runs). |
+| `REQUEST_LOG` | on | `false` turns off the per-request log line (health and stats lines stay). Added to measure what the logging costs; the answer is in the stage 4 results, not assumed. |
 
-One JSON log line is written per request: `{method, url, status, aborted, ms, upstream, attempts}` (`upstream` is the last one tried; `attempts` of 2 or more means it was retried). Health changes are logged as `{"msg":"health", upstream, healthy, reason}`.
+One JSON log line is written per request: `{method, url, status, aborted, ms, upstream, attempts, error}` (`upstream` is the last one tried; `attempts` of 2 or more means it was retried; `error` is the last upstream error, for example `ECONNREFUSED`, `ECONNRESET`, `ConnectTimeoutError`, `UpstreamTimeoutError` or `UPSTREAM_ABORTED`, and on a 2xx with `attempts` >= 2 it is the failure a retry hid). Health changes are logged as `{"msg":"health", upstream, healthy, reason}`.
 
 ## What stage 1 does (and the test that proves it)
 
@@ -104,7 +106,7 @@ retried); that gap is now closed by a test.
 - Health state is per process, like the counters.
 - A real network black hole is not tested for the connect timeout: the timer helper is tested with a fake socket, and the
   proxy wiring only with a slow-but-reachable upstream.
-- Graceful shutdown still has no test.
+- Graceful shutdown: a test now starts the real CLI and sends SIGTERM, but it only runs on Linux/macOS (Windows cannot send a catchable SIGTERM). It has NOT been run yet at the time of writing; see the stage 4 results.
 - WebSocket / `Upgrade` (the `upgrade` event is not handled, so such connections are closed).
 - HTTPS upstreams and TLS termination (Caddy does TLS in front of this).
 - Request body size limits, rate limiting, caching, compression.
@@ -117,6 +119,7 @@ retried); that gap is now closed by a test.
 - `src/connect.ts` -- `watchConnect`: the connect timeout.
 - `src/proxy.ts` -- `createProxy()`: the request lifecycle, error mapping, aborts, keep-alive agent.
 - `src/index.ts` -- CLI: environment variables, JSON logging, graceful shutdown.
+- `bench/` -- the stage 4 experiments (own `package.json` with a pinned `autocannon`, so the proxy keeps zero dependencies): `upstream.mjs` test server, `scenarios.mjs` E1-E9, `run.mjs` runner that saves raw JSON and a generated `SUMMARY.md`. Run `BENCH_QUICK=1 node run.mjs all` for a short dry run; real runs are described in `STAGE4_PLAN.md`.
 - `test/` -- vitest; the proxy tests run real upstream servers on ephemeral ports. Files run one at a time (`vitest.config.ts`) because the helper that makes a "dead" port frees it and could race with another file.
 
 Interview questions for this project: `interview/data/p12-reverse-proxy/`.

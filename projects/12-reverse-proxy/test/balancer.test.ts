@@ -9,6 +9,12 @@ describe("construction", () => {
     expect(() => new Balancer([])).toThrow(/at least one/);
     expect(() => new Balancer(urls("a"), "random" as never)).toThrow(/unknown strategy/);
   });
+
+  it("rejects upstreams it cannot honour: https and URLs with a path or query", () => {
+    expect(() => new Balancer([new URL("https://a.test")])).toThrow(/http/);
+    expect(() => new Balancer([new URL("http://a.test/base")])).toThrow(/path/);
+    expect(() => new Balancer([new URL("http://a.test/?x=1")])).toThrow(/path/);
+  });
 });
 
 describe("round-robin", () => {

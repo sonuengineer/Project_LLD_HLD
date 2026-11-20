@@ -136,6 +136,46 @@ describe("retries", () => {
   });
 });
 
+describe("the log says why a request failed", () => {
+  it("records the error code, including one that a retry hid from the client", async () => {
+    const entries: RequestLog[] = [];
+    const dead = await deadPort();
+    const live = await listen(namedUpstream("live"));
+    const px = await startProxy([dead, live], { strategy: "round-robin", log: (e) => entries.push(e) });
+    expect((await send(px)).status).toBe(200); // dead first, retried on live
+    await settle();
+    expect(entries[0]).toMatchObject({ status: 200, attempts: 2, error: "ECONNREFUSED" });
+  });
+
+  it("records the failing reason when the client gets a 502, a 504 and a cut-short body", async () => {
+    const entries: RequestLog[] = [];
+    const dead = await startProxy(await deadPort(), { retries: 0, log: (e) => entries.push(e) });
+    expect((await send(dead)).status).toBe(502);
+
+    const hang = http.createServer(() => undefined);
+    const slow = await startProxy(await listen(hang), { upstreamTimeoutMs: 80, retries: 0, log: (e) => entries.push(e) });
+    expect((await send(slow)).status).toBe(504);
+
+    const cut = http.createServer((_q, r) => {
+      r.writeHead(200, { "content-length": "50" });
+      r.write("x");
+      setTimeout(() => r.destroy(), 20);
+    });
+    const cutPx = await startProxy(await listen(cut), { log: (e) => entries.push(e) });
+    await expect((await fetch(`http://127.0.0.1:${cutPx}/`)).text()).rejects.toThrow();
+    await settle();
+    expect(entries.map((e) => e.error).sort()).toEqual(["ECONNREFUSED", "UPSTREAM_ABORTED", "UpstreamTimeoutError"]);
+  });
+
+  it("leaves error unset on a clean request", async () => {
+    const entries: RequestLog[] = [];
+    const px = await startProxy(await listen(namedUpstream("ok")), { log: (e) => entries.push(e) });
+    await send(px);
+    await settle();
+    expect(entries[0]!.error).toBeUndefined();
+  });
+});
+
 describe("passive health on real traffic", () => {
   it("stops sending to an upstream after it fails ejectAfter times in a row", async () => {
     const dead = await deadPort();

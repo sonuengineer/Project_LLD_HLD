@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { STRATEGIES } from "./balancer.js";
+import { Balancer, STRATEGIES } from "./balancer.js";
 import type { Strategy } from "./balancer.js";
 import { createProxy } from "./proxy.js";
 
@@ -27,19 +27,35 @@ const port = intEnv("PORT") ?? 8080;
 const host = process.env.HOST ?? "127.0.0.1";
 const healthPath = process.env.HEALTH_PATH;
 
+let balancer: Balancer;
+try {
+  balancer = new Balancer(
+    upstreamRaw.split(",").map((u) => new URL(u.trim())),
+    strategy,
+    {
+      ejectAfter: intEnv("EJECT_AFTER"),
+      ejectMs: intEnv("EJECT_MS"),
+      onHealthChange: (event) => console.log(JSON.stringify({ msg: "health", ...event })),
+    },
+  );
+} catch (err) {
+  fail(`invalid UPSTREAM: ${(err as Error).message}`);
+}
+
 const server = createProxy({
-  upstream: upstreamRaw.split(",").map((u) => new URL(u.trim())),
-  strategy,
+  balancer,
   trustForwarded: process.env.TRUST_FORWARDED === "true",
   upstreamTimeoutMs: intEnv("UPSTREAM_TIMEOUT_MS"),
   connectTimeoutMs: intEnv("CONNECT_TIMEOUT_MS"),
   retries: intEnv("RETRIES"),
-  ejectAfter: intEnv("EJECT_AFTER"),
-  ejectMs: intEnv("EJECT_MS"),
   healthCheck: healthPath ? { path: healthPath, intervalMs: intEnv("HEALTH_INTERVAL_MS") } : undefined,
-  onHealthChange: (event) => console.log(JSON.stringify({ msg: "health", ...event })),
-  log: (entry) => console.log(JSON.stringify(entry)),
+  // One line per request is handy but costs a write per request. REQUEST_LOG=false turns it off.
+  log: process.env.REQUEST_LOG === "false" ? undefined : (entry) => console.log(JSON.stringify(entry)),
 });
+
+// Optional: one line per interval with every upstream's active count and health, to see leaks in a long run.
+const statsMs = intEnv("STATS_INTERVAL_MS");
+if (statsMs) setInterval(() => console.log(JSON.stringify({ msg: "stats", targets: balancer.snapshot() })), statsMs).unref();
 
 server.listen(port, host, () =>
   console.log(JSON.stringify({ msg: "listening", host, port, strategy, upstream: upstreamRaw, activeHealthCheck: healthPath ?? null })),

@@ -105,6 +105,22 @@ describe("passive ejection", () => {
   });
 });
 
+describe("snapshot", () => {
+  it("reports active count, health and ejection for every target", () => {
+    const { b, advance } = make(["a", "b", "c"], "round-robin", 1, 1000);
+    b.acquire(); // a is busy
+    b.setHealthy(b.targets[1]!, false, "probe");
+    b.reportFailure(b.targets[2]!); // c ejected (ejectAfter 1)
+    expect(b.snapshot()).toEqual([
+      { upstream: "a", active: 1, healthy: true, ejected: false },
+      { upstream: "b", active: 0, healthy: false, ejected: false },
+      { upstream: "c", active: 0, healthy: true, ejected: true },
+    ]);
+    advance(1000);
+    expect(b.snapshot()[2]!.ejected).toBe(false);
+  });
+});
+
 describe("health events", () => {
   it("reports an ejection once, and the recovery once", () => {
     const { b, events } = make(["a"], "round-robin", 2);
