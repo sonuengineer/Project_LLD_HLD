@@ -36,7 +36,7 @@ export const round = (n, d = 1) => (n === null || n === undefined ? null : Numbe
 export function envInfo() {
   const git = (...args) => {
     try {
-      return execFileSync("git", args, { cwd: ROOT, encoding: "utf8" }).trim();
+      return execFileSync("git", args, { cwd: ROOT, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
     } catch {
       return "unknown";
     }
@@ -47,8 +47,9 @@ export function envInfo() {
     platform: `${process.platform}/${process.arch}`,
     cpus: os.cpus().length,
     cpuModel: os.cpus()[0]?.model ?? "unknown",
-    commit: git("rev-parse", "--short", "HEAD"),
-    dirty: git("status", "--porcelain", "--", ".") !== "",
+    // On a server the code arrives as a git archive (no .git folder): pass the commit in BENCH_COMMIT.
+    commit: process.env.BENCH_COMMIT ?? git("rev-parse", "--short", "HEAD"),
+    dirty: process.env.BENCH_COMMIT ? false : git("status", "--porcelain", "--", ".") !== "",
     quick: QUICK,
   };
 }
