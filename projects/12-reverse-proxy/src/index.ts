@@ -2,6 +2,7 @@
 import { Balancer, STRATEGIES } from "./balancer.js";
 import type { Strategy } from "./balancer.js";
 import { createProxy } from "./proxy.js";
+import { gracefulShutdown } from "./shutdown.js";
 
 function fail(message: string): never {
   console.error(message);
@@ -61,11 +62,12 @@ server.listen(port, host, () =>
   console.log(JSON.stringify({ msg: "listening", host, port, strategy, upstream: upstreamRaw, activeHealthCheck: healthPath ?? null })),
 );
 
-// Graceful shutdown: stop accepting, let in-flight requests finish, drop idle keep-alive sockets.
+// Graceful shutdown: stop accepting, let in-flight requests finish, keep dropping idle keep-alive sockets.
+let shuttingDown = false;
 function shutdown(): void {
-  server.close(() => process.exit(0));
-  server.closeIdleConnections();
-  setTimeout(() => process.exit(1), 10_000).unref();
+  if (shuttingDown) return; // a second signal must not start a second shutdown
+  shuttingDown = true;
+  void gracefulShutdown(server).then((outcome) => process.exit(outcome === "closed" ? 0 : 1));
 }
 process.on("SIGTERM", shutdown);
 process.on("SIGINT", shutdown);

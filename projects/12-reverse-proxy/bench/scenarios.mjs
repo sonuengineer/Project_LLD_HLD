@@ -163,8 +163,9 @@ async function e3() {
 async function e4() {
   const N = QUICK ? 40 : 300;
   const raw = [];
-  for (const retries of [0, 1]) {
-    const up = await startUpstream({ name: "u", keepAliveMs: 200 });
+  const kinds = [["node server (sends a Keep-Alive hint)", false], ["raw server (no hint)", true]];
+  for (const [kind, isRaw] of kinds) for (const retries of [0, 1]) {
+    const up = await startUpstream({ name: "u", keepAliveMs: 200, raw: isRaw });
     const px = await startProxy({ UPSTREAM: up.url, RETRIES: String(retries) });
     const rng = mulberry32(12345);
     const statuses = {};
@@ -185,17 +186,17 @@ async function e4() {
       const reqs = px.requests();
       const errors = {};
       for (const q of reqs) if (q.error) errors[q.error] = (errors[q.error] ?? 0) + 1;
-      raw.push({ retries, N, statuses, errors, retried: reqs.filter((q) => q.attempts > 1).length });
+      raw.push({ kind, retries, N, statuses, errors, retried: reqs.filter((q) => q.attempts > 1).length });
     } finally {
       await px.stop();
       await up.stop();
     }
   }
-  const rows = raw.map((r) => [r.retries, r.N, JSON.stringify(r.statuses), JSON.stringify(r.errors), r.retried]);
+  const rows = raw.map((r) => [r.kind, r.retries, r.N, JSON.stringify(r.statuses), JSON.stringify(r.errors), r.retried]);
   return {
     title: "E4 - stale keep-alive connections: do resets happen, and do retries hide them?",
-    note: "One upstream with a 200 ms keep-alive timeout; sequential GETs with random gaps of 150-260 ms, so some requests arrive just as the upstream closes the idle connection. Seeded random numbers: the gaps are the same in both rows.",
-    columns: ["retries", "requests", "client saw (status: count)", "upstream errors seen by proxy", "requests that were retried"],
+    note: "Two kinds of upstream, both closing idle connections after 200 ms: a Node server, and a raw one that sends no Keep-Alive hint. sequential GETs with random gaps of 150-260 ms, so some requests arrive just as the upstream closes the idle connection. Seeded random numbers: the gaps are the same in both rows.",
+    columns: ["upstream", "retries", "requests", "client saw (status: count)", "upstream errors seen by proxy", "requests that were retried"],
     rows, raw,
   };
 }

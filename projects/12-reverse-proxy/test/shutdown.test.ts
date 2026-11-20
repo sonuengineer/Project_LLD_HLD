@@ -57,10 +57,13 @@ run("graceful shutdown of the real process", () => {
 
     const inFlight = fetch(`http://127.0.0.1:${port}/`).then(async (r) => ({ status: r.status, body: await r.text() }));
     await arrived;
+    const sigtermAt = Date.now();
     child.kill("SIGTERM");
 
     expect(await inFlight).toEqual({ status: 200, body: "finished" }); // not cut off by the shutdown
     expect(await exited).toBe(0);
+    // The request needs about 700 ms. The client's keep-alive connection must not hold the exit back for seconds.
+    expect(Date.now() - sigtermAt).toBeLessThan(2500);
     await expect(fetch(`http://127.0.0.1:${port}/`)).rejects.toThrow(); // nothing listens any more
   });
 

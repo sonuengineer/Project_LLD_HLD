@@ -117,9 +117,10 @@ export function start(cmd, args, { env = {}, ready, label }) {
   };
 }
 
-export async function startUpstream({ name = "upstream", delayMs = 0, keepAliveMs, resetPercent = 0, port } = {}) {
+export async function startUpstream({ name = "upstream", delayMs = 0, keepAliveMs, resetPercent = 0, port, raw = false } = {}) {
   port ??= await freePort();
   const env = { PORT: String(port), NAME: name, DELAY_MS: String(delayMs), RESET_PERCENT: String(resetPercent) };
+  if (raw) env.RAW = "1";
   if (keepAliveMs) env.KEEPALIVE_MS = String(keepAliveMs);
   const up = start(process.execPath, [path.join(HERE, "upstream.mjs")], { env, ready: /"msg":"listening"/, label: `upstream ${name}` });
   await up.ready;
