@@ -3,7 +3,9 @@
 Status (2026-11-21): stages 1-3 DONE (single server with queue groups, headers, no-responders, slow-consumer protection
 and graceful close; full-mesh cluster with interest propagation, one-hop forwarding, cluster-wide queue groups, re-dial
 and client failover; 138 tests incl. interop with the official `nats` client; 34 mutation checks, 33 caught, 1 explained
-in README.md). Stages 4-5 not started.
+in README.md). Stage 4 DONE 2026-11-21: measured on portfolio-a2 + portfolio-micro + portfolio-a1 (B1-B7), all
+temporary rules and files removed and the servers verified against snapshots; results in README.md ("Measured on real
+servers"), raw files in bench/reference-results/, server steps in deployment/08-message-broker-cluster.md. Stage 5 left.
 
 ## Why this project, and how it differs from H5
 
@@ -101,4 +103,5 @@ brokers share a machine, so B3/B4/B6 cross a real network for only one of the tw
 
 ## Next step
 
-Your answer to: may the run use all three servers (micro + A2 + A1, as above), or micro + A2 only?
+Stage 5: interview bank from 45 to 100+ questions (the new ones from the stage 4 findings: the 12x gap to nats-server,
+the B5 memory multiple, the B4 loss window), and the portfolio entry. Optional: investigate the B5 memory question.

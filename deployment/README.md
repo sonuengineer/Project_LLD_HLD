@@ -16,6 +16,7 @@ Screenshots are in `screenshots/` (kept out of git because they show the Oracle 
 | 5 | Deploy NestJS + FastAPI projects + selected demos | Planned -- layout in `04-oracle-server-setup.md` |
 | 6 | H11 reverse proxy on `portfolio-a2` (loopback only, measured, hardened systemd service installed but stopped) | DONE 2026-11-20 -- `07-reverse-proxy-on-a2.md` 7.1-7.8; no public exposure |
 | 6a | H11 two-host measurement (proxy on A2, test upstreams on A1, private network) | DONE 2026-11-21 -- `07-reverse-proxy-on-a2.md` 7.9; temporary network and firewall rules were removed again and A1 verified against a snapshot |
+| 6b | H12 message broker as a 3-server cluster (A2 + micro + A1, private network), experiments B1-B7 | DONE 2026-11-21 -- `08-message-broker-cluster.md`; everything temporary, removed again, all three servers verified against snapshots |
 
 ## Server change log (dated)
 
@@ -36,8 +37,9 @@ given so it can be checked.
 | 2026-11-20 | portfolio-a2 | systemd units `reverse-proxy` and `demo-upstream` and user `reverse-proxy` installed; tried, then stopped and disabled | `07-reverse-proxy-on-a2.md` 7.6 |
 | 2026-11-20 | Vercel | portfolio site redeployed with H11 (live at 11:57 UTC) | deploy check |
 | 2026-11-21 11:57-12:04 | Oracle network + portfolio-a1 | TEMPORARY: one security-list rule and one A1 firewall rule (A2 only, test ports), two test processes and Node in A1's home folder; all removed and verified | `07-reverse-proxy-on-a2.md` 7.9 |
+| 2026-11-21 16:58-17:25 | Oracle network + portfolio-a2, -micro, -a1 | TEMPORARY (H12): three security-list rules `h12-bench-*` (TCP 19001-19002, each from one private address), two iptables rules per server (comment `h12-bench`, not saved), `~/h12` with code and Node on micro and A1, brokers as `nice -n 19` processes, bench + nats-server in `~/h12` on A2. All removed; servers compared with before-snapshots; one orphaned loopback nats-server on A2 found and stopped | `08-message-broker-cluster.md` 8.9-8.10 |
 
-## What is on each server now (2026-11-21)
+## What is on each server now (2026-11-21, checked again after the H12 run at 17:25 UTC: unchanged)
 
 | Server | Installed / running | Notes |
 |---|---|---|
@@ -58,6 +60,7 @@ given so it can be checked.
 | [05-oci-cli-auto-retry.md](05-oci-cli-auto-retry.md) | OCI CLI/SDK install, API key, network creation, auto-retry loop -- every command |
 | [06-oracle-micro-server.md](06-oracle-micro-server.md) | The small free AMD micro server: why, how it was created, SSH key lesson, verify, limits |
 | [07-reverse-proxy-on-a2.md](07-reverse-proxy-on-a2.md) | Running and measuring the H11 reverse proxy on the second A1 server: Node install, tests, service, experiments |
+| [08-message-broker-cluster.md](08-message-broker-cluster.md) | The H12 broker as a temporary 3-server cluster (A2 + micro + A1): rules, brokers, experiments B1-B7, cleanup and proof, dated timeline |
 | [04-oracle-server-setup.md](04-oracle-server-setup.md) | After the server exists: public IP, SSH, firewall, Docker, Caddy, app layout |
 | [scripts/bootstrap-ubuntu.sh](scripts/bootstrap-ubuntu.sh) | One-time server setup script (run on the server) |
 | [scripts/Caddyfile.example](scripts/Caddyfile.example) | Reverse proxy + automatic HTTPS for several apps on one server |
