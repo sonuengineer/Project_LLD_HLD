@@ -19,6 +19,10 @@ describe("refresh tokens: rotation and reuse detection", () => {
     const r2 = await refresh(s.base, r1.body.refresh_token as string);
     expect(r2.status).toBe(200);
     expect(new Set([rt, r1.body.refresh_token, r2.body.refresh_token]).size).toBe(3);
+    // The first token is dead now. (Presenting it is reuse, which also kills the family; that has its own test.)
+    const old = await refresh(s.base, rt);
+    expect(old.status).toBe(400);
+    expect(old.body.error).toBe("invalid_grant");
   });
 
   it("reusing an old refresh token revokes the WHOLE family, including the newest token", async () => {
