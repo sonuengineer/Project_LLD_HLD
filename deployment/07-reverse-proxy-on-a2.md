@@ -1,10 +1,13 @@
 # Step 7 -- Run the H11 reverse proxy on the second A1 server (portfolio-a2) and measure it
 
+Dates: single-host work and the service on 2026-11-20; the two-host run (section 7.9) on 2026-11-21.
+
 Project code: `projects/12-reverse-proxy` (TypeScript, zero runtime dependencies). Plan: `projects/12-reverse-proxy/STAGE4_PLAN.md`.
 Placeholders: `<A2_IP>` is the public IP of `portfolio-a2` (Oracle console, Compute > Instances).
 
-Scope of this step: everything stays on A2, over loopback. Nothing is exposed to the internet, no Oracle security-list
-rule is added, and the first A1 server (which runs another application) is not touched.
+Scope of sections 7.1-7.8 (2026-11-20): everything stays on A2, over loopback. Nothing is exposed to the internet, no Oracle
+security-list rule is added, and the first A1 server (which runs another application) is not touched. Section 7.9
+(2026-11-21) is the two-host run: it added TEMPORARY rules and removed them again.
 
 ## 7.1 Look before you touch (read-only)
 
@@ -139,8 +142,95 @@ The full tables are in `projects/12-reverse-proxy/README.md` ("Measured on a rea
 
 ## 7.8 What was NOT done
 
-- No second host: nothing was measured across the network, and a closed port on another host (`EHOSTUNREACH`) was not tried.
-  Doing it needs an ingress rule in the shared Oracle security list; it was deliberately left out.
-- No public URL, DNS name or certificate: the proxy only listens on loopback.
-- Not measured: uploads through the proxy, per-process CPU, the cost of health probes, any production error rate.
+- No public URL, DNS name or certificate: the proxy only listens on loopback (single host) or is reached over the private
+  network (two-host run, 7.9).
+- Not measured: a whole machine failing (only processes were killed), uploads through the proxy, per-process CPU, the cost
+  of health probes, any production error rate.
 - Defaults were reviewed against the data and left unchanged.
+
+## 7.9 Two-host measurement (2026-11-21): proxy on A2, test upstreams on A1
+
+Goal: measure what one machine cannot show: a real network hop, and how a closed port on ANOTHER machine fails.
+Layout: load generator + proxy on `portfolio-a2`, two small test upstreams on `portfolio-a1` (which also runs another
+application; it was only touched as described here and restored afterwards).
+
+Timeline (UTC):
+
+| Time | Step |
+|---|---|
+| 11:56 | Read-only snapshot of A1: load, containers, `iptables -S INPUT` (7 rules), listening ports, home folder |
+| 11:57 | Node.js unpacked into A1's HOME folder (no system-wide install, checksum verified); two test upstreams started at `nice 19`, bound to A1's PRIVATE address only |
+| 11:57 | One A1 host firewall rule added, tagged `h11-bench-temp`: TCP 18001, 18002, 18004 from A2's private address only (not saved, so a reboot also removes it) |
+| 11:57 | One rule added to the cloud network rules (Oracle security list), tagged `h11-bench-temp`: TCP 18001-18004 from A2's private address (/32) only |
+| 11:58-12:03 | Experiments X1-X4 from A2 (about 5 minutes) |
+| 12:03 | A1: upstreams stopped, firewall rule deleted, folder deleted; state compared with the 11:56 snapshot: identical |
+| 12:04 | Cloud network rule removed; the tool re-read the rule list and verified the other 4 rules were unchanged |
+
+### The cloud network rule (Oracle security list)
+
+The tool `deployment/scripts/oci_seclist_rule.py` exists because `update_security_list` REPLACES the whole rule list: a
+careless call can delete the SSH/80/443 rules. The tool reads the list, changes only one tagged rule, shows the difference,
+writes a backup of the full list to `~/.oci/seclist-backups/` (outside the repo, it contains resource IDs), and re-reads
+afterwards to prove nothing else changed. It does a dry run unless `--apply` is given.
+
+```bash
+cd deployment/scripts
+~/.oci-cli-venv/Scripts/python -I -u oci_seclist_rule.py show
+~/.oci-cli-venv/Scripts/python -I -u oci_seclist_rule.py add --cidr <A2_PRIVATE_IP>/32 --ports 18001-18004 --tag h11-bench-temp           # dry run
+~/.oci-cli-venv/Scripts/python -I -u oci_seclist_rule.py add --cidr <A2_PRIVATE_IP>/32 --ports 18001-18004 --tag h11-bench-temp --apply
+# ... experiments ...
+~/.oci-cli-venv/Scripts/python -I -u oci_seclist_rule.py remove --tag h11-bench-temp --apply
+```
+
+Before the change the list had 4 rules (TCP 22, 80, 443 and ICMP, from anywhere), attached to the one subnet that all three
+servers use. The rule applies to every server in that subnet, but only A1 had something listening and a matching host
+firewall rule.
+
+A mistake of mine, recorded honestly: the first `--apply` WROTE the rule correctly, then crashed in its own verification
+step (it compared egress rules with the ingress key). I verified by hand against the backup (4 old rules unchanged, 1 new
+rule, egress identical), fixed the bug (commit `75f898b`), and the removal later ran with the automatic verification.
+
+### On A1 (the upstream machine)
+
+```bash
+# Node in the home folder, no sudo (same checksum check as in 7.3), then:
+PORT=18001 HOST=<A1_PRIVATE_IP> NAME=fast             nohup nice -n 19 ./node/bin/node upstream.mjs > fast.log 2>&1 < /dev/null &
+PORT=18002 HOST=<A1_PRIVATE_IP> NAME=slow DELAY_MS=40 nohup nice -n 19 ./node/bin/node upstream.mjs > slow.log 2>&1 < /dev/null &
+sudo iptables -I INPUT 1 -p tcp -s <A2_PRIVATE_IP> -m multiport --dports 18001,18002,18004 \
+  -m comment --comment h11-bench-temp -j ACCEPT
+```
+
+Port 18003 was allowed by the cloud rule but NOT by A1's firewall (so A1 REJECTs it), port 18004 was allowed by both but
+nothing listened on it, and port 18005 was not allowed by the cloud rule at all (silently dropped). That gives the three
+failure kinds of experiment X4.
+
+### On A2 (the proxy machine)
+
+```bash
+cd ~/h11/projects/12-reverse-proxy/bench
+nohup env BENCH_COMMIT=<COMMIT> REMOTE_HOST=<A1_PRIVATE_IP> REMOTE_FAST_PORT=18001 REMOTE_SLOW_PORT=18002 \
+  REMOTE_REJECTED_PORT=18003 REMOTE_REFUSED_PORT=18004 REMOTE_BLACKHOLE_PORT=18005 \
+  node run.mjs x1 x2 x3 x4 --label=a2-a1-two-host > ~/h11/run-twohost.log 2>&1 < /dev/null &
+echo $! > ~/h11/twohost.pid          # wait on THIS process id, not on a name pattern (see below)
+```
+
+### Cleanup on A1, and the proof
+
+```bash
+sudo iptables -D INPUT -p tcp -s <A2_PRIVATE_IP> -m multiport --dports 18001,18002,18004 \
+  -m comment --comment h11-bench-temp -j ACCEPT
+rm -rf ~/h11-bench
+sudo iptables -S INPUT; ss -ltn; docker ps        # compared line by line with the 11:56 snapshot
+```
+
+Result: the INPUT chain was identical (7 rules), the listening ports were identical, the home folder was empty again and
+the other application's containers were all up and healthy before, during and after (load on A1 stayed below 0.5).
+After the cloud rule was removed: SSH to both servers OK, A1 port 80 answered 200, A1's HTTPS site answered 200 with a
+valid certificate when called by its name, and the test port from A2 to A1 was blocked again.
+
+Lesson learned twice: `pkill -f <pattern>` and `pgrep -f <pattern>` also match the shell whose command line CONTAINS the
+pattern. A cleanup with `pkill -f "...node upstream.mjs"` killed its own ssh session after stopping the upstreams (the
+rest was then done with exact commands), and a wait loop with `pgrep -f "node run.mjs"` waited for itself. Use a saved
+process id (`kill -0 $PID`) or exact commands instead.
+
+Results: `projects/12-reverse-proxy/bench/reference-results/a2-a1-two-host/` and the README section "Two machines".

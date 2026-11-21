@@ -26,7 +26,11 @@ const md = [
   "",
   `Date: ${env.date}  |  Node ${env.node}  |  ${env.platform}  |  ${env.cpus} CPUs (${env.cpuModel})  |  commit ${env.commit}${env.dirty ? " (uncommitted changes)" : ""}${env.quick ? "  |  QUICK DRY RUN, not real numbers" : ""}`,
   "",
-  "Everything ran on ONE machine (load generator, proxy and upstreams share the CPUs). Read the comparisons, not the absolute numbers.",
+  chosen.every((n) => n.startsWith("x"))
+    ? "Two machines: the load generator and the proxy on one server, the test upstreams on a second server (REMOTE_HOST), over the network."
+    : chosen.some((n) => n.startsWith("x"))
+      ? "Mixed run: e-experiments ran on ONE machine, x-experiments used a second machine for the upstreams."
+      : "Everything ran on ONE machine (load generator, proxy and upstreams share the CPUs). Read the comparisons, not the absolute numbers.",
   "",
 ];
 
