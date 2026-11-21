@@ -1,0 +1,1288 @@
+[
+ {
+  "id": "MB-074",
+  "project_slug": "p13-message-broker",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The first version of B5 hung forever on the PC dry run. What was the bug, and what does it teach about measuring from the right side?",
+  "answer_hinglish": "B5 ka subscriber jaan-boojh kar slow.socket.pause() karta hai -- woh socket se padhna band. Pehle version mein bench drop ko CLIENT side se detect karta tha: subscriber ke socket ka 'close' event aane ka intezaar. Lekin paused socket apna incoming data padhta hi nahi -- aur server ka band karna (FIN/RST) bhi usi read path se pata chalta hai. Toh broker ne client ko slow consumer bana kar destroy kar diya, lekin paused socket ne kabhi notice nahi kiya, aur bench hamesha wait karta raha. Deployment doc: 'it waited for a PAUSED socket to notice that the server closed it, which a paused socket never does.'\n\nFix: drop ko BROKER ke apne counter se padho -- stats line (STATS_INTERVAL_MS=100) ka slowConsumers > 0. Code comment: 'a paused socket does not notice that the server closed it, so waiting for the client side to see close would wait forever (that was a bug in the first version of B5).' Aur loop par 20 s ka limit bhi hai, taaki drop na ho toh bhi run khatam ho.\n\nSabak: (1) Jo cheez measure kar rahe ho, uska signal usi component se lo jo decision leta hai -- drop ka faisla broker karta hai, toh broker ka counter. (2) Fault injection (pause) ka side effect test tool par bhi padta hai. (3) Har wait ka timeout ho. (4) Yeh bug PC dry run (BENCH_QUICK) mein pakda gaya, servers par jaane se pehle -- dry run ki value.",
+  "why_needed": "Benchmarks bhi software hain aur unke bugs results ko ya toh rok dete hain ya galat bana dete hain.",
+  "real_world_analogy": "Kisi ne kaan band kar liye hain (pause), aur aap intezaar kar rahe ho ki woh bataye ki darwaza band hua -- woh kabhi nahi batayega. Darwaze wale se poocho.",
+  "how_it_works": "Old: pause socket -> wait for client 'close' -> never fires. New: pause -> publish -> poll broker stats slowConsumers > 0 -> or stop at 20 s.",
+  "in_this_project": "bench/scenarios.mjs b5 (comment about the bug, dropped() from stats); deployment/08 'What went wrong' (earlier, on the PC dry run); bench/lib.mjs QUICK.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/scenarios.mjs::b5",
+   "projects/13-message-broker/bench/lib.mjs::QUICK",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/scenarios.mjs b5\n// The drop is read from the BROKER's counter: a paused socket does not notice that the server closed it, so\n// waiting for the client side to see \"close\" would wait forever (that was a bug in the first version of B5).\nconst dropped = () => (b.stats().at(-1)?.slowConsumers ?? 0) > 0;\nwhile (!dropped() && now() - t0 < limit) { /* publish 1000, drained, flush */ }",
+  "code_language": "javascript",
+  "advantages": [
+   "Signal sahi component se",
+   "Timeout se hang nahi",
+   "Dry run mein pakda gaya"
+  ],
+  "disadvantages": [
+   "Drop time ab 100 ms granularity ka",
+   "Broker ke stats par dependency"
+  ],
+  "common_mistakes": [
+   "Fault inject karne wale client se hi fault ka result padhna",
+   "Bina timeout ke wait",
+   "Seedha servers par pehla run"
+  ],
+  "follow_up_questions": [
+   "Paused socket kab close notice karega?",
+   "Aur kaunse experiments mein aisa hidden wait ho sakta hai?"
+  ],
+  "concepts": [
+   "benchmark-bugs",
+   "fault-injection",
+   "observability"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Broker counter par depend karna sahi signal deta hai lekin bench ko broker ke stats format se baandhta hai; client-side signal independent hota lekin yahan kaam nahi karta.",
+   "failure_scenarios": "Agar stats line band ho (STATS_INTERVAL_MS unset) toh dropped() kabhi true nahi hoga; 20 s limit run ko bachata hai aur table mein 'NO' dikhega.",
+   "alternatives": "Server ke admin endpoint se state padhna, ya ek doosra (unpaused) control connection jo broker ka status pooche.",
+   "scale_10x_100x": "Kai slow consumers ke variant mein bhi broker counter hi sahi signal hai (slowConsumers ka count).",
+   "production_improvements": "Har wait par timeout ki rule, aur bench ka dry run har badlav ke baad."
+  }
+ },
+ {
+  "id": "MB-075",
+  "project_slug": "p13-message-broker",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The first server run crashed in B2. What were the two causes, how were they fixed, and what did the crash leave behind?",
+  "answer_hinglish": "Do cheezein milkar.\n\nPehla: nats-server apna 'Server is ready' line STDERR par likhta hai. Bench ka process helper start() sirf stdout ki lines mein ready pattern dhoondhta tha, toh nats-server ka ready promise kabhi resolve nahi hua.\n\nDoosra: woh ready promise await nahi kiya gaya tha (port check se kaam chal raha tha). Jab B2 ke pehle run ke baad nats-server normal tarike se stop hua, toh helper ka 'exited early' handler us lambit promise ko reject kar diya -- aur kisi ne use catch nahi kiya. Node mein unhandled rejection poore process ko khatam kar deta hai. run.mjs ka try/catch scenario ke await ko pakadta hai, lekin yeh rejection ek alag, un-awaited promise par tha, toh woh catch tak pahuncha hi nahi.\n\nFix (commit c856b80, sirf bench code): start() ready pattern stdout aur stderr dono mein dekhta hai; startNatsServer() 'await b.ready' karta hai; port check (waitForPort) doosra guard ki tarah rehta hai. Code comment yahi kahani batata hai.\n\nPeeche kya bacha: crash ne us waqt chal raha nats-server orphan kar diya (loopback only, random port). Woh A2 ke after-snapshot mein ek extra listening port ke roop mein mila aur PID se band kiya gaya. B1 ka result file pehle hi save ho chuka tha, isliye results do runs se hain: part 1 (B1) aur part 2 (B2-B7).",
+  "why_needed": "Async code mein ek un-awaited promise poora run gira sakta hai; aur crash ke baad cleanup ka saboot sirf snapshot diff deta hai.",
+  "real_world_analogy": "Ek guard ko bola 'jab ghanti baje toh batana', lekin ghanti doosre kamre mein bajti hai. Aur jab guard ki shift khatam hui toh usne 'ghanti nahi baji' ki complaint kar di -- poora office band.",
+  "how_it_works": "start(): ready regex checked on stdout lines only -> never resolves for nats-server -> not awaited -> on normal exit, rejected -> unhandled rejection -> process exit. Fix: check stderr too, await ready, keep port check.",
+  "in_this_project": "bench/lib.mjs start (looks in stdout and stderr), startNatsServer (await b.ready, waitForPort, comment); bench/run.mjs try/catch per scenario; deployment/08 8.7 and 8.9; reference-results part1 (only b1.json).",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::start",
+   "projects/13-message-broker/bench/lib.mjs::startNatsServer",
+   "projects/13-message-broker/bench/lib.mjs::waitForPort",
+   "projects/13-message-broker/bench/run.mjs",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/lib.mjs\nconst b = start(bin, [\"-a\", \"127.0.0.1\", \"-p\", String(port)], { ready: /Server is ready/, label: \"nats-server\" });\n// Await the ready promise: left un-awaited, its rejection when the process is later stopped crashed the whole first\n// server run (unhandled rejection). The port check stays as a second guard.\nawait b.ready;\nawait waitForPort(port);\n// and in start(): if (lines.some((l) => ready.test(l.text)) || ready.test(stderr)) { ... }",
+  "code_language": "javascript",
+  "advantages": [
+   "Root cause clear aur fix chhota",
+   "Comment mein history",
+   "Broker code untouched, toh dono parts comparable"
+  ],
+  "disadvantages": [
+   "Results do runs mein bate",
+   "Part 1 ka steal record nahi hua"
+  ],
+  "common_mistakes": [
+   "Promise banake await na karna",
+   "Har program ke ready line ko stdout maan lena",
+   "Crash ke baad child processes check na karna"
+  ],
+  "follow_up_questions": [
+   "Child processes ko parent ke crash par kaise saaf karoge?",
+   "process.on('unhandledRejection') lagana sahi fix hota kya?"
+  ],
+  "concepts": [
+   "unhandled-rejection",
+   "process-management",
+   "orphan-process"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Await karna errors ko sahi jagah laata hai; 'fire and forget' promises tab tak chalte hain jab tak reject na hon. Port check akela kaafi lagta tha lekin hidden promise ne run giraya.",
+   "failure_scenarios": "Crash ke baad orphaned child processes (yahan nats-server) resources aur ports pakde rehte hain, aur agle run ko confuse kar sakte hain. Sirf snapshot diff ne ise pakda.",
+   "alternatives": "Process groups (detached + kill group), parent exit par children ko signal, ya ek supervisor; global unhandledRejection handler jo log karke run ko continue kare (lekin bugs chhupa sakta hai).",
+   "scale_10x_100x": "Zyada child processes (kai brokers) par orphan risk badhta hai; process group cleanup zaroori.",
+   "production_improvements": "Bench mein process-group cleanup, har run ke baad listening ports ka check, aur unhandled rejections ko fail-fast aur logged."
+  }
+ },
+ {
+  "id": "MB-076",
+  "project_slug": "p13-message-broker",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "The results come from two runs on two commits. Why is it still valid to put them in one README, and how is that made visible?",
+  "answer_hinglish": "Part 1 commit 43c42d1 par chala aur B2 mein crash hua; sirf b1.json bacha. Fix commit c856b80 SIRF bench code mein tha (stderr ready line aur await). Deployment doc: 'The broker code is identical in both parts.' Toh B1 aur B2-B7 ek hi broker ko measure karte hain.\n\nVisibility: env.json har run ka commit record karta hai (server par .git folder nahi hota, isliye BENCH_COMMIT env se), aur update-readme.mjs README mein do alag sections banata hai -- 'Run a2-micro-a1-part1' (commit 43c42d1, steal not recorded) aur 'Run a2-micro-a1-part2' (commit c856b80, steal 1.07%). Reader dekh sakta hai kaunsa table kis run ka hai. README ka text bhi kehta hai ki do runs kyun hain.\n\nB1 ko dobara kyun nahi chalaya part 2 mein? Run plan ne B2-B7 chalaye; B1 ka result already valid tha (broker code same). Ek check: B2 ke andar 'ours' fan-out 1 aur 10 subscribers par dobara chala (36916 aur 47078), jo B1 ke part 1 numbers (36950 aur 48262) ke paas hai -- do runs ke beech consistency ka ek sasta saboot.\n\nInterview point: alag runs mix karna tabhi theek hai jab system under test same ho aur yeh documented ho.",
+  "why_needed": "Results ka provenance (kaunsa commit, kaunsa run) clear na ho toh comparisons par bharosa nahi kiya ja sakta.",
+  "real_world_analogy": "Do din mein liye gaye exam ke do papers: valid tabhi jab syllabus aur paper same ho, aur marksheet par dono dates likhi hon.",
+  "how_it_works": "env.json (commit via BENCH_COMMIT) -> update-readme per run folder -> two sections with commit and steal -> B2 'ours' rows cross-check B1.",
+  "in_this_project": "bench/lib.mjs envInfo (BENCH_COMMIT), bench/update-readme.mjs (per-run header); reference-results part1 env.json, part2 env.json; deployment/08 8.7 and 8.8.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::envInfo",
+   "projects/13-message-broker/bench/update-readme.mjs",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/env.json",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/lib.mjs envInfo (trimmed)\n// On a server the code arrives as a git archive (no .git folder): pass the commit in BENCH_COMMIT.\ncommit: process.env.BENCH_COMMIT ?? git(\"rev-parse\", \"--short\", \"HEAD\"),\ndirty: process.env.BENCH_COMMIT ? false : git(\"status\", \"--porcelain\", \"--\", \".\") !== \"\",",
+  "code_language": "javascript",
+  "advantages": [
+   "Har table ka commit visible",
+   "Cross-check numbers paas hain"
+  ],
+  "disadvantages": [
+   "Do runs: thoda alag environment ho sakta hai",
+   "Part 1 ka steal unknown"
+  ],
+  "common_mistakes": [
+   "Alag commits ke numbers bina label mix karna",
+   "Server par commit 'unknown' chhod dena"
+  ],
+  "follow_up_questions": [
+   "Kab poora run dobara chalana zaroori hota?",
+   "dirty flag kyun record kiya jaata hai?"
+  ],
+  "concepts": [
+   "provenance",
+   "reproducibility",
+   "result-consistency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-077",
+  "project_slug": "p13-message-broker",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "How was the cloud network opened for the cluster run, and why one tagged rule per source /32 instead of one wide rule?",
+  "answer_hinglish": "Oracle security list subnet ke saare servers mein shared hai. Brokers ko ports 19001 (client) aur 19002 (cluster) par ek doosre se baat karni thi. Rule: har SOURCE server ke private address ka /32, sirf TCP 19001-19002, aur har rule ka apna tag: h12-bench-a2, h12-bench-a1, h12-bench-micro.\n\nTool (deployment/scripts/oci_seclist_rule.py): pehle dry run, phir --apply. Likhne se pehle poori list ka backup, aur baad mein dobara padh kar check ki baaki har rule same hai -- har baar 'verified: every other rule is unchanged'. Hataate waqt 'remove --tag ... --apply' se exact wahi rule, aur 'show' se proof ki list wapas TCP 22, 80, 443 aur ICMP par hai. Rules 16:58 se 17:25 UTC tak khule rahe.\n\nKyun /32 per source: broker mein authentication nahi hai (client ya route dono par). Jo bhi port tak pahunche, woh RINFO bhej kar peer ban sakta hai ya sab subscribe kar sakta hai. /32 ka matlab sirf wahi teen addresses; poora subnet ya 0.0.0.0/0 nahi. Tag har rule ko alag se hataane layak banata hai, aur doosre logon ke rules chhoote nahi.\n\nPublic internet par kuch nahi khula; SSH (22) pehle se tha, aur saara broker traffic private addresses par.",
+  "why_needed": "Bina auth wale service ke liye network hi suraksha hai; usse sabse chhota aur temporary rakhna zaroori hai.",
+  "real_world_analogy": "Building ke gate par teen specific logon ke naam ki entry pass, ek ghante ke liye -- 'sab aa sakte hain' wala board nahi.",
+  "how_it_works": "add --cidr <PRIV>/32 --ports 19001-19002 --tag h12-bench-<server> (dry run, then --apply, backup, verify) -> run -> remove --tag --apply -> show.",
+  "in_this_project": "deployment/08 sections 8.4 aur 8.9; deployment/scripts/oci_seclist_rule.py; src/index.ts (no auth, ALLOW_NON_LOOPBACK).",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md",
+   "deployment/scripts/oci_seclist_rule.py",
+   "projects/13-message-broker/src/index.ts"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.4 (placeholders, no real addresses)\npython deployment/scripts/oci_seclist_rule.py add --cidr <A2_PRIV>/32    --ports 19001-19002 --tag h12-bench-a2           # dry run\npython deployment/scripts/oci_seclist_rule.py add --cidr <A2_PRIV>/32    --ports 19001-19002 --tag h12-bench-a2    --apply\n# ... same for a1 and micro; cleanup:\npython deployment/scripts/oci_seclist_rule.py remove --tag h12-bench-a2 --apply",
+  "code_language": "bash",
+  "advantages": [
+   "Minimum exposure",
+   "Har rule alag se hataane layak",
+   "Backup aur verify har change par"
+  ],
+  "disadvantages": [
+   "Teen rules manage karne",
+   "Manual steps (script ke bawajood)"
+  ],
+  "common_mistakes": [
+   "Subnet-wide ya 0.0.0.0/0 rule",
+   "Bina tag ke rules jo baad mein pehchaane na jayein",
+   "Cleanup ka proof na lena"
+  ],
+  "follow_up_questions": [
+   "Security list aur NSG mein kya fark hai?",
+   "Rule hataana bhool jaate toh kaise pakadte?"
+  ],
+  "concepts": [
+   "least-privilege",
+   "network-security",
+   "temporary-access"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-078",
+  "project_slug": "p13-message-broker",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Why was a host firewall rule also needed on every server, and why were those iptables rules inserted at the top, commented and never saved?",
+  "answer_hinglish": "Cloud security list sirf aadha hai. Har server ka apna iptables INPUT chain 'REJECT --reject-with icmp-host-prohibited' par khatam hota hai (before-snapshot mein: accept 22, 80, 443, ICMP, established, loopback, phir REJECT). Toh cloud rule hone ke bawajood packets server par reject ho jaate.\n\nHar server par, BAAKI do servers ke private /32 ke liye ek rule:\nsudo iptables -I INPUT 1 -s <OTHER_PRIV>/32 -p tcp --dport 19001:19002 -m comment --comment h12-bench -j ACCEPT\n\n-I INPUT 1: top par insert, kyunki chain upar se neeche padhi jaati hai aur neeche REJECT hai -- append (-A) karte toh rule REJECT ke baad aata aur kabhi match nahi hota. Comment 'h12-bench': baad mein exact pehchaan aur hataana, doosre rules ko chhuye bina. Check: har server par 'grep -c h12-bench' = 2.\n\nNever saved: iptables-save/persist nahi kiya, toh reboot bhi rules hata deta -- ek safety net agar cleanup bhool jaate. Cleanup: loop jo har h12-bench rule ki '-A' line ko '-D' bana kar delete karta hai jab tak koi na bache, phir count 0.\n\nDefence in depth: do layers (cloud + host), dono minimum (/32, do ports), dono temporary. Ek layer galat ho toh doosri bachati hai.",
+  "why_needed": "Cloud firewall aur host firewall dono ko samajhna production debugging aur security dono ke liye zaroori hai.",
+  "real_world_analogy": "Building ke gate par pass (cloud rule) mil gaya, lekin flat ke darwaze par bhi taala hai (iptables) -- wahan bhi naam likhwana padega, aur list ke sabse upar, warna 'no entry' wala niyam pehle lagega.",
+  "how_it_works": "iptables -I INPUT 1 (above REJECT) per peer /32 with comment -> verify count 2 -> run -> loop: replace -A with -D for each h12-bench rule -> count 0. Not saved, so reboot also clears.",
+  "in_this_project": "deployment/08 8.1 (iptables snapshot), 8.5 (insert), 8.9 (delete loop).",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.5 and 8.9\nsudo iptables -I INPUT 1 -s <OTHER_PRIV>/32 -p tcp -m tcp --dport 19001:19002 -m comment --comment h12-bench -j ACCEPT\nsudo iptables -S INPUT | grep -c h12-bench     # 2 on each server\n# cleanup:\nwhile sudo iptables -S INPUT | grep -q h12-bench; do\n  r=$(sudo iptables -S INPUT | grep -m1 h12-bench | sed \"s/^-A /-D /\"); eval sudo iptables $r; done",
+  "code_language": "bash",
+  "advantages": [
+   "Defence in depth",
+   "Exact cleanup comment se",
+   "Reboot bhi safe"
+  ],
+  "disadvantages": [
+   "Har server par manual",
+   "eval wala cleanup careful likhna padta hai"
+  ],
+  "common_mistakes": [
+   "-A se append karna (REJECT ke neeche, kabhi match nahi)",
+   "Rules save kar dena",
+   "Sirf cloud rule kholna aur host firewall bhoolna"
+  ],
+  "follow_up_questions": [
+   "iptables ki jagah nftables ya ufw ho toh?",
+   "Rule order debugging kaise karoge (packet counters)?"
+  ],
+  "concepts": [
+   "host-firewall",
+   "defence-in-depth",
+   "iptables"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Do layers zyada kaam aur zyada jagah galti ka mauka, lekin ek layer ki galti doosri pakadti hai. Unsaved rules temporary access ke liye perfect, permanent ke liye nahi.",
+   "failure_scenarios": "Agar rule append hota toh REJECT pehle lagta aur cluster banta hi nahi -- debugging mein cloud rule ko blame karte. Cleanup bhoolne par rules reboot tak rehte.",
+   "alternatives": "Host firewall mein ek named chain jise ek command se flush karo; configuration management tool; ya WireGuard jaisa private overlay.",
+   "scale_10x_100x": "Zyada servers par per-peer rules N x (N-1) ho jaate hain; tab CIDR groups ya overlay network better.",
+   "production_improvements": "Named chain (H12_BENCH) aur ek flush, aur cleanup ka automated diff check."
+  }
+ },
+ {
+  "id": "MB-079",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Starting the remote brokers over SSH first hung the session. What was the pitfall, and why do setsid, nohup, ssh -n and the redirections fix it?",
+  "answer_hinglish": "Command: ssh -n ... 'cd ... && HOST=... PORT=19001 ... setsid nohup nice -n 19 ~/h12/node/bin/node dist/index.js > ~/h12/broker.log 2>&1 < /dev/null & exit 0'.\n\nPitfall (deployment doc): 'without setsid and ssh -n, the SSH session stays attached to the background process and the command never returns.' Background process (&) ne SSH session ke stdin/stdout/stderr ke file descriptors pakad rakhe the, toh SSH session band nahi ho saki -- client un streams ke khatam hone ka intezaar karta raha.\n\nHar piece kya karta hai: ssh -n -- local stdin ki jagah /dev/null, toh SSH remote ko apna stdin nahi deta. setsid -- process ko nayi session mein daalta hai, SSH ke terminal/session se alag, toh session khatam hone par SIGHUP nahi milta. nohup -- extra protection HUP ke against. > broker.log 2>&1 < /dev/null -- teeno streams SSH se hata kar file aur /dev/null par, toh SSH ke pipes koi nahi pakadta. & exit 0 -- background mein chalao aur shell turant success ke saath nikle.\n\nnice -n 19: lowest CPU priority, kyunki A1 par doosre project ke containers bhi chal rahe the aur unhe priority milni chahiye thi. Check: har broker log mein '\"routes\":1' -- micro aur A1 private network par jude.\n\nBench (A2 par) bhi isi tarike se start hua. Kyun systemd nahi: kuch bhi install nahi karna tha; sab temporary.",
+  "why_needed": "Remote processes ko detach karna ops ka basic hai; galat karne par scripts hang hoti hain ya process session ke saath mar jaata hai.",
+  "real_world_analogy": "Phone par kisi ko kaam bolkar line kaatni ho, lekin aap uska haath pakde ho (stdin/stdout) -- jab tak haath nahi chhodoge, call band nahi hogi.",
+  "how_it_works": "ssh -n (no stdin) -> remote shell -> setsid (new session) nohup nice node ... > log 2>&1 < /dev/null & -> exit 0 -> ssh returns, broker keeps running.",
+  "in_this_project": "deployment/08 8.6 (brokers B, C) aur 8.7 (bench on A2); src/index.ts reads HOST, PORT, CLUSTER_PORT, ROUTES, STATS_INTERVAL_MS.",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md",
+   "projects/13-message-broker/src/index.ts"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.6 (placeholders)\nssh -n -i ~/.ssh/oracle_portfolio ubuntu@<MICRO_IP> 'cd ~/h12/projects/13-message-broker &&\n  HOST=<MICRO_PRIV> CLUSTER_HOST=<MICRO_PRIV> PORT=19001 CLUSTER_PORT=19002 ROUTES=<A1_PRIV>:19002 \\\n  ROUTE_RECONNECT_MS=500 STATS_INTERVAL_MS=5000 ALLOW_NON_LOOPBACK=1 \\\n  setsid nohup nice -n 19 ~/h12/node/bin/node dist/index.js > ~/h12/broker.log 2>&1 < /dev/null & exit 0'",
+  "code_language": "bash",
+  "advantages": [
+   "SSH turant return",
+   "Process session se independent",
+   "Log file mein output"
+  ],
+  "disadvantages": [
+   "Koi supervisor nahi: crash par restart nahi",
+   "PID track nahi (pkill pattern se band)"
+  ],
+  "common_mistakes": [
+   "Sirf & lagana aur sochna kaam ho gaya",
+   "Output redirect na karna",
+   "Production ke liye yahi pattern use karna (systemd better)"
+  ],
+  "follow_up_questions": [
+   "Production mein yeh kaise karoge (systemd unit)?",
+   "tmux/screen se kya fark hai?"
+  ],
+  "concepts": [
+   "process-detach",
+   "ssh",
+   "ops"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-080",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Why was the broker stopped with pkill -f \"[h]12/node/bin/node dist/index.js\" instead of a plain pattern?",
+  "answer_hinglish": "pkill -f poore command line par pattern match karta hai. Problem: jab aap 'ssh ... pkill -f \"h12/node/bin/node dist/index.js\"' chalate ho, toh remote par jo shell (bash -c '...') chalta hai, uske apne command line mein bhi yahi string hoti hai. Toh pkill us shell ko bhi match kar sakta hai -- apni hi SSH command ko maar dena, ya pgrep ka count galat aana. Doc isse 'the H11 lesson' kehta hai.\n\n'[h]12' trick: regex mein [h] ek character class hai jo sirf 'h' match karta hai. Toh pattern '[h]12/node...' asli process 'h12/node/bin/node dist/index.js' ko match karta hai. Lekin shell ke command line mein literal text '[h]12/node...' hai (brackets ke saath), jo is regex se match nahi hota -- kyunki '[' ke baad 'h' hai, '12' nahi. Toh pkill apne aap ko ya apne parent shell ko nahi chhoota.\n\nCommand: pkill -f \"[h]12/node/bin/node dist/index.js\"; pgrep -fc \"[h]12/node/bin/node\" || true -- doosra hissa count deta hai (0 hona chahiye), aur '|| true' isliye ki 0 matches par pgrep non-zero exit deta hai jo script ko fail kar deta.\n\nBetter tarika production mein: PID file ya systemd, taaki pattern matching ki zaroorat hi na ho. Yahan temporary run tha, PID store nahi kiya.",
+  "why_needed": "Process management scripts ka ek classic bug apne aap ko kill karna hai; chhoti regex trick isse bachati hai.",
+  "real_world_analogy": "Class mein 'jo bhi Rahul hai khada ho jaye' bolne wala teacher agar khud ke naam ki list padh raha ho toh list bhi khadi ho jaaye -- isliye naam ko thoda alag tarike se likho jo sirf asli Rahul par lage.",
+  "how_it_works": "pkill -f regex -> '[h]12...' matches the node process, not the shell whose argv contains the literal '[h]12...' -> pgrep -fc to verify 0 -> '|| true' for exit code.",
+  "in_this_project": "deployment/08 8.9 cleanup.",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.9\n# brokers B and C: the pattern \"[h]12\" cannot match pkill's own command line (the H11 lesson)\nssh -i ~/.ssh/oracle_portfolio ubuntu@<SERVER_IP> 'pkill -f \"[h]12/node/bin/node dist/index.js\"; pgrep -fc \"[h]12/node/bin/node\" || true'",
+  "code_language": "bash",
+  "advantages": [
+   "Self-match se bachav",
+   "Verification count saath mein"
+  ],
+  "disadvantages": [
+   "Pattern matching ab bhi galat process match kar sakta hai agar naam mile",
+   "PID based se kam precise"
+  ],
+  "common_mistakes": [
+   "pkill -f plain string se apni shell maar dena",
+   "Verify na karna ki process gaya",
+   "pgrep ka non-zero exit script ko fail karne dena"
+  ],
+  "follow_up_questions": [
+   "PID file approach kaisa hota?",
+   "pkill bina -f ke kya match karta hai?"
+  ],
+  "concepts": [
+   "pkill",
+   "regex-trick",
+   "ops-pitfalls"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-081",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "How did the before/after snapshots prove the servers were left clean, and what did the diff actually find?",
+  "answer_hinglish": "Kuch bhi chhoone se pehle (16:57 UTC) har server ka read-only snapshot liya, locally save (repo mein nahi, kyunki usme addresses hain): hostname, architecture, memory, listening ports (ss -ltnH), iptables -S INPUT, chal rahe docker containers, home folder ki listing.\n\nCleanup ke baad wahi command dobara, aur line-by-line diff, memory lines chhod kar (memory hamesha badalti hai). Results:\n- micro: koi fark nahi.\n- A1: koi fark nahi, sirf docker ps mein 4 containers ka ORDER alag (charon up). Ek watcher ne run ke dauran har minute check kiya tha ki woh 4 containers up hain.\n- A2: pehle diff mein ek extra listening port 127.0.0.1 par -- B2 crash ka orphaned nats-server (loopback only, random port). Usse PID se band kiya, aur dobara diff: koi fark nahi.\n\nKya seekha: cleanup commands 'success' print karti hain, lekin unhe jo pata nahi woh nahi hataati. Crash ne ek process chhoda jo kisi cleanup step mein nahi tha -- sirf 'pehle jaisa hai ya nahi' wali comparison ne pakda. Yeh 'checklist' se zyada strong hai, kyunki checklist sirf known cheezein dekhti hai.\n\nLimits: snapshot mein jo nahi (jaise /tmp ke files, cron) woh diff mein bhi nahi. Aur woh nats-server loopback par tha, bahar se reachable nahi.",
+  "why_needed": "Shared servers par kaam karte waqt 'maine saaf kiya' ka saboot dena padta hai, aur unknown leftovers sirf state comparison se milte hain.",
+  "real_world_analogy": "Kiraye ke flat mein ghusne se pehle har kamre ki photo, nikalte waqt wahi photos -- fark dikha toh pata chala ek charger socket mein reh gaya tha.",
+  "how_it_works": "before snapshot (ports, iptables, containers, home) -> work -> cleanup -> after snapshot -> diff minus memory -> investigate every difference -> fix -> diff again.",
+  "in_this_project": "deployment/08 8.1 (snapshot command), 8.7 (crash orphan), 8.9 (proof table), 8.10 timeline.",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md",
+   "projects/13-message-broker/bench/lib.mjs::startNatsServer"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.1 (same command before and after)\nssh -i ~/.ssh/oracle_portfolio ubuntu@<SERVER_IP> 'hostname; uname -m; free -m | head -2; ss -ltnH | awk \"{print \\$4}\" | sort;\n  sudo -n iptables -S INPUT; sudo -n docker ps --format \"{{.Names}} {{.Status}}\"; ls -1 ~'",
+  "code_language": "bash",
+  "advantages": [
+   "Unknown leftovers bhi pakde",
+   "Neighbour app ka state bhi verify",
+   "Proof documented"
+  ],
+  "disadvantages": [
+   "Snapshot scope tak hi",
+   "Manual diff"
+  ],
+  "common_mistakes": [
+   "Cleanup commands ke output ko proof maan lena",
+   "Snapshot repo mein commit karna (addresses)",
+   "Sirf apni banayi cheezein check karna"
+  ],
+  "follow_up_questions": [
+   "Snapshot mein aur kya add karoge (cron, /tmp, systemd units)?",
+   "Is diff ko automate kaise karoge?"
+  ],
+  "concepts": [
+   "state-diff",
+   "cleanup-proof",
+   "shared-infrastructure"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Snapshot diff saste mein unknown changes pakadta hai lekin sirf jo capture kiya; poora machine image compare mehnga hai.",
+   "failure_scenarios": "Orphaned process port pakde rehta (agle run mein conflict) aur resources khata; agar woh public interface par hota toh security risk. Diff ke bina yeh chupchap rehta.",
+   "alternatives": "Ephemeral VMs (kaam ke baad hata do), containers with --rm, configuration management with drift detection.",
+   "scale_10x_100x": "Zyada servers par diff automate karna padega (script jo snapshot leke compare kare aur sirf expected differences allow kare).",
+   "production_improvements": "Snapshot + diff ko script banana, aur bench ko process group mein chalana taaki crash orphan na chhode."
+  }
+ },
+ {
+  "id": "MB-082",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Intermediate",
+  "question": "How was the exact commit shipped to the servers, and how was Node.js installed without touching the system?",
+  "answer_hinglish": "dist/ git mein nahi hai, toh PC par npm run build, phir 'git archive --format=tar --prefix=h12/ HEAD projects/13-message-broker > h12.tar' -- sirf committed files, exact commit. Phir dist/ us tarball mein append: 'tar --force-local -rf h12.tar --transform ... projects/13-message-broker/dist'. Broker ki koi runtime dependency nahi, toh server ko dist/ ke alawa kuch nahi chahiye (no npm install for the broker). Server par: 'rm -rf ~/h12 && tar -x -C ~' < h12.tar over SSH.\n\nPitfall: Windows par GNU tar 'C:/...' ko 'host C, path ...' padhta hai (remote tar syntax); --force-local isse rokta hai.\n\nCommit record: server par .git folder nahi, isliye bench ko BENCH_COMMIT env se commit diya jaata hai aur env.json mein jaata hai.\n\nNode: A2 par pehle se /opt/node (v20.20.1, H11 se). micro aur A1 ko wahi version ~/h12/node mein: SHASUMS256.txt aur tarball download, 'grep \" $F$\" SHASUMS256.txt | sha256sum -c -' (OK print hona chahiye), extract, version check. ~/h12 delete karne se Node bhi poora chala jaata hai -- system mein kuch install nahi.\n\nnats-server v2.15.3 (B2 ke liye) bhi release tarball se, SHA256SUMS check ke saath.",
+  "why_needed": "Benchmarks tabhi meaningful hain jab pata ho exactly kaunsa code chala; aur temporary runs mein system ko chhoona nahi chahiye.",
+  "real_world_analogy": "Ek sealed box (git archive of a commit) bhejna, saath mein batteries (dist), aur tools apne bag mein (~/h12/node) -- ghar ke cupboard mein kuch nahi rakhna.",
+  "how_it_works": "build dist -> git archive HEAD -> append dist (--force-local on Windows) -> ssh tar -x -> Node tarball + SHASUMS check into ~/h12/node -> BENCH_COMMIT for env.json.",
+  "in_this_project": "deployment/08 8.2, 8.3, 8.7; bench/lib.mjs envInfo (BENCH_COMMIT); package.json (no runtime dependencies).",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md",
+   "projects/13-message-broker/bench/lib.mjs::envInfo",
+   "projects/13-message-broker/package.json"
+  ],
+  "code_example": "# real, deployment/08-message-broker-cluster.md 8.2\ncd projects/13-message-broker && npm run build && cd ../..\ngit archive --format=tar --prefix=h12/ HEAD projects/13-message-broker > h12.tar\ntar --force-local -rf h12.tar --transform 's,^projects,h12/projects,' projects/13-message-broker/dist   # Windows: --force-local\nssh -i ~/.ssh/oracle_portfolio ubuntu@<SERVER_IP> 'rm -rf ~/h12 && tar -x -C ~' < h12.tar",
+  "code_language": "bash",
+  "advantages": [
+   "Exact commit, koi local changes nahi",
+   "Checksum verified binaries",
+   "Ek folder delete = poora cleanup"
+  ],
+  "disadvantages": [
+   "dist/ git mein nahi: build aur commit alag cheezein",
+   "Manual steps"
+  ],
+  "common_mistakes": [
+   "Working tree copy karna (uncommitted changes)",
+   "Downloads ka checksum na check karna",
+   "System-wide Node install temporary run ke liye"
+  ],
+  "follow_up_questions": [
+   "dist ko bhi reproducible kaise banaoge?",
+   "Container image se yeh kaisa hota?"
+  ],
+  "concepts": [
+   "reproducible-deploy",
+   "checksums",
+   "temporary-install"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-083",
+  "project_slug": "p13-message-broker",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "What did the run do to protect the A1 server, which also runs another project's containers, and the broker itself while it was reachable on the private network?",
+  "answer_hinglish": "A1 par doosre project ke 4 containers chal rahe the (web, api, antivirus scanner, object store). Broker C wahan chalaana tha bina unhe nuksan pahunchaye.\n\n1. nice -n 19: broker sabse kam CPU priority par, toh contention mein containers ko pehle CPU.\n2. Watcher: run ke dauran PC se har minute check ki A1 par charon containers up hain. Proof table: 'all 4 up' at every check.\n3. Snapshot diff: baad mein sirf docker ps ka order alag, aur kuch nahi.\n4. Sab ~/h12 mein: Node, code, logs -- ek folder, baad mein delete.\n\nBroker ki suraksha: koi authentication nahi, toh CLI non-loopback address par tabhi bind karta hai jab ALLOW_NON_LOOPBACK=1 ho -- aur yahan sirf PRIVATE address (HOST aur CLUSTER_HOST dono) diya. Cloud aur host firewall dono sirf baaki do servers ke /32 ke liye, sirf ports 19001-19002, aur 16:58 se 17:25 UTC tak. Public internet par kuch nahi.\n\nAddresses repo mein nahi: deployment doc placeholders (<A1_PRIV> etc.) use karta hai, snapshots locally saved, aur results commit karne se pehle addresses ke liye scan kiye gaye -- 'none'.",
+  "why_needed": "Shared infrastructure par kaam karte waqt doosre workloads aur data ko protect karna zimmedari hai, aur bina auth wala service sirf tight network boundaries ke andar.",
+  "real_world_analogy": "Padosi ke ghar mein apna saaman rakhna: chhota sa kona, unke kaam mein dakhal nahi, har ghante dekhna sab theek, aur jaate waqt kona waisa hi saaf.",
+  "how_it_works": "nice 19 + per-minute container watcher + snapshot diff + single folder; broker bound to private address with ALLOW_NON_LOOPBACK + /32 firewall rules + time window; placeholders and address scan.",
+  "in_this_project": "deployment/08 (roles table, 8.6, 8.7 watcher, 8.8 scan, 8.9 proof); src/index.ts (isLoopback, ALLOW_NON_LOOPBACK for HOST and CLUSTER_HOST).",
+  "implementation_files": [
+   "deployment/08-message-broker-cluster.md",
+   "projects/13-message-broker/src/index.ts"
+  ],
+  "code_example": "// real, src/index.ts -- why ALLOW_NON_LOOPBACK=1 had to be set for the private address\nfor (const h of [host, ...(process.env.CLUSTER_PORT ? [clusterHost] : [])]) {\n  if (!isLoopback(h) && process.env.ALLOW_NON_LOOPBACK !== \"1\") {\n    console.error(`refusing to bind ${h}: the broker has no authentication. Set ALLOW_NON_LOOPBACK=1 only for a private address.`);\n    process.exit(2);\n  }\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Neighbour workload verified throughout",
+   "Unauthenticated service tightly fenced",
+   "Koi address repo mein nahi"
+  ],
+  "disadvantages": [
+   "nice CPU bachata hai, memory nahi",
+   "Watcher sirf 'up' check karta hai, performance nahi"
+  ],
+  "common_mistakes": [
+   "Shared server par full priority benchmark",
+   "Public IP par bind",
+   "Real addresses docs mein likhna"
+  ],
+  "follow_up_questions": [
+   "Memory ke liye kya protection lagate (cgroups)?",
+   "Neighbour ki latency par asar kaise naapte?"
+  ],
+  "concepts": [
+   "shared-infrastructure",
+   "least-privilege",
+   "secrets-hygiene"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-084",
+  "project_slug": "p13-message-broker",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Why does the cluster run work across x86 and ARM, and why is broker A local to the bench while B and C run on other servers?",
+  "answer_hinglish": "Mixed architecture: micro x86 hai, A2 aur A1 ARM. Route protocol aur client protocol dono plain text hain -- RINFO, RS+, RS-, RMSG ka JSON meta, aur byte-counted payloads. Koi binary integers, struct layout ya byte order nahi. Payload opaque bytes hain jo jaise aaye waise jaate hain. Toh CPU se kuch depend nahi karta; deployment doc ise 'a useful side effect' kehta hai: mixed cluster bina kisi change ke chala. Node bhi har architecture ke liye same version (v20.20.1).\n\nBroker A local kyun: bench ko kuch experiments mein broker ko maarna ya restart karna padta hai -- B4 mein SIGKILL. Bench sirf apne child processes ko control kar sakta hai. Toh cluster3() multi-host mode mein EK local broker start karta hai (jo dono remote brokers ko dial karta hai) aur do remote brokers (REMOTE_NODES) se sirf connect karta hai. Remote ones ek doosre ko ROUTES mein list karte hain, toh full mesh banta hai. Comment: 'one local broker (so the bench can kill it)'.\n\nKeemat: load generator aur broker A ek hi machine (A2, 2 cores) par CPU share karte hain; B1/B2/B5 isi machine par hain. Aur remote brokers ke stats bench live nahi padh sakta (logs se copy). Aur har multi-host experiment mein victim hamesha local A hai.",
+  "why_needed": "Distributed test harness ka design (kaun control karta hai kya) results ki scope tay karta hai.",
+  "real_world_analogy": "Teen shehron ki team: aapka apna office (jise aap band ya khol sakte ho) aur do partner offices jinse sirf phone par baat -- unke darwaze aap band nahi kar sakte.",
+  "how_it_works": "cluster3 multi-host: startBroker(local, routes = remote cluster urls) -> waitMesh(local, 2) -> [local, remoteB, remoteC]. Remote B and C list each other in ROUTES.",
+  "in_this_project": "bench/lib.mjs cluster3, remoteNodes, waitMesh; deployment/08 intro (mixed architecture), 8.6 (ROUTES between B and C); src/route.ts (text protocol).",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::cluster3",
+   "projects/13-message-broker/bench/lib.mjs::remoteNodes",
+   "projects/13-message-broker/src/route.ts::encodeRmsg",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/lib.mjs cluster3 (trimmed)\nconst remote = remoteNodes();\n// ... single-host branch: three local brokers that all dial each other\nif (remote.length !== 2) throw new Error(\"REMOTE_NODES must list exactly 2 brokers for the 3-node experiments\");\nconst local = await startBroker({ clusterPort: localClusterPort, routes: remote.map((r) => r.clusterUrl), env });\nawait waitMesh([local], 2);\nreturn [local, ...remote];",
+  "code_language": "javascript",
+  "advantages": [
+   "Architecture-independent protocol",
+   "Bench victim ko control karta hai",
+   "Same code single-host aur multi-host"
+  ],
+  "disadvantages": [
+   "Generator aur broker A same machine",
+   "Remote stats live nahi",
+   "Victim hamesha A"
+  ],
+  "common_mistakes": [
+   "Binary protocol mein native byte order use karna",
+   "Remote broker ko bench se kill karne ki koshish"
+  ],
+  "follow_up_questions": [
+   "Remote broker kill karna ho toh harness kaise badlega?",
+   "Kya text protocol ki koi keemat B1/B2 mein dikhti hai?"
+  ],
+  "concepts": [
+   "heterogeneous-cluster",
+   "test-harness",
+   "text-protocol"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Text protocol portability aur debuggability deta hai, keemat parsing cost (B2 gap ka ek hissa ho sakta hai, measured nahi). Local victim harness simple rakhta hai lekin experiments ko ek node tak seemit karta hai.",
+   "failure_scenarios": "Agar remote broker pehle se crash ho toh cluster3 ka waitMesh 15 s ke baad 'mesh not formed' deta hai. Remote broker ki death bench detect ya restart nahi kar sakta.",
+   "alternatives": "Remote control agent (har server par ek chhota helper jo kill/restart kare), ya SSH-driven orchestration.",
+   "scale_10x_100x": "Zyada nodes ke liye REMOTE_NODES list badhegi, aur 'exactly 2' check badalna padega; full mesh ke N^2 routes.",
+   "production_improvements": "Ek remote control agent, remote stats ka live stream, aur victim ko rotate karna."
+  }
+ },
+ {
+  "id": "MB-085",
+  "project_slug": "p13-message-broker",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does the bench tell single-host from multi-host runs, and how does waitMesh decide the cluster is ready?",
+  "answer_hinglish": "REMOTE_NODES env: 'host:clientPort:clusterPort,...'. Khaali ho toh single-host: cluster3() teen local brokers start karta hai, har ek free ports par, jo ek doosre ko ROUTES mein list karte hain. Set ho toh multi-host: remoteNodes() har entry ko {host, port, clusterPort, local: false} banata hai, aur cluster3 exactly 2 remote maangta hai -- ek local broker unhe dial karta hai.\n\ntopologyLabel() yahi env.json aur README mein likhta hai ('single host ... over loopback' ya 'multi host: one local broker plus 2 remote broker(s) over the private network'). B3 ka note bhi isse badalta hai: single host mein woh kehta hai ki route hop loopback hai, toh network latency nahi, broker ka hop cost dikhta hai.\n\nwaitMesh(nodes, routes): sirf LOCAL nodes ki aakhri stats line dekhta hai aur intezaar karta hai jab tak har ek ki routes === expected (yahan 2). 100 ms polling, 15 s ke baad error 'mesh not formed' with route counts. Remote nodes ke stats bench padh nahi sakta, isliye unka check ready() probes se hota hai: agar koi remote subscriber tak probe pahuncha, toh route bhi chal raha hai.\n\nstopAll sirf local nodes ko stop karta hai -- remote brokers poore run mein chalte rehte hain (B7 ke baad bhi), aur unhe cleanup mein SSH se band kiya.",
+  "why_needed": "Ek hi bench code ko laptop aur real cluster dono par chalana debugging (dry run) aur real measurement dono ko sasta banata hai.",
+  "real_world_analogy": "Ek hi recipe ghar ke chhote oven aur restaurant ke bade oven dono mein; recipe card par likha ho kaunsa oven use hua.",
+  "how_it_works": "REMOTE_NODES empty? 3 local brokers : 1 local + 2 remote -> waitMesh(local nodes, 2) on stats.routes -> experiments -> stopAll(local only).",
+  "in_this_project": "bench/lib.mjs remoteNodes, topologyLabel, cluster3, waitMesh, stopAll; bench/scenarios.mjs b3 note.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::remoteNodes",
+   "projects/13-message-broker/bench/lib.mjs::waitMesh",
+   "projects/13-message-broker/bench/lib.mjs::stopAll",
+   "projects/13-message-broker/bench/lib.mjs::cluster3"
+  ],
+  "code_example": "// real, bench/lib.mjs\nexport async function waitMesh(nodes, routes, ms = 15_000) {\n  const end = Date.now() + ms;\n  for (;;) {\n    const ok = nodes.filter((n) => n.local).every((n) => n.stats().at(-1)?.routes === routes);\n    if (ok) return;\n    if (Date.now() > end) throw new Error(`mesh not formed: ${nodes.map((n) => n.stats().at(-1)?.routes).join(\",\")}`);\n    await sleep(100);\n  }\n}",
+  "code_language": "javascript",
+  "advantages": [
+   "Ek code, do modes",
+   "Topology result ke saath record",
+   "Clear error jab mesh na bane"
+  ],
+  "disadvantages": [
+   "Remote nodes ka mesh state direct nahi dikhta",
+   "Exactly 2 remote ki hard requirement"
+  ],
+  "common_mistakes": [
+   "Single-host numbers ko multi-host ki tarah report karna",
+   "Mesh ka wait fixed sleep se"
+  ],
+  "follow_up_questions": [
+   "Remote mesh state kaise verify karoge?",
+   "QUICK mode ka kya role hai?"
+  ],
+  "concepts": [
+   "test-harness",
+   "configuration",
+   "readiness"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-086",
+  "project_slug": "p13-message-broker",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "How are benchmark results stored on disk, and why does each bN.json carry both the table rows and the raw data?",
+  "answer_hinglish": "Har run ka ek folder: bench/results/<ISO timestamp>-<label>/ (makeResultsDir). Usme env.json -- date, node, platform, cpus, cpuModel, commit, dirty, quick, runs, topology, aur end par wallSeconds aur cpuShareDuringRun. Har experiment ka bN.json -- {title, note, columns, rows, raw, seconds}, ya {skipped} / {failed}. Aur SUMMARY.md jo run.mjs usi data se likhta hai.\n\nReference results jo README mein jaate hain, bench/reference-results/<run-name>/ mein copy hote hain (a2-micro-a1-part1, a2-micro-a1-part2), aur extra b7-remote-brokers.json jisme remote brokers ki final stats line aur RSS min/max.\n\nRows aur raw saath kyun: rows woh hain jo table mein dikhte hain (cell() se formatted), raw woh hai jisse woh bane -- har run ke numbers, B4 ke firstMissing/lastMissing, B5 ke RSS samples, B7 ki poori stats series. Ek hi file mein dono hone se: (1) table ko raw se verify kar sakte ho, (2) baad mein naya analysis (jaise B4 ka contiguous loss block) bina dobara chalaye, (3) README regenerate karna sirf files padhna hai.\n\nYeh ek tarah ka 'schema': flat JSON files, ek folder per run, primary key = run folder + experiment name. Database nahi chahiye kyunki writes kam hain aur sab git mein version hota hai.\n\nKeemat: B7 ka raw 8000+ lines hai (har stats line). Aur schema versioned nahi -- agar columns badle toh purane runs ka render alag.",
+  "why_needed": "Measurement data ko is tarah rakhna ki baad mein re-analysis aur audit ho sake, ek design decision hai.",
+  "real_world_analogy": "Lab notebook: har experiment ka page, upar summary table, neeche har reading -- baad mein koi bhi calculation dobara kar sake.",
+  "how_it_works": "run.mjs -> makeResultsDir -> env.json + bN.json (title, note, columns, rows, raw) + SUMMARY.md -> copy to reference-results -> update-readme reads them.",
+  "in_this_project": "bench/lib.mjs makeResultsDir, save, envInfo; bench/run.mjs; bench/update-readme.mjs; bench/reference-results/*.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::makeResultsDir",
+   "projects/13-message-broker/bench/lib.mjs::save",
+   "projects/13-message-broker/bench/run.mjs",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b4.json"
+  ],
+  "code_example": "// real, bench/run.mjs (trimmed)\nconst dir = makeResultsDir(label);\nsave(dir, \"env.json\", env);\n// per experiment:\nsave(dir, `${name}.json`, { ...result, seconds: Math.round((Date.now() - started) / 1000) });\n// at the end:\nsave(dir, \"env.json\", { ...env, wallSeconds: seconds, cpuShareDuringRun: share });",
+  "code_language": "javascript",
+  "advantages": [
+   "Audit aur re-analysis possible",
+   "Git mein versioned",
+   "Simple: koi DB nahi"
+  ],
+  "disadvantages": [
+   "Schema version nahi",
+   "Raw files bade"
+  ],
+  "common_mistakes": [
+   "Sirf summary save karna",
+   "Results ko alag files mein bina environment ke"
+  ],
+  "follow_up_questions": [
+   "Schema versioning kaise jodoge?",
+   "Kab DB (SQLite) better hoga?"
+  ],
+  "concepts": [
+   "result-storage",
+   "schema-design",
+   "provenance"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-087",
+  "project_slug": "p13-message-broker",
+  "category": "Database Design",
+  "difficulty": "Advanced",
+  "question": "If you wanted to track these benchmarks across many commits and machines over time, how would you design the storage? (Not built.)",
+  "answer_hinglish": "Abhi: flat JSON per run, git mein. Do runs ke liye kaafi. Agar har commit par bench chale aur trend dekhna ho (regression detection), toh queries chahiye: 'B1 10 subscribers ka delivered msg/s pichhle 20 commits par, sirf A2 jaisi machine par, steal < 5% wale runs'. Yeh BUILT NAHI hai; design:\n\nTables (SQLite ya Postgres):\n- runs(run_id, started_at, commit, dirty, node_version, platform, cpus, cpu_model, topology, steal_pct, busy_pct, wall_seconds, label).\n- experiments(run_id, name, title, seconds, status) -- status: ok/skipped/failed.\n- measurements(run_id, experiment, metric, params_json, repetition, value, unit) -- ek row per repetition, jaise ('b1', 'deliveredPerSec', {subscribers: 10}, 2, 48262, 'msg/s'). Median/min-max query se, store nahi.\n- samples(run_id, experiment, series, t, value) -- B5 ke RSS samples, B7 ki series; alag table kyunki bahut rows.\n\nIndexes: (experiment, metric, commit), (cpu_model, topology). Raw JSON bhi blob ke roop mein rakho (re-analysis ke liye, jaise B4 ka contiguous block).\n\nKyun repetitions alag rows: median/percentiles baad mein badalne ho toh dobara compute; aggregate store karoge toh information gayi. Kyun steal aur topology har run par: comparison sirf similar conditions mein valid.\n\nKeemat: schema migrations, ingestion script, aur abhi ke chhote scale par overkill.",
+  "why_needed": "Performance trends tabhi dikhte hain jab results queryable hon; summary-only storage regressions chhupa deta hai.",
+  "real_world_analogy": "Ek runner ka diary se spreadsheet par jaana: har din ka time, mausam, jagah -- taaki pata chale sach mein tez hua ya bas thandi subah thi.",
+  "how_it_works": "ingest reference-results JSON -> runs + experiments + measurements (per repetition) + samples -> queries filter by machine/steal -> median over repetitions -> trend per commit.",
+  "in_this_project": "Current storage: bench/lib.mjs makeResultsDir, envInfo; bench/run.mjs; reference-results. Schema above is a proposal.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::envInfo",
+   "projects/13-message-broker/bench/run.mjs",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/env.json"
+  ],
+  "code_example": "-- a PROPOSAL, not in the repo\nCREATE TABLE runs (run_id TEXT PRIMARY KEY, started_at TEXT, commit_sha TEXT, dirty INTEGER, node_version TEXT,\n  platform TEXT, cpus INTEGER, cpu_model TEXT, topology TEXT, steal_pct REAL, busy_pct REAL, wall_seconds INTEGER);\nCREATE TABLE measurements (run_id TEXT REFERENCES runs, experiment TEXT, metric TEXT, params TEXT,\n  repetition INTEGER, value REAL, unit TEXT);\nCREATE INDEX m_lookup ON measurements (experiment, metric);",
+  "code_language": "sql",
+  "advantages": [
+   "Trend aur regression queries",
+   "Conditions ke hisaab se filtering",
+   "Raw repetitions safe"
+  ],
+  "disadvantages": [
+   "Extra infrastructure",
+   "Ingestion maintain karna",
+   "Abhi ke scale par zaroorat nahi"
+  ],
+  "common_mistakes": [
+   "Sirf medians store karna",
+   "Environment columns na rakhna",
+   "Alag machines ke runs ek saath average karna"
+  ],
+  "follow_up_questions": [
+   "Regression ka threshold kaise tay karoge (noise ke hisaab se)?",
+   "Samples table kitni badi hogi aur kaise prune karoge?"
+  ],
+  "concepts": [
+   "time-series",
+   "schema-design",
+   "regression-tracking"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Flat files simple aur git-friendly; DB queryable lekin infrastructure aur migrations. Chhote scale par files, regular CI runs par DB.",
+   "failure_scenarios": "Bina environment columns ke alag machines ke numbers mix hokar fake regressions ya improvements dikhayenge.",
+   "alternatives": "Files + ek chhota script jo trend chart banaye; dedicated benchmark dashboards; time-series DB.",
+   "scale_10x_100x": "Har commit par bench aur samples (B7 jaise) store karoge toh samples table jaldi badi hogi; aggregate karke ya purane samples hata kar.",
+   "production_improvements": "Pehle ingestion script reference-results par, phir regression alert jab median noise band se bahar jaye."
+  }
+ },
+ {
+  "id": "MB-088",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "After seeing the stage 4 numbers, what would you change before this broker could carry real production traffic?",
+  "answer_hinglish": "Stage 4 ne teen cheezein saaf ki: throughput ceiling (B1: ek broker lagbhag 37k-48k delivered msg/s is ARM machine par, B2: nats-server lagbhag 12x), memory risk (B5: slow consumer par memory limit ki 2.6-4.6x), aur failure cost (B4: kill par 20-29 messages at 2000 msg/s, ~10 ms reconnect). Production ke liye order:\n\n1. Security (stage 4 se pehle ka gap, ab bhi): client aur route auth, TLS agar private network se bahar. Stage 4 mein /32 rules hi suraksha the.\n2. Memory safety: maxPending ko measured multiplier ke hisaab se set karna, global pending budget aur max connections (dono missing), aur B5 open question ka jawab (heap/external breakdown).\n3. Capacity: expected peak ko B1 numbers se compare karo. Agar zaroorat ceiling ke paas hai, toh pehle write batching aur copy hatana (profile ke baad), warna mature server.\n4. Failure handling: lame duck mode (planned restarts ka loss window chhota), route PING aur slow-route limit, aur application ko at-most-once ke liye taiyaar karna (B4 jaisa loss normal hai).\n5. Observability: stats line already hai (STATS_INTERVAL_MS) -- isse metrics system mein bhejna, alerts on slowConsumers, RSS, routes.\n6. Re-measure: har change ke baad wahi bench, wahi method.\n\nSabse honest jawab: agar requirement core NATS jaisi hai, toh production ke liye real nats-server, aur yeh project learning aur interview ke liye.",
+  "why_needed": "Measured data se prioritised production plan banana senior engineers ka kaam hai.",
+  "real_world_analogy": "Car ka test drive ho gaya: top speed pata, brakes kitni door rukte pata, aur ek ajeeb awaaz (memory) bhi mili. Ab highway par le jaane se pehle seatbelt (auth), awaaz ki jaanch, aur speed limit ke andar chalaana.",
+  "how_it_works": "Measured limits (B1/B2/B4/B5) -> security first -> memory safety -> capacity decision -> failure handling -> observability -> re-measure.",
+  "in_this_project": "README 'Measured on real servers' aur 'NOT implemented yet'; reference-results part1/part2; src/server.ts deliver (maxPending), stats; src/index.ts statsMs.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b5.json",
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/src/index.ts::statsMs"
+  ],
+  "code_example": "// real, src/index.ts -- the observability that already exists and would feed metrics\nconst statsMs = intEnv(\"STATS_INTERVAL_MS\", 0);\n// one JSON line per interval: { event: \"stats\", t, rssKiB, connections, subscriptions, routes, remoteInterest,\n//   inMsgs, inBytes, outMsgs, outBytes, slowConsumers, routeInMsgs, routeOutMsgs }",
+  "code_language": "typescript",
+  "advantages": [
+   "Plan measured data par",
+   "Clear priority",
+   "Mature alternative ka honest option"
+  ],
+  "disadvantages": [
+   "Bahut kaam baaki",
+   "Kuch fixes (batching) ka fayda abhi unknown"
+  ],
+  "common_mistakes": [
+   "Benchmarks pass hone ko production readiness samajhna",
+   "Throughput par pehle kaam karna jab auth nahi",
+   "B5 finding ko ignore karna"
+  ],
+  "follow_up_questions": [
+   "Kaunsa ek metric production mein sabse pehle alert karega?",
+   "nats-server choose karne ka faisla kis data par loge?"
+  ],
+  "concepts": [
+   "production-readiness",
+   "prioritisation",
+   "measured-decisions"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Apna broker deep understanding aur control deta hai; mature server performance aur security features. Learning goal vs production goal alag.",
+   "failure_scenarios": "Bina global memory budget ke ek se zyada slow consumers OOM; bina auth ke koi bhi publisher; capacity ke paas chalne par p99 aur kharab.",
+   "alternatives": "nats-server production mein; yeh broker internal tools ya learning ke liye; ya specific needs (custom routing) ke liye is code ko base banana.",
+   "scale_10x_100x": "10x traffic ke liye ya toh per-message cost ghatana ya zyada brokers; dono ke baad dobara measure.",
+   "production_improvements": "Auth + TLS, global budget + max connections, batching after profiling, lame duck, metrics export, aur CI-style regular bench."
+  }
+ },
+ {
+  "id": "MB-089",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "How would you use the stage 4 numbers for capacity planning, and what must you NOT conclude from them?",
+  "answer_hinglish": "Method, numbers se: (1) workload ko 'delivered messages per second' mein likho, published mein nahi -- B1 ne dikhaya cost per delivery hai (10 aur 100 subscribers par lagbhag 48k delivered/s). (2) Ek broker ka measured ceiling is setup par: 128-byte messages, ek publisher, A2 (ARM 2 cores), median 37k-48k delivered/s. (3) Ceiling par mat chalao: headroom rakho, kyunki ceiling par latency badhti hai (B2 p99 already teen guna se zyada nats-server se, aur woh bhi idle-ish). (4) Memory: per slow consumer worst case lagbhag limit x 2.6-4.6 (B5), connections x maxPending nahi. (5) Failure budget: B4 -- ek broker kill par us broker ke subscribers ke liye ~10-15 ms ka traffic jaata hai; rate badhao toh messages zyada.\n\nKya NAHI conclude karna:\n- Doosre message sizes: sirf 128 B (B1-B3) aur 1 KiB (B5) test hue. Bade messages par copy cost badhega.\n- Multiple publishers ya kai subjects ka mixed load: B1 ek publisher, ek subject tha.\n- Doosri machines: x86 micro ka throughput measure nahi hua (wahan sirf broker B tha).\n- Cluster ka total throughput: B1/B2 ek broker par the; cluster mein route traffic aur full mesh ka cost alag.\n- Load ke neeche latency: rtt ek waqt mein ek request tha.\n- Long-term memory: B7 slow leak rule out nahi karta.\n\nPractical step: apne workload jaisa ek naya experiment likho (bench structure easy hai) aur usse plan karo.",
+  "why_needed": "Benchmark numbers ko apne workload par extrapolate karna sabse aam galti hai; scope jaanna capacity planning ka hissa hai.",
+  "real_world_analogy": "Ek lift ka test 8 logon ke saath hua: aap 8 logon ka plan bana sakte ho, lekin 'furniture shift karne mein bhi theek chalegi' nahi bol sakte.",
+  "how_it_works": "Workload in deliveries/s -> compare with measured ceiling and setup -> add headroom -> memory worst case from B5 -> loss budget from B4 -> list what was not measured -> run a workload-specific experiment.",
+  "in_this_project": "README 'Measured on real servers' tables; bench/scenarios.mjs (PAYLOAD 128 bytes, b5 1 KiB body); reference-results.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/bench/scenarios.mjs::fanoutRun",
+   "projects/13-message-broker/bench/scenarios.mjs::b5",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b2.json"
+  ],
+  "code_example": "// real, bench/scenarios.mjs -- the message sizes that were actually measured\nconst PAYLOAD = Buffer.alloc(128, \"x\");      // B1, B2, B3, B6, B7\n// ... in b5:\nconst body = Buffer.alloc(1024, \"s\");       // B5 only",
+  "code_language": "typescript",
+  "advantages": [
+   "Data-driven planning",
+   "Scope honestly listed",
+   "Headroom ka argument measured"
+  ],
+  "disadvantages": [
+   "Bahut cheezein measured nahi",
+   "Ek machine type ka ceiling"
+  ],
+  "common_mistakes": [
+   "Published msg/s se plan karna",
+   "128 B result ko 64 KiB messages par lagana",
+   "Ceiling par 100% plan karna"
+  ],
+  "follow_up_questions": [
+   "Apne workload ke liye kaunsa experiment likhoge?",
+   "Headroom kitna rakhoge aur kyun?"
+  ],
+  "concepts": [
+   "capacity-planning",
+   "extrapolation",
+   "benchmark-scope"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Measured numbers achha starting point hain lekin narrow; har nayi workload shape ke liye naya measurement chahiye. Sasta: bench framework already hai.",
+   "failure_scenarios": "Galat extrapolation se production mein ya toh overload (latency, slow consumer drops) ya wasted capacity.",
+   "alternatives": "Production traffic replay, canary rollout with metrics, ya load test with real message mix.",
+   "scale_10x_100x": "Cluster capacity ek broker x N nahi hai: full mesh mein har publish har interested peer ko jaata hai, toh route traffic bhi badhta hai.",
+   "production_improvements": "Workload-specific scenario (mixed sizes, kai publishers), x86 par bhi B1, aur load ke neeche latency."
+  }
+ },
+ {
+  "id": "MB-090",
+  "project_slug": "p13-message-broker",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "With a measured 12x gap to nats-server, would you keep this broker in Node.js or rewrite it? Argue both sides.",
+  "answer_hinglish": "Facts: B2 mein same machine aur client par 12x throughput gap aur p99 teen guna se zyada; median latency paas. Causes code analysis se: ek event loop, har delivery ek write aur ek copy, koi batching nahi; profile nahi kiya. Abhi koi rewrite nahi hua; yeh decision discussion hai.\n\nKeep Node (aur optimise):\n- Gap ka bada hissa design ho sakta hai (batching, copies), language nahi -- yeh profile ke bina pata nahi, aur sasta test hai.\n- Saare 138 tests, interop tests, aur 34 mutation checks TypeScript mein hain; rewrite par sab port karna.\n- Cluster already hai: zyada brokers per machine ya zyada machines se total capacity badh sakti hai.\n- Learning goal: protocol, routing, failure -- woh language-independent hai.\n\nRewrite (Go/Rust):\n- Multi-core ek process mein, concurrent GC, aur kam allocation cost -- tail latency (p99) ke liye structural fayda.\n- Production NATS khud Go mein hai; agar production chahiye toh shayad seedha nats-server use karo, apna rewrite nahi.\n\nMera recommendation: pehle profile + batching (MB-059) aur dobara B1/B2. Agar gap design se band hota hai, Node mein raho. Agar ek-core ceiling aur GC tails hi bache, aur production chahiye, toh rewrite se pehle nats-server consider karo -- rewrite tabhi jab custom behaviour chahiye jo nats-server nahi deta.",
+  "why_needed": "Rewrite ka faisla measured data aur cost ke saath hona chahiye, 'language X slow hai' feeling se nahi.",
+  "real_world_analogy": "Purani car slow hai: pehle check karo tyres aur engine tuning (sasta), phir nayi car (mehnga). Aur agar bas office jaana hai toh taxi (nats-server) bhi option hai.",
+  "how_it_works": "Measured gap -> profile to split design vs runtime -> optimise design (batching) -> re-measure -> if runtime limits remain: adopt nats-server or rewrite for custom needs.",
+  "in_this_project": "README (B2 table, 'NOT implemented yet': single event loop, no batching, no worker threads); src/server.ts deliver; test suite and mutation tables in README.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b2.json",
+   "projects/13-message-broker/test/interop.test.ts"
+  ],
+  "code_example": "// real, src/server.ts -- the hot path any rewrite or optimisation would start from\nconst frame = Buffer.concat([Buffer.from(head), body, CRLF]);\nif (target.socket.writableLength + frame.length > this.opts.maxPending) {\n  this.slowConsumer(target);\n  return false;\n}\ntarget.write(frame);",
+  "code_language": "typescript",
+  "advantages": [
+   "Decision data-driven",
+   "Sasta step pehle",
+   "Mature alternative ka option"
+  ],
+  "disadvantages": [
+   "Profile ke bina causes ka split unknown",
+   "Rewrite mein saare tests port"
+  ],
+  "common_mistakes": [
+   "Bina profile ke rewrite",
+   "Gap ko sirf language par daalna",
+   "Production ke liye apna server likhna jab mature exists"
+  ],
+  "follow_up_questions": [
+   "Profile mein kya dekhoge jo rewrite ka faisla karega?",
+   "Rust vs Go is case mein kya fark?"
+  ],
+  "concepts": [
+   "rewrite-decision",
+   "build-vs-buy",
+   "performance-strategy"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Optimising existing code sasta aur incremental; rewrite bada jump de sakta hai lekin risk aur cost. Buy (nats-server) sabse sasta production path.",
+   "failure_scenarios": "Rewrite mein naye bugs (framing, interest counting) -- isliye tests aur mutation checks ka port zaroori. Optimisation mein batching se protocol corruption ka risk.",
+   "alternatives": "Native addon sirf hot path ke liye, worker threads, multiple processes behind a cluster, ya nats-server.",
+   "scale_10x_100x": "10x scale par single-core ceiling har broker par rahega; horizontal scale cluster se, lekin full mesh ki keemat ke saath.",
+   "production_improvements": "Profile-guided optimisation, phir decision document jisme measured before/after numbers hon."
+  }
+ },
+ {
+  "id": "MB-091",
+  "project_slug": "p13-message-broker",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "The broker uses one core. Could you run two brokers on the 2-core A2 machine in a cluster to use both cores, and what would that cost?",
+  "answer_hinglish": "Idea: ek machine par do broker processes, cluster ports alag, ek doosre ko ROUTES mein. Clients ko dono mein baant do. Har broker ka apna event loop, toh dono cores. Yeh BUILT/MEASURED nahi hai -- sirf stage 3 cluster ke features se reasoning.\n\nKya milta: agar publishers aur subscribers mostly ek hi broker par hain (jaise queue groups with local preference, ya subjects jo ek broker ke clients tak seemit), toh do brokers do guna kaam kar sakte hain.\n\nKeemat:\n1. Cross-broker traffic: publisher broker 1 par aur subscriber broker 2 par ho toh har message RMSG ke roop mein route par jaata hai -- extra encode (JSON meta + payload copy), loopback write, aur doosre broker par parse aur deliver. B3 ne dikhaya ki cross-node path mehnga hai (us mein network bhi tha); loopback par network nahi hoga lekin broker ka kaam dugna.\n2. Fan-out across both: plain subscribers dono brokers par hon toh har message dono jagah process hota hai.\n3. Full mesh: zyada brokers = zyada routes, aur one-hop rule ke liye har broker ko har broker se juda rehna.\n4. Interest traffic: har distinct subject ka RS+/RS- doosre broker ko.\n5. Load generator bhi usi machine par tha B1/B2 mein -- teen processes, do cores.\n\nKab sahi: workload jo partition ho sake (locality). Kab galat: sab subscribers sab messages chahte hain (broadcast), tab route hop har message par.\n\nSahi tarika jaanne ka: B1 jaisa experiment do local brokers ke saath (single-host cluster3 mode already hai) aur compare.",
+  "why_needed": "Single-threaded runtime ko scale karne ka aam tarika multiple processes hai; uski distributed keemat samajhna zaroori hai.",
+  "real_world_analogy": "Ek kitchen ke do chef: agar har chef apne orders khud banaye toh do guna; agar har dish dono ke haath se guzre toh fayda kam, aur beech mein plate pass karne ka time bhi.",
+  "how_it_works": "2 brokers on one host, routes over loopback -> partitionable traffic: ~2 loops in parallel; cross-broker traffic: extra RMSG encode/parse per message -> measure with cluster3 single-host.",
+  "in_this_project": "bench/lib.mjs cluster3 (single-host mode), src/server.ts publish (RMSG per interested peer), fromRoute; README B3.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::cluster3",
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/src/server.ts::fromRoute",
+   "projects/13-message-broker/src/route.ts::encodeRmsg"
+  ],
+  "code_example": "// real, src/route.ts -- the extra work every cross-broker message pays\nexport function encodeRmsg(meta: RouteMsgMeta, payload: Buffer): Buffer {\n  return Buffer.concat([Buffer.from(`RMSG ${JSON.stringify(meta)} ${payload.length}\\r\\n`), payload, Buffer.from(\"\\r\\n\")]);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Dono cores use",
+   "Code change ki zaroorat nahi (cluster exists)",
+   "Locality wale workloads ke liye natural"
+  ],
+  "disadvantages": [
+   "Cross-broker messages ka dugna kaam",
+   "Measured nahi",
+   "Clients ko baantna padta hai"
+  ],
+  "common_mistakes": [
+   "Sochna ki do brokers = do guna throughput har workload par",
+   "Broadcast workload ko partition karna"
+  ],
+  "follow_up_questions": [
+   "Clients ko brokers mein kaise baantoge?",
+   "SO_REUSEPORT se ek port par do processes kyun kaafi nahi?"
+  ],
+  "concepts": [
+   "multi-process",
+   "horizontal-scaling",
+   "locality"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Multiple processes multi-core dete hain bina threads ke, lekin state (subscriptions) partitioned hai aur cross-partition traffic mehnga.",
+   "failure_scenarios": "Ek broker crash ho toh uske clients failover karte hain doosre par (B4 jaisa loss window). Do brokers ek machine par -- machine gayi toh dono.",
+   "alternatives": "Worker threads shared state ke saath (complex), SO_REUSEPORT (subscriptions share nahi hoti, toh galat), ya ek multi-threaded runtime.",
+   "scale_10x_100x": "N cores par N brokers ka full mesh N^2 routes; bade machines par hierarchy ya different design.",
+   "production_improvements": "Single-host cluster experiment, locality-aware client placement, aur cross-broker share ka metric (routeOutMsgs / inMsgs)."
+  }
+ },
+ {
+  "id": "MB-092",
+  "project_slug": "p13-message-broker",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A bench run prints 'INCOMPLETE' in the delivered column of a fan-out table. How would you investigate?",
+  "answer_hinglish": "fanoutRows likhta hai 'all' sirf jab har run complete aur delivered === expected; warna 'INCOMPLETE a/b/c' with har run ka delivered count. Complete false tab hota hai jab waitUntil(got >= m * n) 60 s mein poora nahi hua.\n\nInvestigation, sasti cheez pehle:\n1. -ERR seen column: subscribers ya publisher ko koi -ERR mila? 'Slow Consumer' ho toh ek subscriber kat gaya -- fan-out generator ek process mein hai, aur agar woh padhne mein peeche reh jaye toh uska writableLength maxPending tak ja sakta hai. 'Maximum Payload Violation' ya protocol errors bhi yahin dikhte.\n2. Broker ki stats lines (bench har broker ki lines rakhta hai): slowConsumers badha? connections ghate?\n3. Readiness: ready() pass hua tha? Agar nahi, toh run error deta, INCOMPLETE nahi -- toh interest issue kam likely.\n4. Kitna kam: agar ek subscriber ka poora hissa missing hai, toh woh disconnect hua; agar sab thoda kam, toh timeout bahut chhota ya generator overload.\n5. Raw JSON: delivered, expected, publishSeconds, totalSeconds -- publish khatam hua lekin delivery nahi, toh broker ya subscribers peeche.\n6. Steal aur machine load: env.json ka cpuShareDuringRun.\n\nStage 4 ke reference results mein yeh nahi hua -- B1 mein teeno sizes 'all' aur -ERR 0. Lekin bench ko is case ke liye design kiya gaya hai: incomplete run chhupta nahi, saath mein raw counts.",
+  "why_needed": "Benchmark failures ko debug karna aur unhe results mein visible rakhna, 'saaf' numbers dikhane se zyada important hai.",
+  "real_world_analogy": "Parcel delivery report mein '98 of 100 delivered': pehle dekho koi address galat tha (-ERR), koi ghar band tha (disconnect), ya truck time par nahi pahuncha (timeout).",
+  "how_it_works": "INCOMPLETE -> check -ERR seen (slow consumer?) -> broker stats (slowConsumers, connections) -> per-run delivered vs expected -> publish vs total seconds -> machine steal.",
+  "in_this_project": "bench/scenarios.mjs fanoutRun (complete, errors), fanoutRows (INCOMPLETE label); bench/client.mjs line (-ERR collected); bench/lib.mjs start (stats lines).",
+  "implementation_files": [
+   "projects/13-message-broker/bench/scenarios.mjs::fanoutRows",
+   "projects/13-message-broker/bench/scenarios.mjs::fanoutRun",
+   "projects/13-message-broker/bench/client.mjs::BenchClient",
+   "projects/13-message-broker/bench/lib.mjs::start"
+  ],
+  "code_example": "// real, bench/scenarios.mjs fanoutRows (trimmed)\nrs.every((x) => x.complete && x.delivered === x.expected) ? \"all\" : `INCOMPLETE ${rs.map((x) => x.delivered).join(\"/\")}`,\nrs.flatMap((x) => x.errors).length,",
+  "code_language": "javascript",
+  "advantages": [
+   "Failure visible table mein hi",
+   "Raw counts se jaldi diagnosis"
+  ],
+  "disadvantages": [
+   "Root cause table nahi batata",
+   "Generator aur subscribers ek process mein -- confusing"
+  ],
+  "common_mistakes": [
+   "Incomplete runs ko median mein chupchap ginna",
+   "-ERR column ignore karna"
+  ],
+  "follow_up_questions": [
+   "Generator ko slow consumer banne se kaise rokoge?",
+   "Timeout 60 s sahi hai kya?"
+  ],
+  "concepts": [
+   "benchmark-debugging",
+   "failure-visibility",
+   "slow-consumer"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-093",
+  "project_slug": "p13-message-broker",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Why does 'one write() per delivery' hurt throughput, and how would batching interact with the slow-consumer check?",
+  "answer_hinglish": "Har socket.write() JS se libuv tak ek call hai, aur stream machinery (buffer queue, callbacks) ka kaam karta hai. 10 subscribers ke saath ek publish = 10 writes; 1000 messages = 10000 writes. Agar ek connection ke liye kai frames ek saath (ek tick mein) jaayein, toh ek write (ya writev) kaafi -- kam calls, kam syscalls (kernel tak bhi kam jaana), aur bade packets. README isse 'No batching of frames per connection' kehta hai aur gap ki wajah mein ginta hai. Bench client khud yahi karta hai: pub() frames jama karke 64 KiB par ek write.\n\nBatching (built nahi) ke tarike: (1) socket.cork() pehli write par, process.nextTick ya setImmediate par uncork() -- Node ek tick ke writes ko jod deta hai. (2) Per-connection output array, tick ke end par ek Buffer.concat + write (ek copy) ya writev (bina copy).\n\nSlow-consumer interaction: abhi check har frame se pehle hai -- writableLength + frame.length > maxPending. Batching ke saath bytes kuch der apne array mein rehte hain, writableLength mein nahi dikhte. Toh check ko 'writableLength + queued-but-not-yet-written bytes + frame' par karna hoga, warna limit late lagegi aur memory B5 se bhi zyada badhegi. cork() ke saath writableLength corked bytes ko gin-ta hai, toh wahan check same rehta hai -- ek reason cork pehle try karne ka.\n\nLatency trade: tick ke end tak rukna typical latency thoda badha sakta hai; ek tick chhota hai, lekin measure karna padega (B2 rtt).",
+  "why_needed": "Syscall aur call overhead per message high-throughput servers ka classic bottleneck hai; batching ka asar correctness checks par bhi padta hai.",
+  "real_world_analogy": "Har chitthi ke liye alag post office jaana vs din bhar ki chitthiyan ek baar mein; lekin ab yeh bhi gin-na padega ki thaile mein kitni chitthiyan pehle se hain, warna thaila phat jayega.",
+  "how_it_works": "Now: per delivery -> concat -> check -> write. Batched: per delivery -> append to connection queue (or corked write) -> check includes queued bytes -> flush once per tick.",
+  "in_this_project": "src/server.ts deliver (per-frame check and write); bench/client.mjs pub/flushOut (batching example, OUT_BATCH); README 'NOT implemented yet'.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/bench/client.mjs::flushOut",
+   "projects/13-message-broker/bench/client.mjs::BenchClient",
+   "projects/13-message-broker/README.md"
+  ],
+  "code_example": "// real, bench/client.mjs -- the client side already batches\nflushOut() {\n  if (this.outLen === 0 || this.closed) return true;\n  const ok = this.socket.write(Buffer.concat(this.out, this.outLen));\n  this.out = [];\n  this.outLen = 0;\n  return ok;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Kam calls aur syscalls",
+   "Bade packets",
+   "Client side already proven pattern"
+  ],
+  "disadvantages": [
+   "Slow-consumer accounting complex",
+   "Thodi latency",
+   "Built nahi, fayda measured nahi"
+  ],
+  "common_mistakes": [
+   "Batching ke baad check ko writableLength par hi chhod dena",
+   "Har message par setImmediate (overhead badhega)",
+   "Frames ko reorder karna"
+  ],
+  "follow_up_questions": [
+   "cork vs writev mein kaunsa pehle try karoge?",
+   "Fairness: ek bade connection ki batch doosron ko rok degi?"
+  ],
+  "concepts": [
+   "write-batching",
+   "syscalls",
+   "back-pressure-accounting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Batching throughput badhata hai par per-message latency aur accounting complexity; per-frame writes simple aur exact.",
+   "failure_scenarios": "Galat accounting se slow consumer late katega aur memory badhegi; galat flush scheduling se messages atak sakte hain (flush kabhi na ho).",
+   "alternatives": "cork/uncork, writev, per-connection ring buffer, ya kernel-level batching (TCP_CORK) -- Node mein cork sabse aasaan.",
+   "scale_10x_100x": "High fan-out par batching ka fayda sabse zyada (zyada frames per tick per connection).",
+   "production_improvements": "Batching implement karke B1/B2 aur B5 dono dobara: throughput badha aur memory limit ab bhi sahi lagi, dono saabit karne honge."
+  }
+ },
+ {
+  "id": "MB-094",
+  "project_slug": "p13-message-broker",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Every socket uses setNoDelay(true). How does that interact with the measured throughput and latency, and what would you test?",
+  "answer_hinglish": "setNoDelay(true) Nagle's algorithm band karta hai: chhote writes turant packet ban kar jaate hain, kernel chhote writes ko jodne ke liye ACK ka intezaar nahi karta. Broker accept() mein har client socket par, aur routes par (setupRoute) yeh set karta hai; bench client bhi.\n\nLatency par: request/reply jaise ek-message-ek-jawab traffic mein Nagle delay add kar sakta tha; band hone se B2/B3 ke p50 numbers (224-238 us local) mein woh delay nahi. Yeh low-latency ke liye sahi default hai.\n\nThroughput par: kyunki broker har delivery par alag write karta hai (koi batching nahi), Nagle off hone ka matlab bahut saare chhote packets -- 128-byte message ka MSG frame ek chhota packet. Kernel aur network stack ka per-packet cost badhta hai. Agar Nagle on hota, toh kernel kuch frames jod deta -- throughput shayad badhta, latency badhti. Yeh measure NAHI kiya gaya; yeh hypothesis hai.\n\nSahi jawab Nagle on karna nahi, balki application-level batching (MB-093): ek tick ke frames ek write mein -- tab Nagle off rehte hue bhi bade packets jaate hain, aur latency control mein rehti hai.\n\nTest karna ho toh: B1 aur B2 ka variant jahan broker setNoDelay(false) kare, aur dono -- throughput aur rtt p50/p99 -- compare. Ek change, same machine, steal check.",
+  "why_needed": "TCP options ka throughput-latency trade samajhna network servers ke liye basic hai; aur unke asar ko measure karna chahiye, guess nahi.",
+  "real_world_analogy": "Courier jo har parcel aate hi alag truck mein bhej deta hai (fast lekin bahut trucks) vs jo kuch parcels jama hone ka intezaar karta hai (kam trucks, thoda late). Behtar: sender khud parcels ek box mein pack kare.",
+  "how_it_works": "setNoDelay(true) -> each write leaves as its own packet quickly -> good for rtt, many small packets under fan-out -> better fix: batch in the app, keep NoDelay.",
+  "in_this_project": "src/server.ts accept (socket.setNoDelay(true)), setupRoute (r.socket.setNoDelay(true)); bench/client.mjs connect (setNoDelay); reference-results b2/b3.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::accept",
+   "projects/13-message-broker/src/server.ts::setupRoute",
+   "projects/13-message-broker/bench/client.mjs::BenchClient",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b3.json"
+  ],
+  "code_example": "// real, src/server.ts\nprivate accept(socket: net.Socket): void {\n  socket.setNoDelay(true);\n  // ...\n}\n// and for routes, in setupRoute:\nr.socket.setNoDelay(true);\nr.socket.setKeepAlive(true, 10_000);",
+  "code_language": "typescript",
+  "advantages": [
+   "Low latency default",
+   "Client aur route dono par consistent"
+  ],
+  "disadvantages": [
+   "Bina batching ke bahut chhote packets",
+   "Asar measured nahi"
+  ],
+  "common_mistakes": [
+   "Throughput ke liye Nagle on kar dena aur latency bigaadna",
+   "Socket option ko benchmark kiye bina badalna"
+  ],
+  "follow_up_questions": [
+   "Delayed ACK aur Nagle saath mein kya problem dete hain?",
+   "TCP_CORK aur cork() mein fark?"
+  ],
+  "concepts": [
+   "tcp-nodelay",
+   "nagle",
+   "latency-vs-throughput"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "NoDelay latency ke liye, Nagle throughput ke liye; application batching dono ka best -- control app ke paas.",
+   "failure_scenarios": "Nagle on + request/reply pattern + delayed ACK = kabhi kabhi badi latency spikes. NoDelay + no batching = packet storm under fan-out.",
+   "alternatives": "App-level batching with NoDelay (recommended), ya cork/uncork per tick.",
+   "scale_10x_100x": "Fan-out badhne par chhote packets ki ginti linearly badhti hai; batching ke bina network stack par load.",
+   "production_improvements": "NoDelay on/off ka controlled B1/B2 experiment, phir batching ke saath dobara."
+  }
+ },
+ {
+  "id": "MB-095",
+  "project_slug": "p13-message-broker",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write the small statistics helpers the bench uses: median, nearest-rank percentile, and a 'median (min-max)' table cell.",
+  "answer_hinglish": "Teen functions, bench/lib.mjs jaise.\n\nmedian(values): null/undefined hatao (failed measurements), copy karke sort (numeric compare, default string sort galat hai), odd count par beech wala, even par beech ke do ka average. Khaali par null.\n\npercentile(sorted, p): already sorted array leta hai (sort ek baar, percentiles kai -- rtt mein p50, p90, p99). Nearest-rank: index = ceil(p/100 x n) - 1, aur n-1 se upar nahi. Har result ek asli sample hai, interpolate nahi.\n\ncell(values, digits): median aur min-max; agar sirf ek value hai toh bracket nahi -- taaki ek run spread wala na dikhe. Rounding digits ke saath.\n\nTest cases jo likhne chahiye: median([3, 1, 2]) = 2; median([4, 1, 3, 2]) = 2.5; median([null, 5]) = 5; percentile([1..100], 99) = 99; percentile([1..100], 50) = 50; percentile([7], 99) = 7; cell([10, 12, 11]) = '11 (10-12)'; cell([5]) = '5'.\n\nCommon bug: values.sort() bina comparator -- [10, 9, 100] string order mein [10, 100, 9] ho jaata hai.",
+  "why_needed": "Benchmarks ke statistics ke chhote bugs pure results ko galat bana dete hain; yeh helpers interview mein bhi aam exercise hain.",
+  "real_world_analogy": "Exam ke marks: beech wala student ka score (median), aur 'top 1% kitne se upar' (p99) -- dono ke liye list ko pehle sahi order mein lagana padta hai.",
+  "how_it_works": "median: filter nulls -> numeric sort -> middle. percentile: index ceil(p/100*n)-1 on sorted. cell: median + (min-max) if more than one value.",
+  "in_this_project": "bench/lib.mjs median, percentile, spread, cell, round.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::median",
+   "projects/13-message-broker/bench/lib.mjs::percentile",
+   "projects/13-message-broker/bench/lib.mjs::cell"
+  ],
+  "code_example": "export function median(values) {\n  const v = values.filter((x) => x !== null && x !== undefined).sort((a, b) => a - b);\n  if (v.length === 0) return null;\n  const mid = Math.floor(v.length / 2);\n  return v.length % 2 ? v[mid] : (v[mid - 1] + v[mid]) / 2;\n}\n\nexport function percentile(sorted, p) {\n  if (sorted.length === 0) return null;\n  return sorted[Math.min(sorted.length - 1, Math.ceil((p / 100) * sorted.length) - 1)];\n}\n\nexport function cell(values, d = 0) {\n  const v = values.filter((x) => x !== null && x !== undefined);\n  const m = median(v);\n  if (m === null) return \"-\";\n  if (v.length === 1) return m.toFixed(d);\n  return `${m.toFixed(d)} (${Math.min(...v).toFixed(d)}-${Math.max(...v).toFixed(d)})`;\n}\n\n// tests\nconsole.assert(median([4, 1, 3, 2]) === 2.5);\nconsole.assert(percentile([...Array(100).keys()].map((i) => i + 1), 99) === 99);\nconsole.assert(cell([10, 12, 11]) === \"11 (10-12)\");",
+  "code_language": "javascript",
+  "advantages": [
+   "Chhote, testable",
+   "Nearest-rank: asli samples",
+   "Single run ko honestly dikhata hai"
+  ],
+  "disadvantages": [
+   "Nearest-rank chhote samples par coarse",
+   "Confidence interval nahi"
+  ],
+  "common_mistakes": [
+   "sort() bina comparator",
+   "Percentile ke liye unsorted array dena",
+   "Nulls ko 0 maan lena"
+  ],
+  "follow_up_questions": [
+   "Interpolated percentile kab better hai?",
+   "Bahut bade sample par sort ki jagah kya (histogram)?"
+  ],
+  "concepts": [
+   "statistics",
+   "percentiles",
+   "testing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-096",
+  "project_slug": "p13-message-broker",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Write a readiness helper that proves a set of subscribers (possibly on other brokers) can receive from a publisher before a measurement starts.",
+  "answer_hinglish": "Requirement: fixed sleep nahi; actual delivery se saboot; timeout; local aur remote subscribers dono.\n\nDesign (bench ka ready() jaisa): har subscriber, apni asli subscriptions ke BAAD, ek unique probe subject subscribe kare aur flush (PING/PONG) kare -- taaki uska broker SUB process kar chuka ho. Publisher loop: jin probes ka jawab nahi aaya unpar publish, flush, 20 ms ruko, dobara; sab aa gaye toh done; deadline paar toh error with count.\n\nValidity ki shart (likh kar rakho): probe asli SUB ke baad usi connection par; tab subscriber ke broker se RS+ usi order mein ek route par jaate hain, toh probe pahunchna asli interest pahunchne ka saboot hai.\n\nEdge cases: (1) Probe subjects unique per call (tag) taaki ek experiment ke probes doosre se mix na hon. (2) Probe handler sirf set mein index daale -- duplicate probes harmless. (3) Publisher ka flush har round mein, taaki probes buffer mein na atke. (4) Timeout ka error message mein kitne reachable the -- debugging ke liye.\n\nTest kaise: ek single-host cluster (cluster3 bina REMOTE_NODES) par, ek subscriber remote broker par; ready() ke turant baad 100 messages; sab pahunchne chahiye. Negative test: ek subscriber ka broker band karke ready() timeout dena chahiye.",
+  "why_needed": "Distributed measurement aur tests dono mein readiness ka sahi saboot flaky results aur galat numbers rokta hai.",
+  "real_world_analogy": "Party shuru karne se pehle har mehmaan ko ek chhota test message bhejo; jab sab 'mila' bol dein tab speech shuru -- aur agar ek ghante tak koi na bole toh pata chale kaun nahi aaya.",
+  "how_it_works": "subs: sub(probe.tag.i) after real subs, flush -> pub: loop missing probes, flush, sleep 20 -> done or timeout with count.",
+  "in_this_project": "bench/scenarios.mjs ready (the real helper); bench/client.mjs flush; bench/lib.mjs cluster3 for a test setup.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/scenarios.mjs::ready",
+   "projects/13-message-broker/bench/client.mjs::flush",
+   "projects/13-message-broker/bench/lib.mjs::cluster3"
+  ],
+  "code_example": "export async function ready(pub, subs, tag = \"p\", timeoutMs = 15_000) {\n  const got = new Set();\n  // AFTER the real subscriptions, on the same connections: ordering makes the probe a proof for them too\n  subs.forEach((s, i) => s.sub(`_bench.probe.${tag}.${i}`, () => got.add(i)));\n  await Promise.all(subs.map((s) => s.flush()));\n  const end = Date.now() + timeoutMs;\n  while (got.size < subs.length) {\n    if (Date.now() > end) throw new Error(`probe: only ${got.size}/${subs.length} subscribers reachable`);\n    subs.forEach((_, i) => got.has(i) || pub.pub(`_bench.probe.${tag}.${i}`, Buffer.from(\"probe\")));\n    await pub.flush();\n    await new Promise((r) => setTimeout(r, 20));\n  }\n}",
+  "code_language": "javascript",
+  "advantages": [
+   "Proof by delivery, sleep nahi",
+   "Clear timeout error",
+   "Reusable across experiments"
+  ],
+  "disadvantages": [
+   "Ordering assumption par tika",
+   "Extra probe traffic"
+  ],
+  "common_mistakes": [
+   "Probe ko asli SUB se pehle bhejna",
+   "Har call mein same probe subjects",
+   "Bina flush ke publish loop"
+  ],
+  "follow_up_questions": [
+   "Agar subscriber ka broker aur publisher ka broker ek hop door na hon toh?",
+   "Ready hone ka time bhi kaise record karoge?"
+  ],
+  "concepts": [
+   "readiness",
+   "distributed-testing",
+   "coding-exercise"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Delivery-based readiness har topology mein sach batata hai (jahan ordering hold kare), internal state padhne se zyada portable; keemat thoda traffic aur code.",
+   "failure_scenarios": "Ordering assumption toote (multi-hop, alag connections) toh probe false positive de sakta hai -- asli subscription abhi bhi raste mein.",
+   "alternatives": "Broker ke stats (remoteInterest) poll karna, ya ek admin API; dono broker-specific.",
+   "scale_10x_100x": "Bahut subscribers par har round mein sab missing probes; theek hai, lekin round time badhega.",
+   "production_improvements": "Ready time ko metric ki tarah record karna -- yeh interest propagation latency ka proxy hai."
+  }
+ },
+ {
+  "id": "MB-097",
+  "project_slug": "p13-message-broker",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Given the sequence numbers a subscriber received, write code that reports lost count, duplicates, and the missing ranges (like B4's analysis).",
+  "answer_hinglish": "Input: sent (0 se sent-1 tak numbers bheje gaye) aur received numbers ki list (order kuch bhi, repeats possible). Output: received unique count, lost, duplicates (kitne numbers ek se zyada baar aaye), aur missing ranges -- B4 jaisa jahan raw mein firstMissing/lastMissing tha aur loss ek contiguous block nikla.\n\nApproach: Map<number, count> (B4 seen Map jaisa). lost = sent - unique. duplicates = counts > 1 wale numbers. Missing ranges: 0..sent-1 par loop, consecutive missing numbers ko [start, end] mein jodo.\n\nKyun ranges: sirf count se pata nahi chalta ki loss ek window mein hua (failover) ya bikhra hua (random drops, jaise slow consumer ya network). B4 mein teeno runs mein ek hi block tha (jaise 7371-7399, 29 messages), jo 'ek failover window' ki kahani ko support karta hai.\n\nEdge: numbers jo >= sent hon (bug) -- unhe 'unexpected' mein gino. Bahut bada sent ho toh bitset ya sorted array better.\n\nTest: sent 10, received [0,1,2,2,6,7,8,9] -> unique 7, lost 3, duplicates 1, ranges [[3,5]].",
+  "why_needed": "Loss analysis sirf count nahi, pattern bhi batata hai; yeh failure experiments ka core code hai.",
+  "real_world_analogy": "Roll call mein sirf 'teen bachche gayab' nahi, balki 'roll number 12 se 14 gayab' -- pata chalta hai ek hi group bahar gaya tha.",
+  "how_it_works": "count occurrences -> unique, duplicates -> scan 0..sent-1 for gaps -> merge consecutive into ranges -> report.",
+  "in_this_project": "bench/scenarios.mjs b4 (seen Map, missing, firstMissing, lastMissing); reference-results part2 b4.json.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/scenarios.mjs::b4",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b4.json"
+  ],
+  "code_example": "export function lossReport(sent, receivedSeqs) {\n  const seen = new Map();\n  let unexpected = 0;\n  for (const n of receivedSeqs) {\n    if (!Number.isInteger(n) || n < 0 || n >= sent) { unexpected++; continue; }\n    seen.set(n, (seen.get(n) ?? 0) + 1);\n  }\n  const duplicates = [...seen.values()].filter((c) => c > 1).length;\n  const ranges = [];\n  for (let i = 0; i < sent; i++) {\n    if (seen.has(i)) continue;\n    const last = ranges.at(-1);\n    if (last && last[1] === i - 1) last[1] = i;\n    else ranges.push([i, i]);\n  }\n  return { received: seen.size, lost: sent - seen.size, duplicates, unexpected, ranges };\n}\n\nconst r = lossReport(10, [0, 1, 2, 2, 6, 7, 8, 9]);\nconsole.assert(r.lost === 3 && r.duplicates === 1 && JSON.stringify(r.ranges) === \"[[3,5]]\");",
+  "code_language": "javascript",
+  "advantages": [
+   "Pattern dikhata hai, sirf count nahi",
+   "Duplicates alag gine",
+   "Bugs (unexpected) pakde"
+  ],
+  "disadvantages": [
+   "Bade sent par memory",
+   "Order/reorder analysis nahi"
+  ],
+  "common_mistakes": [
+   "Sirf received count se loss nikaalna",
+   "Duplicates ko received mein gin kar loss chhupana"
+  ],
+  "follow_up_questions": [
+   "Reordering kaise detect karoge?",
+   "10 crore messages par isko kaise scale karoge?"
+  ],
+  "concepts": [
+   "loss-analysis",
+   "sequence-numbers",
+   "coding-exercise"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-098",
+  "project_slug": "p13-message-broker",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What do p50, p90 and p99 latency mean, and why does the bench report all three instead of an average?",
+  "answer_hinglish": "Latency ke saare samples ko chhote se bade order mein lagao. p50 (median): beech wala -- aadhe requests isse tez, aadhe dheeme. p90: 90% requests isse tez. p99: 99% isse tez; sabse dheeme 1% isse upar.\n\nAverage kyun nahi: kuch bahut dheeme requests average ko kheench dete hain, aur phir average na typical batata hai na worst. Percentiles dono batate hain: p50 typical, p99 tail.\n\nIs project mein (B3, 3000 requests per run): same broker p50 224 us, p90 343, p99 1317. Matlab aam request lagbhag ek-chauthai millisecond, lekin har sau mein ek request 1.3 ms se zyada. B2 mein comparison ka sabse bada fark p99 mein tha (1037 vs nats-server 315), p50 mein nahi (238 vs 194). Average yeh kahani chhupa deta.\n\nTail kyun matter karta hai: ek user page load mein kai requests karta hai; agar har ek ka 1% chance slow hai, toh page ke slow hone ka chance zyada. Isliye production SLAs aksar p99 par hote hain.\n\nCaveat: 3000 samples par p99 sirf 30 sabse dheeme samples se banta hai -- noisy, isliye p99 ka min-max range bada (B3 same-broker 1060-1490).",
+  "why_needed": "Latency numbers padhna aur bolna har backend interview ka basic hai.",
+  "real_world_analogy": "Office pahunchne ka time: aam din 30 minute (p50), das mein ek din 45 (p90), aur saal mein kuch din 2 ghante (p99) -- boss ko p99 yaad rehta hai.",
+  "how_it_works": "samples -> sort -> p50 = middle, p90 = 90% point, p99 = 99% point (nearest-rank in this bench).",
+  "in_this_project": "bench/lib.mjs percentile; bench/scenarios.mjs rtt, b2, b3; reference-results part2 b3.json.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::percentile",
+   "projects/13-message-broker/bench/scenarios.mjs::rtt",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b3.json"
+  ],
+  "code_example": "// real, bench/scenarios.mjs rtt (trimmed)\nconst s = samples.sort((a, b) => a - b);\nreturn { count: s.length, p50: percentile(s, 50), p90: percentile(s, 90), p99: percentile(s, 99), max: s.at(-1) };",
+  "code_language": "javascript",
+  "advantages": [
+   "Typical aur tail dono",
+   "Outliers average nahi bigaadte"
+  ],
+  "disadvantages": [
+   "p99 chhote samples par noisy",
+   "Tail ke andar ka shape nahi dikhta"
+  ],
+  "common_mistakes": [
+   "Average latency report karna",
+   "p99 ko max samajhna",
+   "Kam samples par p99.9 bolna"
+  ],
+  "follow_up_questions": [
+   "p99.9 ke liye kitne samples chahiye?",
+   "Max kyun record kiya par table mein nahi?"
+  ],
+  "concepts": [
+   "latency",
+   "percentiles",
+   "tail-latency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-099",
+  "project_slug": "p13-message-broker",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What is RSS, how does the bench read it in two different ways, and why is RSS not the same as 'how much memory the JavaScript objects use'?",
+  "answer_hinglish": "RSS (resident set size): process ki woh memory jo abhi physical RAM mein hai -- JS heap, Buffers, native code, libraries, stacks sab. OS ki nazar se process kitni RAM le raha hai; OOM killer isi tarah sochta hai.\n\nBench do jagah se padhta hai: (1) broker ki stats line ka rssKiB -- broker khud process.memoryUsage().rss se likhta hai (STATS_INTERVAL_MS). (2) B5 mein bench har 100 ms /proc/<pid>/status ka VmRSS padhta hai (rssKiB(pid)), Linux only -- broker se independent aur zyada frequent. B5 ke raw mein rssSource '/proc' likha hai.\n\nRSS != JS objects: process.memoryUsage() alag numbers bhi deta hai -- heapUsed (JS objects), external aur arrayBuffers (Buffers ki memory, jo V8 heap ke bahar hoti hai). Ek broker jo bahut saare Buffers queue karta hai (slow consumer ke socket buffers) uski memory zyada tar external/arrayBuffers mein hoti hai, heapUsed mein nahi. Aur jab memory free hoti hai, allocator use OS ko turant wapas nahi deta -- RSS high reh sakta hai. B5 mein drop ke 2 s baad bhi RSS peak par tha (79, 250, 1375 MiB); README cause ko open question kehta hai, aur allocator/V8 ka memory na lautana ek candidate hai.\n\nIsliye B5 ka investigation plan heapUsed aur external ko bhi record karna hai -- abhi sirf RSS record hota hai.",
+  "why_needed": "Memory numbers ka matlab samjhe bina leaks aur limits ke baare mein galat conclusions nikalte hain.",
+  "real_world_analogy": "Ghar mein kitni jagah gheri hai (RSS) vs kitna saamaan aap use kar rahe ho (heapUsed): khaali dabbe bhi jagah gherte hain jab tak bahar na phenko.",
+  "how_it_works": "stats line: process.memoryUsage().rss -> rssKiB. B5: /proc/<pid>/status VmRSS every 100 ms. Neither shows heapUsed/external split.",
+  "in_this_project": "bench/lib.mjs rssKiB; src/index.ts statsMs (rssKiB from process.memoryUsage().rss); bench/scenarios.mjs b5 (rssSource); reference-results part2 b5.json.",
+  "implementation_files": [
+   "projects/13-message-broker/bench/lib.mjs::rssKiB",
+   "projects/13-message-broker/src/index.ts::statsMs",
+   "projects/13-message-broker/bench/scenarios.mjs::b5",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b5.json"
+  ],
+  "code_example": "// real, bench/lib.mjs\n/** Resident memory of a process in KiB, from /proc (Linux only); null elsewhere. */\nexport function rssKiB(pid) {\n  try {\n    const m = /VmRSS:\\s+(\\d+) kB/.exec(readFileSync(`/proc/${pid}/status`, \"utf8\"));\n    return m ? Number(m[1]) : null;\n  } catch {\n    return null;\n  }\n}",
+  "code_language": "javascript",
+  "advantages": [
+   "RSS OS ka asli view",
+   "/proc sampling broker se independent",
+   "Source raw mein likha"
+  ],
+  "disadvantages": [
+   "Heap breakdown nahi",
+   "/proc sirf Linux"
+  ],
+  "common_mistakes": [
+   "RSS girne ka intezaar karke 'leak nahi' bolna",
+   "heapUsed ko total memory samajhna",
+   "Buffers ko JS heap mein maan lena"
+  ],
+  "follow_up_questions": [
+   "external aur arrayBuffers mein kya fark hai?",
+   "RSS ko force karke kaise ghataoge (aur kyun yeh zaroori nahi)?"
+  ],
+  "concepts": [
+   "rss",
+   "memory-metrics",
+   "v8-heap"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-100",
+  "project_slug": "p13-message-broker",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What did the stage 4 run NOT measure, and which of those gaps matter most for someone relying on these numbers?",
+  "answer_hinglish": "Honest list, code aur docs se:\n1. Message sizes: sirf 128 B (B1, B2, B3, B6, B7) aur 1 KiB (B5). Bade messages par copy cost aur memory alag.\n2. Load shapes: ek publisher, ek subject (B1/B2); kai publishers ya kai subjects ka mixed load nahi.\n3. Latency under load: rtt ek waqt mein ek request -- throughput chalte hue latency nahi.\n4. x86 throughput: micro (x86) par sirf broker B tha; B1/B2 ARM A2 par.\n5. Cluster throughput: ek broker ka hi throughput measure; cluster ka total ya route ki capacity nahi.\n6. Other failures: sirf subscriber ke broker ka SIGKILL (B4). Publisher ke broker ki death, network partition (process zinda, network gaya), clean shutdown -- nahi.\n7. Multiple slow consumers: B5 mein ek.\n8. Long-term memory: B7 sirf 10 minute -- slow leak rule out nahi.\n9. Generator isolation: generator aur broker A same machine.\n10. Remote brokers ka CPU steal.\n11. Profiles: kahan time jaata hai, measure nahi kiya.\n\nSabse zyada matter: (6) network partition -- production mein half-open connections ke saath loss window PING timeout tak lamba ho sakta hai, jo B4 ke 10 ms se bahut alag hai. (8) slow memory leak -- dino baad OOM. (3) load ke neeche latency -- capacity ke paas p99. (7) kai slow consumers -- B5 ka multiplier per consumer judega.\n\nInterview line: 'yeh numbers is setup ke liye sach hain; yeh rahe woh sawal jo yeh numbers answer nahi karte.'",
+  "why_needed": "Benchmark ki limitations batana utna hi zaroori hai jitna results; warna log galat jagah numbers lagate hain.",
+  "real_world_analogy": "Car test ki report: 'shehar mein, saaf mausam mein, akele driver ke saath' -- baarish, pahaad aur poori family ka test nahi hua.",
+  "how_it_works": "List what each experiment fixed (size, rate, topology, failure type, duration) -> everything else is unmeasured -> rank by production risk.",
+  "in_this_project": "bench/scenarios.mjs (PAYLOAD 128, b5 body 1 KiB, b4 SIGKILL, b7 600 s); README notes; deployment/08 (which experiment used which servers).",
+  "implementation_files": [
+   "projects/13-message-broker/bench/scenarios.mjs::b4",
+   "projects/13-message-broker/bench/scenarios.mjs::b7",
+   "projects/13-message-broker/README.md",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/scenarios.mjs -- the fixed parameters that bound what was measured\nconst PAYLOAD = Buffer.alloc(128, \"x\");\n// b4: const ratePerSec = 2000; victim.proc.kill(\"SIGKILL\");\n// b5: const variants = [8 * MiB, 64 * MiB, 512 * MiB]; const body = Buffer.alloc(1024, \"s\");\n// b7: const seconds = Number(process.env.SOAK_SECONDS ?? (QUICK ? 15 : 600));",
+  "code_language": "javascript",
+  "advantages": [
+   "Scope clear",
+   "Risk-ranked gaps",
+   "Agla experiment plan karna aasaan"
+  ],
+  "disadvantages": [
+   "Bahut kuch unmeasured",
+   "Partition jaisa important case missing"
+  ],
+  "common_mistakes": [
+   "Numbers ko general claims banana",
+   "Gaps chhupana"
+  ],
+  "follow_up_questions": [
+   "Network partition ka experiment kaise banaoge (iptables DROP)?",
+   "Kaunsa gap sabse saste mein band hoga?"
+  ],
+  "concepts": [
+   "benchmark-scope",
+   "unknowns",
+   "risk-ranking"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-101",
+  "project_slug": "p13-message-broker",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Senior/System Design",
+  "question": "In an interview, how do you present 'our broker is about 12x slower than nats-server' without it sounding like a failure, and why was publishing it the right call?",
+  "answer_hinglish": "Framing: goal kya tha. H12 ek learning project hai -- protocol, routing, cluster aur failure behaviour khud likh kar samajhna. B2 ka asli purpose generator ko bottleneck se rule out karna tha (MB-051), 'nats-server ko harana' nahi. Ek single-event-loop TypeScript implementation ka ek mature, multi-threaded Go server se peeche rehna expected hai; sawal tha kitna aur kyun -- aur dono ka jawab hai: lagbhag 12x, aur code-level causes (ek loop, per-delivery write aur copy, no batching), profiling abhi baaki.\n\nPresent karne ka tareeka: (1) Number + context: 'same machine, same raw-protocol client, 128-byte messages, median of 3'. (2) Kya theek hai: median latency paas (238 vs 194 us), fan-out cost per delivery predictable, queue groups balanced, failover 20-29 messages ka loss aur zero duplicates, 10-minute churn ke baad zero state. (3) Kya nahi: throughput, p99, B5 memory finding. (4) Agla kadam: profile, batching, re-measure.\n\nPublish karna kyun sahi: (a) credibility -- jo number chhupate hain unke baaki numbers par bhi bharosa nahi hota. (b) README mein raw files aur generated tables hain, toh koi bhi verify kar sakta hai. (c) Weak points (B4 column, B7 slow leak, C7 mutation) bhi likhe hain -- yeh dikhata hai ki measurement ko seriously liya. (d) Galat expectations se bachav: agar koi ise production mein le jaana chahe toh limits pehle se pata.\n\nInterview mein yeh engineering maturity ka signal hai: measure, compare, explain, aur limits bolna.",
+  "why_needed": "Senior engineers se expected hai ki kamzor numbers ko honestly aur context ke saath present karein, aur unse decisions nikaalein.",
+  "real_world_analogy": "Ek naye cook ka biryani ek 5-star chef ke saath taste test: 'woh behtar hai, yeh rahi wajah, aur yeh rahi meri agli koshish' -- yeh 'meri biryani best hai' se zyada bharosemand.",
+  "how_it_works": "State the goal -> give the number with its setup -> what is good -> what is not -> causes (measured vs hypothesis) -> next steps -> point to raw data.",
+  "in_this_project": "README 'Measured on real servers' (interpretation bullets, generated tables, two bench bugs), 'NOT implemented yet'; bench/reference-results; deployment/08.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b2.json",
+   "projects/13-message-broker/bench/update-readme.mjs",
+   "deployment/08-message-broker-cluster.md"
+  ],
+  "code_example": "// real, bench/scenarios.mjs b2 note -- the comparison was designed to locate the bottleneck\nnote: `Median of ${RUNS} run(s). Same machine, same client, same message size. nats-server is written in Go and multi-threaded; ours is one Node.js event loop. If both give a similar number, the load generator is the limit, not the broker.`,",
+  "code_language": "typescript",
+  "advantages": [
+   "Credibility",
+   "Verifiable",
+   "Clear next steps"
+  ],
+  "disadvantages": [
+   "Bahar se 'slow' dikhta hai",
+   "Context ke bina number misquote ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Gap chhupana ya sirf favourable numbers dikhana",
+   "Gap ko bina causes ke 'Node slow hai' bolna",
+   "Learning project ko production server se equal claim karna"
+  ],
+  "follow_up_questions": [
+   "Agar interviewer kahe 'toh yeh project kis kaam ka?', kya jawab doge?",
+   "Kaunsa ek number tumhe sabse zyada surprise karta hai aur kyun?"
+  ],
+  "concepts": [
+   "honest-reporting",
+   "engineering-maturity",
+   "communication"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Honesty short-term mein kam impressive lagti hai lekin long-term credibility deti hai; selective reporting ulta.",
+   "failure_scenarios": "Bina context ke number quote ho toh 'broker bekaar' ban jaata hai; isliye setup aur purpose hamesha saath.",
+   "alternatives": "Sirf internal numbers dikhana (bina reference) -- impressive lagta lekin meaningless; ya koi number na dena -- safe lekin kuch saabit nahi.",
+   "scale_10x_100x": "Har optimisation ke baad wahi comparison dobara -- gap ka trend khud ek story hai.",
+   "production_improvements": "Results ke saath hamesha setup, raw data, aur 'what this does not show' section."
+  }
+ }
+]

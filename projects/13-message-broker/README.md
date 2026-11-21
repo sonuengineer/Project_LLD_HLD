@@ -24,7 +24,9 @@ What the numbers say (every figure below is in the generated tables further down
   subscribers: the cost is per delivered message, not per published one.
 - **One route hop is cheap next to the network (B3).** Across brokers, the round trip includes two route hops and the
   real network both ways.
-- **Killing a broker under load loses a few tens of messages (B4).** That is about 10-15 ms of traffic at 2000 msg/s.
+- **Killing a broker under load loses a few tens of messages (B4).** The publisher was set to 2000 msg/s but really sent
+  about 1850-1880 msg/s (22160-22600 messages in 12 s: its 10 ms timer ran late), so 20-29 lost messages are about 11-16 ms
+  of traffic.
   The official client reconnects to the next server in about 10 ms, and the cluster re-learns its interest. No duplicates,
   ever: at-most-once means loss, never repeats. The "first message again" column is weak (a message already in flight can
   arrive right after the kill and count as "first"), so read the reconnect column.
