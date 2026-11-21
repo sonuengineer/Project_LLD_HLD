@@ -51,7 +51,7 @@ function sample(): Message {
     ],
     additional: [
       rr("example.test", TYPE.MX, { kind: "MX", preference: 10, exchange: "mail.example.test" }),
-      rr("example.test", TYPE.TXT, { kind: "TXT", texts: ["v=spf1 -all", "", "bytes \u0000ÿ kept"] }),
+      rr("example.test", TYPE.TXT, { kind: "TXT", texts: ["v=spf1 -all", "", "bytes \u0000\u00ff kept"] }),
       rr("10.2.0.192.in-addr.arpa", TYPE.PTR, { kind: "PTR", host: "web.example.test" }),
       rr("example.test", 99, { kind: "RAW", bytes: Buffer.from([1, 2, 3, 0xc0, 0x0c]) }),
     ],
