@@ -276,8 +276,8 @@ and the clean tree was shipped again. A check passes when at least one test turn
   container outside its cgroup; the server's own per-session limit stopped it. Details in `SERVER_RUN.md`.
 - Mutations of the UTS namespace flag were not run: without it `sethostname` would rename the real server.
 
-After every mutation: the clean tree was shipped again and the full suite passed (192/192: 140 unit + 52
-integration).
+Before every mutation the clean tree was shipped again. After the mutation runs the clean tree passed the full suite
+(192/192: 140 unit + 52 integration, 18:20 UTC); code and tests did not change after that run.
 
 ## NOT implemented (honest list)
 
