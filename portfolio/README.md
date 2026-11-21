@@ -15,7 +15,7 @@ npm run build     # dist/ -- static files, open via any static server (e.g. npm 
 
 | Route | What |
 |---|---|
-| `#/` | Portfolio: the 14 projects, what they demonstrate, how to run |
+| `#/` | Portfolio: the 15 projects, what they demonstrate, how to run |
 | `#/project/<slug>` | Implemented features, tests, measured benchmarks (from each TESTING.md), design docs, "Explain this project in an interview" (30s / 2min / 5min / architecture / decisions / challenges / failures / improvements), learning path, question stats |
 | `#/interview` | All questions: search, filters (project, category, difficulty, learned / bookmarked); modes Browse, Random, Mock interview (timed, hidden answer, self-grading), Revision (bookmarked and not yet learned) |
 | `#/system-design` | Cross-project system design questions |

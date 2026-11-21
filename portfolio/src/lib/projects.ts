@@ -390,6 +390,43 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 15, slug: "p16-container-runtime", dir: "projects/16-container-runtime", name: "Container Runtime (minibox)",
+    tagline: "Containers from scratch in Python: Linux namespaces, pivot_root, a PID 1 init, cgroup v2 limits and images pulled from Docker Hub.",
+    stack: ["Python 3.12 (standard library only)", "Linux namespaces + cgroup v2", "overlayfs", "ctypes (mount, pivot_root)"],
+    features: [
+      "PID, mount, UTS and IPC namespaces; pivot_root into the image (a test shows the classic chroot escape works against chroot and fails here)",
+      "Its own PID 1 inside the container: reaps zombies, forwards signals, passes the exit code back (128+N for a signal)",
+      "cgroup v2 limits proven on a real server: a fork bomb stopped at pids.max, a memory hog killed by the kernel at memory.max, a busy loop held to its cpu.max share",
+      "Pulls alpine from Docker Hub with only urllib/tarfile/hashlib: every layer and config digest checked, whiteouts applied, unsafe tar paths refused",
+      "Overlay root: the image stays read-only, each container writes to its own layer that is thrown away on exit",
+      "Honest limits: runs as root, no user namespace, no seccomp, no capability dropping, no network beyond loopback -- not a security boundary",
+      "29 deliberate code breaks, 28 caught; the one that cannot be caught by design is explained",
+    ],
+    tests: "192 passing on Linux as root (140 unit + 52 integration); on Windows the 135 portable unit tests pass",
+    run: "cd projects/16-container-runtime && sudo python3 -m minibox pull alpine:3.20 --dest ~/images/alpine && sudo python3 -m minibox run --rootfs ~/images/alpine/rootfs --hostname box1 --memory 64M --pids 32 --cpus 0.5 -- /bin/sh -c 'hostname; ps'   # Linux, as root",
+    docs: ["README", "PLAN", "SERVER_RUN"],
+    benches: [
+      {
+        title: "cpu.max: share of one CPU a busy loop really got", unit: "CPU share",
+        note: "One 2-core Oracle ARM server, one busy loop for 5 s, median of 3 runs. At 0.5 and 0.25 the kernel throttled it in 50 of about 50 periods.",
+        source: "projects/16-container-runtime/bench/reference-results/a2-2026-11-21/l3-cpu.json", series: ["CPU share"],
+        rows: [{ label: "no limit", "CPU share": 0.998 }, { label: "cpus 1.0", "CPU share": 0.998 }, { label: "cpus 0.5", "CPU share": 0.501 }, { label: "cpus 0.25", "CPU share": 0.252 }],
+      },
+      {
+        title: "memory.max = 64 MiB: peak memory of a hog vs a small program", unit: "MiB memory.peak",
+        note: "Swap disabled for the container, median of 3 runs. The hog (growing a string to 128 MiB) was OOM-killed in 3 of 3 runs, exit 137; the 16 MiB program survived.",
+        source: "projects/16-container-runtime/bench/reference-results/a2-2026-11-21/l2-memory.json", series: ["memory.peak"],
+        rows: [{ label: "hog (killed)", "memory.peak": 64.0 }, { label: "16 MiB program (survived)", "memory.peak": 33.5 }],
+      },
+      {
+        title: "Start and stop an empty container", unit: "ms",
+        note: "Median of 20 runs. Inner = inside minibox (namespaces, mounts, cgroup, run `true`, clean up); outer adds starting the Python interpreter.",
+        source: "projects/16-container-runtime/bench/reference-results/a2-2026-11-21/l0-start.json", series: ["ms"],
+        rows: [{ label: "inside minibox", ms: 18 }, { label: "including Python start", ms: 105 }],
+      },
+    ],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
