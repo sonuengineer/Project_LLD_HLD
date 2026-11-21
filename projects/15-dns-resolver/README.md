@@ -3,7 +3,7 @@
 A recursive DNS resolver in TypeScript on Node's `dgram` and `net` modules, with **zero runtime dependencies** and
 without `node:dns`.
 
-Status (2026-11-21): **stage 1 of 4 done** -- the wire format. Resolution, cache and stub server follow.
+Status (2026-11-21): **stages 1-3 of 4 done** -- wire format, iterative resolution, cache and stub server. The full write-up (tables, mutation checks) comes with stage 4.
 
 ## Stage 1: wire format (`src/wire.ts`)
 
@@ -21,5 +21,5 @@ Status (2026-11-21): **stage 1 of 4 done** -- the wire format. Resolution, cache
 
 ## NOT implemented yet (honest list)
 
-- Resolution, cache, server (stages 2 and 3).
+- Mutation checks and the full README (stage 4).
 - EDNS(0), DNSSEC record types (they decode as raw rdata).
