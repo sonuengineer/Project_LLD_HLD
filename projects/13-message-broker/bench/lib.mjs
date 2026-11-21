@@ -100,7 +100,8 @@ export function start(cmd, args, { env = {}, ready, label }) {
   const readyP = new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} not ready in 10 s. stderr: ${stderr}`)), 10_000);
     const check = setInterval(() => {
-      if (lines.some((l) => ready.test(l.text))) {
+      // Some programs (nats-server) log to stderr, so look in both.
+      if (lines.some((l) => ready.test(l.text)) || ready.test(stderr)) {
         clearTimeout(timer);
         clearInterval(check);
         resolve();
@@ -168,7 +169,9 @@ export async function startNatsServer() {
   if (!bin) return null;
   const port = await freePort();
   const b = start(bin, ["-a", "127.0.0.1", "-p", String(port)], { ready: /Server is ready/, label: "nats-server" });
-  // nats-server logs to stderr; poll the port instead of reading the log.
+  // Await the ready promise: left un-awaited, its rejection when the process is later stopped crashed the whole first
+  // server run (unhandled rejection). The port check stays as a second guard.
+  await b.ready;
   await waitForPort(port);
   return { ...b, kind: "nats-server", local: true, host: "127.0.0.1", port };
 }
