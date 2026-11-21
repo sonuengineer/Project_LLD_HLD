@@ -15,6 +15,8 @@ export interface ClientConfig {
   /** Compared with the request's redirect_uri by EXACT string equality. */
   redirect_uris: string[];
   allowed_scopes: string[];
+  /** Where /logout may send the browser afterwards. EXACT string match, like redirect_uris. Optional. */
+  post_logout_redirect_uris: string[];
   /** "authorization_code" is always allowed; add "refresh_token" to get refresh tokens. */
   grant_types: string[];
 }
@@ -85,6 +87,9 @@ export function validateConfig(raw: unknown): ServerConfig {
     for (const uri of c.redirect_uris) checkRedirectUri(id, uri);
     if (!isStringArray(c.allowed_scopes)) fail(`client ${id}: allowed_scopes must be a string array`);
     for (const s of c.allowed_scopes) if (!SUPPORTED_SCOPES.includes(s)) fail(`client ${id}: unsupported scope ${s}`);
+    const postLogout = c.post_logout_redirect_uris === undefined ? [] : c.post_logout_redirect_uris;
+    if (!isStringArray(postLogout)) fail(`client ${id}: post_logout_redirect_uris must be a string array`);
+    for (const uri of postLogout) checkRedirectUri(id, uri);
     const grants = c.grant_types === undefined ? ["authorization_code"] : c.grant_types;
     if (!isStringArray(grants)) fail(`client ${id}: grant_types must be a string array`);
     for (const g of grants) if (!SUPPORTED_GRANTS.includes(g)) fail(`client ${id}: unsupported grant_type ${g}`);
@@ -94,6 +99,7 @@ export function validateConfig(raw: unknown): ServerConfig {
       client_type: c.client_type,
       client_secret_hash: c.client_secret_hash as string | undefined,
       redirect_uris: [...c.redirect_uris],
+      post_logout_redirect_uris: [...postLogout],
       allowed_scopes: [...c.allowed_scopes],
       grant_types: [...grants],
     });

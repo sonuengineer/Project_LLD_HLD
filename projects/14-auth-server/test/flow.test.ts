@@ -40,7 +40,8 @@ describe("full flow", () => {
     expect(r1.status).toBe(200);
     expect(r1.headers.get("cache-control")).toBe("no-store");
     expect(r1.body.refresh_token).not.toBe(tok.body.refresh_token);
-    expect(r1.body.id_token).toBeUndefined();
+    // Stage 2: a refresh with the openid scope also returns a new id_token (details in refresh.test.ts).
+    expect(typeof r1.body.id_token).toBe("string");
     expect((await userinfo(s.base, r1.body.access_token as string)).status).toBe(200);
 
     const rv = await postForm(s.base, "/revoke", { token: r1.body.refresh_token as string, client_id: "spa" });

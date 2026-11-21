@@ -26,3 +26,9 @@ export function errorPage(title: string, message: string): string {
 <html lang="en"><head><meta charset="utf-8"><title>${escapeHtml(title)}</title><style>${STYLE}</style></head>
 <body><h1>${escapeHtml(title)}</h1><p class="err">${escapeHtml(message)}</p></body></html>`;
 }
+
+export function signedOutPage(): string {
+  return `<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><title>Signed out</title><style>${STYLE}</style></head>
+<body><h1>Signed out</h1><p>You are signed out. You can close this window.</p></body></html>`;
+}

@@ -1,7 +1,7 @@
 # H14 -- OAuth 2.0 / OpenID Connect Authorization Server (TypeScript, zero runtime dependencies)
 
-A hand-written authorization server on Node's built-in `node:http` and `node:crypto` (plus `node:fs` to read the
-config file). No express, no jose, no passport at runtime. Built in stages so every claim here is backed by code and
+A hand-written authorization server on Node's built-in `node:http` and `node:crypto` (plus `node:fs` for the
+config file, the file-backed store and the key file). No express, no jose, no passport at runtime. Built in stages so every claim here is backed by code and
 tests that exist today.
 
 ## Status
@@ -9,14 +9,15 @@ tests that exist today.
 | Stage | What | Status |
 |---|---|---|
 | 1 | Authorization Code + PKCE (S256 only), login form with CSRF token, ES256 JWT access tokens, rotating refresh tokens with reuse detection, OIDC id_token / discovery / JWKS / userinfo, RFC 7009 revocation | DONE (125 tests, incl. 8 interop tests with `jose` and `openid-client`) |
-| 2+ | Persistent storage, consent, key rotation, client credentials, sender-constrained tokens, rate limiting, logout ... | NOT STARTED (ideas in `PLAN.md`) |
+| 2 | File-backed persistent store (append-only log, survives a restart), signing-key rotation with overlap (keys generated into the data dir), login session cookie + OIDC RP-initiated logout, id_token on refresh | DONE 2026-11-21 (177 tests, incl. 10 interop tests; 1 test skipped on Windows, see below) |
+| 3+ | Consent, SSO (`prompt=none` with the session), client credentials, introspection, sender-constrained tokens, rate limiting, a database store ... | NOT STARTED (ideas in `PLAN.md`) |
 
 No performance numbers are claimed. Nothing has been measured or deployed.
 
-**Storage is in memory** (`src/store.ts`): login transactions, authorization codes, token families and refresh
-tokens live in `Map`s behind three small interfaces (`TransactionStore`, `CodeStore`, `TokenStore`). Everything is
-lost on restart and works for ONE process only. A database implementation can be added behind the same interfaces;
-the comments say which operations must be atomic.
+**Storage** sits behind four small interfaces (`TransactionStore`, `CodeStore`, `TokenStore`, `SessionStore` in
+`src/store.ts`). Two implementations: in memory (`Map`s, lost on restart; the default and what most tests use) and
+file-backed (`src/file-store.ts`, `DATA_DIR`), which survives a restart. Both work for ONE process only. A database
+implementation can be added behind the same interfaces; the comments say which operations must be atomic.
 
 ## Endpoints
 
@@ -29,6 +30,7 @@ the comments say which operations must be atomic.
 | `/token` | POST | `authorization_code` and `refresh_token` grants |
 | `/userinfo` | GET, POST | Claims for a Bearer access token |
 | `/revoke` | POST | RFC 7009 revocation of refresh tokens |
+| `/logout` | GET, POST | OIDC RP-initiated logout (`end_session_endpoint`) |
 
 ## What it does, and the test that proves it
 
@@ -91,12 +93,76 @@ Test files are in `test/`. Integration tests start the real HTTP server on an ep
 **6. Revocation (RFC 7009)**: refresh token revocation kills its family; unknown token -> 200; another client's
 token is left alone (200); client authentication required. `revoke.test.ts`.
 
+**8. Persistent storage (stage 2)** -- `src/file-store.ts`, tests in `test/persistence.test.ts`
+
+| Rule | Test |
+|---|---|
+| Restart on the same data dir (same port, so the same issuer): the old access token works at `/userinfo`, the refresh token works, `/jwks` is unchanged | "access token, refresh token and signing key all work after a restart on the same data dir" |
+| Security state survives the restart: a refresh token used before it is still reuse after it (family revoked, and that revocation is itself persisted); a code redeemed before it is still single-use; a revoked family stays revoked | "a refresh token used BEFORE the restart ...", "an authorization code redeemed before the restart ...", "a revoked token family stays revoked after a restart" |
+| Only hashes on disk: the log contains SHA-256 of the code, the refresh token and the session cookie, never the raw values | "the log holds only hashes ..." |
+| Write-ahead: a failed disk write leaves memory unchanged | "write-ahead: when the disk write fails, the in-memory state does not change" |
+| Torn last line (crash mid-append) dropped; a bad line in the middle refuses to start | "a torn LAST line ...", "a bad line in the MIDDLE of the log is corruption ..." |
+| Compaction at start drops expired codes / refresh tokens / unreferenced families and keeps used / revoked flags | "compaction at start drops ...", "compaction keeps live entries with their state" |
+| Login transactions are NOT persisted (documented limitation, tested so it cannot change silently) | "login transactions are NOT persisted ..." |
+
+How it works: every change is one JSON line, written with `writeSync` + `fsyncSync` and only THEN applied in memory;
+the HTTP response goes out after that. At start the log is replayed through the same `apply()` function, then
+compacted: the live state is written to `store.jsonl.tmp`, fsync'ed and renamed over `store.jsonl`.
+
+Crash safety, honestly:
+- Crash between two appends: every acknowledged change is on disk. A request that wrote only some of its records
+  fails closed (for example: code consumed, family not created -> the code is burned and the client got nothing;
+  refresh token marked used, new one not saved -> the client never got the new token, its retry with the old one
+  is reuse and kills the family).
+- Crash in the middle of an append: the torn last line is dropped at the next start (it was never acknowledged).
+- Crash during compaction: the old log is untouched until the rename; a leftover temp file is overwritten.
+  On POSIX the rename is atomic and the directory is fsync'ed. On Windows node's rename uses
+  `MoveFileEx(REPLACE_EXISTING)`, which is not documented as atomic, and directories cannot be fsync'ed.
+- fsync is only as good as the disk (write caches that lie). NOT tested with real power loss: the tests write a torn
+  line themselves. There is no per-line checksum, so a line that is valid JSON but wrong is not detected.
+- ONE process per data directory and NO lock file: a second process on the same directory would double-redeem
+  codes and not see the other's revocations.
+
+**9. Signing-key rotation (stage 2)** -- `src/keys.ts` `FileKeyRing`, tests in `test/keys.test.ts` and `test/interop.test.ts`
+
+| Rule | Test |
+|---|---|
+| First start generates an `active` key and a pre-published `next` key into `<DATA_DIR>/keys.json`; both are in `/jwks`, only the active one signs | `keys.test.ts` "first start generates ..." |
+| Keys are read back at the next start (same kids); a file with two active keys or a wrong kid is refused | "the keys are read back ...", "a file with two active keys ..." |
+| `keys.json` mode 0600 | "keys.json is created with mode 0600" -- SKIPPED on Windows (node ignores the mode there), so it did NOT run on the machine these results come from |
+| `rotate()`: next -> active, active -> retired, a new next appears; tokens signed by the retired key still pass `/userinfo` | "rotate(): the pre-published key starts signing ..." |
+| The retired key stays published until its last token has expired (retention = longest JWT lifetime = 300 s), then disappears | "the retired key stays published until ...", "the retention is the longest token lifetime ..." |
+| Automatic rotation when the active key is older than `rotateAfterMs` (CLI: `KEY_ROTATE_DAYS`, default 30) | "automatic rotation once the active key is older than rotateAfterMs" |
+| Rotation is persisted; expired retired keys are removed from the file at the next rotation | "a rotation is written to keys.json ...", "expired retired keys are removed ..." |
+| jose across a rotation: a JWKS fetched BEFORE the rotation already verifies the new token (pre-published key; jose does not refetch inside its 30 s cooldown), old and new tokens verify, after the overlap the old kid gives `JWKSNoMatchingKey` | `interop.test.ts` "a JWKS fetched BEFORE the rotation ..." |
+
+One response is always signed with one key (access token and id_token have the same kid). Private keys are PKCS#8
+PEM, NOT encrypted at rest; never committed (generated at first start; `data/` is git-ignored).
+
+**10. Login session and RP-initiated logout (stage 2)** -- tests in `test/logout.test.ts`
+
+| Rule | Test |
+|---|---|
+| A successful login creates a session: cookie `auth_session` (random, HttpOnly, SameSite=Lax, Path=/, 12 h, Secure on https), stored only as a hash; the public `sid` goes into the id_token | "a successful login sets an HttpOnly SameSite=Lax session cookie ...", "each login gets its own sid" |
+| `/logout` with `id_token_hint` + registered `post_logout_redirect_uri`: 302 to exactly that URI with `state`, session cookie cleared, every token family of the session revoked (refresh -> `invalid_grant`, access token -> 401) | "id_token_hint + registered post_logout_redirect_uri ...", "no state parameter ...", "POST form works the same way" |
+| Without `post_logout_redirect_uri`: 200 "Signed out" page | "without post_logout_redirect_uri ..." |
+| `post_logout_redirect_uri` exact match (prefix, trailing slash, extra query, the LOGIN redirect_uri, other host -> 400, no redirect, nothing revoked) | "post_logout_redirect_uri %s -> 400 page ..." (5 cases); config validation in `units.test.ts` |
+| `id_token_hint` is required and fully verified (signature with a published key, `typ: JWT`, iss, aud); only `exp` is ignored (an expired hint is accepted, as the spec allows) | "missing id_token_hint", "tampered signature", "signed by a key this server does not publish", "an access token is not an id_token_hint", "an EXPIRED id_token is still accepted"; `units.test.ts` "ignoreExpiry skips ONLY the exp check" |
+| `client_id` must equal the hint's `aud`; repeated parameters refused | "client_id that differs ...", "a repeated parameter" |
+| Only that session ends; the browser's session cookie is ended too if it belongs to the SAME user, never another user's | "only the families of THAT session ...", "the browser's session cookie is ended too ...", "a session cookie of ANOTHER user is not ended ..." |
+| Idempotent; an id_token from a refresh names the same session | "a second logout ...", "the id_token from a REFRESH also names the session ..." |
+| Discovery advertises `end_session_endpoint` | `discovery.test.ts`; `interop.test.ts` (openid-client reads it) |
+
+**11. id_token on refresh (stage 2, OIDC Core 12.2)**: same iss, sub, aud, auth_time and sid, new iat, no nonce,
+at_hash of the new access token; none when the narrowed scope has no `openid`. `refresh.test.ts`; openid-client
+validates it in `interop.test.ts`.
+
 **7. Errors** use the OAuth JSON format (`error`, `error_description`) with the RFC status codes (400, 401 with
 `WWW-Authenticate`, 403, 405, 413). Checked throughout `token.test.ts`, `userinfo.test.ts`, `revoke.test.ts`.
 
 ## Interop with independent libraries (devDependencies only)
 
-`test/interop.test.ts`, 8 tests, all passing:
+`test/interop.test.ts`, 10 tests, all passing:
 
 - **jose 6.2.15**: `createRemoteJWKSet` fetches OUR `/jwks` and `jwtVerify` accepts our access token (with
   `typ: at+jwt`, issuer, audience, ES256) and id_token; it rejects a tampered signature and a wrong audience.
@@ -105,6 +171,14 @@ token is left alone (200); client authentication required. `revoke.test.ts`.
   `fetchUserInfo` -> `refreshTokenGrant` -> `tokenRevocation`, for a public client (`None()`) and a confidential
   client (`ClientSecretBasic`). It also surfaces our `invalid_grant` on a reused code, rejects a wrong state, and
   rejects a wrong expected nonce.
+- **Stage 2 additions**: jose across a key rotation (see section 9); openid-client reads `end_session_endpoint`
+  from discovery, `buildEndSessionUrl` (it adds `client_id` itself) goes through our `/logout` with
+  `id_token_hint`, `post_logout_redirect_uri` and `state`, and `refreshTokenGrant` afterwards gets `invalid_grant`;
+  openid-client also validates the id_token in the refresh response.
+- What does NOT interoperate / is not covered: openid-client only BUILDS the logout URL; there is no library-side
+  handling of the logout response to test, so the test follows the redirect itself. openid-client does not verify
+  id_token signatures from the token endpoint by default (TLS-protected response, allowed by OIDC), so the key
+  rotation is checked with jose only, not with openid-client.
 - Two honest caveats: openid-client is a client library, so the test posts the login form itself (it follows the URL
   openid-client built and hands the redirect back). And `allowInsecureRequests` is enabled because the test server
   runs on plain `http://127.0.0.1`.
@@ -137,28 +211,78 @@ that the three tokens were different. It now presents the old token and expects 
 M8. Note also: the id_token-as-access-token test did NOT turn red under M12, because the `typ` check rejects it too;
 the dedicated wrong-audience test is the one that catches M12.
 
+### Stage 2 mutation checks (M16-M40)
+
+Same procedure, scripted: each mutation is a string replacement in one source file, the full suite runs with the
+vitest JSON reporter, the failed tests are counted, and the file is restored with `git checkout`. Then the whole
+suite was run green again.
+
+| # | Rule broken (where) | Failed tests | Which |
+|---|---|---|---|
+| M16 | write-ahead broken: apply in memory BEFORE the disk write (`file-store.ts`) | 1 | `persistence.test.ts` "write-ahead: when the disk write fails, the in-memory state does not c..." |
+| M17 | code consumption not logged (memory only) (`file-store.ts`) | 4 | `persistence.test.ts` "an authorization code redeemed before the restart is still single-use...", "a torn LAST line (crash in the middle of an append) is dropped...", "compaction at start drops expired codes and refresh tokens (and famili...", "compaction keeps live entries with their state (used, revoked)" |
+| M18 | refresh-token use not logged (memory only) (`file-store.ts`) | 2 | `persistence.test.ts` "a refresh token used BEFORE the restart is still detected as reuse AFT...", "write-ahead: when the disk write fails, the in-memory state does not c..." |
+| M19 | family revocation not logged (memory only) (`file-store.ts`) | 3 | `persistence.test.ts` "a refresh token used BEFORE the restart is still detected as reuse AFT...", "a revoked token family stays revoked after a restart", "compaction keeps live entries with their state (used, revoked)" |
+| M20 | corrupt middle line silently skipped instead of refusing to start (`file-store.ts`) | 1 | `persistence.test.ts` "a bad line in the MIDDLE of the log is corruption: the store refuses t..." |
+| M21 | compaction keeps expired refresh tokens (`file-store.ts`) | 1 | `persistence.test.ts` "compaction at start drops expired codes and refresh tokens (and famili..." |
+| M22 | session cookie stored raw instead of hashed (`server.ts`) | 1 | `persistence.test.ts` "the log holds only hashes of codes, refresh tokens and session cookies..." |
+| M23 | next key not pre-published in /jwks (`keys.ts`) | 3 | `interop.test.ts` "a JWKS fetched BEFORE the rotation already has the new key..."; `keys.test.ts` "first start generates an active and a pre-published next key...", "rotate(): the pre-published key starts signing, the old key stays publ..." |
+| M24 | retired key dropped at once (no overlap) (`keys.ts`) | 6 | `interop.test.ts` "a JWKS fetched BEFORE the rotation already has the new key..."; `keys.test.ts` "rotate(): the pre-published key starts signing, the old key stays publ...", "the retired key stays published until its last token has expired, then...", "automatic rotation once the active key is older than rotateAfterMs", "a rotation is written to keys.json, so a restart keeps the retired key...", "expired retired keys are removed from keys.json at the next rotation" |
+| M25 | retired key never dropped (`keys.ts`) | 3 | `interop.test.ts` "a JWKS fetched BEFORE the rotation already has the new key..."; `keys.test.ts` "the retired key stays published until its last token has expired, then...", "expired retired keys are removed from keys.json at the next rotation" |
+| M26 | rotation does not switch the signing key (old key keeps signing) (`keys.ts`) | 3 | `interop.test.ts` "a JWKS fetched BEFORE the rotation already has the new key..."; `keys.test.ts` "rotate(): the pre-published key starts signing, the old key stays publ...", "automatic rotation once the active key is older than rotateAfterMs" |
+| M27 | automatic rotation by age disabled (`keys.ts`) | 1 | `keys.test.ts` "automatic rotation once the active key is older than rotateAfterMs" |
+| M28 | rotation not written to keys.json (`keys.ts`) | 2 | `keys.test.ts` "a rotation is written to keys.json, so a restart keeps the retired key...", "expired retired keys are removed from keys.json at the next rotation" |
+| M29 | keys.json created without mode 0600 (`keys.ts`) | 0 | NONE on this machine (Windows): the only test for it is skipped on win32 -- see below |
+| M30 | post_logout_redirect_uri prefix match instead of exact (`server.ts`) | 3 | `logout.test.ts` "post_logout_redirect_uri prefix -> 400 page, no redirect, nothing revo...", "post_logout_redirect_uri trailing slash -> 400 page, no redirect, noth...", "post_logout_redirect_uri extra query -> 400 page, no redirect, nothing..." |
+| M31 | id_token_hint not verified (decoded only) (`server.ts`) | 2 | `logout.test.ts` "an id_token_hint with a tampered signature -> 400, nothing revoked", "an id_token_hint signed by a key this server does not publish -> 400" |
+| M32 | logout deletes the session but does not revoke its token families (`server.ts`) | 10 | `interop.test.ts` "RP-initiated logout: discovery advertises end_session_endpoint, buildE..."; `logout.test.ts` "id_token_hint + registered post_logout_redirect_uri: redirect with sta...", "without post_logout_redirect_uri: 200 'signed out' page, no redirect,...", "an EXPIRED id_token is still accepted as a hint (signature, iss, aud s...", "only the families of THAT session are revoked...", "the browser's session cookie is ended too when it belongs to the same...", "a session cookie of ANOTHER user is not ended by this user's id_token", "a second logout with the same hint is harmless (200, still logged out)", "POST form works the same way", "the id_token from a REFRESH also names the session and logs it out" |
+| M33 | state dropped from the post-logout redirect (`server.ts`) | 3 | `interop.test.ts` "RP-initiated logout: discovery advertises end_session_endpoint, buildE..."; `logout.test.ts` "id_token_hint + registered post_logout_redirect_uri: redirect with sta...", "POST form works the same way" |
+| M34 | session cookie not cleared at logout (`server.ts`) | 2 | `logout.test.ts` "id_token_hint + registered post_logout_redirect_uri: redirect with sta...", "without post_logout_redirect_uri: 200 'signed out' page, no redirect,..." |
+| M35 | cookie session of ANOTHER user ended too (sub check removed) (`server.ts`) | 1 | `logout.test.ts` "a session cookie of ANOTHER user is not ended by this user's id_token" |
+| M36 | client_id vs aud mismatch not checked at logout (`server.ts`) | 1 | `logout.test.ts` "client_id that differs from the id_token's aud -> 400" |
+| M37 | expired id_token_hint refused (ignoreExpiry off) (`server.ts`) | 1 | `logout.test.ts` "an EXPIRED id_token is still accepted as a hint (signature, iss, aud s..." |
+| M38 | no sid claim in id_tokens (`server.ts`) | 11 | `interop.test.ts` "RP-initiated logout: discovery advertises end_session_endpoint, buildE..."; `logout.test.ts` "a successful login sets an HttpOnly SameSite=Lax session cookie...", "each login gets its own sid", "without post_logout_redirect_uri: 200 'signed out' page, no redirect,...", "an EXPIRED id_token is still accepted as a hint (signature, iss, aud s...", "only the families of THAT session are revoked...", "the browser's session cookie is ended too when it belongs to the same...", "a session cookie of ANOTHER user is not ended by this user's id_token", "a second logout with the same hint is harmless (200, still logged out)", "POST form works the same way", "the id_token from a REFRESH also names the session and logs it out" |
+| M39 | no id_token on refresh (`server.ts`) | 5 | `flow.test.ts` "public client: authorize -> login (CSRF) -> code -> token -> userinfo..."; `interop.test.ts` "public client (token_endpoint_auth_method none) + PKCE: discovery, cod...", "confidential client with client_secret_basic"; `logout.test.ts` "the id_token from a REFRESH also names the session and logs it out"; `refresh.test.ts` "OIDC Core 12.2: a refresh returns a new id_token with the same iss, su..." |
+| M40 | refreshed id_token gets auth_time = now instead of the original login time (`server.ts`) | 1 | `refresh.test.ts` "OIDC Core 12.2: a refresh returns a new id_token with the same iss, su..." |
+
+**Gap found and fixed (M16)**: in the first run M16 turned NOTHING red. The write-ahead test closes the store and
+expects the write to fail with memory unchanged, but the "store is closed" check ran before both the write and the
+apply, so swapping their order changed nothing the test could see. The check now lives inside the write step
+(`durable()` in `src/file-store.ts`), so "apply before write" really applies first and the test turns red (the
+row above is the re-run).
+
+**Gap NOT closed (M29)**: writing `keys.json` with mode 0644 is caught by no test on this machine. The mode test
+is `it.skipIf(process.platform === "win32")` because node on Windows ignores the mode (apart from the read-only
+bit), and these results come from a Windows machine. It needs a run on Linux / macOS to count.
+
+Also note: M18 turns the write-ahead test red as a side effect (an unlogged markUsed no longer touches the closed
+store), not because that test is about M18.
+
 ## Run it
 
 ```bash
 npm install
-npm test                 # 125 tests
+npm test                 # 177 tests (1 skipped on Windows)
 npx tsc --noEmit
 npm run build
-CONFIG_FILE=config/example.json PORT=9000 node dist/index.js
+CONFIG_FILE=config/example.json PORT=9000 DATA_DIR=./data node dist/index.js
 curl http://127.0.0.1:9000/.well-known/openid-configuration
 node dist/hash-secret.js 'my-new-secret'    # scrypt hash for the config file
 ```
 
 Environment: `CONFIG_FILE` (required), `PORT` (9000), `HOST` (127.0.0.1), `ISSUER` (default
-`http://127.0.0.1:<PORT>`), `SIGNING_KEY_FILE` (optional PKCS#8 PEM, EC P-256). Without a key file a new key is
-generated at every start, so all issued tokens become unverifiable after a restart.
+`http://127.0.0.1:<PORT>`), `DATA_DIR` (file-backed store `store.jsonl` and rotating keys `keys.json`; created with
+mode 0700 / 0600), `KEY_ROTATE_DAYS` (30). Without `DATA_DIR` the store is in memory and the key comes from
+`SIGNING_KEY_FILE` (optional PKCS#8 PEM, EC P-256) or is generated at every start, so all issued tokens become
+unverifiable after a restart. `./data` is git-ignored by the repository's `.gitignore`.
 
 The example config contains OBVIOUSLY FAKE secrets: users `alice` / `alice-password-FAKE`, `bob` /
 `bob-password-FAKE`, client `demo-web` secret `webapp-secret-FAKE`. Test secrets are generated at runtime.
 
 ## Design notes
 
-- Lifetimes: code 60 s, access token 300 s, id_token 300 s, refresh token 14 days, login transaction 10 min.
+- Lifetimes: code 60 s, access token 300 s, id_token 300 s, refresh token 14 days, login transaction 10 min,
+  login session 12 h. A retired signing key stays published for 300 s (the longest JWT lifetime).
 - Access tokens are self-contained JWTs, so a third-party API verifying them offline cannot see a revocation until
   `exp` (max 300 s). Only this server's `/userinfo` honours revocation, because it records each access token's `jti`
   and its token family.
@@ -171,17 +295,27 @@ The example config contains OBVIOUSLY FAKE secrets: users `alice` / `alice-passw
 - `/revoke` answers 200 for a token that belongs to another client and leaves it alone, so the endpoint does not tell
   a client which tokens exist. RFC 7009 2.1 says such a request is "refused"; I chose not to reveal it instead.
 
-## Not implemented (stage 1)
+## NOT implemented (after stage 2)
 
-- Persistent storage; more than one process; expiry sweeping (expired entries stay in memory until restart).
-- Consent screen (any allowed scope is granted after login); login sessions / SSO (`prompt`, `max_age`, `id_token_hint`
-  are not supported; `prompt=none` always returns `login_required`).
-- Signing-key rotation (one key; `/jwks` can publish several, but there is no rotation logic).
+- A database store; more than one process per data directory (no lock file, no shared state); a lock that stops a
+  second process from opening the same `DATA_DIR`.
+- Expiry sweeping while running (the file store compacts at start only; the in-memory store never sweeps).
+- One fsync per request (today one per record; a code grant writes 5 records); per-line checksums in the log.
+- Real power-loss testing of the crash-safety claims.
+- Login transactions and the failed-password counter survive a restart (they are memory only, by design).
+- Keys encrypted at rest / KMS / HSM; emergency removal of a compromised key (today: stop the server and edit
+  `keys.json`); one key ring shared by several processes. The 0600 mode test has not run on Windows.
+- SSO: the session cookie is set and cleared but NOT used to skip the login form; `prompt=none` still always
+  returns `login_required`; no `prompt=login`, `max_age`.
+- Logout without `id_token_hint` (no confirmation page), `logout_hint`, front-channel and back-channel logout
+  (other RPs are not told); "log out everywhere" for a user. Access tokens verified offline by third parties stay
+  valid until `exp` after logout (only our `/userinfo` sees the revocation).
+- Consent screen (any allowed scope is granted after login).
 - Grants other than authorization_code and refresh_token (no client credentials, no device flow, no implicit, no
   password grant).
 - `client_secret_post`, `private_key_jwt`, mTLS client auth; DPoP / mTLS sender-constrained tokens.
 - Revocation of access tokens at `/revoke` (only refresh tokens); token introspection (RFC 7662).
-- id_token on refresh (not issued); `c_hash`, `acr`, `amr`; request objects / PAR / JAR; `response_mode` other than query.
+- `c_hash`, `acr`, `amr`; request objects / PAR / JAR; `response_mode` other than query.
 - Rate limiting of logins (only 5 wrong passwords per login transaction; an attacker can start new transactions).
-- Logout / session management; dynamic client registration.
+- Dynamic client registration.
 - Any measurement; any deployment.

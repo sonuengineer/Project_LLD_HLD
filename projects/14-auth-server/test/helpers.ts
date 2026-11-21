@@ -19,6 +19,7 @@ export const ALICE = { username: "alice", password: "alice-test-password", sub: 
 export const WEB_SECRET = "web-client-test-secret";
 export const SPA_REDIRECT = "http://127.0.0.1:5173/callback";
 export const WEB_REDIRECT = "https://app.example.test/callback";
+export const SPA_LOGGED_OUT = "http://127.0.0.1:5173/logged-out";
 
 let configPromise: Promise<ServerConfig> | undefined;
 
@@ -26,7 +27,7 @@ export function testConfig(): Promise<ServerConfig> {
   configPromise ??= (async () =>
     validateConfig({
       clients: [
-        { client_id: "spa", client_type: "public", redirect_uris: [SPA_REDIRECT], allowed_scopes: ["openid", "profile", "email"], grant_types: ["authorization_code", "refresh_token"] },
+        { client_id: "spa", client_type: "public", redirect_uris: [SPA_REDIRECT], post_logout_redirect_uris: [SPA_LOGGED_OUT], allowed_scopes: ["openid", "profile", "email"], grant_types: ["authorization_code", "refresh_token"] },
         { client_id: "other-spa", client_type: "public", redirect_uris: ["http://127.0.0.1:5174/callback"], allowed_scopes: ["openid"], grant_types: ["authorization_code", "refresh_token"] },
         { client_id: "no-refresh", client_type: "public", redirect_uris: ["http://127.0.0.1:5175/cb"], allowed_scopes: ["openid"], grant_types: ["authorization_code"] },
         { client_id: "web", client_type: "confidential", client_secret_hash: await hashSecret(WEB_SECRET, FAST), redirect_uris: [WEB_REDIRECT], allowed_scopes: ["openid", "profile", "email"], grant_types: ["authorization_code", "refresh_token"] },
@@ -41,6 +42,7 @@ export function testConfig(): Promise<ServerConfig> {
 
 export interface TestServer {
   base: string;
+  port: number;
   clock: { t: number };
   stores: Stores;
   keys: SigningKey[];
@@ -50,17 +52,20 @@ export interface TestServer {
 const open: http.Server[] = [];
 
 /** Starts the real HTTP server on an ephemeral port. The issuer is the URL it really listens on. */
-export async function startServer(extra: Partial<AuthServerOptions> = {}): Promise<TestServer> {
+export async function startServer(extra: Partial<AuthServerOptions> = {}, opts: { port?: number; clock?: { t: number } } = {}): Promise<TestServer> {
   const server = http.createServer();
-  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  // `port` lets a restart test come back on the same port, so the issuer (and every token's iss) stays the same.
+  await new Promise<void>((resolve) => server.listen(opts.port ?? 0, "127.0.0.1", resolve));
   open.push(server);
-  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const clock = { t: Date.now() };
+  const port = (server.address() as AddressInfo).port;
+  const base = `http://127.0.0.1:${port}`;
+  const clock = opts.clock ?? { t: Date.now() };
   const stores = extra.stores ?? memoryStores();
   const keys = extra.keys ?? [generateSigningKey()];
   server.on("request", createAuthHandler({ issuer: base, config: await testConfig(), now: () => clock.t, stores, keys, ...extra }));
   return {
     base,
+    port,
     clock,
     stores,
     keys,
@@ -125,7 +130,7 @@ export function postLogin(base: string, cookie: string, form: Record<string, str
 }
 
 /** Whole front channel: authorize -> login form -> post credentials -> read the code from the redirect. */
-export async function getCode(base: string, extra: Record<string, string> = {}): Promise<{ code: string; state: string; verifier: string; location: URL; params: Record<string, string> }> {
+export async function getCode(base: string, extra: Record<string, string> = {}): Promise<{ code: string; state: string; verifier: string; location: URL; params: Record<string, string>; sessionCookie: string }> {
   const { verifier, challenge } = pkce();
   const params = authorizeParams(challenge, extra);
   const page = await openLogin(base, params);
@@ -133,7 +138,8 @@ export async function getCode(base: string, extra: Record<string, string> = {}):
   const r = await postLogin(base, page.cookie, { csrf_token: page.csrf, username: ALICE.username, password: ALICE.password });
   if (r.status !== 302) throw new Error(`login returned ${r.status}`);
   const location = new URL(r.headers.get("location") ?? "");
-  return { code: location.searchParams.get("code") ?? "", state: location.searchParams.get("state") ?? "", verifier, location, params };
+  const sessionCookie = r.headers.getSetCookie().find((c) => c.startsWith("auth_session="))?.split(";")[0] ?? "";
+  return { code: location.searchParams.get("code") ?? "", state: location.searchParams.get("state") ?? "", verifier, location, params, sessionCookie };
 }
 
 export async function postForm(base: string, path: string, form: Record<string, string>, headers: Record<string, string> = {}): Promise<{ status: number; headers: Headers; body: Record<string, unknown> }> {
