@@ -1,0 +1,906 @@
+[
+ {
+  "id": "AUTH-026",
+  "project_slug": "p14-auth-server",
+  "category": "Database Design",
+  "difficulty": "Intermediate",
+  "question": "Stage 2 makes the stores survive a restart with only node:fs. Why an append-only JSON-lines log plus compaction, and not rewriting one JSON file on every change?",
+  "answer_hinglish": "Do simple options the: (1) har change par poori state ek JSON file mein likho (temp file + rename), ya (2) har change ko ek line ke roop mein log ke end mein append karo aur start par replay karo. Option 1 har write par poori state likhta hai -- O(n) per request, aur tokens badhne ke saath slow. Option 2 har change par sirf ek chhoti line likhta hai -- O(1) -- aur fsync ke baad woh change durable hai.\n\nLog ki problem yeh hai ki woh badhta rehta hai, aur usme expired cheezein bhi padi rehti hain. Isliye start par compaction hota hai: log replay karke current state banti hai, expired codes / refresh tokens / access-token records / sessions hata diye jaate hain, aur bachi state ek temp file mein likh ke fsync karke purane log par rename hoti hai. Matlab har start par log 'snapshot' ban jaata hai aur aage uske end par append hota hai -- ek hi file, snapshot aur journal dono.\n\nIs project mein yeh src/file-store.ts mein hai: openFileStores(dir) store.jsonl padhta hai, apply() har record ko memory stores par lagata hai, snapshot() compaction ke records banata hai. In-memory stores (store.ts) hi asli data structure hain; file store unke upar ek durable log hai.",
+  "why_needed": "Stage 1 mein restart par saare refresh tokens, codes aur revocations gayab ho jaate the -- har user ko dobara login, aur revoked family restart ke baad phir zinda (agar tokens bache hote).",
+  "real_world_analogy": "Bank ki passbook: har transaction ek nayi line. Saal ke end mein bank naya passbook kholta hai jisme sirf closing balance likha hota hai -- woh compaction hai.",
+  "how_it_works": "Live: commit(record) -> writeSync(line) -> fsyncSync -> apply(live, record). Start: readLog -> har line JSON.parse -> apply -> snapshot(now) -> temp file write + fsync -> renameSync over store.jsonl -> fsync directory (POSIX) -> naya append fd.",
+  "in_this_project": "src/file-store.ts: LogRecord union (code.save, code.used, family.create, family.revoke, refresh.save, refresh.used, access.record, session.save, session.delete), apply(), snapshot(), openFileStores(). Test: test/persistence.test.ts 'access token, refresh token and signing key all work after a restart on the same data dir'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::openFileStores",
+   "projects/14-auth-server/src/file-store.ts::snapshot",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "// real, src/file-store.ts (trimmed)\nconst commit = (...recs: LogRecord[]): void => {\n  writeSync(fd, recs.map((r) => JSON.stringify(r) + \"\\n\").join(\"\"));\n  if (doFsync) fsyncSync(fd);\n  for (const r of recs) apply(live, r);\n};",
+  "code_language": "typescript",
+  "advantages": [
+   "Har change ek chhoti append, poori state nahi",
+   "Replay aur live dono ek hi apply() se, toh dono agree karte hain",
+   "Sirf node:fs, koi database dependency nahi"
+  ],
+  "disadvantages": [
+   "Compaction sirf start par hota hai; lambe chalne wale process mein log badhta rehta hai",
+   "Ek process per data dir; koi lock nahi",
+   "Har change par fsync: disk ki latency har request mein"
+  ],
+  "common_mistakes": [
+   "Log mein raw secrets likh dena (yahan sirf hashes)",
+   "Replay ke liye alag code likhna jo live path se alag behave kare",
+   "Compaction mein seedha purani file overwrite karna (crash par dono gaye)"
+  ],
+  "follow_up_questions": [
+   "Compaction running process mein kaise karoge bina requests roke?",
+   "Is design ko PostgreSQL par kaise le jaoge?",
+   "fsync ko batch (group commit) karna kab theek hai?"
+  ],
+  "concepts": [
+   "append-only-log",
+   "compaction",
+   "persistence",
+   "fsync"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-027",
+  "project_slug": "p14-auth-server",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "In the file store, why is every change written and fsync'ed to disk BEFORE it is applied in memory? What would break with the opposite order?",
+  "answer_hinglish": "Yeh write-ahead rule hai: pehle durable record, phir visible state. commit() pehle writeSync + fsyncSync karta hai, aur sirf tab apply(live, record). Agar disk write throw kare (disk full, file closed), toh exception apply se pehle aata hai -- memory bilkul nahi badalti, request 500 deti hai, aur jo memory mein hai wahi disk par hai.\n\nUlta order socho: pehle memory mein refresh token used mark, phir disk write fail. Ab memory kehti hai 'used', disk kehti hai 'unused'. Process chalta rahe toh ek baat, lekin restart ke baad disk wali state wapas aati hai -- token phir se 'unused'. Ya code ke case mein: memory mein code burned, disk par nahi, restart ke baad woh code dobara redeem ho sakta hai. Single-use rule restart ke paar toot jaata.\n\nIsliye consume() aur markUsed() pehle memory se sirf PADHTE hain (peek / getRefresh), decide karte hain, phir commit karte hain jo log + apply karta hai. Yeh sab synchronous hai, toh beech mein koi doosri request nahi chal sakti. Test 'write-ahead: when the disk write fails, the in-memory state does not change' store close karke markUsed bulata hai: throw hota hai aur token unused rehta hai. Mutation M16 (apply pehle) is test ko red karta hai.",
+  "why_needed": "Durability ka matlab hai: jo client ko 'ok' bola, woh crash ke baad bhi sach ho. Aur jo disk par nahi gaya, woh memory mein bhi nahi hona chahiye, warna restart par state peeche jaati hai.",
+  "real_world_analogy": "Notary: pehle register mein entry, phir stamp. Agar register mein likhne se pehle pen toot jaaye, toh stamp bhi nahi lagta.",
+  "how_it_works": "consume(hash): e = live.codes.peek(hash); missing/reused -> return bina likhe; else commit({op: 'code.used'}) -> write + fsync -> apply -> return ok. HTTP response sendTokens ke end mein jaata hai, sab commits ke baad.",
+  "in_this_project": "src/file-store.ts commit(), codes.consume, tokens.markUsed; test/persistence.test.ts 'write-ahead: when the disk write fails, the in-memory state does not change'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::openFileStores",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "// real, src/file-store.ts\nconsume(codeHash): ConsumeResult {\n  const e = live.codes.peek(codeHash);\n  if (!e) return { kind: \"missing\" };\n  if (e.used) return { kind: \"reused\", code: e.code };\n  commit({ op: \"code.used\", codeHash });\n  return { kind: \"ok\", code: e.code };\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Disk aur memory kabhi alag nahi hote",
+   "Failure par state peeche nahi jaati",
+   "Databases (WAL) jaisa hi proven idea"
+  ],
+  "disadvantages": [
+   "Har change par fsync ki latency",
+   "Ek request ke kai records alag-alag fsync hote hain (batching nahi)"
+  ],
+  "common_mistakes": [
+   "Memory pehle update karna 'kyunki fast hai'",
+   "fsync bhool jaana (write OS cache mein hai, disk par nahi)",
+   "Response bhejne ke baad likhna"
+  ],
+  "follow_up_questions": [
+   "Ek request ke saare records ek fsync mein kaise bhejoge?",
+   "fsync ka cost kaise measure karoge?",
+   "Agar disk write cache jhooth bole toh kya?"
+  ],
+  "concepts": [
+   "write-ahead-logging",
+   "durability",
+   "atomicity"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Correctness ke liye har change par ek fsync. Throughput kam, lekin auth server mein galat state (dobara chalne wala code) zyada mehenga hai.",
+   "failure_scenarios": "Disk full: commit throw karta hai, request 500, memory unchanged. Code grant ke beech mein fail: code burned (pehla record gaya), family nahi bani -- client ko tokens nahi mile, fail-closed.",
+   "alternatives": "Group commit (kai requests ke records ek fsync mein), ya PostgreSQL jiska WAL yahi kaam karta hai, ek transaction per request.",
+   "scale_10x_100x": "100x par fsync per change bottleneck banega; group commit ya database. Is project mein kuch measure nahi kiya.",
+   "production_improvements": "Ek request ke records ek commit() mein (abhi code grant 5 alag commits karta hai), metrics on fsync latency, disk-full alert."
+  }
+ },
+ {
+  "id": "AUTH-028",
+  "project_slug": "p14-auth-server",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "The process crashes in the middle of appending a line to store.jsonl. What happens at the next start, and why is only the LAST line allowed to be broken?",
+  "answer_hinglish": "Append ek line ka partial hissa disk par chhod sakta hai, jaise '{\"op\":\"refresh.used\",\"tokenHa' -- bina newline ke. Woh write kabhi acknowledge nahi hua tha: commit() fsync ke baad hi aage badhta hai aur HTTP response tab hi jaata hai. Toh is line ko drop karna safe hai: client ko us change ka 'ok' kabhi mila hi nahi.\n\nreadLog() file ko '\\n' par todta hai. Ek complete log '\\n' par khatam hota hai, toh last element khaali string hota hai. Agar last element khaali nahi hai, toh woh torn tail hai: drop, aur info.droppedTornLine = true. Compaction phir file ko saaf likh deta hai.\n\nLekin beech ki koi line JSON nahi hai toh woh crash ka nishaan nahi -- append sirf end par hota hai. Beech ki kharabi = corruption (disk error, kisi ne file edit ki). Wahan guess karna khatarnak hai: agar ek 'family.revoke' ya 'code.used' line skip ho jaye toh revoked tokens zinda ho jaayenge. Isliye StoreCorruptError aur server start hi nahi hota. Tests: 'a torn LAST line ... is dropped' aur 'a bad line in the MIDDLE of the log is corruption'. Mutation M20 (beech ki kharab line skip) pakdi gayi. Honest note: real power loss test nahi kiya; test torn line khud likhta hai.",
+  "why_needed": "Crash-safety ka asli sawaal: crash ke baad kya bachta hai, kya khota hai, aur kya galat ho sakta hai. Silent skip security state ko peeche le ja sakta hai.",
+  "real_world_analogy": "Diary ka aakhri adhoora vaakya: likhte waqt pen chhoot gaya, use ignore kar do. Lekin beech ka page phata ho toh diary pe bharosa nahi -- kisi ko dikhao.",
+  "how_it_works": "lines = text.split('\\n'); tail = lines.pop(); har line JSON.parse, fail -> StoreCorruptError; tail !== '' -> droppedTornLine. Phir snapshot + temp + rename se file clean.",
+  "in_this_project": "src/file-store.ts readLog(), StoreCorruptError, OpenInfo.droppedTornLine; test/persistence.test.ts 'file store: crash safety and compaction'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::readLog",
+   "projects/14-auth-server/src/file-store.ts::StoreCorruptError",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "// real, src/file-store.ts readLog (trimmed)\nconst lines = text.split(\"\\n\");\nconst tail = lines.pop() ?? \"\";\nfor (const [i, line] of lines.entries()) {\n  let rec: LogRecord;\n  try { rec = JSON.parse(line) as LogRecord; }\n  catch { throw new StoreCorruptError(`${path}: line ${i + 1} is not valid JSON; refusing to start`); }\n  apply(mem, rec);\n}\nreturn { replayed, droppedTornLine: tail !== \"\" };",
+  "code_language": "typescript",
+  "advantages": [
+   "Crash ke baad server khud recover karta hai",
+   "Corruption chhupti nahi, start fail hota hai",
+   "Sirf unacknowledged change khota hai"
+  ],
+  "disadvantages": [
+   "Line-level checksum nahi hai: ek valid-JSON par galat line pakdi nahi jaayegi",
+   "Corrupt file par manual kaam chahiye"
+  ],
+  "common_mistakes": [
+   "Har bad line skip karna",
+   "Torn tail par start fail karna (har crash ke baad manual fix)",
+   "fsync se pehle response bhejna"
+  ],
+  "follow_up_questions": [
+   "Har line par CRC kyun add karoge?",
+   "Torn line aur bit-rot mein fark kaise pehchanoge?",
+   "Corrupt log se recover ka operational runbook kya hoga?"
+  ],
+  "concepts": [
+   "crash-safety",
+   "torn-write",
+   "recovery"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Tail tolerant, middle strict: availability crash ke baad, lekin security state par koi guess nahi.",
+   "failure_scenarios": "Power loss jab disk ne fsync ka jhootha ok diya: acknowledged change bhi kho sakta hai -- yeh disk/OS ki guarantee par nirbhar hai, yahan test nahi hua.",
+   "alternatives": "Har record par length + CRC32 (jaise Kafka / LevelDB), ya SQLite/PostgreSQL jo yeh sab karte hain.",
+   "scale_10x_100x": "Bade log par replay time badhta hai; snapshot ko alag file aur log rotation chahiye.",
+   "production_improvements": "CRC per line, startup par replay ka time aur dropped line ka log/alert, backup of data dir."
+  }
+ },
+ {
+  "id": "AUTH-029",
+  "project_slug": "p14-auth-server",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "How do code redemption and refresh rotation stay atomic in the file store, and why can you not run two server processes on the same data directory?",
+  "answer_hinglish": "Atomic ka matlab: do requests ek hi code ya refresh token ke saath aayein toh exactly ek jeete. File store mein consume() aur markUsed() poori tarah synchronous hain: peek (memory) -> decide -> writeSync + fsyncSync -> apply. Node ek thread par JavaScript chalata hai aur sync fs calls beech mein event loop ko chhodte nahi, toh doosri request beech mein ghus nahi sakti. Isi wajah se check-and-set ek step hai, bilkul memory store ki tarah.\n\nYeh guarantee sirf EK process ke andar hai. Do processes same store.jsonl par: dono ke paas apni memory copy, dono end par append karte hain. Process A code consume karta hai aur log mein likhta hai; process B ki memory mein woh code abhi bhi unused hai, toh B bhi use redeem kar dega. Ek code, do token sets -- single-use rule toot gaya. Revocation bhi ek process mein dikhegi, doosre mein nahi. Aur lines interleave bhi ho sakti hain.\n\nIsliye README aur file-store.ts saaf kehte hain: ONE process per data directory, aur koi lock file nahi hai (stale lock crash ke baad restart rokta, isliye abhi nahi joda). Multi-process ke liye shared database chahiye: UPDATE codes SET used = true WHERE hash = $1 AND used = false aur row count check.",
+  "why_needed": "Single-use codes aur reuse detection tabhi kaam karte hain jab 'used' ka check-and-set race-free ho.",
+  "real_world_analogy": "Ek register, ek clerk: jab tak clerk likh raha hai koi aur entry nahi kar sakta. Do clerks, do alag registers ki copy -- dono same seat bech denge.",
+  "how_it_works": "Same thread, sync calls: peek + commit beech mein await nahi. HTTP handler async hai lekin store calls sync hain, toh atomic section kabhi yield nahi karta.",
+  "in_this_project": "src/file-store.ts codes.consume, tokens.markUsed (sync); comment 'ONE process per data directory. There is no lock file'. Memory store ka same comment src/store.ts mein.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::openFileStores",
+   "projects/14-auth-server/src/store.ts::MemoryCodeStore",
+   "projects/14-auth-server/src/server.ts::refreshGrant"
+  ],
+  "code_example": "// real, src/file-store.ts\nmarkUsed(tokenHash) {\n  const t = live.tokens.getRefresh(tokenHash);\n  if (!t || t.used) return false;\n  commit({ op: \"refresh.used\", tokenHash });\n  return true;\n},",
+  "code_language": "typescript",
+  "advantages": [
+   "Lock ke bina atomic, kyunki ek thread aur sync I/O",
+   "Simple aur test karne mein aasaan"
+  ],
+  "disadvantages": [
+   "Sync fsync event loop ko block karta hai (har request ka disk wait sab par)",
+   "Horizontal scaling nahi: ek hi process"
+  ],
+  "common_mistakes": [
+   "Store method ke andar await daal dena (atomicity khatam)",
+   "Load balancer ke peeche do instances same file par chalana",
+   "Lock file bina stale-lock handling ke"
+  ],
+  "follow_up_questions": [
+   "Lock file kaise add karoge jo crash ke baad bhi restart na roke?",
+   "Atomic UPDATE ka row count kyun check karte hain?",
+   "Async fs (promises) use karte toh kya badalta?"
+  ],
+  "concepts": [
+   "atomicity",
+   "single-threaded",
+   "race-condition",
+   "multi-process"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Sync I/O = atomic lekin event loop block. Async I/O = fast lekin phir per-key lock ya queue chahiye.",
+   "failure_scenarios": "Do processes: double redemption, revocation sirf ek mein, log interleaving. Kuch bhi data-dir lock nahi rokta.",
+   "alternatives": "PostgreSQL ya Redis (Lua / WATCH) shared state ke liye; ya ek single writer process aur baaki read-only.",
+   "scale_10x_100x": "10x: ek process aur fsync latency limit. 100x: database zaroori, aur codes/refresh tables par index.",
+   "production_improvements": "Data dir par exclusive lock (pid ke saath, stale detect), PostgreSQL store same interfaces ke peeche, concurrency test jo do redemptions ek saath bheje."
+  }
+ },
+ {
+  "id": "AUTH-030",
+  "project_slug": "p14-auth-server",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "What does compaction drop, and how is the new log swapped in safely? What is different on Windows?",
+  "answer_hinglish": "openFileStores() replay ke baad snapshot(mem, now) bulata hai. Woh sirf zinda cheezein rakhta hai: codes jinka expiresAt > now (used flag ke saath), refresh tokens jinka expiresAt > now (used flag ke saath), access-token records (jti -> family) jinka expiresAt > now, sessions jo expire nahi hue, aur sirf woh families jinhe inmein se koi refer karta hai (revoked flag ke saath). Jo family kisi ko refer nahi hoti, uska koi token bacha hi nahi, toh woh bhi jaati hai.\n\nSwap: records ek temp file (store.jsonl.tmp) mein likhe jaate hain, mode 0600, fsync, phir renameSync(tmp, store.jsonl), phir directory fsync (taaki rename khud durable ho). Crash rename se pehle: purana log intact, temp file agli baar overwrite. Crash rename ke baad: naya log complete hai.\n\nWindows par node rename ke liye MoveFileEx(REPLACE_EXISTING) use karta hai, jo atomic documented nahi hai, aur directory ko fsync ke liye open nahi kar sakte (fsyncDir error ko ignore karta hai). Yeh code comment aur README mein likha hai. Ek trade-off: expired code ka reuse compaction ke baad 'missing' dikhega 'reused' nahi, toh us family ka revoke nahi hoga -- lekin us code ke tokens ka access token bhi tab tak expire ho chuka hota hai aur refresh token family alag rule se check hoti hai.",
+  "why_needed": "Bina compaction ke log hamesha badhta aur replay slow hota; expired tokens hamesha disk par rehte.",
+  "real_world_analogy": "Almari saaf karna: pehle naye dibbe mein sirf kaam ki cheezein, phir purana dibba hatao -- beech mein gir jaaye toh purana dibba abhi bhi hai.",
+  "how_it_works": "snapshot -> tmp write + fsync -> rename -> fsyncDir -> fresh memory mein records replay (taaki expired cheezein memory se bhi gayab) -> append fd open.",
+  "in_this_project": "src/file-store.ts snapshot(), fsyncDir(), openFileStores(). Tests: 'compaction at start drops expired codes and refresh tokens (and families nothing refers to)', 'compaction keeps live entries with their state (used, revoked)'. Mutation M21 (expired refresh tokens rakhna) pakdi gayi.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::snapshot",
+   "projects/14-auth-server/src/file-store.ts::fsyncDir",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Log chhota rehta hai",
+   "Purana log rename tak safe",
+   "Expired secrets ke hashes bhi disk se hat jaate hain"
+  ],
+  "disadvantages": [
+   "Sirf start par, runtime mein nahi",
+   "Windows par rename atomicity documented nahi"
+  ],
+  "common_mistakes": [
+   "Seedha purani file truncate karke likhna",
+   "Directory fsync bhool jaana (POSIX par rename kho sakta hai)",
+   "Used/revoked flags snapshot mein na rakhna"
+  ],
+  "follow_up_questions": [
+   "Runtime compaction kaise trigger karoge (size threshold)?",
+   "Expired code ke reuse ka 'missing' hona kitna bada risk hai?",
+   "Snapshot aur log ko alag files mein kab rakhna chahiye?"
+  ],
+  "concepts": [
+   "compaction",
+   "atomic-rename",
+   "fsync"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-031",
+  "project_slug": "p14-auth-server",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Login transactions are deliberately NOT persisted by the file store. Why, and what does the user see after a restart?",
+  "answer_hinglish": "LoginTransaction mein raw values hain: transaction id (jo cookie mein hai) aur csrfToken. Yeh dono secrets hain aur login form ke 10 minute ke liye hi zinda rehte hain. Disk par likhne ka matlab hota raw secrets file mein -- stage 1 ka rule tha ki codes aur refresh tokens sirf hash ke roop mein store hon, aur transaction ko hash karke store karna bhi possible tha, lekin fayda kam hai.\n\nKya khota hai? Sirf woh users jo restart ke waqt login form par the. Unka form post 'Login expired' page dikhata hai aur unhe application se dobara shuru karna padta hai. Yeh rare aur sasta failure hai. Badle mein: kam writes (har /authorize par fsync nahi), disk par koi raw secret nahi, aur code simple.\n\nfile-store.ts transactions ke liye seedha MemoryTransactionStore deta hai. Isi tarah per-transaction failed-password counter (ctx.failures) bhi memory mein hai. Test 'login transactions are NOT persisted: a login form opened before a restart has to start again' yeh behaviour pakka karta hai -- honest limitation ko bhi test chahiye, taaki koi galti se badal de toh pata chale.",
+  "why_needed": "Har cheez persist karna zaroori nahi; short-lived, secret-heavy state ko memory mein rakhna conscious decision hai.",
+  "real_world_analogy": "Restaurant ka token number: kitchen band hui toh naya token lo. Lekin bill (refresh token) ka record register mein rehta hai.",
+  "how_it_works": "openFileStores returns { transactions: new MemoryTransactionStore(), codes, tokens, sessions }. Restart -> naya Map -> cookie ka tx id unknown -> handleLogin 400 'Login expired'.",
+  "in_this_project": "src/file-store.ts openFileStores (transactions memory mein), test/persistence.test.ts login transactions test.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::openFileStores",
+   "projects/14-auth-server/src/server.ts::handleLogin",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Disk par raw CSRF token / tx id nahi",
+   "Har /authorize par disk write nahi"
+  ],
+  "disadvantages": [
+   "Restart ke waqt login kar rahe users ko dobara shuru karna padta hai",
+   "Multi-process mein transaction doosre process mein nahi milega"
+  ],
+  "common_mistakes": [
+   "Sab kuch blindly persist karna",
+   "Limitation ko test na karna"
+  ],
+  "follow_up_questions": [
+   "Agar transactions persist karne hon toh kya store karoge?",
+   "Sticky sessions is problem ko kaise chhupate hain?"
+  ],
+  "concepts": [
+   "persistence-scope",
+   "secrets-at-rest",
+   "trade-off"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-032",
+  "project_slug": "p14-auth-server",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "How does the test suite prove that the server really survives a restart? What two details made the first version of the restart test fail?",
+  "answer_hinglish": "persistence.test.ts mein boot(dir, clock, port) ek 'process' banata hai: openFileStores(dir) + FileKeyRing.open(dir) + real HTTP server. restart() server band karta hai, stores close karta hai, aur same dir + same port par dobara boot karta hai. Phir purane tokens ko naye server par chalaya jaata hai: purana access token /userinfo par 200 (key aur jti record dono disk se aaye), refresh 200, aur /jwks pehle jaisa.\n\nDo details: (1) Port. Issuer = 'http://127.0.0.1:<port>', aur har token ka iss wahi hai. Naye random port par issuer badal jaata aur saare purane tokens 'wrong issuer' se fail hote -- persistence ka nahi, test ka bug. Isliye startServer ko port option mila. (2) Keep-alive. fetch (undici) ne purane server ke idle socket ko pool mein rakha tha; restart ke turant baad usi socket par request gayi aur ECONNRESET aaya. Fix: restart ke baad 50 ms wait taaki pool dekh le ki socket band ho gaya -- yeh comment ke saath test mein hai.\n\nBaaki tests restart ke paar security rules check karte hain: restart se pehle use hua refresh token baad mein reuse detect karta hai, redeemed code baad mein bhi 'already used', revoked family revoked rehti hai. Mutations M17, M18, M19 (in records ko log na karna) inhi tests ko red karte hain.",
+  "why_needed": "Persistence ka claim sirf tab sach hai jab ek test sach mein process 'restart' kare aur purane tokens naye instance par chalaye.",
+  "real_world_analogy": "Car ka engine band karke dobara start karna aur check karna ki odometer wahi hai -- sirf dashboard dekhna kaafi nahi.",
+  "how_it_works": "boot -> flow -> restart (close http, close fd, wait, reopen same dir/port) -> purane tokens naye server par.",
+  "in_this_project": "test/persistence.test.ts boot(), restart(); test/helpers.ts startServer(extra, { port, clock }).",
+  "implementation_files": [
+   "projects/14-auth-server/test/persistence.test.ts",
+   "projects/14-auth-server/test/helpers.ts::startServer"
+  ],
+  "code_example": "// real, test/persistence.test.ts\nasync function restart(dir, prev) {\n  await prev.s.close();\n  prev.stores.close();\n  await new Promise((r) => setTimeout(r, 50));\n  return boot(dir, prev.s.clock, prev.s.port);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Real HTTP aur real files, mocks nahi",
+   "Security rules restart ke paar check hote hain"
+  ],
+  "disadvantages": [
+   "Same process mein restart hai, naya OS process nahi (node dist/index.js ko spawn nahi kiya)",
+   "50 ms wait ek timing assumption hai"
+  ],
+  "common_mistakes": [
+   "Restart test mein issuer badal jaane dena",
+   "Sirf 'file exist karti hai' check karna"
+  ],
+  "follow_up_questions": [
+   "Asli OS process restart kaise test karoge?",
+   "Keep-alive socket problem ka better fix kya hai (Connection: close, naya dispatcher)?"
+  ],
+  "concepts": [
+   "integration-testing",
+   "restart-test",
+   "keep-alive"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-033",
+  "project_slug": "p14-auth-server",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "Explain the signing-key rotation in this server: the next / active / retired states, and why the next key is published BEFORE it signs anything.",
+  "answer_hinglish": "FileKeyRing (src/keys.ts) har key ko teen states mein rakhta hai. next: /jwks mein published, lekin abhi sign nahi karti. active: naye tokens isse sign hote hain (exactly ek). retired: sign karna band, lekin tab tak published jab tak uske sign kiye tokens expire na ho jaayen. rotate(): active -> retired, next -> active, aur ek nayi key next banti hai. Pehli start par active + next dono generate hote hain.\n\nPre-publish kyun? Resource servers JWKS cache karte hain (hamara Cache-Control max-age=300, aur jose ka apna cache). Agar nayi key pehli baar usi pal publish ho jab woh sign karna shuru kare, toh purane cache wale verifier ko unknown kid milega. jose unknown kid par refetch karta hai, lekin sirf 30 s cooldown ke baad -- toh kuch tokens reject honge. Next key pichhli rotation se published hai, toh har cache mein pehle se hai.\n\nInterop test isi ko dikhata hai: jose ka createRemoteJWKSet rotation se PEHLE fetch hota hai, phir rotate, phir naya token -- same cached JWKS usse verify karta hai bina refetch ke. Mutation M23 (next key ko /jwks se hata do) us test ko red karti hai. Purana token bhi verify hota hai jab tak retired key published hai.",
+  "why_needed": "Bina overlap ke rotation par ya toh naye tokens fail (key published nahi) ya purane tokens fail (key hata di). Key rotation compromise ka nuksan seemit karta hai aur crypto hygiene hai.",
+  "real_world_analogy": "Building ki chaabi badalna: nayi chaabi pehle sab residents ko de do (pre-publish), phir taala badlo, aur purani chaabi kuch din aur chalne do jab tak sab ne switch na kar liya.",
+  "how_it_works": "signing(now): active ki umar >= rotateAfterMs ho toh rotate(now); active key return. published(now): expired retired hata ke active, next, retired. rotate: naya list banao, keys.json mein likho (temp + rename), fail ho toh purani list wapas.",
+  "in_this_project": "src/keys.ts FileKeyRing.rotate, signing, published; test/keys.test.ts 'rotate(): the pre-published key starts signing ...'; test/interop.test.ts 'interop: jose across a signing-key rotation'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/keys.ts::FileKeyRing",
+   "projects/14-auth-server/test/keys.test.ts",
+   "projects/14-auth-server/test/interop.test.ts"
+  ],
+  "code_example": "// real, src/keys.ts published() (trimmed)\nconst rank = { active: 0, next: 1, retired: 2 } as const;\nreturn this.keys\n  .filter((k) => !this.expired(k, nowMs))\n  .sort((a, b) => rank[this.state(a)] - rank[this.state(b)])\n  .map((k) => k.key);",
+  "code_language": "typescript",
+  "advantages": [
+   "Rotation par koi token reject nahi hota",
+   "Verifiers ko kuch special nahi karna",
+   "Automatic by age, ya rotate() se manual"
+  ],
+  "disadvantages": [
+   "Teen keys tak published (thoda bada JWKS)",
+   "Compromised key ko turant hatane ka koi command nahi"
+  ],
+  "common_mistakes": [
+   "Nayi key ko usi pal publish karna jab woh sign kare",
+   "Purani key turant hata dena",
+   "Access token aur id_token alag keys se sign karna ek response mein"
+  ],
+  "follow_up_questions": [
+   "Key compromise par kya karoge (emergency removal)?",
+   "JWKS cache max-age aur rotation interval ka rishta kya hai?",
+   "Kai instances ek hi key ring kaise share karenge?"
+  ],
+  "concepts": [
+   "key-rotation",
+   "jwks",
+   "kid",
+   "jose"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Pre-publish + overlap: zero-downtime, lekin JWKS mein extra keys aur compromise par slow removal.",
+   "failure_scenarios": "Process ka clock galat: rotation jaldi/der se. keys.json save fail: rotate throw karta hai aur memory purani list par rehti hai (test nahi kiya). Do processes: alag rotations, alag active keys.",
+   "alternatives": "KMS / HSM jo rotation aur signing khud kare; ya JWKS ko alag service se serve karna.",
+   "scale_10x_100x": "Kai instances: key ring shared storage ya KMS se aani chahiye, aur rotation ek hi jagah se trigger ho.",
+   "production_improvements": "Emergency revoke command, rotation events ka audit log, JWKS endpoint ka monitoring, KMS integration."
+  }
+ },
+ {
+  "id": "AUTH-034",
+  "project_slug": "p14-auth-server",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "How long must a retired signing key stay in /jwks? What goes wrong if it is removed too early or kept forever?",
+  "answer_hinglish": "Rule: tab tak jab tak us key ka sign kiya hua aakhri token expire na ho jaaye. Ek token jo rotation se ek pal pehle sign hua, woh rotation ke baad apni poori lifetime tak valid hai. Isliye retention = sabse lambi token lifetime jo yeh key sign karti hai. keyRetentionMs(lifetimes) = max(accessToken, idToken) * 1000 -- defaults mein 300 s. Refresh tokens opaque hain (JWT nahi), toh woh is hisaab mein nahi aate.\n\nBahut jaldi hatao: valid tokens verify hona band -- users ko 401, bina kisi galti ke. Mutation M24 (retired key turant drop) rotation tests aur jose interop test ko red karti hai. Hamesha rakho: JWKS badhta jaata hai, aur agar purani key leak hui ho toh uske sign kiye forged tokens hamesha verify honge -- rotation ka security fayda khatam. Mutation M25 (kabhi drop nahi) 'the retired key stays published until its last token has expired, then disappears' test ko red karti hai.\n\nTest exact boundary check karta hai: RETAIN - 1 s par key published aur purana token /userinfo par 200; RETAIN par key gayab. Ek dhyan dene wali baat: id_token_hint ke liye logout expired id_token accept karta hai, lekin key hat jaane ke baad woh hint verify nahi hoga -- tab logout 400 deta hai.",
+  "why_needed": "Overlap window galat ho toh ya outage (jaldi) ya security leak (kabhi nahi).",
+  "real_world_analogy": "Purane note band karna: bank ek tarikh tak purane note leta hai, phir nahi. Hamesha lete rahe toh nakli purane note chalte rahenge.",
+  "how_it_works": "expired(k, now) = k.retiredAt !== null && now >= k.retiredAt + retainMs. published() expired keys skip karta hai; rotate() unhe keys.json se bhi hata deta hai.",
+  "in_this_project": "src/server.ts keyRetentionMs; src/keys.ts expired(); test/keys.test.ts 'the retention is the longest token lifetime the key could have signed', 'expired retired keys are removed from keys.json at the next rotation'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::keyRetentionMs",
+   "projects/14-auth-server/src/keys.ts::FileKeyRing",
+   "projects/14-auth-server/test/keys.test.ts"
+  ],
+  "code_example": "// real, src/server.ts\nexport function keyRetentionMs(l: Lifetimes): number {\n  return Math.max(l.accessToken, l.idToken) * 1000;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Exact, lifetimes se calculate hota hai",
+   "Lifetime badlo toh retention khud badalta hai"
+  ],
+  "disadvantages": [
+   "Clock skew ka margin nahi joda",
+   "Logout ka expired id_token_hint retention ke baad kaam nahi karta"
+  ],
+  "common_mistakes": [
+   "Retention ko hard-code karna jo lifetime se alag ho",
+   "Refresh token lifetime ko retention mein ginna (woh JWT nahi hai)"
+  ],
+  "follow_up_questions": [
+   "Verifier ke clock skew ke liye margin chahiye kya?",
+   "Agar access token lifetime 1 ghanta ho toh rotation interval kaise chunoge?"
+  ],
+  "concepts": [
+   "key-retention",
+   "token-lifetime",
+   "jwks"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-035",
+  "project_slug": "p14-auth-server",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "What is the kid header, and how do caching verifiers like jose's createRemoteJWKSet behave across a key rotation? What does the interop test prove?",
+  "answer_hinglish": "kid (key id) JWT header mein batata hai ki kaunsi key se sign hua. Hamara kid RFC 7638 thumbprint hai -- public key ka SHA-256, toh ek key ka kid hamesha wahi aur file ka kid galat ho toh FileKeyRing.open fail karta hai ('does not match its key'). Verifier JWKS mein se same kid wali key chunta hai.\n\njose ka createRemoteJWKSet JWKS ko cache karta hai. Unknown kid aaye toh woh refetch karta hai, lekin cooldown (default 30 s) ke andar dobara nahi. Interop test 'interop: jose across a signing-key rotation' yeh steps chalata hai: (1) purana token, JWKS fetch + verify; (2) ring.rotate(); (3) naya token, alag kid; (4) WAHI cached JWKS naye token ko verify karta hai -- kyunki next key pehle se published thi, aur cooldown refetch hone bhi nahi deta; (5) purana token bhi verify; (6) retention ke baad fresh JWKS par purana kid nahi -- jose JWKSNoMatchingKey deta hai. currentDate pin kiya hai taaki failure 'key missing' ki wajah se ho, expiry ki wajah se nahi.\n\nYeh hamare apne code ke bahar ka saboot hai: ek independent library hamare /jwks se rotation ko sahi samajhti hai.",
+  "why_needed": "Rotation ka asli test woh client hai jo hamara code nahi hai aur JWKS cache karta hai.",
+  "real_world_analogy": "Chaabi par naam ka tag (kid): chowkidar guchhe mein se tag dekh ke sahi chaabi nikalta hai.",
+  "how_it_works": "signJwt header { alg: ES256, typ, kid }. verifyJwt(keys.find(kid)). jose: JWKS cache, unknown kid -> cooldown check -> reload ya JWKSNoMatchingKey.",
+  "in_this_project": "src/jwt.ts jwkThumbprint, signJwt; src/keys.ts FileKeyRing.open (kid check); test/interop.test.ts rotation test.",
+  "implementation_files": [
+   "projects/14-auth-server/src/jwt.ts::jwkThumbprint",
+   "projects/14-auth-server/src/keys.ts::FileKeyRing",
+   "projects/14-auth-server/test/interop.test.ts"
+  ],
+  "code_example": "// real, test/interop.test.ts (trimmed)\nconst cached = createRemoteJWKSet(new URL(`${s.base}/jwks`));\nawait jwtVerify(oldToken, cached, opts);\nring.rotate(clock.t);\nconst newToken = await issue();\nawait jwtVerify(newToken, cached, opts); // next key was already published",
+  "code_language": "typescript",
+  "advantages": [
+   "Independent library se verification",
+   "Thumbprint kid deterministic hai"
+  ],
+  "disadvantages": [
+   "openid-client id_token signature ko default mein verify nahi karta (token endpoint TLS response), toh rotation interop sirf jose se hai"
+  ],
+  "common_mistakes": [
+   "kid ko random string banana jo key se bandha na ho",
+   "Unknown kid par har baar refetch (DoS vector)"
+  ],
+  "follow_up_questions": [
+   "kid na ho toh verifier kya kare?",
+   "JWKS refetch par rate limit kyun zaroori hai?"
+  ],
+  "concepts": [
+   "kid",
+   "jwks-caching",
+   "interop"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-036",
+  "project_slug": "p14-auth-server",
+  "category": "Security",
+  "difficulty": "Senior/System Design",
+  "question": "Where do the private signing keys live, how are they protected, and what would you change for a production deployment?",
+  "answer_hinglish": "Private keys <DATA_DIR>/keys.json mein hain: har key PKCS#8 PEM, createdAt, activatedAt, retiredAt ke saath. Woh pehli start par generate hoti hain (generateKeyPairSync EC P-256), repo mein kabhi nahi -- root .gitignore 'data/' ignore karta hai aur default koi data dir repo mein nahi bante. File temp file ke through likhi jaati hai jo mode 0600 (sirf owner read/write) se banti hai, fsync, phir rename -- rename mode rakhta hai. Directory 0700 se banti hai.\n\nHonest limits: (1) Keys encrypted at rest nahi hain -- jo bhi us OS user ke roop mein file padh sake, woh tokens forge kar sakta hai. (2) Windows par node mode ko lagbhag ignore karta hai (sirf read-only bit); wahan NTFS permissions se directory protect karni padegi. Isi wajah se mode 0600 ka test 'it.skipIf(win32)' hai aur is machine (Windows) par skip hua -- mutation M29 (0644) yahan koi test red nahi kar saka; yeh README mein likha hai. (3) Ek process ek key ring.\n\nProduction mein: keys KMS ya HSM mein (sign operation wahan, private key kabhi process mein nahi), ya kam se kam envelope encryption with a KMS key; rotation central jagah se; audit log; key compromise par emergency revoke jo key ko turant JWKS se hata de.",
+  "why_needed": "Signing key = poore auth server ki identity. Leak hui toh attacker kisi bhi user ka token bana sakta hai.",
+  "real_world_analogy": "Bank ki master stamp: tijori (KMS) mein rehni chahiye, clerk ki drawer (file) mein nahi.",
+  "how_it_works": "FileKeyRing.open: keys.json nahi hai -> do keys generate -> save() (openSync(tmp, 'w', 0o600) -> writeSync -> fsyncSync -> renameSync).",
+  "in_this_project": "src/keys.ts FileKeyRing.save, open; test/keys.test.ts 'keys.json is created with mode 0600 (owner only)' (POSIX only), 'keys.json holds PKCS#8 private keys; /jwks never exposes the private part'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/keys.ts::FileKeyRing",
+   "projects/14-auth-server/test/keys.test.ts"
+  ],
+  "code_example": "// real, src/keys.ts save() (trimmed)\nconst fd = openSync(tmp, \"w\", 0o600);\ntry { writeSync(fd, body); fsyncSync(fd); } finally { closeSync(fd); }\nrenameSync(tmp, this.path);",
+  "code_language": "typescript",
+  "advantages": [
+   "Koi secret repo mein nahi",
+   "Restart par same keys, tokens verify hote rehte hain",
+   "POSIX par sirf owner padh sakta hai"
+  ],
+  "disadvantages": [
+   "Plain PEM at rest",
+   "Windows par mode ka koi asar nahi",
+   "Mode test is machine par chala hi nahi"
+  ],
+  "common_mistakes": [
+   "Key ko env var ya repo mein rakhna",
+   "chmod baad mein karna (file kuch pal world-readable)",
+   "JWKS mein galti se private 'd' bhej dena"
+  ],
+  "follow_up_questions": [
+   "KMS signing se latency aur availability par kya asar?",
+   "Compromised key ka incident response kya hai?",
+   "Envelope encryption kaise kaam karta hai?"
+  ],
+  "concepts": [
+   "key-management",
+   "file-permissions",
+   "kms"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "File keys: simple, dependency-free, lekin disk/OS user access = key access. KMS: strong, lekin har sign ek network call aur vendor dependency.",
+   "failure_scenarios": "Backup mein keys.json chala gaya aur backup leak hua; container image mein data dir bake ho gaya; Windows par galat ACL.",
+   "alternatives": "AWS KMS / GCP KMS asymmetric signing, HSM, HashiCorp Vault transit engine, ya kam se kam passphrase-encrypted PKCS#8.",
+   "scale_10x_100x": "Kai instances par har instance ko same keys chahiye: shared secret store ya central KMS; rotation ek leader karega.",
+   "production_improvements": "KMS signing, key access audit, emergency revoke, keys.json ko data dir ke bahar alag permission ke saath, startup par permission check jo galat mode par fail kare."
+  }
+ },
+ {
+  "id": "AUTH-037",
+  "project_slug": "p14-auth-server",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "Stage 2 adds a login session. Why does the browser cookie hold a different random value than the sid claim in the id_token?",
+  "answer_hinglish": "Har successful login par ek LoginSession banta hai: { sid, cookieHash, sub, authTime, expiresAt }. sid id_token ke 'sid' claim mein jaata hai -- matlab yeh RP (client) ke paas hai, uske logs mein ho sakta hai, browser storage mein ho sakta hai. Isliye sid ko public maana hai.\n\nBrowser ki auth_session cookie ek alag 32-byte random value hai, aur server sirf uska SHA-256 (cookieHash) store karta hai -- bilkul codes aur refresh tokens ki tarah. Agar cookie = sid hota, toh jo bhi id_token dekh sake (RP, ya koi jisne RP ke logs dekhe) woh user ki session cookie bana sakta tha. Abhi session cookie sirf logout mein use hoti hai, lekin future SSO (prompt=none, cookie se silent login) mein yahi cookie authentication ban jaayegi -- tab yeh mistake critical hoti.\n\nCookie flags: HttpOnly (JS nahi padh sakta), SameSite=Lax, Path=/, Max-Age = 12 ghante, aur https issuer par Secure. Test 'a successful login sets an HttpOnly SameSite=Lax session cookie; the id_token carries the session's sid' exact header check karta hai aur cookie mein sid nahi hona chahiye. persistence test check karta hai ki log mein cookie ka hash hai, raw value nahi. Mutation M22 (raw cookie store) wahan pakdi gayi.",
+  "why_needed": "Public identifier aur secret credential ko alag rakhna basic hygiene hai.",
+  "real_world_analogy": "Hotel: room number (sid) sabko pata ho sakta hai, lekin key card (cookie) sirf guest ke paas, aur reception ke paas card ka copy nahi, sirf uska fingerprint.",
+  "how_it_works": "handleLogin: sessionCookie = randomToken(); sid = randomToken(16); sessions.save({ sid, cookieHash: sha256(sessionCookie), ... }); code.sid = sid -> family.sid -> id_token.sid.",
+  "in_this_project": "src/server.ts handleLogin, sessionCookieHeader; src/store.ts LoginSession, SessionStore; test/logout.test.ts 'login session' block; test/persistence.test.ts hash test.",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::handleLogin",
+   "projects/14-auth-server/src/server.ts::sessionCookieHeader",
+   "projects/14-auth-server/src/store.ts::LoginSession",
+   "projects/14-auth-server/test/logout.test.ts"
+  ],
+  "code_example": "// real, src/server.ts handleLogin\nconst sessionCookie = randomToken();\nconst sid = randomToken(16);\nctx.stores.sessions.save({ sid, cookieHash: sha256(sessionCookie), sub: user.sub, authTime: Math.floor(now / 1000), expiresAt: now + ctx.life.session * 1000 });",
+  "code_language": "typescript",
+  "advantages": [
+   "DB/log leak se cookie nahi milti",
+   "sid ko freely share kar sakte hain",
+   "Future SSO ke liye safe base"
+  ],
+  "disadvantages": [
+   "Abhi session sirf logout ke kaam aati hai (SSO nahi)",
+   "Har login naya session, purana cookie overwrite"
+  ],
+  "common_mistakes": [
+   "Session id ko hi cookie bana dena",
+   "Cookie ko plain store karna",
+   "HttpOnly / SameSite bhool jaana"
+  ],
+  "follow_up_questions": [
+   "SSO (prompt=none) is session par kaise banoge?",
+   "SameSite=Lax vs Strict logout redirect ke liye?"
+  ],
+  "concepts": [
+   "session-cookie",
+   "sid",
+   "secret-hashing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-038",
+  "project_slug": "p14-auth-server",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What is OpenID Connect RP-initiated logout and what parameters does this server's /logout endpoint take?",
+  "answer_hinglish": "Login ke baad user ke paas do cheezein hoti hain: RP (application) ki apni session aur authorization server (OP) ki session plus tokens. RP-initiated logout mein application user ke browser ko OP ke end_session_endpoint par bhejti hai taaki OP bhi apni taraf ki session khatam kare, phir browser wapas application par aata hai.\n\nYahan endpoint /logout hai (GET aur POST form), discovery mein 'end_session_endpoint' advertise hota hai -- openid-client isi se buildEndSessionUrl banata hai. Parameters: id_token_hint (is server mein zaroori; jo id_token client ko mila tha), post_logout_redirect_uri (optional; client ke registered post_logout_redirect_uris mein se EXACT match), state (optional; redirect ke saath wapas), client_id (optional; id_token ke aud se match hona chahiye).\n\nResult: id_token ke sid wali session delete, us session ki saari token families revoke (refresh tokens dead, /userinfo par access tokens 401), auth_session cookie Max-Age=0 se clear, aur ya toh 302 redirect post_logout_redirect_uri?state=... par ya 200 'Signed out' page. Interop test openid-client ke buildEndSessionUrl se poora round trip chalata hai.",
+  "why_needed": "Bina OP logout ke application se logout karne par bhi OP ke refresh tokens zinda rehte; shared computer par agla user khatre mein.",
+  "real_world_analogy": "Mall se nikalte waqt sirf dukaan (RP) ka bill nahi, parking (OP) ka ticket bhi wapas karo, warna gaadi tumhare naam par khadi hai.",
+  "how_it_works": "GET /logout?id_token_hint=..&post_logout_redirect_uri=..&state=.. -> hint verify -> URI check -> sessions end + families revoke -> clear cookie -> 302 / 200.",
+  "in_this_project": "src/server.ts handleLogout, discoveryDocument (end_session_endpoint); test/logout.test.ts; test/interop.test.ts 'RP-initiated logout ...'.",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::handleLogout",
+   "projects/14-auth-server/src/server.ts::discoveryDocument",
+   "projects/14-auth-server/test/logout.test.ts"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Standard parameters, standard client libraries kaam karti hain",
+   "Ek request mein session aur tokens dono khatam"
+  ],
+  "disadvantages": [
+   "Front-channel / back-channel logout nahi: doosre RPs ko khabar nahi jaati",
+   "Confirmation page nahi, isliye hint zaroori"
+  ],
+  "common_mistakes": [
+   "Sirf RP ki cookie delete karke logout maan lena",
+   "post_logout_redirect_uri ko bina check ke redirect karna"
+  ],
+  "follow_up_questions": [
+   "Back-channel logout kya hai aur kab chahiye?",
+   "Logout ke baad bhi third-party API par access token kyun chalega?"
+  ],
+  "concepts": [
+   "rp-initiated-logout",
+   "end-session-endpoint",
+   "openid-connect"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-039",
+  "project_slug": "p14-auth-server",
+  "category": "Security",
+  "difficulty": "Intermediate",
+  "question": "Why must post_logout_redirect_uri be matched exactly against registered values, and what does the server do on a mismatch?",
+  "answer_hinglish": "Logout ke baad server browser ko redirect karta hai. Agar koi bhi URI chal jaaye toh /logout ek open redirector ban jaata: attacker link banata hai jo pehle hamare trusted domain par jaata hai aur phir phishing page par -- user ko lagta hai link genuine hai. Prefix match bhi kaafi nahi: 'https://app/logged-out' ka prefix 'https://app/logged-out.evil.test' ya '/logged-out/../evil' jaisi cheezon ko allow kar sakta hai.\n\nIsliye bilkul login ke redirect_uri jaisa rule: config mein client ke post_logout_redirect_uris (validateConfig unhe bhi check karta hai -- fragment nahi, http sirf loopback), aur request ki value includes() se exact string compare. Login ka redirect_uri logout ke liye registered nahi maana jaata -- alag list. Mismatch par 400 error page, koi Location header nahi, koi cookie clear nahi, aur session/tokens untouched -- kyunki request invalid hai, toh uska koi side effect nahi hona chahiye.\n\nTest 'post_logout_redirect_uri %s -> 400 page, no redirect, nothing revoked' paanch variants chalata hai: prefix, trailing slash, extra query, login redirect_uri, doosra host. Mutation M30 (startsWith) prefix, trailing slash aur extra query ko red karti hai.",
+  "why_needed": "Open redirect phishing ka classic tool hai aur trusted domain ki reputation churata hai.",
+  "real_world_analogy": "Society ka gate: guard sirf list mein likhe exact flat number par hi bhejta hai, 'B-wing ke aas paas' par nahi.",
+  "how_it_works": "postLogout !== undefined && !client.post_logout_redirect_uris.includes(postLogout) -> bad(...) (400 HTML), sab checks side effects se pehle.",
+  "in_this_project": "src/server.ts handleLogout; src/config.ts validateConfig (post_logout_redirect_uris); test/logout.test.ts; test/units.test.ts config cases.",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::handleLogout",
+   "projects/14-auth-server/src/config.ts::validateConfig",
+   "projects/14-auth-server/test/logout.test.ts"
+  ],
+  "code_example": "// real, src/server.ts handleLogout\nif (postLogout !== undefined && !client.post_logout_redirect_uris.includes(postLogout)) {\n  return bad(\"post_logout_redirect_uri is not registered for this client.\");\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Open redirect impossible",
+   "Invalid request ka koi side effect nahi"
+  ],
+  "disadvantages": [
+   "Har naye logout page ke liye config change"
+  ],
+  "common_mistakes": [
+   "Prefix / wildcard match",
+   "Mismatch par redirect_uri par fallback",
+   "Check se pehle hi session khatam kar dena"
+  ],
+  "follow_up_questions": [
+   "Redirect ke bina 'Signed out' page dikhana kab better hai?",
+   "Native apps ke loopback ports ka kya?"
+  ],
+  "concepts": [
+   "open-redirect",
+   "exact-match",
+   "logout"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-040",
+  "project_slug": "p14-auth-server",
+  "category": "Security",
+  "difficulty": "Advanced",
+  "question": "The logout endpoint accepts an EXPIRED id_token_hint but still checks its signature, issuer and audience, and it refuses a request without a hint. Explain both choices.",
+  "answer_hinglish": "id_token sirf 5 minute ka hai, lekin user ghanton baad logout dabata hai. OIDC RP-Initiated Logout kehta hai OP expired id_token ko hint ke roop mein accept kare. Isliye verifyJwt ko naya option ignoreExpiry mila: SIRF exp check skip hota hai. alg (ES256 fixed), typ (JWT, isliye access token hint nahi ban sakta), kid se published key, signature, iss aur aud sab check hote hain -- aur exp claim present hona chahiye. Unit test 'ignoreExpiry skips ONLY the exp check' yahi pakka karta hai.\n\nSignature kyun? Hint batata hai kaunsi session (sid) aur kaunsa user (sub) khatam karna hai, aur kaunsa client (aud) -- jiske registered URIs par redirect hoga. Bina verify ke koi bhi forged token banake kisi ki session khatam kar sakta, ya aud badal ke doosre client ke URI par redirect le ja sakta. Pehle aud unverified padha jaata hai sirf client dhoondhne ke liye, phir poora token usi client ke audience ke saath verify. Mutation M31 (sirf decode) tampered aur foreign-key tests ko red karti hai.\n\nHint zaroori kyun? Spec kehta hai bina hint ke OP user se confirm kare. Hamare paas confirmation page nahi, aur bina confirm ke koi bhi site ek <img src='/logout'> se user ko logout kar deti (logout CSRF). Toh simple aur safe: hint nahi -> 400. Yeh README mein limitation ke roop mein likha hai.",
+  "why_needed": "Logout ek state-changing action hai; usse authenticate karne wala input (hint) trust karne layak hona chahiye.",
+  "real_world_analogy": "Purana movie ticket dikha ke exit gate: date nikal gayi chalega, lekin ticket asli hona chahiye aur isi theatre ka.",
+  "how_it_works": "decode aud -> findClient -> verifyJwt(hint, published, { issuer, audience: client_id, typ: 'JWT', ignoreExpiry: true }) -> client_id param check -> URI check.",
+  "in_this_project": "src/jwt.ts VerifyOptions.ignoreExpiry; src/server.ts handleLogout; test/logout.test.ts tampered / foreign key / access token / expired / missing hint tests; mutation M31, M37.",
+  "implementation_files": [
+   "projects/14-auth-server/src/jwt.ts::verifyJwt",
+   "projects/14-auth-server/src/server.ts::handleLogout",
+   "projects/14-auth-server/test/logout.test.ts",
+   "projects/14-auth-server/test/units.test.ts"
+  ],
+  "code_example": "// real, src/jwt.ts verifyJwt (trimmed)\nif (typeof payload.exp !== \"number\") throw new JwtError(\"expired\");\nif (!opts.ignoreExpiry && opts.nowSeconds >= payload.exp) throw new JwtError(\"expired\");",
+  "code_language": "typescript",
+  "advantages": [
+   "Real-world logout timing ke saath kaam karta hai",
+   "Forged hint se koi session nahi marti",
+   "Logout CSRF band"
+  ],
+  "disadvantages": [
+   "Retired key retention ke baad purana hint verify nahi hota -> 400",
+   "Bina id_token wale clients logout nahi kar sakte"
+  ],
+  "common_mistakes": [
+   "Expired hint ke liye poora verification hi skip kar dena",
+   "aud ko client_id param se lena",
+   "Hint ke bina cookie dekh ke logout kar dena"
+  ],
+  "follow_up_questions": [
+   "Confirmation page ke saath bina hint ka logout kaise design karoge?",
+   "Hint ki maximum age kitni honi chahiye?"
+  ],
+  "concepts": [
+   "id-token-hint",
+   "logout-csrf",
+   "jwt-verification"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Expired accept = usability; full signature check = security. Hint required = safe lekin kuch clients ke liye kam convenient.",
+   "failure_scenarios": "Key rotation retention ke baad hint fail -> user ko logout error page. Attacker ke paas user ka purana id_token hai -> woh user ko logout karwa sakta hai (nuisance, data leak nahi).",
+   "alternatives": "Confirmation page jo SameSite cookie + CSRF token se protect ho; logout_hint parameter.",
+   "scale_10x_100x": "Verification CPU-light hai (ek ECDSA verify); scale issue nahi.",
+   "production_improvements": "Hint ki max age (jaise 30 din), confirmation UI, logout events ka audit log."
+  }
+ },
+ {
+  "id": "AUTH-041",
+  "project_slug": "p14-auth-server",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "What exactly is revoked at logout, how are token families linked to a login session, and what does logout NOT achieve?",
+  "answer_hinglish": "Link: login par session (sid) banta hai, code ko sid milta hai, code redeem hone par TokenFamily { ..., sid } banti hai. Har family ek code se aati hai, aur har code ek login se. Logout par TokenStore.familiesOfSession(sid) us session ki families deta hai aur har ek revokeFamily hoti hai -- refresh tokens dead, aur /userinfo jti -> family check se access tokens bhi 401. Refresh se mila naya id_token bhi same sid rakhta hai, toh usse bhi logout hota hai.\n\nKaunsi sessions? Hint ka sid, aur browser ki auth_session cookie wali session agar woh SAME user (sub) ki hai. Doosre user ki cookie session ko kisi aur ke id_token se nahi chhua jaata -- test 'a session cookie of ANOTHER user is not ended' aur mutation M35. Usi user ka doosra login (doosra browser) untouched rehta hai -- test 'only the families of THAT session are revoked'.\n\nKya nahi hota: (1) Access tokens self-contained JWTs hain; koi third-party API jo offline verify karti hai, unhe exp (300 s) tak maanegi -- sirf hamara /userinfo revocation dekhta hai. (2) Doosre RPs ko khabar nahi jaati (front-channel/back-channel logout nahi). (3) SSO nahi hai, toh 'OP session' ka matlab abhi sirf yahi tokens hain. (4) Memory store mein familiesOfSession linear scan hai.",
+  "why_needed": "Logout ka matlab tabhi hai jab chura hua ya bacha hua refresh token bhi kaam karna band kare.",
+  "real_world_analogy": "Ghar chhodte waqt sirf darwaza band nahi, us visit ke saare guest passes bhi cancel -- lekin jo pass kisi ne bahar photocopy karke rakha (offline JWT), woh apni expiry tak dikhega.",
+  "how_it_works": "ended = {hint.sid} + {cookieSession.sid if same sub}; for each: sessions.delete(sid); familiesOfSession(sid).forEach(revokeFamily). File store mein har revoke ek logged record.",
+  "in_this_project": "src/server.ts handleLogout, codeGrant (family.sid); src/store.ts TokenStore.familiesOfSession; test/logout.test.ts; mutation M32 (families revoke nahi) ne kai logout tests aur openid-client logout test red kiye.",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::handleLogout",
+   "projects/14-auth-server/src/server.ts::codeGrant",
+   "projects/14-auth-server/src/store.ts::MemoryTokenStore",
+   "projects/14-auth-server/test/logout.test.ts"
+  ],
+  "code_example": "// real, src/server.ts handleLogout\nfor (const sid of ended) {\n  ctx.stores.sessions.delete(sid);\n  for (const f of ctx.stores.tokens.familiesOfSession(sid)) ctx.stores.tokens.revokeFamily(f.id);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Logout ke baad refresh token bekaar",
+   "Sirf sahi user ki sessions",
+   "Restart ke baad bhi revoked (log mein)"
+  ],
+  "disadvantages": [
+   "Offline-verified access tokens 300 s tak",
+   "Doosre RPs ko notify nahi"
+  ],
+  "common_mistakes": [
+   "Sirf cookie clear karke tokens zinda chhodna",
+   "User ki SAARI sessions khatam kar dena bina poochhe",
+   "Kisi bhi cookie session ko khatam karna"
+  ],
+  "follow_up_questions": [
+   "Back-channel logout token kaise design karoge?",
+   "Access token ko turant revoke karna ho toh kya options?"
+  ],
+  "concepts": [
+   "logout",
+   "token-family",
+   "session-management"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Family-per-login granular revocation deta hai; JWT access tokens ki wajah se downstream revocation delayed hai.",
+   "failure_scenarios": "Hint sid wali session pehle hi expire: families phir bhi revoke hoti hain (sid families par stored hai). Logout ke beech crash: kuch families revoke, kuch nahi (har revoke alag record); dobara logout idempotent hai.",
+   "alternatives": "Back-channel logout (logout_token to RPs), introspection, short access token lifetime, opaque access tokens.",
+   "scale_10x_100x": "familiesOfSession ko index chahiye (DB mein families(sid)); memory store linear scan hai.",
+   "production_improvements": "Back-channel logout, 'logout everywhere' per user, introspection endpoint, audit log."
+  }
+ },
+ {
+  "id": "AUTH-042",
+  "project_slug": "p14-auth-server",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "Stage 2 returns an id_token on refresh. Which claims must stay the same, which change, and how is it tested?",
+  "answer_hinglish": "OIDC Core 12.2 refresh par id_token allow karta hai, kuch shartein ke saath: iss, sub, aud original jaise; auth_time original login ka time, naye refresh ka nahi (warna client ko lagega user abhi login hua); iat naya; aur nonce nahi hona chahiye (nonce authentication request ke liye tha). Hamara sid bhi same rehta hai kyunki family session se bandhi hai, aur at_hash naye access token ka hai.\n\nrefreshGrant ab sendTokens ko withIdToken: scope.includes('openid') deta hai, aur sendTokens nonce sirf code grant se pass hota hai. Agar client ne scope narrow karke openid hata diya, toh id_token nahi milta.\n\nTests: 'OIDC Core 12.2: a refresh returns a new id_token with the same iss, sub, aud, auth_time and sid, a new iat, no nonce' clock 60 s aage karke check karta hai ki iat +60 aur baaki same, at_hash naye access token se. 'no id_token on refresh when the (narrowed) scope has no openid'. Interop: openid-client ka refreshTokenGrant response ka id_token validate karta hai (iss, aud, exp, iat) aur claims() se sub/aud test hote hain. Mutation M39 (id_token band) aur M40 (auth_time = now) dono pakde gaye. Stage 1 ka flow test jo 'no id_token on refresh' kehta tha, update hua.",
+  "why_needed": "Client ko fresh signed identity statement milta hai bina user ko dobara login karaye; logout ke liye bhi naya hint.",
+  "real_world_analogy": "Membership card renew: naya card, nayi issue date, lekin member since wahi purani date.",
+  "how_it_works": "sendTokens(ctx, res, client, family, scope, { withIdToken }) -> claims { iss, sub, aud, iat, exp, auth_time: family.authTime, at_hash, sid } -> nonce sirf code grant par.",
+  "in_this_project": "src/server.ts refreshGrant, sendTokens; test/refresh.test.ts; test/interop.test.ts runOpenIdClientFlow (refreshed.claims()).",
+  "implementation_files": [
+   "projects/14-auth-server/src/server.ts::refreshGrant",
+   "projects/14-auth-server/src/server.ts::sendTokens",
+   "projects/14-auth-server/test/refresh.test.ts"
+  ],
+  "code_example": "// real, src/server.ts refreshGrant\n// OIDC Core 12.2: a refresh may return a new id_token (same iss, sub, aud, auth_time; new iat; no nonce).\nsendTokens(ctx, res, client, family, scope, { withIdToken: scope.includes(\"openid\") });",
+  "code_language": "typescript",
+  "advantages": [
+   "Client ke paas hamesha taaza id_token",
+   "Logout ke liye valid hint"
+  ],
+  "disadvantages": [
+   "Har refresh par ek extra ECDSA signature"
+  ],
+  "common_mistakes": [
+   "auth_time ko refresh time bana dena",
+   "Purana nonce dobara daal dena",
+   "openid narrow hone par bhi id_token dena"
+  ],
+  "follow_up_questions": [
+   "Kya client ko refreshed id_token ka sub compare karna chahiye?",
+   "max_age ke saath auth_time ka kya rishta hai?"
+  ],
+  "concepts": [
+   "id-token",
+   "refresh-token",
+   "openid-connect"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-043",
+  "project_slug": "p14-auth-server",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Stage 2 ran 25 more mutation checks. Which kinds of rules did they cover, and which check did no test catch on this machine, and why?",
+  "answer_hinglish": "Mutation check: ek rule ko jaan-boojh ke todo, poora suite chalao, red hona chahiye, phir git checkout se restore. Stage 2 mein M16-M40: file store (write-ahead order, code.used / refresh.used / family.revoke ko log na karna, beech ki corrupt line skip, compaction expired na hataye, session cookie raw store), key rotation (next key pre-publish na ho, retired key turant drop, kabhi drop nahi, rotation ke baad purani key sign karti rahe, auto-rotation band, rotation keys.json mein save na ho, keys.json 0644), logout (prefix match, hint verify na ho, families revoke na hon, state drop, cookie clear na ho, doosre user ki cookie session, client_id check, expired hint reject), aur id_token (sid na ho, refresh par id_token na ho, refreshed auth_time = now).\n\nNatija: 25 mein se 24 checks red hue (M16 fix ke baad). Do kahaniyan hain. M16 (write-ahead order ulta: memory pehle, disk baad mein) pehli baar KOI test red nahi kar saka. Test store close karke write fail karwata tha, lekin 'store is closed' check write aur apply dono se PEHLE tha, toh order ulta karne se kuch nahi badla. Fix: check ko write step (durable()) ke andar rakha; ab mutation par test red hota hai. M29 (keys.json 0644 se banana) is machine par pakda nahi gaya: mode test it.skipIf(win32) hai kyunki Windows par node mode ignore karta hai, aur yeh results Windows se hain. Woh gap khula hai aur README mein likha hai -- Linux/macOS par chalana padega.\n\nYeh table README mein hai. Seekh: green tests tabhi kuch saabit karte hain jab rule tootne par woh red hon -- aur platform-specific rules ko us platform par chalana padta hai jahan woh lagte hain.",
+  "why_needed": "Naye persistence aur rotation code ke tests galti se kuch na check karein toh pata nahi chalta; mutation yeh dikhata hai.",
+  "real_world_analogy": "Smoke detector ka test button: dabao aur awaaz aani chahiye. Ek detector jo sirf doosri building mein bajta hai, woh is building mein test nahi hua.",
+  "how_it_works": "Script har mutation ko string replace se lagata hai, vitest JSON reporter se failed tests ginta hai, aur file git checkout se wapas.",
+  "in_this_project": "README.md 'Proving the tests can fail' table M16-M40; test/keys.test.ts mode test it.skipIf(win32).",
+  "implementation_files": [
+   "projects/14-auth-server/README.md",
+   "projects/14-auth-server/test/keys.test.ts"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Har naya rule kam se kam ek test se bandha",
+   "Gaps honestly likhe"
+  ],
+  "disadvantages": [
+   "Mutations haath se chune gaye, Stryker jaisa exhaustive nahi"
+  ],
+  "common_mistakes": [
+   "Mutation ke baad restore bhool jaana",
+   "Skip hue test ko 'covered' bolna"
+  ],
+  "follow_up_questions": [
+   "Linux CI is gap ko kaise band karega?",
+   "Kaunse mutations equivalent ho sakte hain (behaviour same)?"
+  ],
+  "concepts": [
+   "mutation-testing",
+   "test-quality"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Hand-picked mutations: sasta aur focused, lekin sirf woh rules jo humne soche.",
+   "failure_scenarios": "Platform-specific code (file mode) ek OS par untested reh sakta hai; CI matrix chahiye.",
+   "alternatives": "Stryker (JS mutation testing) automatic mutants ke liye; property-based tests store ke liye.",
+   "scale_10x_100x": "Suite ~25-40 s hai; 25 mutations ek run mein kai minute. Parallel workers se tez.",
+   "production_improvements": "Linux CI mein mode test chalana, mutation script ko repo mein rakhna (abhi scratch script hai)."
+  }
+ },
+ {
+  "id": "AUTH-044",
+  "project_slug": "p14-auth-server",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: write the replay function for an append-only JSON-lines log that tolerates a torn last line but refuses corruption anywhere else.",
+  "answer_hinglish": "Requirement: file padho, har complete line ek record hai. Complete log '\\n' par khatam hota hai. Last part bina newline ke ho toh woh crash ke beech ka adhoora append hai -- drop karo aur flag set karo. Kisi complete line ka JSON.parse fail ho toh corruption -- error throw karo, guess mat karo.\n\nSteps: (1) file nahi hai -> zero records. (2) text.split('\\n'); array ka last element hamesha woh hai jo aakhri newline ke baad hai -- complete log mein ''. (3) Usko pop karke alag rakho. (4) Baaki har line parse -- fail par line number ke saath error. (5) Har record ko apply callback ko do, jo wahi function hai jo live path use karta hai. (6) return { replayed, droppedTornLine: tail !== '' }.\n\nInterview mein bolo: torn tail drop karna safe hai kyunki write-ahead order mein fsync ke baad hi response jaata hai -- woh change kabhi acknowledge nahi hua. Aur beech ki line skip karna unsafe hai kyunki woh 'code.used' ya 'family.revoke' ho sakti hai. Yeh src/file-store.ts readLog() ka simplified version hai; tests persistence.test.ts mein.",
+  "why_needed": "Crash recovery ka code chhota hai lekin galti security state ko peeche le ja sakti hai.",
+  "real_world_analogy": "Kitaab padhna jiska aakhri page aadha chhapa hai: aadha vaakya chhod do, lekin beech ka page gayab ho toh kitaab wapas karo.",
+  "how_it_works": "split -> pop tail -> parse each -> apply -> flag.",
+  "in_this_project": "src/file-store.ts readLog(); test/persistence.test.ts torn line aur corrupt middle line tests.",
+  "implementation_files": [
+   "projects/14-auth-server/src/file-store.ts::readLog",
+   "projects/14-auth-server/test/persistence.test.ts"
+  ],
+  "code_example": "function replay(text: string, apply: (r: unknown) => void): { replayed: number; droppedTornLine: boolean } {\n  const lines = text.split(\"\\n\");\n  const tail = lines.pop() ?? \"\";\n  lines.forEach((line, i) => {\n    let rec: unknown;\n    try { rec = JSON.parse(line); } catch { throw new Error(`line ${i + 1} is corrupt`); }\n    apply(rec);\n  });\n  return { replayed: lines.length, droppedTornLine: tail !== \"\" };\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Chhota, testable, pure function",
+   "Live aur replay same apply"
+  ],
+  "disadvantages": [
+   "Valid-JSON-but-wrong line nahi pakadta (CRC chahiye)"
+  ],
+  "common_mistakes": [
+   "Har kharab line skip karna",
+   "Empty file ko corruption maanna",
+   "Windows CRLF ko bhoolna (yahan writer hamesha '\\n' likhta hai)"
+  ],
+  "follow_up_questions": [
+   "CRC add karke kaise likhoge?",
+   "Bahut badi file ko stream karke kaise replay karoge?"
+  ],
+  "concepts": [
+   "coding-exercise",
+   "log-replay",
+   "crash-recovery"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "AUTH-045",
+  "project_slug": "p14-auth-server",
+  "category": "Performance & Scalability",
+  "difficulty": "Senior/System Design",
+  "question": "The file store is single-process with an fsync per change. How would you take this design to many instances behind a load balancer, and what would you measure first?",
+  "answer_hinglish": "Abhi ke limits: ek process per data dir (koi lock, koi sharing nahi), har store change par sync fsync (event loop block, aur code grant mein 5 records = 5 fsync), compaction sirf start par, key ring ek process ki file mein. Kuch bhi measure nahi hua -- koi throughput number claim nahi.\n\nMany instances ke liye: (1) Stores ko PostgreSQL par le jao, same interfaces ke peeche. consume = UPDATE codes SET used = true WHERE hash = $1 AND used = false RETURNING *, markUsed same pattern, aur row count se jeetne wala decide. Ek request ke records ek transaction mein -- group commit DB karega. (2) Login transactions bhi shared store mein (ya sticky sessions), kyunki /authorize aur /login alag instances par ja sakte hain. (3) Key ring: shared (KMS ya DB row), aur rotation ek leader/cron se, taaki sab instances same active key aur same JWKS dikhayein; pre-publish window JWKS cache (300 s) se lamba ho. (4) Sessions aur families ke liye index on sid.\n\nPehle measure: fsync latency per request aur token endpoint p99 ek instance par, scrypt cost per login (yeh shayad sabse bada CPU cost hai), aur replay/compaction time vs log size. Numbers raw results ke saath save karke hi claim karne chahiye -- PLAN.md stage 5 yahi kehta hai.",
+  "why_needed": "Interviewer dekhna chahta hai ki aap apne design ki seemayein jaante ho aur unhe todne ka plan bina hand-waving ke bata sakte ho.",
+  "real_world_analogy": "Ek dukaan ki diary (file store) ek munshi ke liye theek hai; das branches ke liye central ledger (database) aur ek hi tijori (KMS) chahiye.",
+  "how_it_works": "Interfaces (CodeStore, TokenStore, SessionStore, KeyRing) hi seams hain: implementation badlo, server.ts nahi.",
+  "in_this_project": "src/store.ts interfaces, src/file-store.ts, src/keys.ts KeyRing; PLAN.md stage 2 PostgreSQL item abhi bhi open.",
+  "implementation_files": [
+   "projects/14-auth-server/src/store.ts::TokenStore",
+   "projects/14-auth-server/src/keys.ts::KeyRing",
+   "projects/14-auth-server/src/file-store.ts::openFileStores",
+   "projects/14-auth-server/PLAN.md"
+  ],
+  "code_example": "-- the atomic step a database store needs\nUPDATE refresh_tokens SET used = true\n WHERE token_hash = $1 AND used = false\nRETURNING family_id;  -- 0 rows = reuse",
+  "code_language": "typescript",
+  "advantages": [
+   "Interfaces ki wajah se migration local hai",
+   "Atomic rules SQL mein seedhe map hote hain"
+  ],
+  "disadvantages": [
+   "DB ek nayi dependency aur failure point",
+   "Distributed key rotation complex"
+  ],
+  "common_mistakes": [
+   "Har instance ka apna file store load balancer ke peeche",
+   "Measure kiye bina 'fast' kehna",
+   "Rotation har instance par alag chalana"
+  ],
+  "follow_up_questions": [
+   "Read replicas par refresh lookup kyun khatarnak?",
+   "Group commit latency vs throughput trade-off?",
+   "Scrypt ko alag worker pool mein kab daaloge?"
+  ],
+  "concepts": [
+   "scalability",
+   "postgresql",
+   "horizontal-scaling",
+   "measurement"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "File store: zero dependency, ek machine. DB: scale aur multi-instance, lekin ops cost aur network latency.",
+   "failure_scenarios": "DB down = login aur refresh down (fail closed); replica lag par revoked token valid dikh sakta hai agar reads replica se hon.",
+   "alternatives": "Redis (Lua scripts) codes/refresh ke liye + Postgres families ke liye; ya managed IdP (Keycloak, Auth0) agar build karna zaroori nahi.",
+   "scale_10x_100x": "10x: ek bada instance + Postgres. 100x: kai instances, connection pooling, partitioned token tables, cleanup jobs, KMS signing ki rate limits.",
+   "production_improvements": "PostgreSQL store, concurrency test (do redemptions ek saath), load test with saved raw results, metrics (fsync/DB latency, scrypt time, reuse events)."
+  }
+ }
+]
