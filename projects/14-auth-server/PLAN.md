@@ -26,7 +26,7 @@ without a test or a measurement.
 - A data-dir lock so a second process cannot open the same store.
 - One commit (one fsync) per request instead of one per record; runtime compaction by log size.
 - Per-line checksum in the log so a valid-JSON-but-wrong line is detected.
-- Run the keys.json mode test (skipped on Windows) on a POSIX machine / CI.
+- DONE 2026-11-21: the keys.json mode test (skipped on Windows) was run on Linux (portfolio-a2): passes, and M29 turns it red. A CI job on Linux would keep it covered.
 
 ## Stage 3 -- more of the protocol
 

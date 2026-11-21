@@ -232,7 +232,7 @@ suite was run green again.
 | M26 | rotation does not switch the signing key (old key keeps signing) (`keys.ts`) | 3 | `interop.test.ts` "a JWKS fetched BEFORE the rotation already has the new key..."; `keys.test.ts` "rotate(): the pre-published key starts signing, the old key stays publ...", "automatic rotation once the active key is older than rotateAfterMs" |
 | M27 | automatic rotation by age disabled (`keys.ts`) | 1 | `keys.test.ts` "automatic rotation once the active key is older than rotateAfterMs" |
 | M28 | rotation not written to keys.json (`keys.ts`) | 2 | `keys.test.ts` "a rotation is written to keys.json, so a restart keeps the retired key...", "expired retired keys are removed from keys.json at the next rotation" |
-| M29 | keys.json created without mode 0600 (`keys.ts`) | 0 | NONE on this machine (Windows): the only test for it is skipped on win32 -- see below |
+| M29 | keys.json created without mode 0600 (`keys.ts`) | 0 on Windows, **1 on Linux** | "keys.json is created with mode 0600" -- skipped on win32; run on Linux (portfolio-a2, 2026-11-21) it turned red -- see below |
 | M30 | post_logout_redirect_uri prefix match instead of exact (`server.ts`) | 3 | `logout.test.ts` "post_logout_redirect_uri prefix -> 400 page, no redirect, nothing revo...", "post_logout_redirect_uri trailing slash -> 400 page, no redirect, noth...", "post_logout_redirect_uri extra query -> 400 page, no redirect, nothing..." |
 | M31 | id_token_hint not verified (decoded only) (`server.ts`) | 2 | `logout.test.ts` "an id_token_hint with a tampered signature -> 400, nothing revoked", "an id_token_hint signed by a key this server does not publish -> 400" |
 | M32 | logout deletes the session but does not revoke its token families (`server.ts`) | 10 | `interop.test.ts` "RP-initiated logout: discovery advertises end_session_endpoint, buildE..."; `logout.test.ts` "id_token_hint + registered post_logout_redirect_uri: redirect with sta...", "without post_logout_redirect_uri: 200 'signed out' page, no redirect,...", "an EXPIRED id_token is still accepted as a hint (signature, iss, aud s...", "only the families of THAT session are revoked...", "the browser's session cookie is ended too when it belongs to the same...", "a session cookie of ANOTHER user is not ended by this user's id_token", "a second logout with the same hint is harmless (200, still logged out)", "POST form works the same way", "the id_token from a REFRESH also names the session and logs it out" |
@@ -251,9 +251,11 @@ apply, so swapping their order changed nothing the test could see. The check now
 (`durable()` in `src/file-store.ts`), so "apply before write" really applies first and the test turns red (the
 row above is the re-run).
 
-**Gap NOT closed (M29)**: writing `keys.json` with mode 0644 is caught by no test on this machine. The mode test
-is `it.skipIf(process.platform === "win32")` because node on Windows ignores the mode (apart from the read-only
-bit), and these results come from a Windows machine. It needs a run on Linux / macOS to count.
+**M29 needed Linux, and was then caught (2026-11-21)**: on Windows no test can see it, because the mode test is
+`it.skipIf(process.platform === "win32")` (node on Windows ignores the mode apart from the read-only bit). So the suite
+was also run on Linux (Ubuntu 24.04 arm64, Node v20.20.1, on `portfolio-a2`, commit `f158441`, temporary copy removed
+afterwards): **177/177 pass, including the mode test**. With mode 0644 written instead of 0600, that test failed
+("expected 420 to be 384", i.e. 0644 vs 0600); restored, 177/177 again.
 
 Also note: M18 turns the write-ahead test red as a side effect (an unlogged markUsed no longer touches the closed
 store), not because that test is about M18.
@@ -262,7 +264,7 @@ store), not because that test is about M18.
 
 ```bash
 npm install
-npm test                 # 177 tests (1 skipped on Windows)
+npm test                 # 177 tests (1 skipped on Windows; all 177 run and pass on Linux)
 npx tsc --noEmit
 npm run build
 CONFIG_FILE=config/example.json PORT=9000 DATA_DIR=./data node dist/index.js
@@ -304,7 +306,7 @@ The example config contains OBVIOUSLY FAKE secrets: users `alice` / `alice-passw
 - Real power-loss testing of the crash-safety claims.
 - Login transactions and the failed-password counter survive a restart (they are memory only, by design).
 - Keys encrypted at rest / KMS / HSM; emergency removal of a compromised key (today: stop the server and edit
-  `keys.json`); one key ring shared by several processes. The 0600 mode test has not run on Windows.
+  `keys.json`); one key ring shared by several processes. The 0600 mode test cannot run on Windows (it was run on Linux, see M29).
 - SSO: the session cookie is set and cleared but NOT used to skip the login form; `prompt=none` still always
   returns `login_required`; no `prompt=login`, `max_age`.
 - Logout without `id_token_hint` (no confirmation page), `logout_hint`, front-channel and back-channel logout

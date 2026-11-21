@@ -38,6 +38,7 @@ given so it can be checked.
 | 2026-11-20 | Vercel | portfolio site redeployed with H11 (live at 11:57 UTC) | deploy check |
 | 2026-11-21 11:57-12:04 | Oracle network + portfolio-a1 | TEMPORARY: one security-list rule and one A1 firewall rule (A2 only, test ports), two test processes and Node in A1's home folder; all removed and verified | `07-reverse-proxy-on-a2.md` 7.9 |
 | 2026-11-21 16:58-17:25 | Oracle network + portfolio-a2, -micro, -a1 | TEMPORARY (H12): three security-list rules `h12-bench-*` (TCP 19001-19002, each from one private address), two iptables rules per server (comment `h12-bench`, not saved), `~/h12` with code and Node on micro and A1, brokers as `nice -n 19` processes, bench + nats-server in `~/h12` on A2. All removed; servers compared with before-snapshots; one orphaned loopback nats-server on A2 found and stopped | `08-message-broker-cluster.md` 8.9-8.10 |
+| 2026-11-21 17:41-17:43 | portfolio-a2 | TEMPORARY (H14): `git archive` of `projects/14-auth-server` into `~/h14`, `npm ci`, full test suite on Linux (177/177) and mutation M29 (keys.json mode) once; `~/h14` deleted, A2 compared with a before-snapshot: no difference. No ports, no rules | `projects/14-auth-server/README.md` (M29) |
 
 ## What is on each server now (2026-11-21, checked again after the H12 run at 17:25 UTC: unchanged)
 
