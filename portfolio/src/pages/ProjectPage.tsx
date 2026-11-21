@@ -40,7 +40,9 @@ export default function ProjectPage({ slug }: { slug: string }) {
       {bank?.meta.summary && <Section title="Overview"><Rich text={bank.meta.summary} /></Section>}
 
       <Section title="Measured benchmarks">
-        <div className="grid gap-4 lg:grid-cols-2">{p.benches.map((b) => <BenchChart key={b.title} b={b} />)}</div>
+        {p.benches.length === 0
+          ? <p className="text-sm text-slate-600 dark:text-slate-400">Nothing has been measured for this project yet, so no numbers are shown.</p>
+          : <div className="grid gap-4 lg:grid-cols-2">{p.benches.map((b) => <BenchChart key={b.title} b={b} />)}</div>}
       </Section>
 
       <Section title="Design documents">

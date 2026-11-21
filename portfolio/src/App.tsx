@@ -44,7 +44,7 @@ export default function App() {
       </header>
       <main className="mx-auto max-w-6xl px-4 py-8">{page}</main>
       <footer className="border-t border-slate-200 py-6 text-center text-xs text-slate-500 dark:border-slate-800">
-        Local portfolio build. Not deployed; every project runs locally (the first ten with Docker Compose). Benchmark numbers come from each project's TESTING.md (project 11: its README and saved bench results).
+        The projects themselves are not deployed publicly; every project runs locally (the first ten with Docker Compose). Benchmark numbers come from each project's TESTING.md (projects 11 and 12: their READMEs and saved raw bench results; project 13 has not been measured).
       </footer>
     </div>
   );

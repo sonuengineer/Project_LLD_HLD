@@ -317,6 +317,61 @@ export const PROJECTS: ProjectInfo[] = [
       },
     ],
   },
+  {
+    num: 12, slug: "p13-message-broker", dir: "projects/13-message-broker", name: "NATS-style Message Broker + Cluster",
+    tagline: "A hand-written pub/sub broker that the official NATS client talks to, clustered over three real servers and measured.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "own route protocol", "official nats client (tests only)"],
+    features: [
+      "Speaks the core NATS client protocol; the official nats client passes publish/subscribe, wildcards, request/reply, queue groups, headers and failover tests against it",
+      "Streaming parser that reads payloads by byte count and enforces size limits before buffering; subject trie with * and >",
+      "Queue groups, headers, no-responders (503), slow-consumer protection, graceful close",
+      "Full-mesh cluster with its own route protocol: interest propagation, one-hop forwarding (no loops, no duplicates), cluster-wide queue groups, re-dial with backoff",
+      "Measured on three Oracle servers (two ARM, one x86): killing a broker under load lost 20-29 messages per run, the client reconnected in about 10 ms",
+      "10-minute churn of random connects and disconnects: connections, subscriptions and peer interest all back to 0 on all three brokers",
+      "34 deliberate code breaks to check the tests: 33 caught, the one that cannot be caught is explained",
+    ],
+    tests: "138 passing (parser, trie, raw TCP, cluster of 3 in one process, official-client interop)",
+    run: "cd projects/13-message-broker && npm ci && npm run build && npm start   # 127.0.0.1:4222",
+    docs: ["README", "PLAN"],
+    benches: [
+      {
+        title: "Same load generator: our broker vs the real nats-server", unit: "delivered msg/s",
+        note: "One 2-core Oracle ARM server, 128-byte messages, median of 3 runs. nats-server is Go and multi-threaded; ours is one Node.js event loop. The generator was not the limit: it pushed nats-server about 12x higher.",
+        source: "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b2.json", series: ["ours", "nats-server"], log: true,
+        rows: [{ label: "1 subscriber", ours: 36916, "nats-server": 428378 }, { label: "10 subscribers", ours: 47078, "nats-server": 556610 }],
+      },
+      {
+        title: "Request/reply latency: same broker vs across the cluster", unit: "microseconds",
+        note: "One request at a time, timed on the requester's clock, median of 3 runs of 3000 requests. Across = two route hops plus the private network both ways (A2 to the micro and back).",
+        source: "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b3.json", series: ["p50", "p99"],
+        rows: [{ label: "same broker", p50: 224, p99: 1317 }, { label: "across brokers", p50: 1315, p99: 2538 }],
+      },
+      {
+        title: "Slow consumer: broker memory at the moment it drops the reader", unit: "MiB peak RSS",
+        note: "A subscriber stops reading while 1 KiB messages are published as fast as possible. It is dropped right at each limit, but memory grows by 2.6-4.6x the limit (an open question in the README). Started at 42 MiB.",
+        source: "projects/13-message-broker/bench/reference-results/a2-micro-a1-part2/b5.json", series: ["peak RSS"],
+        rows: [{ label: "limit 8 MiB", "peak RSS": 79 }, { label: "limit 64 MiB", "peak RSS": 250 }, { label: "limit 512 MiB", "peak RSS": 1375 }],
+      },
+    ],
+  },
+  {
+    num: 13, slug: "p14-auth-server", dir: "projects/14-auth-server", name: "OAuth 2.0 / OpenID Connect Server",
+    tagline: "A hand-written authorization server with PKCE, rotating refresh tokens, key rotation and logout, checked against two standard client libraries.",
+    stack: ["TypeScript", "Node.js (node:http, node:crypto, node:fs only)", "jose + openid-client (tests only)"],
+    features: [
+      "Authorization Code flow with mandatory PKCE (S256), exact redirect matching, single-use 60-second codes; reusing a code revokes what it issued",
+      "ES256 JWT access tokens, OIDC id_token, discovery, JWKS, userinfo and token revocation",
+      "Refresh tokens rotate on every use; reusing an old one revokes the whole token family",
+      "File-backed store (append-only log, fsync before apply, replay and compaction on start); only hashes of tokens are written to disk",
+      "Signing-key rotation with overlap: the next key is published before it signs, old keys stay until their tokens expire",
+      "RP-initiated logout with a verified id_token_hint; revokes the session's tokens",
+      "Independent checks: jose verifies tokens through the JWKS endpoint, openid-client runs the full flow; 40 deliberate code breaks, all caught (one only on Linux)",
+    ],
+    tests: "177 passing on Linux (176 on Windows: the key-file permission test only runs on Linux/macOS)",
+    run: "cd projects/14-auth-server && npm ci && npm run build && CONFIG_FILE=config/example.json PORT=9000 DATA_DIR=./data node dist/index.js",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
