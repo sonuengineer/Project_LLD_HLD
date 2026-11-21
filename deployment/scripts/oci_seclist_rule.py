@@ -5,7 +5,7 @@ you out. This script reads the current rules, changes only what you ask, shows t
 prove that every other rule is unchanged. It defaults to a dry run; nothing is written without --apply.
 
   show                                                   list the rules, the subnet(s) and which instances use them
-  add    --cidr 10.0.0.39/32 --ports 18001-18004 --tag h11-bench-temp [--apply]
+  add    --cidr <A2_PRIVATE_IP>/32 --ports 18001-18004 --tag h11-bench-temp [--apply]
   remove --tag h11-bench-temp [--apply]                  removes only rules whose description is exactly the tag
 
 Every write first saves a backup of the full rule list under ~/.oci/seclist-backups/ (outside the repo, because it
