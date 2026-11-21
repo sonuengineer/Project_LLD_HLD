@@ -29,7 +29,7 @@ describe("connect", () => {
     const text = await r.waitFor(/\r\n/);
     expect(text.startsWith("INFO ")).toBe(true);
     const info = JSON.parse(text.slice(5, text.indexOf("\r\n")));
-    expect(info).toMatchObject({ proto: 1, headers: false, max_payload: 1234 });
+    expect(info).toMatchObject({ proto: 1, headers: true, max_payload: 1234 });
     expect(typeof info.server_id).toBe("string");
     expect(typeof info.client_id).toBe("number");
   });
@@ -223,7 +223,7 @@ describe("verbose mode", () => {
 describe("errors that keep the connection open", () => {
   it.each([
     ["SUB with an invalid subject", "SUB a..b 1\r\n", "Invalid Subject"],
-    ["SUB with a queue group (stage 2)", "SUB jobs workers 1\r\n", "Queue Groups Not Supported Yet"],
+    ["SUB with an invalid queue name", "SUB jobs wor.kers 1\r\n", "Invalid Queue Name"],
     ["PUB to a wildcard subject", "PUB a.* 1\r\nx\r\n", "Invalid Publish Subject"],
     ["PUB with a wildcard reply subject", "PUB a r.> 1\r\nx\r\n", "Invalid Publish Subject"],
   ])("%s", async (_name, input, message) => {

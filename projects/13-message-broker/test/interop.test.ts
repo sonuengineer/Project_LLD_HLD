@@ -3,7 +3,7 @@
  * check: our own tests could share our own misunderstanding of the protocol, the official client cannot.
  */
 import { afterEach, describe, expect, it } from "vitest";
-import { connect, StringCodec, type NatsConnection } from "nats";
+import { connect, headers, StringCodec, type NatsConnection } from "nats";
 import type { Broker } from "../src/server.js";
 import { startBroker, until } from "./helpers.js";
 
@@ -50,7 +50,7 @@ describe("official nats client against our broker", () => {
     const { client } = await setup();
     const nc = await client();
     expect(nc.info?.server_name).toBe("h12-broker");
-    expect(nc.info?.headers).toBe(false);
+    expect(nc.info?.headers).toBe(true);
   });
 
   it("publish and subscribe, with flush as a round trip", async () => {
@@ -137,6 +137,62 @@ describe("official nats client against our broker", () => {
     const { client } = await setup({ maxPayload: 1000 });
     const nc = await client();
     expect(() => nc.publish("x", new Uint8Array(1001))).toThrow();
+  });
+
+  it("queue group across two connections: every message handled exactly once", async () => {
+    const { client } = await setup();
+    const w1 = await client();
+    const w2 = await client();
+    const pub = await client();
+    const seen: string[] = [];
+    const counts = [0, 0];
+    [w1, w2].forEach((nc, i) => {
+      const s = nc.subscribe("work", { queue: "pool" });
+      (async () => {
+        for await (const m of s) {
+          seen.push(sc.decode(m.data));
+          counts[i]!++;
+        }
+      })();
+    });
+    await w1.flush();
+    await w2.flush();
+    for (let i = 0; i < 100; i++) pub.publish("work", sc.encode(String(i)));
+    await pub.flush();
+    await until(() => seen.length >= 100);
+    await w1.flush();
+    await w2.flush();
+    expect(seen.length).toBe(100);
+    expect(new Set(seen).size).toBe(100);
+    expect(counts[0]! > 0 && counts[1]! > 0).toBe(true);
+  });
+
+  it("headers round trip", async () => {
+    const { client } = await setup();
+    const sub = await client();
+    const pub = await client();
+    const s = sub.subscribe("h");
+    await sub.flush();
+    const h = headers();
+    h.set("Trace-Id", "abc-123");
+    h.append("Tag", "one");
+    h.append("Tag", "two");
+    pub.publish("h", sc.encode("body"), { headers: h });
+    for await (const m of s) {
+      expect(m.headers?.get("Trace-Id")).toBe("abc-123");
+      expect(m.headers?.values("Tag")).toEqual(["one", "two"]);
+      expect(sc.decode(m.data)).toBe("body");
+      break;
+    }
+  });
+
+  it("a request to a subject nobody listens on fails at once with 503 instead of timing out", async () => {
+    const { client } = await setup();
+    const nc = await client();
+    const t0 = Date.now();
+    const err = await nc.request("nobody.home", sc.encode("?"), { timeout: 5000 }).catch((e: { code?: string }) => e);
+    expect((err as { code?: string }).code).toBe("503");
+    expect(Date.now() - t0).toBeLessThan(1000);
   });
 
   it("drain and close leave no connections or subscriptions behind", async () => {

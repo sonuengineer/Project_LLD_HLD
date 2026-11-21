@@ -3,6 +3,7 @@
  *
  *   CONNECT {json}\r\n
  *   PUB <subject> [reply-to] <#bytes>\r\n<payload>\r\n
+ *   HPUB <subject> [reply-to] <#header bytes> <#total bytes>\r\n<headers><payload>\r\n
  *   SUB <subject> [queue group] <sid>\r\n
  *   UNSUB <sid> [max-msgs]\r\n
  *   PING\r\n   PONG\r\n
@@ -15,12 +16,14 @@
  * many bytes arrived without a newline, and a PUB that DECLARES more than maxPayload bytes is rejected before any of the
  * payload is buffered. That is what stops one client from making the server hold an unbounded amount of memory.
  *
- * HPUB (headers) is stage 2; the server announces headers:false, so a well-behaved client never sends it.
+ * HPUB and PUB become the same operation: for HPUB, `headerLen` says how many of the payload's first bytes are the
+ * header block ("NATS/1.0\r\nKey: value\r\n\r\n"); for PUB it is undefined. The total (headers + body) counts against
+ * maxPayload, as in nats-server.
  */
 
 export type Op =
   | { op: "CONNECT"; options: Record<string, unknown> }
-  | { op: "PUB"; subject: string; reply: string | undefined; payload: Buffer }
+  | { op: "PUB"; subject: string; reply: string | undefined; headerLen: number | undefined; payload: Buffer }
   | { op: "SUB"; subject: string; queue: string | undefined; sid: string }
   | { op: "UNSUB"; sid: string; max: number | undefined }
   | { op: "PING" }
@@ -41,8 +44,11 @@ const EMPTY = Buffer.alloc(0);
 interface PendingPub {
   subject: string;
   reply: string | undefined;
+  headerLen: number | undefined;
   size: number;
 }
+
+const HEADER_PREFIX = Buffer.from("NATS/1.0");
 
 export class Parser {
   private parts: Buffer[] = [];
@@ -100,10 +106,13 @@ export class Parser {
         if (buf[size] !== CR || buf[size + 1] !== LF) throw new ParseError("Protocol Error: payload size does not match");
         // Copy the payload so it does not keep the (possibly much larger) receive buffer alive.
         const payload = Buffer.from(buf.subarray(0, size));
-        const { subject, reply } = this.pending;
+        const { subject, reply, headerLen } = this.pending;
+        if (headerLen !== undefined && !payload.subarray(0, HEADER_PREFIX.length).equals(HEADER_PREFIX)) {
+          throw new ParseError("Protocol Error: headers must start with NATS/1.0");
+        }
         this.pending = null;
         this.keep(buf.subarray(size + 2));
-        this.onOp({ op: "PUB", subject, reply, payload });
+        this.onOp({ op: "PUB", subject, reply, headerLen, payload });
         continue;
       }
 
@@ -154,7 +163,19 @@ export class Parser {
         const size = parseCount(args[args.length - 1]!);
         if (size === undefined) throw new ParseError("Invalid PUB: bad size");
         if (size > this.limits.maxPayload) throw new ParseError("Maximum Payload Violation");
-        this.pending = { subject: args[0]!, reply: args.length === 3 ? args[1] : undefined, size };
+        this.pending = { subject: args[0]!, reply: args.length === 3 ? args[1] : undefined, headerLen: undefined, size };
+        return;
+      }
+      case "HPUB": {
+        if (args.length !== 3 && args.length !== 4) {
+          throw new ParseError("Invalid HPUB: expected subject [reply] header-size total-size");
+        }
+        const headerLen = parseCount(args[args.length - 2]!);
+        const size = parseCount(args[args.length - 1]!);
+        if (headerLen === undefined || size === undefined) throw new ParseError("Invalid HPUB: bad size");
+        if (headerLen > size || headerLen < HEADER_PREFIX.length) throw new ParseError("Invalid HPUB: bad header size");
+        if (size > this.limits.maxPayload) throw new ParseError("Maximum Payload Violation");
+        this.pending = { subject: args[0]!, reply: args.length === 4 ? args[1] : undefined, headerLen, size };
         return;
       }
       case "SUB": {

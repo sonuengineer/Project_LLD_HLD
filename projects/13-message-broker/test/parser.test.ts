@@ -63,6 +63,17 @@ describe("parser: each operation", () => {
     expect(ops[1]).toEqual({ op: "PING" });
   });
 
+  it("HPUB: header length and total length, headers kept at the front of the payload", () => {
+    const hdr = "NATS/1.0\r\nA: 1\r\n\r\n"; // 18 bytes
+    const ops = parseAll(`HPUB a r 18 21\r\n${hdr}xyz\r\n`);
+    expect(ops[0]).toMatchObject({ op: "PUB", subject: "a", reply: "r", headerLen: 18 });
+    expect(text(ops[0])).toBe(hdr + "xyz");
+  });
+
+  it("PUB has no header length", () => {
+    expect(parseAll("PUB a 1\r\nx\r\n")[0]).toMatchObject({ headerLen: undefined });
+  });
+
   it("payload byte count is bytes, not characters", () => {
     const body = Buffer.from("h" + String.fromCharCode(0xe9) + "llo"); // e-acute: 6 bytes in UTF-8, 5 characters
     const ops = parseAll(Buffer.concat([Buffer.from(`PUB a ${body.length}\r\n`), body, Buffer.from("\r\n")]));
@@ -78,11 +89,13 @@ describe("parser: each operation", () => {
 });
 
 describe("parser: TCP delivers bytes, not messages", () => {
-  const stream = Buffer.from('CONNECT {"verbose":false}\r\nSUB a.b 1\r\nPUB a.b r 7\r\nab\r\ncde\r\nPING\r\nUNSUB 1 3\r\n');
+  const stream = Buffer.from(
+    'CONNECT {"verbose":false}\r\nSUB a.b 1\r\nPUB a.b r 7\r\nab\r\ncde\r\nPING\r\nHPUB a.b 12 14\r\nNATS/1.0\r\n\r\nhi\r\nUNSUB 1 3\r\n',
+  );
 
   it("splitting the stream at EVERY possible single offset gives the same operations", () => {
     const expected = parseAll(stream);
-    expect(expected).toHaveLength(5);
+    expect(expected).toHaveLength(6);
     for (let cut = 1; cut < stream.length; cut++) {
       expect(parseSplit(stream, [cut]), `cut at ${cut}`).toEqual(expected);
     }
@@ -116,7 +129,10 @@ describe("parser: limits and bad input", () => {
     expect(() => parseAll(input)).toThrowError(new RegExp(message instanceof RegExp ? message.source : message));
 
   it("unknown operation", () => fails("HELLO\r\n", "Unknown Protocol Operation"));
-  it("HPUB is not supported in stage 1", () => fails("HPUB a 0 0\r\n\r\n", "Unknown Protocol Operation"));
+  it("HPUB header size larger than total", () => fails("HPUB a 20 10\r\n", "bad header size"));
+  it("HPUB header size too small to hold NATS/1.0", () => fails("HPUB a 2 4\r\nab\r\n", "bad header size"));
+  it("HPUB headers that do not start with NATS/1.0", () => fails("HPUB a 12 12\r\nHTTP/1.1\r\n\r\n\r\n", "must start with NATS/1.0"));
+  it("HPUB total over maxPayload (headers count too)", () => fails("HPUB a 12 33\r\n", "Maximum Payload Violation"));
   it("bad CONNECT JSON", () => fails("CONNECT {nope\r\n", "bad JSON"));
   it("CONNECT must be an object", () => fails("CONNECT [1]\r\n", "expected a JSON object"));
   it("PUB with a negative, hex or missing size", () => {

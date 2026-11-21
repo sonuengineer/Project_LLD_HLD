@@ -7,6 +7,7 @@
  *   MAX_PAYLOAD          bytes, default 1048576
  *   PING_INTERVAL_MS     default 120000
  *   MAX_PINGS_OUT        default 2
+ *   MAX_PENDING          bytes queued for one client before it is dropped as a slow consumer, default 67108864
  *   ALLOW_NON_LOOPBACK   must be "1" to bind anything but loopback. There is NO authentication yet, so only ever
  *                        bind a PRIVATE address, never a public one.
  */
@@ -35,6 +36,7 @@ const broker = new Broker({
   maxPayload: intEnv("MAX_PAYLOAD", 1024 * 1024),
   pingIntervalMs: intEnv("PING_INTERVAL_MS", 120_000),
   maxPingsOut: intEnv("MAX_PINGS_OUT", 2),
+  maxPending: intEnv("MAX_PENDING", 64 * 1024 * 1024),
 });
 
 const addr = await broker.listen();
@@ -45,7 +47,10 @@ const stop = (signal: string) => {
   if (stopping) return;
   stopping = true;
   console.log(JSON.stringify({ event: "stopping", signal, ...broker.stats() }));
-  void broker.close().then(() => process.exit(0));
+  void broker.close().then((how) => {
+    console.log(JSON.stringify({ event: "stopped", how }));
+    process.exit(0);
+  });
 };
 process.on("SIGINT", () => stop("SIGINT"));
 process.on("SIGTERM", () => stop("SIGTERM"));

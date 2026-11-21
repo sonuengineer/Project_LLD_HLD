@@ -1,7 +1,8 @@
 # H12 -- NATS-style message broker: plan
 
-Status (2026-11-21): stage 1 DONE (single server, 88 tests incl. interop with the official `nats` client, 12 mutation
-checks all caught; see README.md). Stages 2-5 not started.
+Status (2026-11-21): stages 1 and 2 DONE (single server with queue groups, headers, no-responders, slow-consumer
+protection and graceful close; 113 tests incl. interop with the official `nats` client; 23 mutation checks all caught;
+see README.md). Stages 3-5 not started.
 
 ## Why this project, and how it differs from H5
 
@@ -72,4 +73,5 @@ running it on Render or other free tiers.
 
 ## Next step
 
-Stage 2 (queue groups, headers, slow-consumer protection, graceful drain) is local only: no servers, no network rules.
+Stage 3 (cluster: full-mesh routes, interest propagation, cluster-wide queue groups, route reconnect) is still local
+only: three servers in one test process on ephemeral ports. No servers, no network rules until stage 4.
