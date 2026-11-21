@@ -1,0 +1,1271 @@
+[
+ {
+  "id": "CTR-001",
+  "project_slug": "p16-container-runtime",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What is a container, in terms of what minibox actually asks the kernel for? Is it a small VM?",
+  "answer_hinglish": "Container koi VM nahi hai. VM ka apna kernel hota hai; container ek normal Linux process hai jo host ke HI kernel par chalta hai. Fark sirf itna hai ki kernel us process ko teen cheezein alag deta hai: (1) apne namespaces -- PID, UTS (hostname), mount, IPC, net -- taaki use host ke processes, hostname, mounts, shared memory aur network interfaces na dikhen; (2) ek alag root filesystem -- image ka rootfs, pivot_root ke baad wahi uska / ban jaata hai; (3) cgroup limits -- memory.max, pids.max, cpu.max, taaki woh host ke resources kha na jaaye.\n\nminibox exactly yahi karta hai: container.py ka run() cgroup leaf banata hai, unshare(CLONE_NEWPID) karke INIT fork karta hai; INIT setup_container() mein unshare(mount, UTS, IPC, net), sethostname, lo up, mount plan aur pivot_root karta hai, phir CMD fork karke execvpe. Isliye README kehta hai: 'a normal process with its own namespaces, a different root filesystem, and cgroup limits'.\n\nImportant honesty point: minibox security boundary NAHI hai. User namespace nahi hai (container ka root host ka root hai, test_user_namespace_is_shared_with_the_host yeh check karta hai), capabilities drop nahi hoti, seccomp nahi hai. Toh yeh 'honest programs ko ek doosre se alag rakhna' hai, hostile code ke khilaaf protection nahi. Interview line: container = process + namespaces + root fs + cgroups, aur hardening alag layer hai.",
+  "why_needed": "Docker ko black box ki tarah use karna aasaan hai, lekin debugging (PID 1 SIGTERM ignore karta hai, zombies, OOM 137) tab hi samajh aati hai jab pata ho container underneath sirf ek process hai.",
+  "real_world_analogy": "Ek bade office mein cubicle: building (kernel), bijli, lift sab shared hai, lekin har team ko apni deewarein (namespaces), apna naam-plate (hostname), apni almari (root fs) aur bijli ka meter-limit (cgroup) milta hai. Alag building (VM) nahi hai.",
+  "how_it_works": "Host process -> cgroup leaf create + limits write -> unshare(CLONE_NEWPID) -> fork INIT (PID 1) -> INIT: unshare(NEWNS|NEWUTS|NEWIPC|NEWNET), sethostname, lo up, apply_plan, pivot_root -> fork CMD (PID 2) -> execvpe(command, clean env). Kernel wahi hai, sirf 'view' aur 'limits' alag.",
+  "in_this_project": "minibox/container.py (run, setup_container, init_main), minibox/mounts.py (build_plan, enter_root), minibox/cgroups.py (Limits, Cgroup). README ka pehla section 'it is NOT a security boundary' clearly batata hai kya nahi kiya.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/minibox/container.py::setup_container",
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/README.md",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_user_namespace_is_shared_with_the_host"
+  ],
+  "code_example": "# real, minibox/container.py setup_container\ndef setup_container(cfg: Config, plan: mounts.Plan) -> None:\n    \"\"\"Everything between 'new namespaces' and 'exec', in the order it must happen.\"\"\"\n    os.unshare(os.CLONE_NEWNS | os.CLONE_NEWUTS | os.CLONE_NEWIPC | os.CLONE_NEWNET)\n    socket.sethostname(cfg.hostname)\n    bring_up_loopback()\n    mounts.apply_plan(plan)\n    mounts.enter_root(plan.new_root, use_pivot_root=cfg.use_pivot_root)",
+  "code_language": "python",
+  "advantages": [
+   "Host kernel share hota hai, toh start sasta: minibox ke andar empty container ~18 ms (inner), ~105 ms Python start ke saath",
+   "Koi guest OS boot nahi, memory overhead kam",
+   "Har piece (namespace, mount, cgroup) alag se samjha aur test kiya ja sakta hai"
+  ],
+  "disadvantages": [
+   "Kernel shared hai: kernel bug ya missing hardening = host compromise",
+   "minibox mein user ns, caps drop, seccomp nahi -- security boundary nahi"
+  ],
+  "common_mistakes": [
+   "Container ko 'lightweight VM' kehna",
+   "Sochna ki namespaces akele security dete hain",
+   "Bhool jaana ki container ka root host ka root hai jab user namespace nahi"
+  ],
+  "follow_up_questions": [
+   "Container aur VM mein kernel-level fark kya hai?",
+   "minibox ko security boundary banane ke liye kya kya add karna padega?",
+   "18 ms inner aur 105 ms outer start time mein fark kahan se aata hai?"
+  ],
+  "concepts": [
+   "container",
+   "namespaces",
+   "cgroups",
+   "root-filesystem"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-002",
+  "project_slug": "p16-container-runtime",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "Which namespaces does minibox create, what does each one isolate, and how is that proven?",
+  "answer_hinglish": "minibox paanch namespaces banata hai, do jagah se. Host process unshare(CLONE_NEWPID) karta hai (uske baad ka child INIT naye PID ns mein PID 1 hota hai). Phir INIT setup_container() mein ek call mein baaki chaar: CLONE_NEWNS | CLONE_NEWUTS | CLONE_NEWIPC | CLONE_NEWNET.\n\n- PID: container ke processes apni numbering dekhte hain; INIT PID 1, command PID 2. Fresh /proc ke saath ps sirf container ke processes dikhata hai.\n- UTS: hostname alag. sethostname('box1') host ka naam nahi badalta (test_hostname_is_private).\n- mount (NEWNS): mounts ki apni list; container sirf /, /dev, /dev/pts, /dev/shm, /proc dekhta hai (test_only_the_containers_own_mounts_are_visible).\n- IPC: System V shared memory alag; host par shmget kiya segment container ki /proc/sysvipc/shm mein nahi dikhta (test_ipc_namespace_hides_host_shared_memory, mutation M10 ne 2 tests red kiye).\n- net: naya, khaali network namespace -- sirf lo, jo minibox ioctl se up karta hai (test_only_loopback_network_and_it_is_up: lo + PING-OK).\n\ntest_every_namespace_differs_from_the_host parametrized hai pid/uts/ipc/mnt/net par: andar readlink /proc/self/ns/<ns> host ki value se alag hona chahiye. Jo NAHI hai: user namespace (test confirm karta hai woh host jaisa hai, uid 0), aur cgroup namespace -- dono README ki NOT-done list mein hain.",
+  "why_needed": "Har namespace ek specific global resource ko private banata hai. Interview mein 'container = namespaces' bolna kaafi nahi; kaunsa namespace kya chhupata hai woh batana padta hai.",
+  "real_world_analogy": "Hotel ke kamre: alag room number system (PID), apna door-name plate (UTS), apni almari ki list (mount), apna notice board (IPC), apna intercom jo sirf kamre ke andar baat karta hai (net with only lo).",
+  "how_it_works": "unshare(flags) caller ko naye namespaces mein daal deta hai (PID ke alawa, jo next child par lagta hai). /proc/self/ns/<type> symlink 'type:[inode]' dikhata hai; alag inode = alag namespace.",
+  "in_this_project": "minibox/container.py run() mein os.unshare(os.CLONE_NEWPID), setup_container() mein baaki chaar. Proof tests/integration/test_isolation.py mein: test_every_namespace_differs_from_the_host, test_hostname_is_private, test_ipc_namespace_hides_host_shared_memory, test_only_loopback_network_and_it_is_up.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::setup_container",
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_every_namespace_differs_from_the_host",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_ipc_namespace_hides_host_shared_memory",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_user_namespace_is_shared_with_the_host"
+  ],
+  "code_example": "# real, tests/integration/test_isolation.py\n@pytest.mark.parametrize(\"ns\", [\"pid\", \"uts\", \"ipc\", \"mnt\", \"net\"])\ndef test_every_namespace_differs_from_the_host(box, ns):\n    r = box.run(f\"readlink /proc/self/ns/{ns}\")\n    assert r.returncode == 0, r.stderr\n    inside = r.stdout.strip()\n    assert inside.startswith(f\"{ns}:[\") and inside != os.readlink(f\"/proc/self/ns/{ns}\")",
+  "code_language": "python",
+  "advantages": [
+   "Har namespace ka effect alag test se prove hota hai",
+   "Network default se isolated: host network share nahi hota",
+   "Ek unshare call mein chaar namespaces, simple"
+  ],
+  "disadvantages": [
+   "User aur cgroup namespace nahi: root = host root, cgroup path dikhta hai",
+   "Network sirf loopback: bahar se baat nahi (stage 4 nahi kiya)"
+  ],
+  "common_mistakes": [
+   "CLONE_NEWPID ko baaki flags ke saath INIT mein hi daal dena aur sochna INIT khud naye PID ns mein aa gaya",
+   "UTS namespace ke bina sethostname chalana -- real server ka naam badal jaata (isliye yeh mutation chalaya hi nahi gaya)"
+  ],
+  "follow_up_questions": [
+   "IPC namespace na ho toh kya leak hota hai, practical example?",
+   "User namespace add karne se kya badlega aur kya complications aayenge?",
+   "Network namespace mein lo khud up kyun karna padta hai?"
+  ],
+  "concepts": [
+   "pid-namespace",
+   "uts-namespace",
+   "mount-namespace",
+   "ipc-namespace",
+   "network-namespace"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-003",
+  "project_slug": "p16-container-runtime",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "Why does unshare(CLONE_NEWPID) not move the calling process into the new PID namespace, and how does that shape minibox's process design?",
+  "answer_hinglish": "Baaki namespaces (mount, UTS, IPC, net) mein unshare() caller ko turant naye namespace mein daal deta hai. PID namespace alag hai: ek process ka PID uski poori life fixed rehta hai -- getpid() ka answer beech mein badal nahi sakta, warna parent ka waitpid, signals, sab toot jayenge. Isliye kernel unshare(CLONE_NEWPID) ke baad caller ko purane namespace mein hi rehne deta hai aur sirf uske AGLE child ko naye namespace mein banata hai, aur woh pehla child wahan PID 1 hota hai.\n\nminibox ka design isi rule se nikla: host process (run()) os.unshare(os.CLONE_NEWPID) karta hai aur turant os.fork() -- yeh child INIT hai, jo container mein PID 1 hai. INIT phir baaki namespaces unshare karta hai aur CMD fork karta hai, jo PID 2 banta hai. Agar host process khud 'container' banne ki koshish karta, toh woh host ka hi PID rakhta aur /proc mein sab host processes dikhte.\n\nProof: test_command_is_pid_2_and_init_is_pid_1 -- echo $$ ka output '2' aur /proc/1/cmdline mein 'minibox'. container.py ka module docstring bhi likhta hai: 'only its NEXT child is created in the new PID namespace, and that child is PID 1 there. That is why INIT is a separate process.' Ek side effect: host process khud naye PID ns ka member nahi hai, isliye woh INIT ko host-side pid se signal aur waitpid kar sakta hai.",
+  "why_needed": "Yeh samjhe bina log unshare ke baad seedha exec kar dete hain aur hairaan hote hain ki ps abhi bhi host ke processes dikhata hai ya PID 1 nahi mila.",
+  "real_world_analogy": "Naya mohalla (PID namespace) ban gaya, lekin purane ghar waale ka address nahi badal sakta; sirf jo bachcha ab paida hoga woh naye mohalle ka pehla resident (house no. 1) hoga.",
+  "how_it_works": "unshare(CLONE_NEWPID) task ke 'pid_ns_for_children' ko set karta hai, current pid ko nahi. fork() ke waqt kernel child ko us naye ns mein allocate karta hai; pehla process ns ka init (PID 1) hota hai.",
+  "in_this_project": "minibox/container.py run(): ready pipe banane ke baad os.unshare(os.CLONE_NEWPID); init_pid = os.fork(). init_main() phir cmd_pid = os.fork(). Test: tests/integration/test_isolation.py::test_command_is_pid_2_and_init_is_pid_1.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_command_is_pid_2_and_init_is_pid_1",
+   "projects/16-container-runtime/PLAN.md"
+  ],
+  "code_example": "# real, minibox/container.py run (trimmed)\n        ready_r, ready_w = os.pipe()\n        os.unshare(os.CLONE_NEWPID)\n        init_pid = os.fork()\n        if init_pid == 0:                           # ---- INIT, PID 1 in the new namespace\n            os.close(ready_w)\n            os.read(ready_r, 1)                     # wait until the host put us into the cgroup\n            os.close(ready_r)",
+  "code_language": "python",
+  "advantages": [
+   "Host process bahar rehta hai, toh woh INIT ko normal pid se wait/signal kar sakta hai",
+   "Design kernel ke rule ke saath natural fit"
+  ],
+  "disadvantages": [
+   "Ek extra process (INIT) chahiye",
+   "Code mein teen alag roles samajhne padte hain"
+  ],
+  "common_mistakes": [
+   "unshare(CLONE_NEWPID) ke baad bina fork ke exec karna",
+   "Sochna ki getpid() unshare ke baad 1 return karega"
+  ],
+  "follow_up_questions": [
+   "setns() se kisi existing PID namespace mein join karne par bhi yahi rule kyun lagta hai?",
+   "Agar INIT exit ho jaaye toh namespace ke baaki processes ka kya hota hai?",
+   "clone(CLONE_NEWPID) aur unshare+fork mein kya fark hai?"
+  ],
+  "concepts": [
+   "pid-namespace",
+   "unshare",
+   "fork",
+   "pid-1"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-004",
+  "project_slug": "p16-container-runtime",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Walk through minibox's three-process design (host -> INIT PID 1 -> CMD PID 2). Why not simply exec the user's command as PID 1?",
+  "answer_hinglish": "Teen processes hain aur har ek ka kaam alag hai.\n\n1) Host (minibox process): state dir + overlay dirs aur cgroup leaf banata hai, unshare(CLONE_NEWPID), INIT fork karta hai, INIT ka pid cgroup.procs mein likhta hai, phir pipe par ek byte likh kar INIT ko aage jaane deta hai. Uske baad TERM/INT/HUP/QUIT/USR1/USR2 ko INIT ko forward karta hai, waitpid(init_pid) karta hai, aur finally mein cleanup(): cgroup.kill, stats, rmdir cgroup, state dir delete.\n\n2) INIT (PID 1, minibox ka apna Python code): unshare(mount, UTS, IPC, net), hostname, lo up, mount plan, pivot_root, phir CMD fork; uske baad sirf do duties -- waitpid(-1) loop se har orphan reap karna aur signals CMD ko forward karna. CMD exit -> INIT usi code se exit -> kernel namespace ke baaki sab ko SIGKILL karta hai.\n\n3) CMD (PID 2): signal dispositions reset (SIGPIPE samet), chdir(workdir), execvpe(command, clean env).\n\nCommand ko seedha PID 1 kyun nahi banaya? PLAN.md: PID 1 ko kernel default signal actions nahi deta -- jis signal ka handler nahi, woh drop. Toh shell ya web server PID 1 par docker stop ka SIGTERM chupchaap ignore karta hai, aur orphans ko reap nahi karta toh zombies jama hote hain. Yeh dono kaam ek chhota trusted init karta hai -- wahi jo docker run --init / tini add karta hai. Proof: test_sigterm_stops_a_command_without_a_handler -- exec sleep 1000 PID 2 par hai, SIGTERM par 143 aur 3 s ke andar. Mutations M5 (no reaping), M6 (INIT no forward), M7 (host no forward) sab pakde gaye.",
+  "why_needed": "Production mein 'docker stop 10 s tak latka phir SIGKILL' aur 'zombie processes' bahut common complaints hain; dono ka root cause PID 1 semantics hai.",
+  "real_world_analogy": "Building ka chowkidar (INIT): residents (CMD) apna kaam karte hain, chowkidar sirf gate par aaye notice (signals) andar pahunchata hai aur khaali flats (zombies) saaf karta hai. Society office (host) bahar se chowkidar ko hi notice deta hai.",
+  "how_it_works": "host: pipe, unshare(NEWPID), fork -> add_pid -> write pipe -> signal handlers -> waitpid -> cleanup. INIT: read pipe -> setup_container -> fork CMD -> handlers -> loop waitpid(-1) until pid == cmd_pid -> return exit_code_from_status. CMD: SIG_DFL resets -> chdir -> execvpe.",
+  "in_this_project": "minibox/container.py: run() (host), init_main() (INIT aur CMD dono, fork ke do branches), cleanup(). Config mein reap_zombies aur forward_signals flags hain jo sirf tests ke liye switch hote hain.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/minibox/container.py::cleanup",
+   "projects/16-container-runtime/PLAN.md",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_sigterm_stops_a_command_without_a_handler",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_orphans_are_reaped_by_init"
+  ],
+  "code_example": "# real, minibox/container.py init_main (end)\n    while True:\n        try:\n            pid, status = os.waitpid(-1 if cfg.reap_zombies else cmd_pid, 0)\n        except ChildProcessError:\n            return EXIT_SETUP_FAILED\n        if pid == cmd_pid:\n            # Returning makes PID 1 exit, and the kernel then SIGKILLs everything left in the\n            # namespace -- the same as docker: the container lives exactly as long as its command.\n            return exit_code_from_status(status)",
+  "code_language": "python",
+  "advantages": [
+   "User ka command normal PID 2 semantics paata hai: default signal actions kaam karte hain",
+   "Zombie reaping guaranteed, command chahe kuch bhi ho",
+   "Container ki life = command ki life, kernel ke ns-teardown se"
+  ],
+  "disadvantages": [
+   "Har container mein ek extra Python process (memory + start time)",
+   "Host process SIGKILL ho jaaye toh koi cleanup nahi karta (README NOT-done list)"
+  ],
+  "common_mistakes": [
+   "Shell ko PID 1 bana kar maan lena SIGTERM kaam karega",
+   "INIT mein sirf waitpid(cmd_pid) karna -- orphans zombie bante hain (M5)",
+   "Host side forward bhool jaana -- INIT tak signal hi nahi pahunchta (M7)"
+  ],
+  "follow_up_questions": [
+   "INIT ko Python ki jagah C/Go mein likhna kab worth hai?",
+   "exec into a running container (docker exec) is design mein kaise fit hoga?",
+   "Agar CMD khud ek init ho (systemd), tab kya karoge?"
+  ],
+  "concepts": [
+   "pid-1",
+   "init-process",
+   "signal-forwarding",
+   "zombie-reaping",
+   "tini"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Extra INIT process ki cost (ek Python interpreter, start time ka hissa) ke badle har command ko sahi PID 1 behaviour milta hai bina command badle. Alternative 'command as PID 1' sasta hai lekin har image ko khud signal handling aur reaping karni padti.",
+   "failure_scenarios": "Host process SIGKILL -> koi forward/cleanup nahi; container chalta rehta hai, cgroup aur state dir bachte hain. INIT crash -> kernel namespace kill karta hai, host 125 ya 128+N dekhta hai. M6 mutation run mein INIT ne SIGTERM forward nahi kiya toh do containers chalte reh gaye aur unhe cgroup.kill se roka gaya (SERVER_RUN.md).",
+   "alternatives": "Command ko hi PID 1 banana; tini/dumb-init jaisa chhota C init exec karna; PR_SET_CHILD_SUBREAPER se host process ko subreaper banana (lekin PID ns ka init phir bhi chahiye).",
+   "scale_10x_100x": "10x-100x containers par har container ka Python INIT memory aur start time mein dikhega; INIT ko chhote static binary se replace karna logical step hai. Yeh measure nahi kiya, sirf 1 container ka start (18 ms inner) measured hai.",
+   "production_improvements": "Chhota native init, host-side supervisor jo crash ke baad leftovers saaf kare (abhi minibox gc nahi hai), stop timeout ke baad SIGKILL escalation, aur INIT ka exit reason stats mein."
+  }
+ },
+ {
+  "id": "CTR-005",
+  "project_slug": "p16-container-runtime",
+  "category": "Core Concepts",
+  "difficulty": "Advanced",
+  "question": "Why does PID 1 inside a PID namespace ignore SIGTERM by default, and how does minibox make docker-stop-style SIGTERM work?",
+  "answer_hinglish": "Kernel PID namespace ke init (PID 1) ko protect karta hai: us par koi signal tabhi deliver hota hai jab PID 1 ne us signal ka handler install kiya ho. Default action (jaise SIGTERM ka 'terminate') PID 1 par apply nahi hota -- signal bas drop ho jaata hai. Exception: SIGKILL aur SIGSTOP agar ANCESTOR namespace se bheje gaye hon. Wajah: init mar gaya toh poora namespace mar jaata hai, toh galti se kill na ho.\n\nIska matlab: agar user ka shell ya server PID 1 hota, toh docker stop ka SIGTERM kuch nahi karta (aur docker grace period ke baad SIGKILL karta).\n\nminibox mein chain do hops ki hai. Host process run() mein FORWARDED_SIGNALS (TERM, INT, HUP, QUIT, USR1, USR2) ke liye handler lagata hai jo os.kill(init_pid, sig) karta hai. INIT init_main() mein unhi signals ke handlers lagata hai jo os.kill(cmd_pid, sig) karte hain -- handler hai, isliye kernel deliver karta hai. CMD (PID 2) exec se pehle sab ko SIG_DFL karta hai, toh wahan normal default action chalta hai.\n\nTests: test_sigterm_is_forwarded_to_the_command (trap wala shell 'got-term' print karke 42 se exit), test_sigterm_stops_a_command_without_a_handler (exec sleep 1000 -> 143, 3 s ke andar). Mutation M6 (INIT forward nahi karta): 2 failed + 2 errors; M7 (host forward nahi karta): 2 + 3 errors. M6 ke pehle run mein do containers chalte reh gaye the aur cgroup.kill se roke gaye.",
+  "why_needed": "Graceful shutdown (connections drain, files flush) SIGTERM par depend karta hai. PID 1 par yeh silently fail hota hai, aur symptom sirf 'stop slow hai' dikhta hai.",
+  "real_world_analogy": "Raja (PID 1) ke paas sirf woh chitthi pahunchti hai jiske liye usne munshi (handler) rakha hai; baaki chitthiyan darbaan hi phenk deta hai. minibox ka INIT munshi rakhta hai jo chitthi aage CMD ko de deta hai.",
+  "how_it_works": "Kernel signal delivery mein check: target ns init hai aur handler SIG_DFL hai aur sender same ns ya signal SIGKILL/SIGSTOP from ancestor nahi -> ignore. INIT Python signal.signal(sig, forward) se handler install karta hai, toh check pass.",
+  "in_this_project": "minibox/container.py: FORWARDED_SIGNALS tuple; run() mein host-side forward(); init_main() mein INIT-side forward(); CMD branch mein SIG_DFL reset. Config.forward_signals sirf tests ke liye off hota hai.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::FORWARDED_SIGNALS",
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_sigterm_is_forwarded_to_the_command",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_sigterm_stops_a_command_without_a_handler",
+   "projects/16-container-runtime/SERVER_RUN.md"
+  ],
+  "code_example": "# real, minibox/container.py init_main (trimmed)\n    # PID 1 of a namespace gets NO default signal actions: a signal it has no handler for is simply\n    # dropped (only SIGKILL / SIGSTOP from an ancestor namespace get through).\n    if cfg.forward_signals:\n        def forward(sig, _frame):\n            try:\n                os.kill(cmd_pid, sig)\n            except ProcessLookupError:\n                pass\n        for sig in FORWARDED_SIGNALS:\n            signal.signal(sig, forward)",
+  "code_language": "python",
+  "advantages": [
+   "User ke command ko normal signal semantics milte hain",
+   "Dono hops alag mutations se prove kiye (M6, M7)"
+  ],
+  "disadvantages": [
+   "Sirf listed 6 signals forward hote hain (SIGWINCH jaise nahi)",
+   "Handlers fork ke baad install hote hain; CMD fork aur handler ke beech chhota window hai jismein aaya SIGTERM INIT par drop ho sakta hai"
+  ],
+  "common_mistakes": [
+   "Sochna ki 'kill -TERM 1' andar se bhi kaam karega bina handler ke",
+   "Sirf INIT mein forward karna, host mein nahi -- tab signal INIT tak pahunchta hi nahi (M7)",
+   "CMD mein inherited handlers/ignores reset na karna"
+  ],
+  "follow_up_questions": [
+   "SIGKILL ancestor namespace se kyun PID 1 tak pahunchta hai?",
+   "Forwarding window (fork ke baad, handler se pehle) ko kaise band karoge?",
+   "Process group ko signal forward karna vs sirf CMD ko -- fark?"
+  ],
+  "concepts": [
+   "pid-1",
+   "signals",
+   "signal-forwarding",
+   "docker-stop"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Do-hop forwarding simple hai aur user command ko kuch nahi badalna padta. Cost: har signal do baar handle hota hai aur list hard-coded hai.",
+   "failure_scenarios": "M6 run mein INIT ne forward nahi kiya -> test ka container kabhi nahi ruka, aur agle mutation runs ne uske cgroups dekhe; fix: fixture ab leftover cgroups ko kill karke fail karta hai. Handler install hone se pehle aaya signal drop ho sakta hai (code mein dikhta hai, test nahi kiya).",
+   "alternatives": "Command ko PID 1 banana aur use handler likhne ko kehna; tini jaisa init jo process group ko forward kare; signalfd/sigprocmask se signals block karke fork se pehle hi pending rakhna.",
+   "scale_10x_100x": "Signals per-container hain, toh container count badhne se design nahi badalta. Zyada containers par ek supervisor (host process per container ke bajaye) ko signal routing table chahiye hogi -- yeh minibox mein nahi hai.",
+   "production_improvements": "Fork se pehle signals block karna aur handler ke baad unblock (window band), SIGWINCH/SIGCONT forward, stop ke liye timeout + SIGKILL escalation, aur forward hue signals ka log."
+  }
+ },
+ {
+  "id": "CTR-006",
+  "project_slug": "p16-container-runtime",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does minibox's INIT reap zombies, and why must it call waitpid(-1) instead of waitpid(cmd_pid)?",
+  "answer_hinglish": "Jab koi process exit hota hai toh kernel uski process-table entry tab tak rakhta hai jab tak parent wait() karke exit status na le le -- tab tak woh 'zombie' hai. Agar parent pehle mar gaya, toh child orphan ho jaata hai aur kernel use namespace ke PID 1 ko re-parent kar deta hai. Matlab container ke andar jitne bhi orphans bane, sab INIT ke children ban jaate hain, aur unka wait karna INIT ki zimmedari hai.\n\ninit_main() ka loop: os.waitpid(-1, 0) -- '-1' matlab koi bhi child. Har baar ek child reap hota hai; agar woh cmd_pid hai toh exit_code_from_status(status) return, warna loop chalta rehta hai (woh ek orphan tha, ab saaf). ChildProcessError aaye (koi child bacha hi nahi) toh EXIT_SETUP_FAILED.\n\nwaitpid(cmd_pid) kyun galat: tab INIT sirf command ka intezaar karta, aur beech mein re-parent hue orphans exit hone ke baad zombie bane rehte, namespace khatam hone tak. Long-running server jo har request par child fork karta hai, process table bhar sakta hai -- aur pids.max = 32 jaise limit mein zombies bhi count hote hain.\n\nTest test_orphans_are_reaped_by_init: andar ek inner sh 'sleep 0.2 &' chhod kar exit karta hai, sleep INIT ko re-parent hota hai; 1.2 s baad saare /proc/*/status mein 'zombie' nahi hona chahiye. Mutation M5 (INIT sirf command ka wait kare, reap_zombies=False path) ne yeh test red kiya.",
+  "why_needed": "Zombie leak dheere dheere hota hai aur pids limit ya process table ko bhar deta hai; root cause samajhna production debugging ka basic hai.",
+  "real_world_analogy": "Hostel warden (PID 1): jin bachchon ke parents chale gaye, unka checkout form (exit status) warden ko hi sign karna padta hai, warna room (process table entry) kabhi khaali nahi hota.",
+  "how_it_works": "child exit -> state Z -> parent waitpid -> entry freed. Parent pehle mara -> child reparent to ns init. INIT: loop waitpid(-1, 0) -> pid == cmd_pid ? return code : continue.",
+  "in_this_project": "minibox/container.py init_main() ka while True loop; Config.reap_zombies (sirf test/mutation ke liye False). Test tests/integration/test_isolation.py::test_orphans_are_reaped_by_init.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/minibox/container.py::Config",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_orphans_are_reaped_by_init",
+   "projects/16-container-runtime/README.md"
+  ],
+  "code_example": "# real, tests/integration/test_isolation.py\ndef test_orphans_are_reaped_by_init(box):\n    # the inner sh exits at once, its 'sleep 0.2' is re-parented to PID 1 and exits 0.2 s later;\n    # 1 s after that it must be gone, not a zombie\n    r = box.run(\"sh -c 'sleep 0.2 &'; sleep 1.2; grep -h '^State' /proc/[0-9]*/status | sort | uniq -c\")\n    assert r.returncode == 0, r.stderr\n    assert \"zombie\" not in r.stdout, r.stdout",
+  "code_language": "python",
+  "advantages": [
+   "Ek simple blocking loop, koi SIGCHLD handler ki zaroorat nahi",
+   "Command exit hote hi turant return"
+  ],
+  "disadvantages": [
+   "Command exit ke baad bache hue orphans reap nahi hote -- woh kernel ke ns-kill par jaate hain",
+   "Blocking waitpid ke dauran Python signal handlers chalte hain, toh EINTR handling Python par depend"
+  ],
+  "common_mistakes": [
+   "waitpid(cmd_pid) ko kaafi samajhna",
+   "ChildProcessError handle na karna",
+   "Zombie ko 'running process' samajh kar kill karne ki koshish (zombie pehle hi mara hua hai)"
+  ],
+  "follow_up_questions": [
+   "PR_SET_CHILD_SUBREAPER kya hai aur yahan kyun nahi chahiye?",
+   "Kya zombies pids.max mein count hote hain?",
+   "SIGCHLD handler + WNOHANG loop vs blocking waitpid -- kab kya?"
+  ],
+  "concepts": [
+   "zombie",
+   "waitpid",
+   "orphan-reparenting",
+   "pid-1"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-007",
+  "project_slug": "p16-container-runtime",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What exit codes does minibox return (0-255, 125, 126, 127, 128+N), and what does each mean?",
+  "answer_hinglish": "minibox docker jaise exit codes deta hai taaki scripts aur CI unhe same tarah samajh sakein:\n\n- Command ka apna code: exit 0 -> 0, exit 7 -> 7, exit 255 -> 255.\n- 128+N: command signal N se mara. kill -9 -> 137 (128+9), kill -TERM -> 143 (128+15). OOM killer bhi SIGKILL bhejta hai, isliye memory limit hit hone par 137 aata hai -- README ka L2 table: 3 of 3 hogs exit 137, oom_kill 1, peak 64.0 MiB.\n- 125: minibox khud container set up nahi kar paaya -- rootfs directory nahi hai, name already use mein hai, cgroup controller missing, mount fail, workdir nahi mila, ya run() ka koi OSError/RuntimeError/ValueError.\n- 126: command mila lekin execute nahi ho sakta (PermissionError) -- test /etc/passwd chalata hai.\n- 127: command nahi mila (FileNotFoundError) -- test /no/such/binary chalata hai aur stderr mein 'not found' check karta hai.\n\nConstants container.py mein hain: EXIT_SETUP_FAILED = 125, EXIT_NOT_EXECUTABLE = 126, EXIT_NOT_FOUND = 127. 126/127 CMD ke andar execvpe ke exceptions se aate hain aur os._exit se nikalte hain; INIT us status ko exit_code_from_status se convert karta hai aur khud usi code se exit karta hai; host process INIT ka status phir se convert karta hai. CLI mein bhi Linux ya root na ho toh 125. Galat arguments argparse ka code 2 dete hain (test_bad_arguments_exit_2).",
+  "why_needed": "Automation (CI, orchestrators, retry logic) exit code se decide karta hai ki command fail hua, container setup fail hua, ya OOM hua. Galat mapping se galat retry/alert hota hai.",
+  "real_world_analogy": "Courier ki delivery report: 'delivered' (0), 'customer ne mana kiya' (command ka code), 'gaadi hi start nahi hui' (125), 'address mila par gate band' (126), 'address hi nahi mila' (127), 'raste mein accident' (128+N).",
+  "how_it_works": "execvpe FileNotFoundError -> _exit(127); PermissionError -> _exit(126); doosra error ya bad workdir -> _exit(125). Normal exit ya signal -> waitpid status -> waitstatus_to_exitcode -> negative ho toh 128 - code.",
+  "in_this_project": "minibox/container.py constants aur init_main() ka CMD branch; exit_code_from_status(). Tests: test_exit_code_is_propagated (parametrized 0, 7, 255, 137, 143), test_command_not_found_is_127, test_not_executable_is_126, test_bad_rootfs_is_125.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::EXIT_SETUP_FAILED",
+   "projects/16-container-runtime/minibox/container.py::EXIT_NOT_FOUND",
+   "projects/16-container-runtime/minibox/container.py::exit_code_from_status",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_exit_code_is_propagated",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_command_not_found_is_127",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_not_executable_is_126"
+  ],
+  "code_example": "# real, minibox/container.py init_main, CMD branch (trimmed)\n            os.execvpe(cfg.command[0], cfg.command, env)\n        except FileNotFoundError:\n            print(f\"minibox: {cfg.command[0]}: command not found\", file=sys.stderr)\n            os._exit(EXIT_NOT_FOUND)\n        except PermissionError:\n            print(f\"minibox: {cfg.command[0]}: permission denied\", file=sys.stderr)\n            os._exit(EXIT_NOT_EXECUTABLE)\n        except BaseException as e:\n            print(f\"minibox: exec failed: {e}\", file=sys.stderr)\n            os._exit(EXIT_SETUP_FAILED)",
+  "code_language": "python",
+  "advantages": [
+   "Docker jaisi convention: existing scripts kaam karte hain",
+   "Har code ka integration test hai"
+  ],
+  "disadvantages": [
+   "Command khud 125/126/127 return kare toh minibox ke codes se alag nahi pehchaana ja sakta",
+   "137 ka matlab OOM ya manual kill -9 dono ho sakta hai; fark memory.events se dekhna padta hai"
+  ],
+  "common_mistakes": [
+   "137 dekh kar hamesha OOM maan lena",
+   "Exec failure ko generic 1 return karna",
+   "Signal death ko negative number ya 0 report karna"
+  ],
+  "follow_up_questions": [
+   "137 OOM tha ya kill -9, kaise pata karoge?",
+   "Shell khud 126/127 kaise decide karta hai?",
+   "125 ke andar alag alag setup errors ko distinguish kaise karoge?"
+  ],
+  "concepts": [
+   "exit-codes",
+   "oom-kill",
+   "exec",
+   "signals"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-008",
+  "project_slug": "p16-container-runtime",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Explain exit_code_from_status. How is a raw waitpid status encoded, and how does minibox turn death-by-signal into 128+N?",
+  "answer_hinglish": "os.waitpid jo status deta hai woh ek packed integer hai. POSIX encoding: normal exit mein exit code high byte mein hota hai (status = code << 8), aur signal se mara toh low 7 bits mein signal number hota hai (core dump flag ek bit upar). Isliye unit test raw values use karta hai: exit_code_from_status(7 << 8) == 7, (0) == 0, (9) == 137, (15) == 143.\n\nminibox khud bits nahi kholta. Python 3.9+ ka os.waitstatus_to_exitcode(status) yeh decode karta hai: normal exit par positive code, signal par NEGATIVE signal number (SIGKILL -> -9). Function bas itna karta hai: code < 0 ho toh 128 - code (128 - (-9) = 137), warna code jaisa hai. Do lines, koi WIFEXITED/WTERMSIG manual masking nahi.\n\nYeh function do jagah chalta hai: INIT mein (CMD ka status -> INIT ka exit code) aur host mein (INIT ka status -> minibox ka exit code). Kyunki INIT normal exit karta hai os._exit(code) se, host ko 137 bhi 'normal exit 137' ki tarah milta hai, toh double conversion safe hai. Agar INIT khud kisi signal se mare (jaise cgroup OOM ne INIT ko hi maara), host ko signal status milta hai aur wahi 128+N mapping lagti hai.\n\nMutation M11 (death by signal 128+N par map nahi kiya) ne integration mein 3 tests red kiye -- test_exit_code_is_propagated ke 137 aur 143 cases aur test_sigterm_stops_a_command_without_a_handler.",
+  "why_needed": "Bina mapping ke signal death ka code galat aata (Python negative deta hai, aur sys.exit negative ko 0-255 mein wrap kar deta), aur caller OOM ko pehchaan nahi pata.",
+  "real_world_analogy": "Hospital report ka code: 'discharged with note X' (exit code) vs 'emergency type N' (signal). Report card par emergency ko 128+N likhne ki convention hai taaki dono ek hi column mein fit hon.",
+  "how_it_works": "raw status -> os.waitstatus_to_exitcode -> >=0: exit code; <0: -signum -> 128 + signum. INIT: return exit_code_from_status(status) -> os._exit(code). Host: phir waitpid -> same function.",
+  "in_this_project": "minibox/container.py exit_code_from_status; tests/unit/test_cli.py::test_exit_code_from_status (POSIX par hi chalta hai, skipif WIFEXITED nahi). Integration test_exit_code_is_propagated.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::exit_code_from_status",
+   "projects/16-container-runtime/tests/unit/test_cli.py::test_exit_code_from_status",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_exit_code_is_propagated"
+  ],
+  "code_example": "# real, minibox/container.py\ndef exit_code_from_status(status: int) -> int:\n    \"\"\"os.waitpid status -> shell-style exit code (128+N for death by signal N).\"\"\"\n    code = os.waitstatus_to_exitcode(status)\n    return 128 - code if code < 0 else code\n\n# real, tests/unit/test_cli.py (trimmed)\n    assert exit_code_from_status(7 << 8) == 7\n    assert exit_code_from_status(9) == 128 + 9       # SIGKILL -> 137, like docker",
+  "code_language": "python",
+  "advantages": [
+   "Stdlib decoder use karta hai, bit masking ki galti ka chance nahi",
+   "Pure function, unit test raw statuses se"
+  ],
+  "disadvantages": [
+   "Stopped/continued statuses handle nahi (waitpid bina WUNTRACED ke unhe deta hi nahi)",
+   "Core dump hua ya nahi, yeh information drop ho jaati hai"
+  ],
+  "common_mistakes": [
+   "status ko seedha exit code maan lena (7 << 8 = 1792)",
+   "Negative code ko sys.exit mein dena",
+   "INIT aur host dono jagah conversion bhool jaana"
+  ],
+  "follow_up_questions": [
+   "Shell 128+N convention kyun use karta hai aur 255 se upar kya hota hai?",
+   "Core dump flag kaise padhoge?",
+   "Agar INIT khud OOM-kill ho jaaye toh host kya report karega?"
+  ],
+  "concepts": [
+   "waitpid",
+   "exit-status",
+   "signals",
+   "posix"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-009",
+  "project_slug": "p16-container-runtime",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "What is the difference between chroot and pivot_root, and why does minibox use pivot_root?",
+  "answer_hinglish": "chroot(dir) sirf ek cheez badalta hai: IS process ke path lookups kahan se shuru hon. Host ka poora filesystem tree namespace mein ab bhi mounted hai; process ka '/' bas ek pointer badal gaya. Root process (CAP_SYS_CHROOT ke saath, jo minibox container rakhta hai) usse wapas bahar nikal sakta hai -- classic chroot escape.\n\npivot_root(new_root, put_old) poore mount namespace ka root MOUNT swap karta hai: new_root namespace ka / ban jaata hai aur purana root put_old par chala jaata hai. Phir minibox umount2('/.oldroot', MNT_DETACH) se purana root detach karta hai aur directory rmdir. Ab namespace mein host ka tree kahin mounted hi nahi hai, toh '..' se climb karne ke liye kuch bacha hi nahi.\n\nminibox mein: mounts.enter_root(new_root, use_pivot_root=True) yeh karta hai. chroot wala branch sirf ek test ke liye exist karta hai jo fark prove karta hai. Do tests: test_pivot_root_cannot_be_escaped (escape fail) aur test_chroot_alone_can_be_escaped (control: wahi escape chroot par host-only marker file tak pahunch jaata hai). Mutation M1 (pivot_root ki jagah chroot) ne pehla test red kiya. Saath hi README ka caveat: pivot_root sirf YEH raasta band karta hai; sab capabilities rakhne wala root abhi bhi doosre tareekon se (mknod + mount host disk) bahar ja sakta hai.",
+  "why_needed": "Bahut tutorials chroot se 'container' banate hain; interview mein yeh pehchaanna ki chroot isolation nahi hai, basic expectation hai.",
+  "real_world_analogy": "chroot = kisi ko ek kamre mein bitha kar kehna 'yahi tumhari duniya hai', jabki darwaza khula hai. pivot_root + detach = poori building hi badal di aur purani building ka raasta tod diya.",
+  "how_it_works": "chroot: current->fs->root = dir. pivot_root: namespace ka root mount -> new_root, old root mount -> put_old. umount2(MNT_DETACH): old root lazily detach, namespace se gayab.",
+  "in_this_project": "minibox/mounts.py enter_root(); minibox/libc.py pivot_root (syscall number se). Tests tests/integration/test_isolation.py ke end mein; README section 'Why pivot_root and not chroot'.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::enter_root",
+   "projects/16-container-runtime/minibox/libc.py::pivot_root",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_pivot_root_cannot_be_escaped",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_chroot_alone_can_be_escaped",
+   "projects/16-container-runtime/README.md"
+  ],
+  "code_example": "# real, minibox/mounts.py enter_root (trimmed)\n    if use_pivot_root:\n        put_old = os.path.join(new_root, OLD_ROOT)\n        libc.pivot_root(new_root, put_old)\n        os.chdir(\"/\")\n        libc.umount2(\"/\" + OLD_ROOT, libc.MNT_DETACH)\n        os.rmdir(\"/\" + OLD_ROOT)\n    else:\n        os.chdir(new_root)\n        os.chroot(\".\")\n        os.chdir(\"/\")",
+  "code_language": "python",
+  "advantages": [
+   "Host tree namespace se poori tarah hat jaata hai",
+   "Dono behaviour tests se prove, sirf claim nahi"
+  ],
+  "disadvantages": [
+   "pivot_root ko mount point aur non-shared mounts chahiye (extra setup)",
+   "Capabilities ke saath root ab bhi doosre raaste se nikal sakta hai"
+  ],
+  "common_mistakes": [
+   "chroot ko security feature samajhna",
+   "pivot_root ke baad old root detach na karna (M2)",
+   "Sochna ki pivot_root akela container ko safe bana deta hai"
+  ],
+  "follow_up_questions": [
+   "pivot_root ki preconditions kya hain?",
+   "MNT_DETACH aur normal umount mein kya fark hai?",
+   "Capability drop ke bina aur kaun se escape raaste hain?"
+  ],
+  "concepts": [
+   "chroot",
+   "pivot_root",
+   "mount-namespace",
+   "isolation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-010",
+  "project_slug": "p16-container-runtime",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Walk through the chroot escape step by step, why pivot_root stops it, and how the two tests prove it (including why the second test is a control).",
+  "answer_hinglish": "Escape (README ka pseudo-code): mkdir('x'); chroot('x'); -- naya root /x hai lekin CWD abhi bhi '/' hai, yaani naye root ke BAHAR. Phir chdir('..') 64 baar: kernel '..' ko process ke root par tabhi rokta hai jab path walk us root se GUZRE; humara cwd root ke andar hai hi nahi, toh walk chalta rehta hai aur host ke real / tak pahunch jaata hai. Phir chroot('.') -- ab host ka / hi root hai. Escaped. Yeh root process ke liye kaam karta hai jiske paas CAP_SYS_CHROOT hai, aur minibox container saari capabilities rakhta hai.\n\npivot_root kyun rokta hai: pivot_root namespace ka root mount badalta hai aur minibox purana root /.oldroot se MNT_DETACH karke rmdir karta hai. Ab container khud bhi chroot('/escape-dir') karke cwd bahar rakhe, toh bhi '..' climb karke jo top milta hai woh naye root mount ka top hai -- us mount ke upar namespace mein kuch mounted nahi. Host tree hi nahi hai.\n\nTest _escape_attempt forked child mein ASLI setup_container() chalata hai (overlay ke saath), confirm karta hai marker pehle visible nahi, phir exactly yahi escape karta hai aur pipe par '1' ya '0' bhejta hai ki host-only HOST-ONLY-MARKER file dikhi ya nahi. test_pivot_root_cannot_be_escaped expect karta hai False. test_chroot_alone_can_be_escaped (use_pivot_root=False) expect karta hai True -- yeh control experiment hai: agar escape code hi toota hota (jaise marker path galat), toh pehla test bina kuch prove kiye green hota. Control dikhata hai ki yahi code chroot par sach mein bahar nikalta hai. M1 (pivot_root -> chroot) ne pehla test red kiya.",
+  "why_needed": "Negative test ('escape nahi hua') tabhi meaningful hai jab saabit ho ki attack code sach mein kaam karta hai; yeh testing discipline security-adjacent code mein bahut important hai.",
+  "real_world_analogy": "Jail ka test: pehle purani jail mein (chroot) wahi surang khod kar dikhao ki bahar nikal sakte ho (control), phir nayi jail mein (pivot_root) wahi surang try karo. Sirf nayi jail par try karna aur fail hona kuch prove nahi karta.",
+  "how_it_works": "chroot escape: root changes, cwd outside root -> '..' walk never meets root -> reaches real / -> chroot('.'). pivot_root: real / no longer mounted in ns -> walk tops out at the container root mount.",
+  "in_this_project": "tests/integration/test_isolation.py _escape_attempt, test_pivot_root_cannot_be_escaped, test_chroot_alone_can_be_escaped; minibox/mounts.py enter_root ka use_pivot_root flag (container Config.use_pivot_root) sirf is test ke liye.",
+  "implementation_files": [
+   "projects/16-container-runtime/tests/integration/test_isolation.py::_escape_attempt",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_pivot_root_cannot_be_escaped",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_chroot_alone_can_be_escaped",
+   "projects/16-container-runtime/minibox/mounts.py::enter_root",
+   "projects/16-container-runtime/README.md"
+  ],
+  "code_example": "# real, tests/integration/test_isolation.py _escape_attempt (trimmed)\n            setup_container(Config(rootfs=rootfs, command=[\"x\"], use_pivot_root=use_pivot_root),\n                            mounts.build_plan(rootfs, o))\n            assert not os.path.exists(str(marker))          # before the escape: not visible\n            os.mkdir(\"/escape-dir\")\n            os.chroot(\"/escape-dir\")                        # cwd is still OUTSIDE the new root\n            for _ in range(64):\n                os.chdir(\"..\")\n            os.chroot(\".\")\n            result = b\"1\" if os.path.exists(str(marker)) else b\"0\"",
+  "code_language": "python",
+  "advantages": [
+   "Attack real setup code ke against chalta hai, mock ke against nahi",
+   "Control test false-green ko pakadta hai",
+   "Mutation M1 se proven ki test sensitive hai"
+  ],
+  "disadvantages": [
+   "Sirf ek escape technique test hoti hai, saari nahi",
+   "Linux + root + rootfs chahiye; Windows par skip"
+  ],
+  "common_mistakes": [
+   "Sirf negative test likhna bina control ke",
+   "Escape ke baad marker check karna bina pehle check ke ki marker setup ke baad invisible tha",
+   "Child process mein exception par parent ko kuch na bhejna (yahan 'E' bheja jaata hai aur dict lookup fail karta hai)"
+  ],
+  "follow_up_questions": [
+   "Is test ko kaise badloge taaki mknod + mount host disk escape bhi cover ho?",
+   "Child mein os._exit kyun, sys.exit kyun nahi?",
+   "Capability CAP_SYS_CHROOT drop karne se kya chroot escape band ho jaata?"
+  ],
+  "concepts": [
+   "chroot-escape",
+   "pivot_root",
+   "control-experiment",
+   "testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "pivot_root + detach mount-level isolation deta hai lekin preconditions (private mounts, new_root mount point) laata hai; chroot simple hai par path-level sirf. Test ke liye use_pivot_root flag production Config mein hai -- ek test-only knob production code mein, jo trade-off hai.",
+   "failure_scenarios": "Agar escape code toota ho (marker path galat, chdir loop chhota), pivot_root test bina control ke false-green deta. Agar child mein setup fail ho, 'E' bheja jaata hai aur {b'1', b'0'}[b'E'] KeyError se test fail hota hai -- silent pass nahi.",
+   "alternatives": "Sirf chroot + capability drop (CAP_SYS_CHROOT hatao); user namespace mein chroot; Landlock/seccomp se chroot syscall block.",
+   "scale_10x_100x": "Test count/scale ka sawaal nahi; per-container cost zero hai. 100x containers par bhi escape protection same hai kyunki yeh per-namespace property hai.",
+   "production_improvements": "Capability drop (CAP_SYS_CHROOT, CAP_SYS_ADMIN, CAP_MKNOD), seccomp, user namespace -- jo README ki NOT-done list mein hain -- taaki doosre escape raaste bhi band hon, aur unke liye bhi control + negative test pairs."
+  }
+ },
+ {
+  "id": "CTR-011",
+  "project_slug": "p16-container-runtime",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "Explain enter_root line by line: pivot_root, chdir('/'), umount2(MNT_DETACH), rmdir. What breaks if a step is skipped?",
+  "answer_hinglish": "enter_root(new_root) ke chaar steps:\n\n1) libc.pivot_root(new_root, new_root/.oldroot): namespace ka root mount new_root ban jaata hai, purana root .oldroot par chala jaata hai. .oldroot directory build_plan ka aakhri step (Mkdir 0o700) pehle hi bana chuka hai, kyunki put_old new_root ke andar existing directory honi chahiye.\n\n2) os.chdir('/'): pivot_root process ka cwd khud nahi badalta. Cwd purane tree mein ho sakta hai (host path). '/' par aane se cwd naye root mein aa jaata hai -- warna cwd purane root ka reference pakde rehta aur umount bhi mushkil.\n\n3) libc.umount2('/.oldroot', MNT_DETACH): purana root (poora host tree) namespace se detach. MNT_DETACH lazy unmount hai: busy ho tab bhi mount tree se turant hat jaata hai. Normal umount EBUSY de sakta tha kyunki uske neeche bahut submounts hain.\n\n4) os.rmdir('/.oldroot'): khaali directory hata do taaki container mein ajeeb /.oldroot na dikhe.\n\nStep 3 skip karo = mutation M2: host ka poora tree /.oldroot par container ke andar visible -- test_only_the_containers_own_mounts_are_visible (jo /proc/mounts mein exactly /, /dev, /dev/pts, /dev/shm, /proc expect karta hai) red. pivot_root ko chroot se replace = M1. libc.pivot_root koi glibc wrapper nahi -- syscall number se call hota hai (aarch64 41, x86_64 155), aur _check failure par errno ke saath OSError deta hai.",
+  "why_needed": "pivot_root ko 'ek call' samajhna galti hai; bina detach ke host tree container mein mount ki tarah pada rehta hai aur saara isolation bekaar.",
+  "real_world_analogy": "Ghar shift karna: naye ghar mein jao (pivot_root), apna saaman bhi naye ghar mein rakho (chdir), purane ghar ki chabi phenk do (detach), aur purane ghar ka khaali dabba bhi hata do (rmdir).",
+  "how_it_works": "pivot_root -> ns root = new_root, old at put_old; chdir('/') -> cwd fixed; umount2(MNT_DETACH) -> old tree detached lazily; rmdir -> mountpoint dir gone.",
+  "in_this_project": "minibox/mounts.py enter_root aur OLD_ROOT = '.oldroot'; build_plan ka last step Mkdir(j(OLD_ROOT), 0o700) (unit test test_root_before_proc_before_dev_and_oldroot_last). Syscall wrappers minibox/libc.py.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::enter_root",
+   "projects/16-container-runtime/minibox/mounts.py::OLD_ROOT",
+   "projects/16-container-runtime/minibox/libc.py::umount2",
+   "projects/16-container-runtime/minibox/libc.py::pivot_root",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_root_before_proc_before_dev_and_oldroot_last",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_only_the_containers_own_mounts_are_visible"
+  ],
+  "code_example": "# real, minibox/mounts.py enter_root (trimmed)\n    if use_pivot_root:\n        put_old = os.path.join(new_root, OLD_ROOT)\n        libc.pivot_root(new_root, put_old)\n        os.chdir(\"/\")\n        libc.umount2(\"/\" + OLD_ROOT, libc.MNT_DETACH)\n        os.rmdir(\"/\" + OLD_ROOT)",
+  "code_language": "python",
+  "advantages": [
+   "Chaar chhote steps, har ek ka reason code comment aur test mein",
+   "MNT_DETACH busy submounts par bhi kaam karta hai"
+  ],
+  "disadvantages": [
+   "MNT_DETACH lazy hai: agar koi fd purane tree par khula ho toh woh access rakhta hai",
+   "Error handling: beech mein fail hua toh partial state (lekin INIT 125 se exit karta hai aur namespace mar jaata hai)"
+  ],
+  "common_mistakes": [
+   "chdir('/') bhool jaana",
+   "Normal umount2 bina MNT_DETACH ke aur EBUSY",
+   "put_old directory pehle se na banana"
+  ],
+  "follow_up_questions": [
+   "pivot_root ke baad khule file descriptors host files ki taraf point karein toh?",
+   "pivot_root('.', '.') trick kya hai jo runc use karta hai?",
+   "rmdir fail ho toh kya karna chahiye?"
+  ],
+  "concepts": [
+   "pivot_root",
+   "umount2",
+   "mnt-detach",
+   "mount-namespace"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-012",
+  "project_slug": "p16-container-runtime",
+  "category": "Architecture & System Design",
+  "difficulty": "Advanced",
+  "question": "Why is the mount setup built as a plan of data (build_plan returning Mount/Mkdir/Mknod/Symlink steps) and then applied, instead of calling mount() directly?",
+  "answer_hinglish": "mounts.build_plan(rootfs, overlay) ek pure function hai: koi syscall nahi, sirf ek Plan(new_root, steps) return karta hai jismein frozen dataclasses hain -- Mount(source, target, fstype, flags, data), Mkdir(path, mode), Mknod(path, major, minor, mode), Symlink(path, target). apply_plan(plan) unhe order mein apply_step se execute karta hai.\n\nFayda: mount code ka sabse risky hissa ORDER aur FLAGS hai, aur woh ab kisi bhi OS par unit test ho sakta hai (dev machine Windows hai). tests/unit/test_mounts.py check karta hai: pehla step Mount(None, '/', None, MS_REC|MS_PRIVATE) hai; overlay data exactly 'lowerdir=...,upperdir=...,workdir=...'; mount kinds ka order private, overlay, proc, tmpfs, devpts, tmpfs; proc ke flags NOSUID|NOEXEC|NODEV; saare Mknod /dev ke tmpfs ke BAAD (warna device nodes image mein hi ban jaate); har target new_root ke andar (test_every_target_is_inside_new_root); flag values Linux headers se match. Effect alag se integration tests prove karte hain (test_minimal_dev, test_root_is_the_overlay).\n\nEk aur design point: plan host process mein run() ke andar bante hai (overlay_options ke ValueError jaise galat paths ',' ':' wahi pakde jaate hain, 125 ke saath), aur apply INIT ke naye mount namespace mein hota hai. Trade-off: indirection ki ek layer, aur plan sirf 'kya' batata hai -- runtime state (jaise path already exists) apply_step handle karta hai (lexists -> unlink).",
+  "why_needed": "Privileged, order-sensitive side effects ko test karna mushkil hai; unhe data mein badalna 'functional core, imperative shell' pattern hai jo test speed aur review dono aasaan karta hai.",
+  "real_world_analogy": "Shaadi ka event plan: pehle kaagaz par list (pehle tent, phir lights, phir stage) jise koi bhi padh kar galti pakad le; phir team usse execute kare. Direct execute karte waqt order galti tab pata chalti jab stage tent se pehle khada ho.",
+  "how_it_works": "build_plan -> [Mount private /, Mount overlay|bind, Mkdir proc, Mount proc, Mkdir dev, Mount tmpfs dev, Mknod x6, Symlink x5, Mkdir pts, Mount devpts, Mkdir shm, Mount shm, Mkdir .oldroot] -> apply_plan loops apply_step -> enter_root.",
+  "in_this_project": "minibox/mounts.py: dataclasses Mount, Mkdir, Mknod, Symlink, Plan; build_plan, apply_step, apply_plan. container.run() plan banata hai, setup_container() apply karta hai. Unit tests tests/unit/test_mounts.py.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::build_plan",
+   "projects/16-container-runtime/minibox/mounts.py::apply_plan",
+   "projects/16-container-runtime/minibox/mounts.py::apply_step",
+   "projects/16-container-runtime/minibox/mounts.py::Plan",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_root_before_proc_before_dev_and_oldroot_last",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_every_target_is_inside_new_root",
+   "projects/16-container-runtime/PLAN.md"
+  ],
+  "code_example": "# real, tests/unit/test_mounts.py\ndef test_root_before_proc_before_dev_and_oldroot_last():\n    plan = build_plan(ROOT, overlay())\n    kinds = [m.fstype or (\"bind\" if m.flags & libc.MS_BIND else \"private\") for m in mounts_of(plan)]\n    assert kinds == [\"private\", \"overlay\", \"proc\", \"tmpfs\", \"devpts\", \"tmpfs\"]\n    assert plan.steps[-1] == Mkdir(os.path.join(plan.new_root, mounts.OLD_ROOT), 0o700)",
+  "code_language": "python",
+  "advantages": [
+   "Order aur flags Windows par bhi unit test",
+   "Plan print/review kiya ja sakta hai, jaise dry-run",
+   "Setup errors (bad overlay paths) fork se pehle host mein pakde jaate hain"
+  ],
+  "disadvantages": [
+   "Ek extra layer of indirection",
+   "Plan runtime state nahi jaanta; apply_step ko existing files handle karni padti hain",
+   "Unit tests yeh prove nahi karte ki kernel flags ko waise hi samjhega -- uske liye integration tests"
+  ],
+  "common_mistakes": [
+   "Plan ko immutable na rakhna aur beech mein mutate karna",
+   "Sirf unit tests par bharosa karna (M3, M4 jaise effects integration se pakde gaye)",
+   "Mknod ko /dev tmpfs se pehle rakh dena"
+  ],
+  "follow_up_questions": [
+   "Is plan ko OCI runtime-spec config.json ke mounts list se kaise compare karoge?",
+   "Plan ka rollback (undo) kaise design karoge?",
+   "Kaunsi galti unit test pakad sakta hai aur kaunsi sirf integration?"
+  ],
+  "concepts": [
+   "functional-core",
+   "mount-plan",
+   "testability",
+   "dataclasses"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Data plan testability aur review deta hai, cost ek indirection layer hai. Direct syscalls kam code hain par order bugs sirf root + Linux par dikhte. minibox ka dev PC Windows hai, isliye yeh decision zaroori tha.",
+   "failure_scenarios": "Plan sahi ho par kernel alag behave kare (jaise shared propagation) -- yeh M4 ne dikhaya, jo integration mein pakda gaya. Apply beech mein fail ho toh partial mounts reh jaate hain, lekin woh INIT ke mount namespace mein hain jo INIT ke saath mar jaata hai.",
+   "alternatives": "Direct imperative mount calls; OCI config.json (runc ka mounts array) jo exactly yahi idea standard format mein hai; ek declarative library.",
+   "scale_10x_100x": "Plan per-container tiny hai (lagbhag 20 steps); 100x containers par bhi plan building negligible. Start time 18 ms inner mein yeh sab included hai.",
+   "production_improvements": "Plan ko JSON mein dump karne ka --dry-run, OCI config.json se plan banana, read-only rootfs aur /proc masking steps add karna (abhi NOT done)."
+  }
+ },
+ {
+  "id": "CTR-013",
+  "project_slug": "p16-container-runtime",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Why must the first mount step be mount(NULL, '/', MS_REC|MS_PRIVATE)? What happened in mutation M4, and how would you diagnose leaked mounts?",
+  "answer_hinglish": "Naya mount namespace (CLONE_NEWNS) parent ke mounts ki COPY se shuru hota hai, propagation settings ke saath. systemd hosts par '/' shared mount hota hai (SERVER_RUN.md: server par read-only check mein '/' shared mila). Shared peer group ka matlab: is namespace mein jo bhi mount neeche hoga, woh peer (host) namespace mein bhi propagate hoga. Toh bina private kiye, container ka overlay, proc, /dev tmpfs, devpts, shm sab host par bhi dikhne lagte. Doosra problem: pivot_root shared mounts ko refuse karta hai (EINVAL).\n\nIsliye build_plan ka step 1 hamesha Mount(None, '/', None, MS_REC | MS_PRIVATE) hai -- poore tree ko recursively private, ab propagation band. Unit test test_first_step_makes_everything_private dono plans (bind aur overlay) mein yeh check karta hai.\n\nM4 mutation (2026-11-21, 18:18): yeh step hataya gaya. Exactly prediction ke mutabik: 2 isolation tests fail + 2 errors, pivot_root ne shared mount refuse kiya, aur 10 mounts host ke /proc/mounts mein leak hue (normal 29 lines). Unhe sudo umount -R <state>/merged se haath se hatana pada; /proc/mounts wapas 29 lines, 0 h16 waale.\n\nDiagnose kaise: (1) host par grep -c overlay /proc/mounts aur wc -l, before/after compare; (2) findmnt -o TARGET,PROPAGATION se dekho '/' shared hai ya nahi; (3) conftest ka no_leftovers fixture har test ke baad host /proc/self/mounts mein '/state/' ya 'minibox' dhoondta hai aur fail karta hai -- isi se errors count aaye.",
+  "why_needed": "Mount propagation sabse confusing Linux topics mein se hai; galti ka symptom host par dikhta hai (leaked mounts, unmount na hone wale dirs), container mein nahi.",
+  "real_world_analogy": "Shared WhatsApp group: aap group mein jo bhi post karo (mount), sab members (host) ko dikhta hai. MS_PRIVATE = pehle group chhod kar apna personal notes chat banana, phir kuch bhi likho.",
+  "how_it_works": "unshare(CLONE_NEWNS) -> copy of mount tree with same peer groups -> mount(NULL, '/', MS_REC|MS_PRIVATE) -> every mount leaves its peer group -> later mounts stay local; pivot_root precondition satisfied.",
+  "in_this_project": "minibox/mounts.py build_plan ka pehla step; minibox/libc.py MS_PRIVATE = 1 << 18, MS_REC = 16384. Tests: tests/unit/test_mounts.py::test_first_step_makes_everything_private, integration conftest no_leftovers fixture. Incident: SERVER_RUN.md section 3 point 5.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::build_plan",
+   "projects/16-container-runtime/minibox/libc.py::MS_PRIVATE",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_first_step_makes_everything_private",
+   "projects/16-container-runtime/tests/integration/conftest.py::no_leftovers",
+   "projects/16-container-runtime/SERVER_RUN.md"
+  ],
+  "code_example": "# real, minibox/mounts.py build_plan (trimmed)\n    steps: list[Step] = [Mount(None, \"/\", None, libc.MS_REC | libc.MS_PRIVATE)]\n    if overlay:\n        steps.append(Mount(\"overlay\", overlay.merged, \"overlay\", 0, overlay_options(overlay)))\n    else:\n        steps.append(Mount(rootfs, rootfs, None, libc.MS_BIND | libc.MS_REC))",
+  "code_language": "python",
+  "advantages": [
+   "Ek line host ko container ke mounts se bachaati hai",
+   "Unit test + mutation dono se locked"
+  ],
+  "disadvantages": [
+   "MS_PRIVATE se host ke naye mounts bhi container mein nahi aate (yahan desired hai)",
+   "MS_SLAVE jaisi middle option use nahi ki"
+  ],
+  "common_mistakes": [
+   "Sochna ki naya mount namespace automatically private hai",
+   "Sirf '/' private karna bina MS_REC ke",
+   "Leaked mounts ko rm -rf se hatane ki koshish (pehle umount -R)"
+  ],
+  "follow_up_questions": [
+   "MS_SLAVE kab better hai MS_PRIVATE se?",
+   "unshare(1) command line tool yeh default kaise handle karta hai?",
+   "Leaked overlay mount ke saath state dir delete karne ki koshish karo toh kya hoga? (cleanup() is case mein RuntimeError deta hai)"
+  ],
+  "concepts": [
+   "mount-propagation",
+   "ms-private",
+   "shared-subtree",
+   "debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "MS_PRIVATE sabse simple aur safe default hai; MS_SLAVE host ke naye mounts container mein aane deta (kabhi kabhi useful) lekin container ka kuch bahar nahi jaata. minibox ko host se kuch nahi chahiye, isliye private.",
+   "failure_scenarios": "Step missing -> mounts host mein leak, pivot_root EINVAL, container 125; leaked mounts haath se umount karne pade (M4). Agar host process khud kabhi merged dir mount kare host ns mein, cleanup() ismount check se RuntimeError deta hai bajaye mounted dir delete karne ke.",
+   "alternatives": "MS_SLAVE recursive; clone ke baad poore tree ko private ki jagah sirf new_root ko private karna; systemd ke PrivateMounts= jaisa feature.",
+   "scale_10x_100x": "Har container ka private mount namespace hai, toh scale se behaviour nahi badalta. Leak hota toh 10x containers = 10x leaked mounts host par -- isliye fixture har test ke baad check karta hai.",
+   "production_improvements": "Startup par propagation verify karna (/proc/self/mountinfo padh kar), aur crash ke baad leftover mount scan ke saath gc command (abhi nahi hai)."
+  }
+ },
+ {
+  "id": "CTR-014",
+  "project_slug": "p16-container-runtime",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "Why does minibox bind-mount the rootfs onto itself when --no-overlay is used? What does the overlay root step do instead?",
+  "answer_hinglish": "pivot_root(new_root, put_old) ki ek precondition hai: new_root ek MOUNT POINT hona chahiye, sirf directory nahi. Image ka rootfs (jaise ~/images/alpine/rootfs) host filesystem ki ek normal directory hai. Isliye --no-overlay mode mein build_plan step 2 Mount(rootfs, rootfs, None, MS_BIND | MS_REC) add karta hai -- directory ko khud par bind mount, ab woh mount point hai aur pivot_root accept karta hai. MS_REC isliye ki rootfs ke neeche koi submounts hon toh woh bhi aayein.\n\nDefault (overlay) mode mein yeh zaroorat overlay khud poori karta hai: Mount('overlay', merged, 'overlay', 0, 'lowerdir=<rootfs>,upperdir=<state>/upper,workdir=<state>/work'). merged ek fresh mount point hai aur wahi new_root banta hai. lowerdir image hai jo kabhi likha nahi jaata; container ke saare writes upper mein jaate hain, jo cleanup() container ke baad shutil.rmtree se delete karta hai -- har run fresh image se. overlay_options ',' ya ':' wale paths refuse karta hai (overlayfs option separators) bajaye escaping ke.\n\nUnit tests: test_bind_root_when_no_overlay (plan.new_root == ROOT aur step 1 bind), test_overlay_root (data string exact), test_overlay_lower_must_be_rootfs, test_overlay_rejects_separator_chars. Integration test_root_is_the_overlay andar /proc/mounts mein 'overlay / overlay' aur lowerdir=rootfs check karta hai. Mutation M19 (overlay ki jagah image ka bind) ne overlay tests mein 4 red kiye.",
+  "why_needed": "pivot_root ki 'EINVAL' errors ka sabse common cause yahi hai ki new_root mount point nahi hai; bind-to-self trick standard hai (runc bhi karta hai).",
+  "real_world_analogy": "Stage par perform karne ke liye pehle stage register karna padta hai; aapka ghar ka kamra stage nahi hai jab tak use khud ko hi 'stage' register (bind mount) na kar do.",
+  "how_it_works": "--no-overlay: mount --bind rootfs rootfs -> rootfs is a mount point -> pivot_root(rootfs, rootfs/.oldroot). overlay: mount -t overlay overlay -o lowerdir,upperdir,workdir merged -> pivot_root(merged, merged/.oldroot).",
+  "in_this_project": "minibox/mounts.py build_plan step 2 aur overlay_options, OverlayDirs. container.run() state dir aur upper/work/merged banata hai; cleanup() unhe delete karta hai. CLI flag --no-overlay (cli.build_parser, dest overlay).",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::build_plan",
+   "projects/16-container-runtime/minibox/mounts.py::overlay_options",
+   "projects/16-container-runtime/minibox/mounts.py::OverlayDirs",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_bind_root_when_no_overlay",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_overlay_root",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_root_is_the_overlay"
+  ],
+  "code_example": "# real, minibox/mounts.py\ndef overlay_options(o: OverlayDirs) -> str:\n    for p in (o.lower, o.upper, o.work):\n        # ',' separates options and ':' separates lower layers; overlayfs has escaping rules for\n        # them, but refusing such paths is simpler and safer than getting the escaping wrong.\n        if \",\" in p or \":\" in p:\n            raise ValueError(f\"overlay path may not contain ',' or ':': {p!r}\")\n    return f\"lowerdir={o.lower},upperdir={o.upper},workdir={o.work}\"",
+  "code_language": "python",
+  "advantages": [
+   "Bind-to-self ek line ka fix hai",
+   "Overlay mode mein image kabhi modify nahi hoti aur writes container ke saath gayab"
+  ],
+  "disadvantages": [
+   "--no-overlay mein container seedha rootfs mein likhta hai (persist hota hai)",
+   "Overlay ko upper/work same filesystem par chahiye aur state dir ka cleanup"
+  ],
+  "common_mistakes": [
+   "Plain directory par pivot_root call karna",
+   "Overlay options mein comma wale paths bina check ke daalna",
+   "workdir ko upper se alag filesystem par rakhna"
+  ],
+  "follow_up_questions": [
+   "overlayfs ka workdir kis kaam aata hai?",
+   "Container ke andar file delete karne par upper mein kya banta hai?",
+   "Bind mount ke bina pivot_root('.', '.') kaam karega?"
+  ],
+  "concepts": [
+   "bind-mount",
+   "overlayfs",
+   "pivot_root",
+   "mount-point"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-015",
+  "project_slug": "p16-container-runtime",
+  "category": "Fundamentals",
+  "difficulty": "Beginner",
+  "question": "Why does minibox mount a fresh /proc inside the container, and why with nosuid, nodev, noexec?",
+  "answer_hinglish": "/proc koi real directory nahi hai -- yeh procfs hai, ek kernel-generated filesystem jo process information dikhata hai. Important baat: procfs mount ke waqt us PID namespace se bandh jaata hai jismein mount karne wala hai. Image ki /proc ek khaali directory hai (kuch nahi dikhega), aur host ka /proc host ke saikdon processes dikhata. Isliye INIT naye PID namespace mein hote hue new_root/proc par fresh procfs mount karta hai -- ab ps, $$, /proc/1/cmdline sab container ki numbering dikhate hain.\n\nbuild_plan mein: Mkdir(new_root/proc), phir Mount('proc', new_root/proc, 'proc', MS_NOSUID | MS_NOEXEC | MS_NODEV). Flags: nosuid (setuid bits ignore), noexec (wahan se binaries execute nahi), nodev (device files interpret nahi) -- /proc mein in teeno ki koi legit zaroorat nahi, toh band. Unit test test_proc_is_mounted_inside_new_root_with_safe_flags yeh exact flags check karta hai.\n\nIntegration: test_proc_is_fresh_and_shows_only_the_container -- /proc ke numeric entries sorted, pehle do [1, 2] aur total <= 6. test_command_is_pid_2_and_init_is_pid_1 bhi /proc par depend karta hai. Mutation M3 (/proc remount nahi) ne 12 isolation tests red kiye -- kyunki bahut saare tests andar /proc padhte hain. Note: /sys mount NAHI hota aur /proc/kcore jaisi files mask nahi hoti (README NOT-done list).",
+  "why_needed": "Bina fresh /proc ke ps, top, aur bahut tools galat ya khaali output dete hain; aur PID namespace ka effect user ko dikhta hi nahi.",
+  "real_world_analogy": "Naye office mein employee directory (proc) purane office ki copy lagao toh galat log dikhenge; naye office ki live directory lagani padti hai jo sirf yahan ke log dikhaye.",
+  "how_it_works": "procfs mount -> superblock tied to mounter's PID ns -> /proc/<pid> entries are pids in that ns. Mounted before pivot_root at new_root/proc, so after pivot it is /proc.",
+  "in_this_project": "minibox/mounts.py build_plan (mount_proc=True default; test_proc_can_be_left_out False path check karta hai). Tests tests/unit/test_mounts.py aur tests/integration/test_isolation.py::test_proc_is_fresh_and_shows_only_the_container.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::build_plan",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_proc_is_mounted_inside_new_root_with_safe_flags",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_proc_is_fresh_and_shows_only_the_container",
+   "projects/16-container-runtime/README.md"
+  ],
+  "code_example": "# real, minibox/mounts.py build_plan (trimmed)\n    if mount_proc:\n        steps += [Mkdir(j(\"proc\")),\n                  Mount(\"proc\", j(\"proc\"), \"proc\", libc.MS_NOSUID | libc.MS_NOEXEC | libc.MS_NODEV)]",
+  "code_language": "python",
+  "advantages": [
+   "Container ko sahi PID view milta hai",
+   "Safe mount flags unit test se locked"
+  ],
+  "disadvantages": [
+   "Poora procfs visible hai, sensitive paths mask nahi kiye",
+   "/sys bilkul nahi, kuch tools ko chahiye hota hai"
+  ],
+  "common_mistakes": [
+   "Host ka /proc bind mount kar dena",
+   "proc ko pivot_root ke baad aur PID ns ke bahar mount karna",
+   "Sochna ki /proc mount karna safe hai bina masking ke"
+  ],
+  "follow_up_questions": [
+   "Docker /proc ke kaun se paths mask ya read-only karta hai?",
+   "procfs ka hidepid option kya karta hai?",
+   "/sys mount karna ho toh kya dhyan rakhoge?"
+  ],
+  "concepts": [
+   "procfs",
+   "pid-namespace",
+   "mount-flags"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-016",
+  "project_slug": "p16-container-runtime",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How does minibox build a minimal /dev (tmpfs, mknod, symlinks, devpts, shm), and why not just bind the host's /dev?",
+  "answer_hinglish": "Host ka /dev bind karna matlab container ko host ki disks (/dev/sda, /dev/vda, /dev/nvme0n1), /dev/mem sab de dena. minibox runc jaisa chhota set banata hai, build_plan ke steps se:\n\n1) Mkdir new_root/dev, phir tmpfs mount (MS_NOSUID | MS_STRICTATIME, 'mode=755,size=65536k') -- fresh, memory-backed, image ko touch nahi karta.\n2) Mknod DEVICES list se: null (1,3), zero (1,5), full (1,7), random (1,8), urandom (1,9), tty (5,0), mode 0666. apply_step pehle lexists hone par unlink, phir os.mknod(S_IFCHR, makedev(major, minor)) aur chmod (umask bypass).\n3) Symlinks: fd -> /proc/self/fd, stdin/stdout/stderr -> /proc/self/fd/0,1,2, ptmx -> pts/ptmx.\n4) devpts at /dev/pts with 'newinstance,ptmxmode=0666,mode=620' -- apna alag pty instance, host ke ptys nahi dikhte.\n5) /dev/shm tmpfs, mode 1777 (sticky, sab likh sakein), nosuid/nodev/noexec.\n\nUnit test test_dev_has_exactly_the_minimal_devices exact major/minor check karta hai aur ki har Mknod /dev tmpfs ke BAAD hai (warna nodes image directory mein ban jaate). Integration test_minimal_dev ls /dev ka exact set check karta hai aur /dev/null, urandom (16 bytes), zero (00 00 00 00) kaam karte hain; test_host_block_devices_are_absent. Caveat: container CAP_MKNOD rakhta hai, toh woh khud host disk ka node bana sakta hai -- yeh security boundary nahi.",
+  "why_needed": "Programs /dev/null, /dev/urandom, /dev/tty assume karte hain; bina inke bahut cheezein toot ti hain, aur zyada dene se host hardware expose hota hai.",
+  "real_world_analogy": "Hotel room mein sirf zaroori switches (light, fan, AC) -- building ka main electrical panel (host disks) room mein nahi lagate.",
+  "how_it_works": "tmpfs on /dev -> mknod char devices (major,minor) -> symlinks into /proc/self/fd -> devpts newinstance -> tmpfs /dev/shm. All before pivot_root, under new_root.",
+  "in_this_project": "minibox/mounts.py DEVICES, DEV_SYMLINKS, build_plan, apply_step (Mknod branch). Tests tests/unit/test_mounts.py::test_dev_has_exactly_the_minimal_devices, test_dev_symlinks; integration test_minimal_dev, test_host_block_devices_are_absent. M28 ki run mein test_minimal_dev bhi shamil tha.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/mounts.py::DEVICES",
+   "projects/16-container-runtime/minibox/mounts.py::DEV_SYMLINKS",
+   "projects/16-container-runtime/minibox/mounts.py::apply_step",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_dev_has_exactly_the_minimal_devices",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_minimal_dev",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_host_block_devices_are_absent"
+  ],
+  "code_example": "# real, minibox/mounts.py\n# (name, major, minor): the same small set runc creates\nDEVICES = [(\"null\", 1, 3), (\"zero\", 1, 5), (\"full\", 1, 7), (\"random\", 1, 8), (\"urandom\", 1, 9), (\"tty\", 5, 0)]\n\n# real, apply_step Mknod branch\n    elif isinstance(s, Mknod):\n        if os.path.lexists(s.path):\n            os.unlink(s.path)\n        os.mknod(s.path, s.mode | stat.S_IFCHR, os.makedev(s.major, s.minor))\n        os.chmod(s.path, s.mode)",
+  "code_language": "python",
+  "advantages": [
+   "Host disks aur /dev/mem container mein nahi",
+   "Private devpts instance",
+   "tmpfs hone se image ka /dev modify nahi hota"
+  ],
+  "disadvantages": [
+   "Device cgroup / eBPF device filter nahi: CAP_MKNOD ke saath container naye nodes bana sakta hai",
+   "No pty allocation (-t), sirf devpts mount"
+  ],
+  "common_mistakes": [
+   "Host /dev bind mount kar dena",
+   "mknod ko tmpfs mount se pehle karna",
+   "umask ki wajah se mode galat reh jaana (yahan chmod se fix)"
+  ],
+  "follow_up_questions": [
+   "Docker device access ko kaise restrict karta hai (cgroup v2 mein)?",
+   "devpts newinstance ke bina kya problem hoti?",
+   "/dev/console aur /dev/tty ka role container mein kya hai?"
+  ],
+  "concepts": [
+   "dev",
+   "mknod",
+   "devpts",
+   "tmpfs"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-017",
+  "project_slug": "p16-container-runtime",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: given minibox's Mount/Mknod step dataclasses, write a unit test that fails if any device node is created before the tmpfs on /dev, or if any step targets a path outside new_root.",
+  "answer_hinglish": "Yeh exercise 'plan as data' ka seedha fayda dikhata hai: bina root, bina Linux, sirf list par assertions. minibox mein dono tests already hain (tests/unit/test_mounts.py), toh solution unse compare kar sakte ho.\n\nPart 1, order: plan.steps mein woh index dhoondho jahan Mount ka target 'dev' par khatam hota hai (tmpfs on /dev), aur pehla Mknod ka index. Assert dev_tmpfs < first_node. Kyun: agar mknod pehle chale, toh device nodes image (lowerdir ya --no-overlay mein seedha rootfs) mein ban jaate aur tmpfs mount unhe chhupa deta -- image gandi aur /dev khaali.\n\nPart 2, containment: step 0 (Mount None '/' private) chhod kar har step ka target (Mount ke liye s.target, baaki ke liye s.path) ya toh exactly new_root ho ya new_root + os.sep se shuru ho. Dono plans par chalao: build_plan(ROOT) aur build_plan(ROOT, overlay()). os.sep use karo taaki test Windows par bhi chale (ROOT os.path.join se bana hai). Dhyan: simple startswith(new_root) galat hai -- '/srv/img/rootfs2' bhi match ho jaata; isliye '+ os.sep'.\n\nBonus: mknod ke exact major/minor ek dict mein compare karo (null 1,3 ... tty 5,0). Mutation check: build_plan mein Mknod list ko tmpfs se pehle move karo -- test red hona chahiye. Is tarah ka test integration mein M-style break ko seconds mein pakad leta hai.",
+  "why_needed": "Order bugs privileged code mein sabse mehnge hote hain; unhe pure data par cheap tests se lock karna senior habit hai.",
+  "real_world_analogy": "Recipe card check karna ki 'tadka' 'dal ubalne' ke baad likha hai -- khaana banaye bina, sirf card padh kar.",
+  "how_it_works": "Plan.steps list -> enumerate -> find indices by isinstance + target suffix -> compare. Containment: for each step after the first, target == root or startswith(root + os.sep).",
+  "in_this_project": "tests/unit/test_mounts.py::test_dev_has_exactly_the_minimal_devices aur ::test_every_target_is_inside_new_root exactly yahi karte hain; helper overlay() aur ROOT = os.path.join(os.sep, 'srv', 'img', 'rootfs').",
+  "implementation_files": [
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_dev_has_exactly_the_minimal_devices",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_every_target_is_inside_new_root",
+   "projects/16-container-runtime/minibox/mounts.py::build_plan",
+   "projects/16-container-runtime/minibox/mounts.py::Mknod"
+  ],
+  "code_example": "# real, tests/unit/test_mounts.py (trimmed)\n    dev_tmpfs = next(i for i, s in enumerate(plan.steps) if isinstance(s, Mount) and s.target.endswith(\"dev\"))\n    first_node = next(i for i, s in enumerate(plan.steps) if isinstance(s, Mknod))\n    assert dev_tmpfs < first_node\n\ndef test_every_target_is_inside_new_root():\n    for plan in (build_plan(ROOT), build_plan(ROOT, overlay())):\n        for s in plan.steps[1:]:\n            target = s.target if isinstance(s, Mount) else s.path\n            assert target == plan.new_root or target.startswith(plan.new_root + os.sep), s",
+  "code_language": "python",
+  "advantages": [
+   "Millisecond mein chalta hai, kisi bhi OS par",
+   "Order aur path-escape dono class ke bugs pakadta hai"
+  ],
+  "disadvantages": [
+   "Kernel behaviour prove nahi karta",
+   "Agar naya step type aaye (jaise Mount ka koi aur field) toh test update karna padta"
+  ],
+  "common_mistakes": [
+   "startswith(new_root) bina separator ke",
+   "Step 0 (private '/') ko containment check mein shamil karna -- woh jaan bujh kar '/' hai",
+   "Sirf overlay plan test karna, bind plan nahi"
+  ],
+  "follow_up_questions": [
+   "/dev/pts aur /dev/shm ke liye bhi 'Mkdir before Mount' check kaise likhoge?",
+   "Is test ko property-based testing mein kaise convert karoge?",
+   "Kya Symlink targets (/proc/self/fd) ko bhi containment check karna chahiye? Kyun nahi?"
+  ],
+  "concepts": [
+   "unit-testing",
+   "mount-plan",
+   "path-containment",
+   "ordering"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-018",
+  "project_slug": "p16-container-runtime",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: bring up the loopback interface in a new network namespace without iproute2. Explain minibox's bring_up_loopback (ioctl, struct ifreq packing).",
+  "answer_hinglish": "Naye network namespace mein sirf 'lo' hota hai aur woh DOWN hota hai -- ping 127.0.0.1 bhi fail. Normally 'ip link set lo up' karte, lekin image mein iproute2 ho zaroori nahi, aur minibox stdlib-only hai. Isliye bring_up_loopback() seedha kernel se ioctl karta hai, jo 'ifconfig lo up' andar se karta hai.\n\nSteps: (1) ek AF_INET SOCK_DGRAM socket kholo -- interface ioctls kisi bhi socket fd par chalte hain, koi connection nahi. (2) struct ifreq banao: 16 bytes interface name, phir union jiska pehla field short flags hai. Python mein struct.pack('16sH22x', b'lo', 0) -- 16s name (null padded), H unsigned short flags, 22x padding taaki total 40 bytes (sizeof ifreq) ho. (3) SIOCGIFFLAGS (0x8913) se current flags padho; result unpack karke [1] = flags. (4) flags | IFF_UP (0x1) karke SIOCSIFFLAGS (0x8914) se likho. Read-modify-write isliye ki baaki flags (jaise LOOPBACK) na mitein.\n\nfcntl function ke andar import hota hai kyunki fcntl Linux-only hai aur module Windows par unit tests ke liye import hona chahiye. Yeh INIT ke setup_container mein unshare ke baad aur mounts se pehle chalta hai (CAP_NET_ADMIN chahiye, root hai). Test test_only_loopback_network_and_it_is_up: /proc/net/dev mein sirf 'lo' aur ping 127.0.0.1 -> PING-OK. Bahar ka networking (veth, bridge, NAT) stage 4 hai aur NOT done.",
+  "why_needed": "Container mein bahut programs localhost par bind/connect karte hain (health checks, sidecars). lo down ho toh woh ajeeb tareeke se fail karte hain.",
+  "real_world_analogy": "Naye flat mein main switch (lo) OFF milta hai; electrician (iproute2) na ho toh khud panel khol kar switch ON karna -- pehle dekho kaunse switch on hain, phir sirf main ON karo.",
+  "how_it_works": "socket(AF_INET, SOCK_DGRAM) -> ioctl(SIOCGIFFLAGS, ifreq{name='lo'}) -> flags |= IFF_UP -> ioctl(SIOCSIFFLAGS, ifreq{name='lo', flags}) -> lo UP in this net ns.",
+  "in_this_project": "minibox/container.py bring_up_loopback(), setup_container() mein call. Test tests/integration/test_isolation.py::test_only_loopback_network_and_it_is_up. PLAN.md mein network decision aur stage 4 kyun nahi.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::bring_up_loopback",
+   "projects/16-container-runtime/minibox/container.py::setup_container",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_only_loopback_network_and_it_is_up",
+   "projects/16-container-runtime/PLAN.md"
+  ],
+  "code_example": "# real, minibox/container.py\ndef bring_up_loopback() -> None:\n    \"\"\"ifconfig lo up, with SIOCGIFFLAGS / SIOCSIFFLAGS on a plain socket (no iproute2 needed).\"\"\"\n    import fcntl  # Linux only; imported here so the module still imports on Windows for unit tests\n\n    siocgifflags, siocsifflags, iff_up = 0x8913, 0x8914, 0x1\n    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:\n        ifreq = struct.pack(\"16sH22x\", b\"lo\", 0)\n        flags = struct.unpack(\"16sH22x\", fcntl.ioctl(s.fileno(), siocgifflags, ifreq))[1]\n        fcntl.ioctl(s.fileno(), siocsifflags, struct.pack(\"16sH22x\", b\"lo\", flags | iff_up))",
+  "code_language": "python",
+  "advantages": [
+   "Koi external tool ya library nahi",
+   "Read-modify-write baaki flags bachata hai",
+   "Ek chhota function, ek test"
+  ],
+  "disadvantages": [
+   "Magic numbers (ioctl codes, struct layout) Linux-specific",
+   "Netlink (modern API) nahi, purana ioctl interface"
+  ],
+  "common_mistakes": [
+   "Flags padhe bina seedha IFF_UP likh dena (doosre flags mit jaate)",
+   "ifreq ka size galat pack karna",
+   "Sochna ki naye net ns mein lo automatically up hota hai"
+  ],
+  "follow_up_questions": [
+   "Same kaam netlink (RTM_NEWLINK) se kaise karoge?",
+   "veth pair bana kar container ko host se jodne ke steps kya honge (bina NAT)?",
+   "Network namespace ke bina container host ka network share kare toh kya risk?"
+  ],
+  "concepts": [
+   "network-namespace",
+   "ioctl",
+   "loopback",
+   "struct-packing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-019",
+  "project_slug": "p16-container-runtime",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Inside the container, `yes | head -n 1` printed a write error instead of ending quietly. What is the cause and how does minibox fix it?",
+  "answer_hinglish": "Error identify: 'yes' ko head ke exit hone ke baad pipe par likhne par EPIPE milta hai aur woh 'write error' print karta hai. Normal shell mein aisa nahi hota kyunki wahan 'yes' SIGPIPE se chupchaap mar jaata hai (default action terminate).\n\nLikely cause: Python startup par SIGPIPE ko SIG_IGN kar deta hai (taaki Python code ko exception mile). Aur Unix rule: exec ke baad signal HANDLERS reset ho jaate hain (kyunki handler code naye program mein exist nahi karta), lekin IGNORED dispositions exec ke paar survive karte hain. minibox Python hai, toh CMD process (fork of INIT, fork of minibox) SIGPIPE-ignored state inherit karta hai, aur exec ke baad 'yes' bhi SIGPIPE ignore karta hai -> EPIPE -> error message.\n\nInvestigate kaise: andar grep SigIgn /proc/self/status dekho -- bit 13 (SIGPIPE) set hoga. Ya same command host ke python subprocess se chalao vs shell se.\n\nSmallest fix: CMD branch mein exec se pehle signal.signal(SIGPIPE, SIG_DFL) -- minibox yeh SIGINT (Python ka handler), SIGTTOU aur saare FORWARDED_SIGNALS ke liye bhi karta hai. Kyun kaam karta hai: exec se pehle disposition default, toh naya program normal Unix behaviour se shuru hota hai.\n\nTest test_sigpipe_has_its_default_action_in_the_command: stdout ['y', 'done'] aur stderr exactly ''. Mutation M8 (SIGPIPE ignored chhoda) ne yeh 1 test red kiya.",
+  "why_needed": "Python (ya kisi bhi runtime) se processes launch karne waale tools mein yeh classic bug hai; subprocess module ka restore_signals=True isi ke liye hai.",
+  "real_world_analogy": "Purane kirayedaar ne bell ka wire kaat diya (ignore). Naya kirayedaar (exec) apna furniture laata hai (handlers reset), lekin kata hua wire (ignore) waisa hi rehta hai jab tak koi electrician (SIG_DFL) theek na kare.",
+  "how_it_works": "Python start: SIGPIPE -> SIG_IGN. fork: dispositions copied. exec: handlers -> SIG_DFL, SIG_IGN stays. Fix: before execvpe, signal(SIGPIPE, SIG_DFL).",
+  "in_this_project": "minibox/container.py init_main ka CMD branch: 'for sig in (signal.SIGPIPE, signal.SIGINT, signal.SIGTTOU, *FORWARDED_SIGNALS): signal.signal(sig, signal.SIG_DFL)'. Test tests/integration/test_isolation.py::test_sigpipe_has_its_default_action_in_the_command.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_sigpipe_has_its_default_action_in_the_command",
+   "projects/16-container-runtime/README.md"
+  ],
+  "code_example": "# real, minibox/container.py init_main, CMD branch (trimmed)\n            # Python ignores SIGPIPE and installs a SIGINT handler; an exec'd program must start\n            # with default dispositions (ignored signals survive exec, handlers do not).\n            for sig in (signal.SIGPIPE, signal.SIGINT, signal.SIGTTOU, *FORWARDED_SIGNALS):\n                signal.signal(sig, signal.SIG_DFL)",
+  "code_language": "python",
+  "advantages": [
+   "Ek loop se saare inherited dispositions reset",
+   "User command bilkul shell jaisa behave karta hai"
+  ],
+  "disadvantages": [
+   "Signal mask (blocked signals) explicitly reset nahi kiya, sirf dispositions",
+   "List haath se maintain karni padti hai"
+  ],
+  "common_mistakes": [
+   "Sirf handlers reset karna aur ignored signals bhool jaana",
+   "Error ko 'yes' ya busybox ka bug samajhna",
+   "Yeh maan lena ki exec sab kuch reset karta hai"
+  ],
+  "follow_up_questions": [
+   "Signal mask exec ke paar survive karta hai ya nahi? minibox ko uski fikr kab karni chahiye?",
+   "Python ka subprocess restore_signals kya karta hai?",
+   "Ek Go ya Node runtime se launch karne par bhi yeh problem aayegi?"
+  ],
+  "concepts": [
+   "sigpipe",
+   "exec",
+   "signal-disposition",
+   "debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-020",
+  "project_slug": "p16-container-runtime",
+  "category": "Code-Level",
+  "difficulty": "Beginner",
+  "question": "Why does minibox build a clean environment for the command instead of inheriting the host's, and what does container_env contain?",
+  "answer_hinglish": "Agar host ka environment container mein copy ho jaaye toh do problems: (1) secrets leak -- host par sudo chalate waqt AWS_SECRET_ACCESS_KEY, tokens, SSH agent socket jaise variables container ke command ko mil jaate; (2) reproducibility -- container ka behaviour host ke random variables (PYTHONPATH, LD_LIBRARY_PATH) par depend karne lagta.\n\ncontainer_env(cfg) sirf yeh deta hai: PATH = DEFAULT_PATH ('/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin'), HOME = '/root', HOSTNAME = cfg.hostname, TERM = host ka TERM ya 'xterm'. Phir har --env/-e K=V item partition('=') se split hota hai -- pehle '=' par, toh 'B=x=y' ka value 'x=y'. '=' na ho ya key khaali ho toh ValueError ('--env needs KEY=VALUE'), jo run() mein 125 ban jaata hai. User ka K=V default ko override kar sakta hai (test mein PATH=/bin).\n\nYeh env host process mein run() ke shuru mein banta hai aur CMD os.execvpe(command[0], command, env) ko deta hai -- execvpe isi env ke PATH se command dhoondta hai. Tests: unit test_container_env aur test_host_environment_does_not_leak_in (AWS_SECRET_ACCESS_KEY set karke check), integration test_host_environment_does_not_leak (SECRET_TOKEN nahi, FOO=bar aur HOSTNAME=envbox hain). Mutation M9 (host env copy) ne 1 test red kiya. Note: image config ka Env use nahi hota (README NOT-done).",
+  "why_needed": "Env vars sabse aasaan leak path hain; docker bhi host env pass nahi karta, sirf image Env + -e.",
+  "real_world_analogy": "Hotel check-in: aapko naya room key aur basic toiletries milte hain, pichle guest ka saaman nahi. Extra cheez chahiye toh reception (-e) se maango.",
+  "how_it_works": "run(): env = container_env(cfg) (defaults + parsed --env) -> passed to init_main -> CMD: os.execvpe(cmd[0], cmd, env).",
+  "in_this_project": "minibox/container.py DEFAULT_PATH, container_env, init_main ka execvpe. CLI --env/-e action='append' (cli.build_parser). Tests tests/unit/test_cli.py aur tests/integration/test_isolation.py.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::container_env",
+   "projects/16-container-runtime/minibox/container.py::DEFAULT_PATH",
+   "projects/16-container-runtime/tests/unit/test_cli.py::test_container_env",
+   "projects/16-container-runtime/tests/unit/test_cli.py::test_host_environment_does_not_leak_in",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_host_environment_does_not_leak"
+  ],
+  "code_example": "# real, minibox/container.py\ndef container_env(cfg: Config) -> dict[str, str]:\n    env = {\"PATH\": DEFAULT_PATH, \"HOME\": \"/root\", \"HOSTNAME\": cfg.hostname, \"TERM\": os.environ.get(\"TERM\", \"xterm\")}\n    for item in cfg.env:\n        k, sep, v = item.partition(\"=\")\n        if not sep or not k:\n            raise ValueError(f\"--env needs KEY=VALUE, got {item!r}\")\n        env[k] = v\n    return env",
+  "code_language": "python",
+  "advantages": [
+   "Host secrets container mein nahi jaate",
+   "Container ka behaviour predictable",
+   "Galat --env fork se pehle pakda jaata hai"
+  ],
+  "disadvantages": [
+   "Image ka Env ignore hota hai",
+   "TERM host se aata hai (ek chhota intentional leak)"
+  ],
+  "common_mistakes": [
+   "os.environ.copy() pass kar dena",
+   "'K=V=W' ko split('=') se todna aur value kho dena",
+   "PATH set na karna aur execvpe ka 'command not found'"
+  ],
+  "follow_up_questions": [
+   "Image config ka Env support karna ho toh merge order kya hoga?",
+   "--env KEY (bina value, host se copy) docker jaisa support karoge toh risk kya?",
+   "execvpe PATH kis environment se padhta hai -- caller ka ya diya hua?"
+  ],
+  "concepts": [
+   "environment",
+   "secrets",
+   "execvpe"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-021",
+  "project_slug": "p16-container-runtime",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "When stdin is a terminal, the command takes its own process group and the terminal's foreground. Explain setpgid/tcsetpgrp/SIGTTOU here, and what is honestly not tested.",
+  "answer_hinglish": "Problem: terminal par Ctrl-C dabane se kernel SIGINT terminal ke FOREGROUND PROCESS GROUP ke har process ko bhejta hai. minibox host, INIT aur CMD normally ek hi process group mein hote (jo shell ne minibox ke liye banaya). Toh Ctrl-C teeno ko jaata -- host process aur INIT bhi signal handle karte (forward), aur command ko signal do baar ya ajeeb order mein mil sakta.\n\nminibox ka code (init_main CMD branch, sirf jab os.isatty(0)): (1) signal.signal(SIGTTOU, SIG_IGN) -- background process group ka process agar terminal settings badle (tcsetpgrp) toh kernel use SIGTTOU bhejta hai jo default se stop kar deta; ignore karne se call chal jaati hai. (2) os.setpgid(0, 0) -- CMD apna naya process group banata hai (pgid = apna pid). (3) os.tcsetpgrp(0, os.getpgrp()) -- terminal ka foreground group CMD ka group bana do. Ab Ctrl-C sirf command tak jaata hai, jaise bina minibox ke. Phir reset loop SIGTTOU ko wapas SIG_DFL karta hai exec se pehle.\n\nEk subtle point: CMD naye PID namespace mein hai, lekin terminal aur process groups kernel-level objects hain; isatty(0) true hai kyunki stdin host ka terminal fd inherit hua hai -- koi pty allocate nahi hoti.\n\nHonest part: README clearly kehta hai yeh code path likha gaya hai par TESTED NAHI hai, kyunki integration tests bina terminal ke chalte hain (subprocess pipes). Aur -t (TTY allocation), pty inside container -- NOT implemented.",
+  "why_needed": "Interactive containers (docker run -it) mein Ctrl-C, job control aur terminal ownership ka galat handling sabse irritating UX bugs deta hai.",
+  "real_world_analogy": "Class mein teacher (terminal) jab 'chup!' (Ctrl-C) bolti hai toh front bench (foreground group) ke sab bachche sunte hain. CMD ko alag front bench par bitha diya, aur minibox/INIT peeche chale gaye.",
+  "how_it_works": "isatty(0) -> ignore SIGTTOU -> setpgid(0,0) -> tcsetpgrp(0, getpgrp()) -> reset dispositions incl. SIGTTOU -> execvpe. Kernel sends tty-generated signals to the foreground pgrp only.",
+  "in_this_project": "minibox/container.py init_main ka CMD branch (os.isatty(0) block). README NOT-done list: 'that code path is written but NOT tested'. PLAN.md Not in scope: TTY allocation (-t).",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::init_main",
+   "projects/16-container-runtime/README.md",
+   "projects/16-container-runtime/PLAN.md"
+  ],
+  "code_example": "# real, minibox/container.py init_main, CMD branch (trimmed)\n            if os.isatty(0):\n                # Own process group in the terminal's foreground: Ctrl-C then reaches only the\n                # command (as when it runs without minibox), not minibox and INIT as well.\n                signal.signal(signal.SIGTTOU, signal.SIG_IGN)\n                os.setpgid(0, 0)\n                os.tcsetpgrp(0, os.getpgrp())",
+  "code_language": "python",
+  "advantages": [
+   "Ctrl-C ka behaviour bina minibox jaisa",
+   "Sirf terminal case mein chalta hai, pipes par koi effect nahi"
+  ],
+  "disadvantages": [
+   "Untested code path",
+   "Command exit ke baad terminal foreground wapas shell ko dena code nahi karta (shell khud karta hai jab minibox exit hota hai)",
+   "Koi pty nahi: container host ke terminal ko seedha use karta hai"
+  ],
+  "common_mistakes": [
+   "SIGTTOU ignore kiye bina tcsetpgrp call karna (process stop ho jaata)",
+   "Ignore ko exec se pehle reset na karna",
+   "Sochna ki naye PID namespace se process group / terminal alag ho jaate hain"
+  ],
+  "follow_up_questions": [
+   "Is path ko automated test kaise karoge (pty.openpty / pexpect jaisa approach)?",
+   "docker run -t pty kaise allocate karta hai aur kyun?",
+   "Ctrl-Z (SIGTSTP) is design mein kya karega?"
+  ],
+  "concepts": [
+   "process-group",
+   "tty",
+   "job-control",
+   "sigttou"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Simple design: CMD ko foreground de do, koi pty proxy nahi. Cost: container host terminal se seedha bandha hai, aur resize/raw mode jaisi cheezein container ke saath portable nahi. pty proxy zyada correct hai lekin bahut code.",
+   "failure_scenarios": "SIGTTOU ignore na hota toh tcsetpgrp par CMD stop ho jaata aur container latak jaata. Agar CMD crash ho aur foreground wapas na mile, shell recover karta hai jab minibox exit -- yeh assumption tested nahi.",
+   "alternatives": "pty allocate karke host process mein proxy (docker/runc console socket ka model); ya terminal par kuch na karna aur signals sirf forward karna.",
+   "scale_10x_100x": "Terminal per-interactive-session hai; scale ka sawaal nahi. Many containers non-interactive chalenge jahan yeh branch chalti hi nahi.",
+   "production_improvements": "pty-based integration test (abhi missing), -t flag ke saath pty allocation, SIGWINCH forwarding, aur exit par tcsetpgrp restore."
+  }
+ },
+ {
+  "id": "CTR-022",
+  "project_slug": "p16-container-runtime",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "In the first manual run on the server, `echo $$` inside the container printed 3, not 2. How was this found, what caused it, and what was the fix?",
+  "answer_hinglish": "Error identify: design ke mutabik INIT PID 1 aur command PID 2 hona chahiye. Pehle manual run (18:00-18:04) mein echo $$ ne 3 print kiya -- matlab command se pehle namespace mein koi aur process PID 2 le chuka tha.\n\nLikely cause: libc.py pehle ctypes.util.find_library('c') se libc dhoondta tha. find_library Linux par andar ek SUBPROCESS chalata hai (ldconfig -p). libc() lazily load hota hai -- pehli baar tab jab INIT apne naye namespace mein mount() call karta hai. Toh woh ldconfig subprocess naye PID namespace mein PID 2 ban gaya, exit hua, aur phir CMD ko PID 3 mila.\n\nInvestigate kaise: PID numbering sequential hai naye namespace mein, toh 'gap' ka matlab ek extra fork. INIT ke setup path mein dekho kaun fork/subprocess karta hai; strace -f -e trace=clone,execve se ldconfig ka execve dikh jaata.\n\nSmallest fix: libc() pehle ctypes.CDLL('libc.so.6', use_errno=True) try karta hai (glibc ka soname, koi subprocess nahi); sirf OSError par find_library fallback. Comment wahi likhta hai: 'inside the container that extra fork would take PID 2 before the user's command does.' Kyun kaam karta hai: dlopen ek library call hai, process nahi banata.\n\nAb test_command_is_pid_2_and_init_is_pid_1 yeh lock karta hai ($$ == '2'). Lesson: privileged setup path mein hidden forks (subprocess, find_library, shell-outs) namespace state badal dete hain; yeh SERVER_RUN.md section 3 point 1 mein record hai.",
+  "why_needed": "Hidden subprocesses library calls mein chhupe hote hain; namespace ya cgroup ke andar woh PIDs, pids.max counts aur timing badal dete hain.",
+  "real_world_analogy": "Queue mein token number 2 aapka hona tha, lekin receptionist ne beech mein apne chai waale ko token 2 de diya (hidden subprocess). Fix: receptionist ko seedha number yaad rakhne do, chai waale ko bulao hi mat.",
+  "how_it_works": "INIT in new PID ns -> first libc.mount -> libc() -> find_library -> fork+exec ldconfig (PID 2) -> exits -> fork CMD (PID 3). Fix: CDLL('libc.so.6') first -> no fork -> CMD PID 2.",
+  "in_this_project": "minibox/libc.py libc() function; tests/integration/test_isolation.py::test_command_is_pid_2_and_init_is_pid_1; SERVER_RUN.md 'What went wrong' point 1.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/libc.py::libc",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_command_is_pid_2_and_init_is_pid_1",
+   "projects/16-container-runtime/SERVER_RUN.md"
+  ],
+  "code_example": "# real, minibox/libc.py\ndef libc() -> ctypes.CDLL:\n    global _libc\n    if _libc is None:\n        # Try the glibc soname first: ctypes.util.find_library runs a subprocess (ldconfig), and\n        # inside the container that extra fork would take PID 2 before the user's command does.\n        try:\n            _libc = ctypes.CDLL(\"libc.so.6\", use_errno=True)\n        except OSError:\n            _libc = ctypes.CDLL(ctypes.util.find_library(\"c\"), use_errno=True)\n    return _libc",
+  "code_language": "python",
+  "advantages": [
+   "Fix ek line ka, koi behaviour change nahi",
+   "Test ab regression pakadta hai"
+  ],
+  "disadvantages": [
+   "libc.so.6 glibc-specific hai; musl host par fallback phir subprocess karega",
+   "Lazy load ka timing abhi bhi namespace ke andar hai"
+  ],
+  "common_mistakes": [
+   "PID 3 ko 'cosmetic' samajh kar ignore karna",
+   "Bug ko busybox sh ki galti maan lena",
+   "find_library ko pure function samajhna"
+  ],
+  "follow_up_questions": [
+   "libc ko INIT fork hone se pehle host mein eagerly load karna better fix hota kya?",
+   "musl-based host par yeh fallback kaise behave karega?",
+   "pids.max = 1 ya 2 jaise tight limit mein yeh hidden fork kya karta?"
+  ],
+  "concepts": [
+   "ctypes",
+   "pid-namespace",
+   "hidden-subprocess",
+   "debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Soname-first loading simple aur fast hai lekin glibc assume karta hai; fallback portability rakhta hai par hidden fork wapas laata hai. Eager loading host mein (fork se pehle) dono problem hal karta par yeh code mein nahi kiya.",
+   "failure_scenarios": "musl host par CDLL('libc.so.6') fail -> find_library -> extra PID wapas, aur tight pids.max mein setup fail bhi ho sakta. Koi bhi naya subprocess setup path mein yahi bug laayega -- test PID 2 check karke pakdega.",
+   "alternatives": "Fork se pehle host process mein libc() call karke cache karna; os module ke syscalls (3.12 mein mount nahi hai); chhota C extension.",
+   "scale_10x_100x": "Har container start par ek extra fork+exec hota (ldconfig) -- 100x containers par start time aur load badhta. Fix ke baad yeh cost nahi; start inner 18 ms measured fix ke baad ka hai.",
+   "production_improvements": "libc() ko host side par eagerly initialize karna, setup path mein 'no subprocess' assertion (jaise test PID 2), aur musl host par integration run."
+  }
+ },
+ {
+  "id": "CTR-023",
+  "project_slug": "p16-container-runtime",
+  "category": "Code-Level",
+  "difficulty": "Advanced",
+  "question": "Walk through minibox/libc.py: how are mount, umount2 and pivot_root called through ctypes, how are errors reported, and what are the portability traps?",
+  "answer_hinglish": "Python 3.12 stdlib mein os.unshare, os.fork, os.execvpe, os.chroot, os.mknod, socket.sethostname hain, lekin mount(2), umount2(2), pivot_root(2) nahi. libc.py ~75 lines mein yeh teen wrap karta hai.\n\n1) Lazy load: libc() pehli call par CDLL('libc.so.6', use_errno=True). use_errno=True zaroori hai: ctypes har call ke baad errno ko private copy mein save karta hai, warna Python ka apna code errno overwrite kar deta. Lazy isliye ki module Windows/macOS par import ho (unit tests MS_* constants use karte hain).\n\n2) argtypes: mount ke liye [c_char_p x3, c_ulong, c_char_p], umount2 ke liye [c_char_p, c_int]. Isse flags sahi C type mein jaate hain aur None NULL ban jaata hai. _b() str ko os.fsencode se bytes karta hai, None ko None.\n\n3) _check(ret, what): ret != 0 par ctypes.get_errno() se errno lekar OSError(err, 'mount(...): <strerror>') raise. Yeh OSError run() ke except mein 125 banta hai, aur INIT ke andar 'container setup failed' print.\n\n4) pivot_root: glibc mein wrapper nahi, toh syscall(nr, new_root, put_old). Syscall number architecture-specific hai: SYS_PIVOT_ROOT = {'x86_64': 155, 'aarch64': 41, 'arm64': 41}, platform.machine() se. Unknown arch par saaf OSError. syscall.restype = c_long.\n\nConstants (MS_BIND 4096, MS_REC 16384, MS_PRIVATE 1<<18, MNT_DETACH 2) <sys/mount.h> se, aur test_mount_flag_values_match_linux_headers unhe pin karta hai. Traps: galat syscall number = galat syscall (silent disaster), argtypes na do toh 64-bit flags truncate ho sakte hain, use_errno bhoolo toh errno 0 ya galat.",
+  "why_needed": "ctypes se syscalls chhota code hai par type aur errno galtiyan silent hoti hain; interview mein FFI boundary ki samajh dikhana important hai.",
+  "real_world_analogy": "Videsh mein (C libc) baat karne ke liye translator (ctypes): use batana padta hai har shabd ka type kya hai (argtypes), aur jawab ke saath error slip (errno) turant sambhal kar rakhni padti hai, warna agla sawaal use mita deta hai.",
+  "how_it_works": "Python str -> fsencode bytes -> c_char_p; flags -> c_ulong -> libc.mount -> ret -> _check -> get_errno -> OSError. pivot_root: syscall(c_long(nr), bytes, bytes).",
+  "in_this_project": "minibox/libc.py: libc, _check, _b, mount, umount2, pivot_root, SYS_PIVOT_ROOT, MS_* constants. Callers: mounts.apply_step (mount), mounts.enter_root (pivot_root, umount2). Unit test tests/unit/test_mounts.py::test_mount_flag_values_match_linux_headers.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/libc.py::libc",
+   "projects/16-container-runtime/minibox/libc.py::_check",
+   "projects/16-container-runtime/minibox/libc.py::mount",
+   "projects/16-container-runtime/minibox/libc.py::pivot_root",
+   "projects/16-container-runtime/minibox/libc.py::SYS_PIVOT_ROOT",
+   "projects/16-container-runtime/tests/unit/test_mounts.py::test_mount_flag_values_match_linux_headers"
+  ],
+  "code_example": "# real, minibox/libc.py (trimmed)\ndef _check(ret: int, what: str) -> None:\n    if ret != 0:\n        err = ctypes.get_errno()\n        raise OSError(err, f\"{what}: {os.strerror(err)}\")\n\ndef pivot_root(new_root: str, put_old: str) -> None:\n    nr = SYS_PIVOT_ROOT.get(platform.machine())\n    if nr is None:\n        raise OSError(f\"pivot_root: unknown syscall number for {platform.machine()}\")\n    c = libc()\n    c.syscall.restype = ctypes.c_long\n    _check(c.syscall(ctypes.c_long(nr), _b(new_root), _b(put_old)), f\"pivot_root({new_root!r}, {put_old!r})\")",
+  "code_language": "python",
+  "advantages": [
+   "Zero third-party dependencies",
+   "Errors errno ke saath readable OSError",
+   "Module har OS par import hota hai (lazy load)"
+  ],
+  "disadvantages": [
+   "Syscall numbers haath se maintain: naye arch par update",
+   "argtypes har call par set hote hain (chhota overhead, global CDLL object mutate)",
+   "glibc soname assume"
+  ],
+  "common_mistakes": [
+   "use_errno=True bhool jaana",
+   "Flags bina argtypes ke pass karna",
+   "pivot_root ke liye galat arch ka syscall number"
+  ],
+  "follow_up_questions": [
+   "Python 3.12 ke baad os module mein in syscalls ka support aaye toh kya badloge?",
+   "Agar 32-bit ARM par chalana ho toh kya check karoge?",
+   "ctypes vs cffi vs C extension -- yahan kya choose karte aur kyun?"
+  ],
+  "concepts": [
+   "ctypes",
+   "ffi",
+   "errno",
+   "syscalls"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "ctypes zero-dependency aur har syscall visible rakhta hai (learning goal), lekin type safety aur portability manual hai. Production runtime (runc) Go mein seedha syscall package use karta hai.",
+   "failure_scenarios": "Galat syscall number = koi aur syscall chalega (silent). argtypes missing = flags truncate/garbage. Errno save na ho = misleading error. Unknown arch par code saaf OSError deta hai, toh container 125 se fail hota hai bajaye galat call ke.",
+   "alternatives": "cffi ya C extension; os.mount jaisa future stdlib API; libmount; Go/C mein runtime likhna (PLAN.md: production choice Go ya C).",
+   "scale_10x_100x": "Har mount call per-container chand dafa hota hai; ctypes overhead 18 ms inner start mein included hai. 100x containers par yeh bottleneck nahi lagta (measure nahi kiya).",
+   "production_improvements": "argtypes ek baar init par set karna, newer mount API (fsopen/fsmount/move_mount) consider karna, arch table ko test se cross-check karna, aur musl hosts ka support."
+  }
+ },
+ {
+  "id": "CTR-024",
+  "project_slug": "p16-container-runtime",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Coding exercise: implement minibox's CLI so that everything after `--` belongs to the container command (argparse.REMAINDER), and parse sizes like 64M, 1.5G, 64MiB into bytes.",
+  "answer_hinglish": "Do pieces hain, dono tests ke saath.\n\n1) Command parsing (cli.build_parser): run subparser mein aakhri positional r.add_argument('command', nargs=argparse.REMAINDER). REMAINDER ka matlab: jahan se positional shuru hua, uske baad ke SAARE args as-is is list mein, chahe woh '--memory' jaise dikhte hon. parse_args() phir agar cmd[0] == '--' hai toh use hata deta hai, aur khaali command par parser.error('run: missing command (put it after --)') -- exit code 2. Test test_command_flags_after_double_dash_are_not_ours: ['--', 'ls', '--memory', '-la'] -> command ['ls', '--memory', '-la'] aur limits default (Limits()). test_command_without_double_dash: '--' optional hai. Bad args (no command, no rootfs, --pids 0, --cpus 0.001, bad hostname, --name ../etc) sab SystemExit 2 (test_bad_arguments_exit_2).\n\n2) Size parsing (cgroups.parse_size, CLI mein _size wrapper jo ValueError ko ArgumentTypeError banata hai): regex '^\\s*(\\d+(?:\\.\\d+)?)\\s*([kKmMgGtT]?)(?:i?[bB])?\\s*$'. Units binary (K = 1024), jaise docker --memory. value = float * unit; agar whole number of bytes nahi ('1.3' bytes) toh ValueError; <= 0 bhi reject. Tests: '64M' -> 67108864, '1.5G' -> 3 << 29, '64MiB'/'64MB' -> 64 << 20, ' 2K ' -> 2048; reject '', 'abc', '-1M', '0', '1.3', '10X', 'M'.\n\nCPU validation bhi isi pattern mein: _cpus 0 < v <= 1024 aur round(v * 100000) >= 1000 (kernel ka minimum quota 1 ms per 100 ms).",
+  "why_needed": "Container CLI mein user ke command ke flags aur runtime ke flags mix na hon -- yeh bug (ls --memory ko minibox ka flag samajhna) bahut common hai.",
+  "real_world_analogy": "Courier form: '--' ke baad jo likha hai woh parcel ke andar ki chitthi hai, courier company use padhti nahi, as-is deliver karti hai.",
+  "how_it_works": "argv -> argparse (options until first positional) -> REMAINDER grabs rest -> strip leading '--' -> require non-empty. Size: regex -> number + unit -> float * 1024^k -> integral and > 0 check -> int.",
+  "in_this_project": "minibox/cli.py build_parser, parse_args, _size, _cpus, _pids, _hostname, _name; minibox/cgroups.py parse_size. Tests tests/unit/test_cli.py aur tests/unit/test_cgroups.py::test_parse_size / test_parse_size_rejects.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/cli.py::build_parser",
+   "projects/16-container-runtime/minibox/cli.py::parse_args",
+   "projects/16-container-runtime/minibox/cli.py::_size",
+   "projects/16-container-runtime/minibox/cgroups.py::parse_size",
+   "projects/16-container-runtime/tests/unit/test_cli.py::test_command_flags_after_double_dash_are_not_ours",
+   "projects/16-container-runtime/tests/unit/test_cgroups.py::test_parse_size_rejects"
+  ],
+  "code_example": "# real, minibox/cli.py parse_args (trimmed)\n    args = build_parser().parse_args(argv)\n    if args.cmd == \"run\":\n        cmd = args.command\n        if cmd and cmd[0] == \"--\":\n            cmd = cmd[1:]\n        if not cmd:\n            build_parser().error(\"run: missing command (put it after --)\")\n        args.command = cmd\n\n# real, minibox/cgroups.py parse_size (trimmed)\n    m = _SIZE_RE.match(text)\n    if not m:\n        raise ValueError(f\"bad size {text!r} (examples: 64M, 512k, 1G, 1048576)\")\n    value = float(m.group(1)) * _UNITS[m.group(2).lower()]\n    if value != int(value):\n        raise ValueError(f\"size {text!r} is not a whole number of bytes\")",
+  "code_language": "python",
+  "advantages": [
+   "Command ke flags kabhi minibox ke nahi bante",
+   "Validation fork se pehle, argparse exit 2 ke saath",
+   "Size units docker jaise"
+  ],
+  "disadvantages": [
+   "REMAINDER ke quirks: options ko positional ke baad likho toh woh command mein chale jaate",
+   "float se size parse karna bahut bade numbers par precision kho sakta hai"
+  ],
+  "common_mistakes": [
+   "nargs='*' use karna (tab '--memory' minibox ka flag ban jaata)",
+   "'--' ko command ka hissa chhod dena",
+   "M ko 1000*1000 maan lena jabki docker binary units use karta hai"
+  ],
+  "follow_up_questions": [
+   "argparse.REMAINDER documented quirks kya hain aur alternative kya hai (parse_known_args)?",
+   "'1.5G' jaisa input float ke bina exact kaise parse karoge?",
+   "--cpus 0.001 kyun reject hota hai -- kernel ka rule kya hai?"
+  ],
+  "concepts": [
+   "argparse",
+   "cli-design",
+   "input-validation",
+   "size-parsing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "CTR-025",
+  "project_slug": "p16-container-runtime",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "minibox explicitly says it is not a security boundary. If you had to evolve the stage-1 core toward a real runtime, what would you add, in what order, and why?",
+  "answer_hinglish": "Pehle honest baseline (README): minibox sab kuch real root ke roop mein chalata hai -- user namespace nahi (container root = host root, test confirm karta hai), capabilities drop nahi (CAP_SYS_ADMIN, CAP_SYS_MODULE, CAP_MKNOD, CAP_SYS_PTRACE sab), seccomp/AppArmor/SELinux nahi, cgroup namespace nahi, /sys nahi par container khud mount kar sakta hai. Toh bina exploit ke escape possible hai: mknod host disk aur mount. pivot_root sirf chroot-style escape band karta hai.\n\nMeri recommended order, impact ke hisaab se:\n1) Capability drop + no_new_privs: sabse sasta aur sabse bada effect. CAP_SYS_ADMIN, CAP_MKNOD, CAP_SYS_MODULE hatane se 'mknod + mount host disk' raasta band. Docker ka default capability set jaisa chhota allowlist.\n2) Seccomp filter: mount, kexec, module load, keyctl jaise syscalls block -- kernel attack surface kam.\n3) User namespace: container ka uid 0 host par unprivileged uid; rootless bhi possible. Yeh sabse invasive hai: uid mapping, rootfs ownership (minibox root ke roop mein image pull karta hai taaki uid 0 owners hon), cgroup delegation sab badlega.\n4) /proc masking aur read-only paths (/proc/kcore, /proc/sys), read-only rootfs option.\n5) Device cgroup (cgroup v2 mein eBPF) taaki nodes bane bhi toh open na hon.\n\nHar ek ke saath wahi discipline jo chroot escape mein: attack test + control test + mutation. Architecture mein mounts.build_plan jaisa 'data plan' security config ke liye bhi (capabilities list, seccomp profile) -- unit testable. Yeh sab abhi NOT implemented hai.",
+  "why_needed": "Interviewer dekhna chahta hai ki candidate container isolation aur container security ke fark ko samajhta hai aur priorities justify kar sakta hai.",
+  "real_world_analogy": "Ghar ki deewarein (namespaces) ban gayi hain, lekin darwaze par taala (caps), CCTV aur rules (seccomp), aur guest ko master key na dena (user ns) abhi baaki hai.",
+  "how_it_works": "Current: namespaces + pivot_root + cgroups as real root. Target: + capset/bounding set drop + PR_SET_NO_NEW_PRIVS + seccomp BPF + CLONE_NEWUSER with uid/gid maps + masked /proc paths + device controller.",
+  "in_this_project": "README 'Read this first: it is NOT a security boundary' aur NOT implemented list; PLAN.md 'Not in scope'; test_user_namespace_is_shared_with_the_host jo limitation ko true rakhta hai; container.setup_container jahan in steps ko jodna hoga.",
+  "implementation_files": [
+   "projects/16-container-runtime/README.md",
+   "projects/16-container-runtime/PLAN.md",
+   "projects/16-container-runtime/minibox/container.py::setup_container",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_user_namespace_is_shared_with_the_host",
+   "projects/16-container-runtime/minibox/mounts.py::build_plan"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Clear priority: sabse sasta, sabse bada risk pehle",
+   "Har control ke liye testable escape scenario",
+   "Existing data-plan pattern reuse"
+  ],
+  "disadvantages": [
+   "User namespace bahut cheezein badalta hai (ownership, cgroups, overlay in userns)",
+   "Seccomp profile maintain karna aur false positives"
+  ],
+  "common_mistakes": [
+   "Namespaces ko security maan lena",
+   "Sirf seccomp lagana aur CAP_SYS_ADMIN chhod dena",
+   "Security feature add karna bina escape test ke"
+  ],
+  "follow_up_questions": [
+   "CAP_SYS_ADMIN kyun 'the new root' kehlata hai?",
+   "User namespace ke saath overlayfs aur cgroup delegation mein kya problems aati hain?",
+   "Seccomp default-deny vs default-allow profile -- kab kya?"
+  ],
+  "concepts": [
+   "container-security",
+   "capabilities",
+   "seccomp",
+   "user-namespace"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Capabilities + seccomp kam code mein bada fayda dete hain par root-in-container ka fundamental issue nahi hal karte; user namespace woh karta hai lekin sabse invasive hai. Isliye order: cheap high-impact pehle, invasive baad mein.",
+   "failure_scenarios": "Aaj: container mknod + mount se host disk padh sakta hai, /sys mount kar sakta hai, modules load kar sakta hai -- sab README mein likha hai. Galat seccomp profile legit programs ko EPERM deta hai; galat uid map par rootfs files ka ownership toot jaata hai.",
+   "alternatives": "VM-based isolation (Firecracker/gVisor jaise sandbox) jab hostile code ho; rootless runtimes; LSM profiles (AppArmor/SELinux) capabilities ke saath.",
+   "scale_10x_100x": "Security controls per-container constant cost hain; 10x-100x containers par seccomp filter ka per-syscall overhead aur uid range allocation (subuid ranges) manage karna padta -- minibox mein measure nahi kiya.",
+   "production_improvements": "Default-drop capability set, no_new_privs, default seccomp profile, user namespace with subuid mapping, masked /proc paths, read-only rootfs flag, aur har ek ke liye escape + control tests."
+  }
+ },
+ {
+  "id": "CTR-026",
+  "project_slug": "p16-container-runtime",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "How does minibox handle setup failures and cleanup across the three processes (exit 125, the ready pipe, killing INIT, the owned-resources guard), and where are its limits?",
+  "answer_hinglish": "Failure handling run() ke try/except/finally mein concentrated hai.\n\n1) Ownership guard: owned = {'cgroup': False, 'state': False}. os.makedirs(state) aur cgroup.create() dono FAIL karte hain agar naam already use mein ho (makedirs bina exist_ok, os.mkdir leaf). Success ke baad hi owned flag True hota hai, aur finally mein cleanup() sirf owned resources ko chhoota hai. Isliye same --name ka doosra container 125 deta hai lekin pehle ka cgroup nahi mitata -- test_two_containers_with_the_same_name_cannot_run_at_once exactly yeh check karta hai.\n\n2) Ready pipe: INIT fork ke baad os.read(ready_r, 1) par rukta hai jab tak host cgroup.add_pid(init_pid) na kar de. Agar add_pid fail ho (OSError), except block INIT ko SIGKILL + waitpid karta hai -- warna woh pipe par hamesha wait karta. Pipe ke bina M13 race: limits+isolation mein 4, 2, 2 failures, aur ek baar fork bomb cgroup ke bahar chala (load avg 3172, systemd session limit ne roka).\n\n3) INIT ke andar: init_main ka koi bhi exception pakda jaata hai, message print, aur os._exit(code) -- kabhi host ke code path mein return nahi (fork ke baad do copies ka khatra). Default 125.\n\n4) cleanup(): cgroup.kill + populated 0 wait, stats, remove; state dir rmtree, lekin agar merged host ns mein mounted dikhe toh RuntimeError bajaye mounted dir delete karne ke. test_failed_setup_also_cleans_up (bad workdir -> 125, state dir aur cgroup gone).\n\nLimits (README honest): minibox khud SIGKILL ho toh koi cleanup nahi -- container chalta rehta hai, cgroup aur state dir bachte hain, koi gc/ps/stop nahi. Shared parent cgroup remove race: doosra container ENOENT se 125. M18 (cgroup.kill skip) pakda nahi gaya kyunki PID 1 exit hone par kernel poora namespace pehle hi maar deta hai.",
+  "why_needed": "Container runtimes ka sabse mushkil hissa happy path nahi, partial failure ke baad saaf state hai; interview mein yeh ownership aur crash-consistency thinking dikhata hai.",
+  "real_world_analogy": "Event hall booking: aap sirf woh hall saaf karte ho jo aapne book kiya (owned), doosre ki party ka saaman nahi uthate. Aur agar aapki gaadi hi raste mein toot jaaye (minibox SIGKILL), toh hall gandaa pada rehta hai jab tak koi manager (gc) na aaye.",
+  "how_it_works": "try: makedirs state (owned) -> build_plan -> cgroup.create (owned) -> pipe -> unshare+fork -> add_pid -> write pipe -> wait. except: kill INIT if started -> 125. finally: reset handlers -> cleanup(owned only).",
+  "in_this_project": "minibox/container.py run() aur cleanup(); minibox/cgroups.py Cgroup.create (mkdir fails if exists, limits fail -> remove), kill, remove. Tests tests/integration/test_isolation.py::test_failed_setup_also_cleans_up, ::test_two_containers_with_the_same_name_cannot_run_at_once, ::test_state_dir_and_cgroup_are_removed.",
+  "implementation_files": [
+   "projects/16-container-runtime/minibox/container.py::run",
+   "projects/16-container-runtime/minibox/container.py::cleanup",
+   "projects/16-container-runtime/minibox/cgroups.py::Cgroup",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_failed_setup_also_cleans_up",
+   "projects/16-container-runtime/tests/integration/test_isolation.py::test_two_containers_with_the_same_name_cannot_run_at_once",
+   "projects/16-container-runtime/README.md",
+   "projects/16-container-runtime/SERVER_RUN.md"
+  ],
+  "code_example": "# real, minibox/container.py run (trimmed)\n    except (OSError, RuntimeError, ValueError) as e:\n        if init_pid:                                # e.g. joining the cgroup failed: INIT still waits\n            try:\n                os.kill(init_pid, signal.SIGKILL)\n                os.waitpid(init_pid, 0)\n            except (ProcessLookupError, ChildProcessError):\n                pass\n        print(f\"minibox: {e}\", file=sys.stderr)\n        return EXIT_SETUP_FAILED\n    finally:\n        if init_pid:\n            for sig in FORWARDED_SIGNALS:\n                signal.signal(sig, signal.SIG_DFL)\n        cleanup(cfg, cgroup if owned[\"cgroup\"] else None, state if owned[\"state\"] else None, started, exit_code)",
+  "code_language": "python",
+  "advantages": [
+   "Kisi aur container ke resources kabhi delete nahi hote",
+   "INIT kabhi host code path mein return nahi karta",
+   "Failure paths ke integration tests hain"
+  ],
+  "disadvantages": [
+   "minibox SIGKILL = leaked container, cgroup, state dir",
+   "Shared parent cgroup par chhota race",
+   "cgroup.kill path ka koi test nahi (M18 not caught)"
+  ],
+  "common_mistakes": [
+   "Cleanup mein exist check karke kisi bhi naam ka cgroup mita dena",
+   "Fork ke baad child mein exception ko upar propagate hone dena",
+   "Pipe wait mein INIT ko orphan chhod dena jab parent fail ho"
+  ],
+  "follow_up_questions": [
+   "minibox gc kaise design karoge jo crash ke baad leftovers pehchaane aur saaf kare?",
+   "M18 ko pakadne wala test kaise banaoge (hint: process jo INIT ka child nahi hai)?",
+   "Parent cgroup race ko kaise fix karoge?"
+  ],
+  "concepts": [
+   "failure-handling",
+   "cleanup",
+   "ownership",
+   "crash-consistency"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-invocation foreground process simple hai (koi daemon nahi) lekin crash-safety nahi deta; daemon (dockerd/containerd-shim model) state track karta hai par complexity aur ek long-lived privileged process laata hai.",
+   "failure_scenarios": "minibox SIGKILL: container zinda, cgroup aur state dir leak. add_pid fail: INIT killed, 125. Same name: 125, pehla safe. Parent rmdir race: ENOENT, 125. M6 ke time do containers chalte reh gaye aur haath se cgroup.kill karna pada; ab fixture leftovers ko kill karke fail karta hai.",
+   "alternatives": "containerd-shim jaisa per-container supervisor jo runtime crash survive kare; state file (pid, cgroup, state dir) aur startup par reconcile; systemd transient scopes jo cleanup kernel/systemd ko de dete.",
+   "scale_10x_100x": "10x-100x containers par leaks ka asar jama hota (cgroup dirs, overlay upper dirs disk par). Shared parent race zyada frequent. Reconcile/gc loop zaroori ho jaata. Yeh measure nahi kiya.",
+   "production_improvements": "State file + minibox gc/ps/stop, parent cgroup ko remove na karna (ya lock), PR_SET_PDEATHSIG ya pidfd se host-crash detection, aur M18 ke liye exec-style test."
+  }
+ }
+]

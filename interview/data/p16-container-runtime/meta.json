@@ -1,0 +1,128 @@
+{
+ "project_slug": "p16-container-runtime",
+ "project": "minibox: a container runtime written by hand (H16, A1 Build your own Docker)",
+ "source_dir": "projects/16-container-runtime",
+ "summary": "minibox runs a command in a container the way docker run does underneath, in Python 3.12 with zero third-party runtime dependencies (ctypes only for mount, umount2 and pivot_root). Stage 1: PID, UTS, mount, IPC and network namespaces (network has only loopback, brought up with an ioctl); three processes per container (host -> INIT as PID 1 -> CMD as PID 2) because unshare(CLONE_NEWPID) only affects the next child; INIT reaps every orphan with waitpid(-1) and forwards TERM/INT/HUP/QUIT/USR1/USR2 because PID 1 of a namespace gets no default signal actions; a mount plan built as data (MS_PRIVATE first, overlay or bind root, fresh /proc, tmpfs /dev with mknod'ed null/zero/full/random/urandom/tty, devpts, /dev/shm) and pivot_root with the old root detached; the chroot escape is tested both ways; docker-style exit codes (code, 128+N, 125, 126, 127); clean environment and SIGPIPE reset before exec. Stage 2: cgroup v2 through /sys/fs/cgroup/minibox/<name>: memory.max plus memory.swap.max=0, pids.max, cpu.max; INIT joins the cgroup before it forks (pipe sync); cleanup writes cgroup.kill, waits for populated 0, records limits read back and counters in a stats file, then rmdirs. Measured on portfolio-a2 (2 vCPU arm64, kernel 7.0): empty container 18 ms inside minibox / 105 ms with Python start-up; pids.peak 32 for a fork bomb; memory hog OOM-killed (exit 137, oom_kill 1, peak 64.0 MiB); cpu share 0.501 at --cpus 0.5 and 0.252 at 0.25, 0.998 unlimited. Stage 3: minibox pull from Docker Hub with urllib (anonymous bearer token, index -> platform manifest, every manifest/config/layer digest and diff_id verified before anything is applied, token never sent to the CDN on redirects), layers flattened with OCI whiteouts in two passes and tar safety checks, used as the read-only lowerdir of an overlay whose upper dir is discarded on exit. 140 unit tests (run anywhere) and 52 integration tests (Linux + root); 29 mutation checks, 28 caught, M18 (cgroup.kill skipped) not catchable by design. NOT done and NOT a security boundary: no user namespace, no capability dropping, no seccomp/AppArmor, no cgroup namespace, no networking beyond loopback (stage 4 left out because Docker owns the FORWARD/nat chains on that server), no gc/exec/tty, image config ignored.",
+ "pitch": {
+  "intro_30s": "Maine docker ke neeche wala hissa khud likha hai: minibox, Python standard library mein, sirf mount, umount2 aur pivot_root ke liye ctypes. Ek container asal mein normal process hai: apne namespaces (PID, UTS, mount, IPC, net), pivot_root se image ka root filesystem, fresh /proc aur chhota /dev, aur cgroup v2 limits. minibox Docker Hub se image khud pull karta hai, har digest verify karta hai, whiteouts apply karta hai, aur overlay ke upper dir mein likhta hai jo exit par phenk diya jaata hai. Limits server par measure kiye: fork bomb 32 processes par ruk gaya, 64M wala hog OOM kill (137), 0.5 CPU par share 0.501. 192 tests, 29 mutation checks. Aur saaf bolta hoon: yeh security boundary nahi hai -- root hai, user namespace aur seccomp nahi.",
+  "explain_2min": "Teen process hain. Host wala minibox cgroup leaf banata hai (/sys/fs/cgroup/minibox/<name>), overlay ke upper/work/merged dirs banata hai, phir unshare(CLONE_NEWPID) aur fork. unshare PID namespace mein caller ko nahi daalta, sirf agle child ko -- isliye INIT alag process hai aur wahi PID 1 banta hai. Host INIT ka pid cgroup.procs mein likhta hai aur pipe se INIT ko aage jaane deta hai, taaki koi bhi process bina limit ke na chale.\n\nINIT mount, UTS, IPC aur net namespaces kholta hai, hostname set karta hai, lo up karta hai (ioctl), phir mount plan chalata hai: pehle / ko MS_PRIVATE, phir overlay root, fresh /proc, tmpfs /dev mein mknod se null, zero, urandom waghera, devpts, shm. Phir pivot_root aur old root detach -- ab host ka tree namespace mein hai hi nahi. chroot ke saath yeh escape ho sakta hai; dono cases test kiye.\n\nINIT phir CMD fork karta hai (PID 2), jo signals default karke clean env ke saath exec karta hai. INIT waitpid(-1) se har orphan reap karta hai aur signals forward karta hai, kyunki PID 1 ko kernel default signal action nahi deta. CMD khatam -> INIT exit -> kernel baaki sab maar deta hai. Host cgroup.kill, counters stats file mein, rmdir, overlay dirs delete.\n\nImages: registry.py token leta hai, index se arm64 manifest, config aur layers download, har digest aur diff_id check, phir hi layers apply -- whiteouts do pass mein.",
+  "deep_5min": "Ek container start ka safar, code ke order mein.\n\ncli.py: argparse, --memory 64M -> parse_size binary units, --cpus 0.5 -> 1 ms quota minimum check, command '--' ke baad. Root aur Linux check, warna 125.\n\ncontainer.run: name (random mb-xxxx), owned flags taaki doosre container ka cgroup kabhi delete na ho, overlay dirs (makedirs fail kare agar naam already use mein), build_plan, cgroup.create (root ki subtree_control mein cpu memory pids hone chahiye, warna refuse; parent mein +cpu +memory +pids; leaf mein Limits.writes: memory.max, memory.swap.max 0, pids.max, cpu.max). Phir pipe, unshare(CLONE_NEWPID), fork.\n\nINIT: pipe par wait, setup_container: unshare(NEWNS|NEWUTS|NEWIPC|NEWNET), socket.sethostname, bring_up_loopback, apply_plan, enter_root (pivot_root, chdir /, umount2 MNT_DETACH, rmdir). Phir CMD fork: tty ho toh apna process group, SIGPIPE/SIGINT/SIGTTOU default, chdir workdir (fail -> 125), execvpe (not found 127, permission 126). INIT handlers lagata hai aur waitpid(-1) loop; CMD ka status exit_code_from_status se 128+N.\n\nHost: signals INIT ko forward, waitpid, finally cleanup: cgroup.kill, populated 0 ka wait, stats (limits kernel se read back), rmdir leaf aur khaali parent, state dir rmtree. Overlay INIT ke mount namespace mein tha, toh woh apne aap gaya.\n\nMeasurement: bench/limits.py stats files se tables generate karta hai: start 18 ms, pids.peak 32, OOM 137 at 64.0 MiB, cpu 0.501 / 0.252 / 0.998.\n\nTesting: unit tests fake cgroup dirs, fixture tars aur FakeRegistry par; integration tests server par root se, ek fixture jo bache hue containers maar ke test fail karta hai. 29 mutations sirf server ki copy mein; 28 pakde gaye, M18 design ki wajah se nahi pakda ja sakta, M13 race hai. Fork bomb kabhi mutated code par nahi chalaya -- ek baar galti se chala (load average 3172), session ki pids limit ne roka; woh SERVER_RUN.md mein likha hai.",
+  "architecture_walkthrough": "minibox/cli.py -> container.py (host side run + cleanup, INIT init_main + setup_container, CMD exec) -> mounts.py (Plan of Mount/Mkdir/Mknod/Symlink steps, apply_plan, enter_root) -> libc.py (ctypes mount, umount2, pivot_root by syscall number 41 on arm64, 155 on x86_64) -> cgroups.py (parse/format values, Limits.writes, Cgroup create/add_pid/kill/stats/remove). Images: registry.py (parse_reference, parse_www_authenticate, select_platform, Registry.get with one 401 retry, manifest, blob, pull with verify-all-then-apply) -> image.py (sha256, check_digest, clean_member_path, classify whiteouts, _inside symlink check, apply_layer in two passes with _keep_mode filter). bench/limits.py runs real containers and generates the README tables from raw JSON. tests/unit run anywhere; tests/integration need Linux + root + MINIBOX_TEST_ROOTFS and are skipped elsewhere with a reason.",
+  "difficult_decisions": [
+   "INIT ko apna Python process banaya, user command ko PID 1 nahi: reaping aur signal forwarding PID 1 ki zimmedari hai.",
+   "pivot_root + old root detach, chroot nahi; escape ko test se dono taraf prove kiya.",
+   "Mount plan ko data banaya taaki order aur flags kisi bhi OS par unit test ho sakein.",
+   "memory.swap.max 0 hamesha --memory ke saath, warna 4 GB swap wale server par 64M ka matlab 64M nahi.",
+   "Cgroup join fork se pehle, pipe sync ke saath; bina iske M13 race asli hai.",
+   "Root cgroup ko change karne ki jagah refuse karna agar controllers delegate nahi hain.",
+   "Har digest aur diff_id verify karke hi koi layer apply karna; fail hua blob delete.",
+   "Layers ko ek directory mein flatten karna, ek lowerdir per layer nahi: simple, whiteouts ek baar.",
+   "Stage 4 networking chhod di kyunki server par Docker FORWARD aur nat chains ka maalik hai."
+  ],
+  "biggest_challenges": [
+   "PID 3 bug: ctypes.util.find_library ne container ke andar ldconfig fork kiya aur PID 2 le liya.",
+   "Pehla fork bomb test galat wajah se pass hua: busybox sh mein woh bomb 4 process se aage badha hi nahi.",
+   "Mutation runs ne server par containers aur mounts chhod diye; fixture ab unhe maar ke test fail karta hai.",
+   "M13 race ko pakadne ke liye test ko 10 containers chalane pade.",
+   "Ek mutation run mein fork bomb bina cgroup ke chal gaya; uske baad har mutation run se woh test hata diya."
+  ],
+  "failure_scenarios": [
+   "minibox khud SIGKILL ho jaaye: container chalta rehta hai, cgroup aur state dir bache rehte hain (gc nahi hai).",
+   "Mounts private na hon: container ke mounts host par leak hote hain aur pivot_root refuse karta hai (M4).",
+   "Fork bomb bina pids.max: poore server ko gira sakta hai; isliye tests bounded twin rakhte hain.",
+   "Registry se kharab blob: digest mismatch, blob delete, koi layer apply nahi.",
+   "Do containers usi waqt jab parent cgroup remove ho raha ho: doosra ENOENT ke saath 125 deta hai.",
+   "Host process INIT ko pipe par likhne se pehle mar jaaye: INIT ko EOF milta hai aur code abhi isse check nahi karta (known gap)."
+  ],
+  "improvements": [
+   "User namespace, capability dropping, seccomp, no_new_privs, masked /proc paths.",
+   "veth pair (pehle bina NAT), phir bridge aur NAT, sirf agar host ke firewall ko chhue bina ho.",
+   "gc/ps/stop/exec commands aur PR_SET_PDEATHSIG ya state file se cleanup.",
+   "INIT mein pipe ka result check karna (EOF par 125).",
+   "Image config ka Env/Cmd/WorkingDir use karna, zstd layers, shared layer cache.",
+   "cgroup namespace aur io/cpuset limits."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Namespaces and PID 1",
+   "steps": [
+    "1. Concept: container = process + namespaces; unshare(CLONE_NEWPID) sirf agle child ko naye namespace mein daalta hai.",
+    "2. Project need: command ko apna PID 1, hostname, mounts, IPC aur network chahiye.",
+    "3. Code/API: container.py run, init_main, setup_container, exit_code_from_status.",
+    "4. Detail: PID 1 ko default signal actions nahi milte; waitpid(-1) se orphans reap; CMD exit -> namespace khatam.",
+    "5. Demo: sudo MINIBOX_TEST_ROOTFS=... python3 -m pytest tests/integration/test_isolation.py",
+    "6. Interviewer next: docker run --init kya karta hai?"
+   ],
+   "files": [
+    "projects/16-container-runtime/minibox/container.py",
+    "projects/16-container-runtime/tests/integration/test_isolation.py"
+   ]
+  },
+  {
+   "concept": "Root filesystem: mount plan and pivot_root",
+   "steps": [
+    "1. Concept: chroot sirf lookup ka start badalta hai; pivot_root namespace ka root mount badalta hai.",
+    "2. Project need: host ka tree container mein reachable na ho.",
+    "3. Code/API: mounts.py build_plan, apply_plan, enter_root; libc.py mount, umount2, pivot_root.",
+    "4. Detail: MS_PRIVATE pehle, bind ya overlay root, fresh /proc, tmpfs /dev + mknod, old root MNT_DETACH.",
+    "5. Demo: python -m pytest tests/unit/test_mounts.py; integration mein escape tests.",
+    "6. Interviewer next: pivot_root kafi kyun nahi agar saari capabilities bachi hain?"
+   ],
+   "files": [
+    "projects/16-container-runtime/minibox/mounts.py",
+    "projects/16-container-runtime/minibox/libc.py",
+    "projects/16-container-runtime/tests/unit/test_mounts.py"
+   ]
+  },
+  {
+   "concept": "cgroup v2 limits",
+   "steps": [
+    "1. Concept: cgroup v2 filesystem interface, leaf cgroups, subtree_control.",
+    "2. Project need: memory, pids aur CPU ki hard limits.",
+    "3. Code/API: cgroups.py Limits.writes, Cgroup.create, add_pid, kill, stats, remove.",
+    "4. Detail: memory.swap.max 0; join before fork; cgroup.kill + populated wait.",
+    "5. Demo: tests/integration/test_limits.py aur bench/limits.py.",
+    "6. Interviewer next: cpu.max quota/period se 0.5 CPU kaise banta hai?"
+   ],
+   "files": [
+    "projects/16-container-runtime/minibox/cgroups.py",
+    "projects/16-container-runtime/tests/integration/test_limits.py",
+    "projects/16-container-runtime/bench/limits.py"
+   ]
+  },
+  {
+   "concept": "Images, digests, whiteouts, overlay",
+   "steps": [
+    "1. Concept: index -> manifest -> config + layers, sab content addressed.",
+    "2. Project need: image stdlib se pull karna aur verify karna.",
+    "3. Code/API: registry.py pull, Registry.get, select_platform; image.py apply_layer, classify, check_digest.",
+    "4. Detail: verify all before apply; two-pass whiteouts; token unredirected; overlay upper discarded.",
+    "5. Demo: python -m pytest tests/unit/test_registry.py tests/unit/test_image.py",
+    "6. Interviewer next: tag vs digest se pull karne mein trust ka kya farak hai?"
+   ],
+   "files": [
+    "projects/16-container-runtime/minibox/registry.py",
+    "projects/16-container-runtime/minibox/image.py",
+    "projects/16-container-runtime/tests/unit/test_registry.py",
+    "projects/16-container-runtime/tests/integration/test_overlay.py"
+   ]
+  },
+  {
+   "concept": "Proving it: mutation checks and server hygiene",
+   "steps": [
+    "1. Concept: test tabhi kaam ka hai jab rule todne par red ho.",
+    "2. Project need: 29 rules jaan-boojh ke tode, sirf server ki copy mein.",
+    "3. Code/API: tests/integration/conftest.py no_leftovers; README mutation table; SERVER_RUN.md.",
+    "4. Detail: M18 not catchable, M13 race, fork bomb kabhi mutated code par nahi.",
+    "5. Demo: README ka mutation section padho.",
+    "6. Interviewer next: equivalent mutant kya hota hai?"
+   ],
+   "files": [
+    "projects/16-container-runtime/tests/integration/conftest.py",
+    "projects/16-container-runtime/README.md",
+    "projects/16-container-runtime/SERVER_RUN.md"
+   ]
+  }
+ ]
+}
