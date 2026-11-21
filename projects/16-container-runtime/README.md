@@ -296,6 +296,9 @@ Before every mutation the clean tree was shipped again. After the mutation runs 
   `push`, no build.
 - Layers are flattened into one directory per image (simple, one lowerdir) instead of one overlay lowerdir per layer
   (what docker does, so layers are shared between images on disk).
+- INIT does not check what it read from the sync pipe: if the host process died before writing to it, INIT would get
+  end-of-file and carry on outside its cgroup. Found while writing the interview bank, after the server run; not
+  fixed, so the tested code stays the code described here.
 - Two containers starting at the exact moment the last one is removing the shared parent cgroup can race (the
   second gets ENOENT and exits 125).
 
