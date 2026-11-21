@@ -372,6 +372,24 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 14, slug: "p15-dns-resolver", dir: "projects/15-dns-resolver", name: "Recursive DNS Resolver",
+    tagline: "A DNS resolver written byte by byte: it walks from the root servers down to the answer, caches by TTL, and answers nslookup.",
+    stack: ["TypeScript", "Node.js (node:dgram, node:net only)", "UDP + TCP"],
+    features: [
+      "Own DNS wire format: every record type it needs, name compression both ways, pointer-loop protection; 6000 random and bit-flipped packets only ever produce a clean error",
+      "Iterative resolution from the 13 root servers: referrals, glue, out-of-bailiwick name servers, CNAME chains with a limit",
+      "Spoofing defences: random query ID and source port, answers checked against the question, out-of-zone records dropped (bailiwick)",
+      "Truncated UDP answers retried over TCP; dead servers time out and the next one is tried",
+      "TTL cache with negative caching (RFC 2308); a stub server on loopback that the Windows nslookup really talks to",
+      "Opt-in live test against the real root servers passed (example.com, a CNAME chain, MX, NXDOMAIN)",
+      "41 deliberate code breaks: 4 test gaps found and closed, 1 explained as not catchable",
+    ],
+    tests: "82 passing without internet (a fake network of authoritative servers on loopback), plus 9 opt-in live and nslookup tests",
+    run: "cd projects/15-dns-resolver && npm ci && npm run build && node dist/index.js resolve www.wikipedia.org A",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
