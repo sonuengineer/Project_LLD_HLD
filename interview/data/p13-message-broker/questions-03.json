@@ -1,0 +1,509 @@
+[
+ {
+  "id": "MB-036",
+  "project_slug": "p13-message-broker",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "What does the route protocol between brokers look like (RINFO, RS+, RS-, RMSG), why is the RMSG meta JSON, and why is it not compatible with real NATS routes?",
+  "answer_hinglish": "Har broker ek doosra port (cluster port) kholta hai jahan sirf doosre brokers connect karte hain. Wahan apna protocol chalta hai, src/route.ts mein. Yeh jaan-boojh kar real NATS routes ke saath compatible NAHI hai -- sirf 'inspired by'. Real NATS route protocol bada target hai aur learning goal nahi tha; README aur route.ts ka header yahi saaf likhte hain, taaki koi compatibility claim na kare.\n\nCommands: RINFO {\"server_id\":\"...\"} -- dono taraf pehli line, 'main kaun hoon'. Iske bina koi aur op aaya toh 'RINFO expected first' error, aur doosra RINFO bhi error. RS+ <subject> [queue] -- mere clients ab is subject (aur queue group) mein interested hain. RS- <subject> [queue] -- ab nahi. RMSG {meta json} <bytes>\\r\\n<payload>\\r\\n -- tumhare LOCAL subscribers ke liye ek message. PING/PONG bhi parse hote hain (route par PING aaye toh PONG jaata hai), lekin broker khud routes ko PING nahi bhejta -- route liveness abhi sirf TCP keepalive hai.\n\nRMSG meta: {s: subject, r?: reply, p: plain subscribers ko do?, q?: kaunse queue groups tumhe serve karne hain, h?: header length}. JSON kyun? Kyunki fields optional aur badhte rahenge (q ek list hai), aur positional arguments mein 'yeh token reply hai ya queue?' wali ambiguity aati. Parse kaise unambiguous hai: RMSG ke baad lastIndexOf(' ') -- aakhri space ke baad size, pehle JSON. JSON.stringify koi space nahi likhta, aur subjects aur queue names mein whitespace allowed hi nahi, toh JSON ke andar space ho hi nahi sakta. Phir validMeta har field check karta hai (subject publish-valid, p boolean, q valid queue names, h >= 8 aur <= size), aur payload ke liye wahi Framer.expect(size). Route par parse error ka matlab connection band (routeGone + destroy), koi -ERR nahi.",
+  "why_needed": "Brokers ke beech ka protocol hi cluster ki correctness tay karta hai; uska format aur validation clear hona chahiye, aur compatibility ka claim honest.",
+  "real_world_analogy": "Do branch offices ke beech internal memo format: pehla memo 'main kaun hoon', phir 'humare yahan in topics ke log hain' / 'ab nahi hain', aur 'yeh chitthi tumhare logon ke liye, envelope par instructions'. Format apna hai, head office ke format se alag.",
+  "how_it_works": "connect -> both send RINFO -> handshake -> full RS+ list -> live RS+/RS- -> RMSG for messages. RouteParser: line -> switch name; RMSG: lastIndexOf(' ') -> size, JSON.parse(meta), validMeta, framer.expect(size).",
+  "in_this_project": "src/route.ts RouteParser, validMeta, encodeRinfo, encodeInterest, encodeRmsg, RouteMsgMeta. src/server.ts handleRoute, setupRoute. Tests test/route.test.ts (encoders round-trip through the parser, bad input).",
+  "implementation_files": [
+   "projects/13-message-broker/src/route.ts::RouteParser",
+   "projects/13-message-broker/src/route.ts::validMeta",
+   "projects/13-message-broker/src/route.ts::encodeRmsg",
+   "projects/13-message-broker/src/server.ts::handleRoute",
+   "projects/13-message-broker/test/route.test.ts"
+  ],
+  "code_example": "// real, src/route.ts RouteParser.line (trimmed)\ncase \"RMSG\": {\n  const cut = rest.lastIndexOf(\" \");\n  const size = cut < 0 ? undefined : parseCount(rest.slice(cut + 1));\n  if (size === undefined) throw new ParseError(\"Route Protocol Error: bad RMSG\");\n  if (size > this.limits.maxPayload) throw new ParseError(\"Maximum Payload Violation\");\n  let meta: RouteMsgMeta;\n  try {\n    meta = JSON.parse(rest.slice(0, cut)) as RouteMsgMeta;\n  } catch {\n    throw new ParseError(\"Route Protocol Error: bad RMSG\");\n  }\n  if (!validMeta(meta, size)) throw new ParseError(\"Route Protocol Error: bad RMSG\");\n  this.pending = meta;\n  this.framer.expect(size);\n  return;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Chhota protocol, poora test ho sakta hai",
+   "JSON meta mein naye fields bina format tode",
+   "Wahi Framer, toh split reads ka handling dobara nahi likhna pada"
+  ],
+  "disadvantages": [
+   "Real NATS servers ke saath cluster nahi bana sakte",
+   "JSON parse har RMSG par (cost measure nahi kiya)",
+   "Route ki apni PING nahi"
+  ],
+  "common_mistakes": [
+   "Apne route protocol ko 'NATS compatible' bolna",
+   "Meta mein positional optional fields rakhna",
+   "Route se aaye meta ko validate kiye bina trust karna"
+  ],
+  "follow_up_questions": [
+   "Agar kabhi subject mein space allowed ho jaye toh lastIndexOf wala rule kya todega?",
+   "Binary length-prefixed meta kab better hoga?",
+   "Route protocol mein version field kyun chahiye hoga?"
+  ],
+  "concepts": [
+   "route-protocol",
+   "framing",
+   "protocol-design"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-037",
+  "project_slug": "p13-message-broker",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "How does interest propagation work: why is interest counted, when exactly are RS+ and RS- sent, and what happens on a client disconnect and on a new route?",
+  "answer_hinglish": "Goal: broker A ko pata ho ki broker B ke clients kya sunte hain, taaki A sirf wahi forward kare (C1 mutation -- 'sab peers ko bhejo' -- 3 tests tode). Lekin har SUB par RS+ bhejna bekaar hai: B par 100 clients 'orders.*' sunein toh A ko sirf ek baar jaanna hai.\n\nIsliye counting: localInterest Map, key 'subject' ya 'subject queue' -> local subscriptions ki ginti. subscribe() mein interestUp: count++ aur sirf 0 -> 1 par har route ko RS+. removeSub mein interestDown: count--, aur sirf 1 -> 0 par RS- (aur key delete). Test 'interest is counted': B par do clients 't' sunte hain, ek UNSUB karta hai -- A par interest ab bhi hai; doosra disconnect karta hai -- tab interest jaati hai. C2 mutation (pehle unsubscribe par hi RS-) isi test ne pakda.\n\nDisconnect bhi unsubscribe hai: drop() har subscription par removeSub bulata hai, toh counts sahi ghatte hain. removeSub pehle trie.remove karta hai aur false aaye toh ruk jaata hai -- isse ek subscription ka count do baar nahi ghat-ta (jaise auto-unsubscribe ke baad disconnect). Queue groups alag key hain: 'jobs' aur 'jobs w' alag interest hain, kyunki plain aur queue routing alag hai.\n\nNaya route: handshake ke aakhir mein localInterest ki har key par RS+ -- full sync. Test 'a broker that joins later learns the existing interest'; C3 mutation (yeh sync hataya) 2 tests tode. Receiving side: RS+ ko interestByKey se dedupe karke route ke apne interest trie mein daalta hai, RS- se nikalta hai. Route toot-te hi us peer ka poora interest trie Route object ke saath chala jaata hai -- nothing forwarded any more.\n\nImportant: sirf LOCAL client subscriptions interestUp karti hain. Route se aaya RS+ aage kisi peer ko relay nahi hota -- interest bhi ek hop hai, forwarding ki tarah.",
+  "why_needed": "Bina interest propagation ke ya toh har message har broker ko jaata (bandwidth waste) ya kisi ko nahi; bina counting ke RS+/RS- ka toofan aur galat withdrawals.",
+  "real_world_analogy": "Building mein har floor ka receptionist head office ko batata hai 'humare floor par koi Sales newsletter padhta hai' -- pehla reader aane par ek baar, aur aakhri reader jaane par ek baar. Beech ke readers ke liye phone nahi.",
+  "how_it_works": "subscribe -> trie.insert -> interestUp(key): n == 1 ? RS+ to all routes. removeSub -> trie.remove ok? -> interestDown: n == 0 ? RS- to all routes. handshake -> RS+ for every localInterest key. handleRoute RS+/RS- -> route.interest trie.",
+  "in_this_project": "src/server.ts interestUp, interestDown, localInterest, removeSub, drop, handshake (full sync), handleRoute (RS+/RS-), Route.interest, Route.interestByKey, interestKey. Tests test/cluster.test.ts 'interest propagation and forwarding' block.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::interestUp",
+   "projects/13-message-broker/src/server.ts::interestDown",
+   "projects/13-message-broker/src/server.ts::handshake",
+   "projects/13-message-broker/src/server.ts::removeSub",
+   "projects/13-message-broker/test/cluster.test.ts::startCluster"
+  ],
+  "code_example": "// real, src/server.ts\nprivate interestUp(subject: string, queue: string | undefined): void {\n  const key = interestKey(subject, queue);\n  const n = (this.localInterest.get(key) ?? 0) + 1;\n  this.localInterest.set(key, n);\n  if (n === 1) for (const r of this.routes.values()) r.write(encodeInterest(\"RS+\", subject, queue));\n}\n\nprivate interestDown(subject: string, queue: string | undefined): void {\n  const key = interestKey(subject, queue);\n  const n = (this.localInterest.get(key) ?? 0) - 1;\n  if (n > 0) {\n    this.localInterest.set(key, n);\n    return;\n  }\n  this.localInterest.delete(key);\n  for (const r of this.routes.values()) r.write(encodeInterest(\"RS-\", subject, queue));\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Har distinct subject par sirf do route messages (on/off)",
+   "Disconnect apne aap sahi count karta hai",
+   "Naya ya reconnect hua peer full sync paata hai"
+  ],
+  "disadvantages": [
+   "Interest ek hop: full mesh zaroori",
+   "Wildcards ko compress nahi karta (orders.* aur orders.eu dono alag RS+)",
+   "RS+ raste mein ho toh us beech ke messages forward nahi hote"
+  ],
+  "common_mistakes": [
+   "Har SUB par RS+ bhejna",
+   "Pehle UNSUB par hi RS- bhejna (C2)",
+   "Naye peer ko current interest na bhejna (C3)",
+   "Route se aaya RS+ doosre peers ko relay karna"
+  ],
+  "follow_up_questions": [
+   "Agar RS- aur RS+ ka order network mein badal jaye toh? (ek TCP connection par kyun nahi badalta)",
+   "orders.> pehle se announced ho toh orders.eu ka RS+ bhejna zaroori hai kya?",
+   "Hazaron distinct subjects (jaise _INBOX per request) par yeh kitna traffic banayega?"
+  ],
+  "concepts": [
+   "interest-propagation",
+   "reference-counting",
+   "state-sync"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Counting se route traffic subjects ki ginti par depend karta hai, subscriptions ki ginti par nahi. Keemat: har broker ko har peer ka interest trie memory mein rakhna padta hai, aur request/reply ke _INBOX jaise short-lived subjects har baar RS+ aur RS- banate hain.",
+   "failure_scenarios": "RS+ pahunchne se pehle publish hua message forward nahi hota (at most once). Route toot-ne par peer ka interest turant jaata hai; reconnect par full sync. Agar interestDown ka guard na hota toh double decrement se count negative ya galat RS- ho sakta tha -- removeSub ka trie.remove check yeh rokta hai.",
+   "alternatives": "Har message ko sab peers ko bhejna (simple, bandwidth waste -- C1); peers se pull ('kya tumhare paas X hai?') har message par (latency); wildcard aggregation (agar orders.> announced hai toh specific subjects suppress).",
+   "scale_10x_100x": "Bahut saare distinct subjects (per-request inboxes) par RS+/RS- traffic aur har route ke interest trie ka size badhega. Kitna, measure nahi kiya. Real NATS jaise systems ise inbox prefix ke ek wildcard interest se kam karte hain; yahan woh nahi hai.",
+   "production_improvements": "Inbox subjects ke liye prefix-wildcard interest, interest trie size ka metric, aur route par interest ke liye periodic consistency check."
+  }
+ },
+ {
+  "id": "MB-038",
+  "project_slug": "p13-message-broker",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why is forwarding limited to one hop, why does that make a full mesh loop-free and duplicate-free, and what would break in a line or star topology?",
+  "answer_hinglish": "Rule: jo message route se aaya, woh sirf LOCAL subscribers ko deliver hota hai aur kabhi kisi doosre route ko nahi jaata. fromRoute mein koi route write hai hi nahi; code comment kehta hai 'one hop, no loops'.\n\nFull mesh mein yeh kaafi kyun hai: har broker har doosre broker se seedha juda hai. Origin broker A khud har interested peer ko ek RMSG bhejta hai. B aur C ko seedha A se mila, toh unhe kisi ko aage bhejne ki zaroorat nahi. Agar B bhi aage bhejta, toh C ko do copies milti (A se aur B se), aur C phir A aur B ko bhejta -- loop. One-hop rule se dono problem khatam, bina message ids, TTL ya seen-sets ke.\n\nTest 'no duplicates in a full mesh, and a broker never forwards what came from a route': 3 brokers, har ek par ek subscriber 'news', A par 100 publishes. Har subscriber ko exactly 100, A ke routeOutMsgs 200 (100 x 2 peers), aur B aur C ke routeOutMsgs 0. C11 mutation (route se aaya message aage forward) ne 3 tests tode.\n\nLine (A - B - C, A aur C seedhe nahi jude) mein kya tootega: A ka message B tak jaata hai, B use C ko nahi bhejega, toh C ke subscriber ko kabhi nahi milega. Aur interest bhi ek hop hai -- B, C ka RS+ A ko relay nahi karta -- toh A ko C ka pata hi nahi. Star mein bhi yahi: leaves ek doosre tak nahi pahunchte. Isliye README kehta hai: full mesh only, har broker ko har broker tak seedha pahunchna chahiye, aur peer addresses ka gossip nahi hai. Mesh ki keemat: N brokers ke liye N(N-1)/2 connections.",
+  "why_needed": "Distributed forwarding mein loops aur duplicates sabse aam aur mehnge bugs hain; ek simple structural rule unhe bina extra state ke rok sakta hai -- agar topology ki shart poori ho.",
+  "real_world_analogy": "Ek WhatsApp group jahan sab ek doosre ke contacts hain: sender khud sabko bhejta hai, aur koi forward nahi karta. Forward karne lago toh sabko teen-teen copies. Lekin agar koi sender ka contact hi nahi, toh use kabhi nahi milega.",
+  "how_it_works": "publish (origin) -> local deliver + one RMSG per interested peer. fromRoute (receiver) -> local deliver only, no route writes. Full mesh -> every interested broker reached in one hop.",
+  "in_this_project": "src/server.ts fromRoute (comment 'Never forwarded to another route'), publish (RMSG per peer), stats routeInMsgs/routeOutMsgs. Test test/cluster.test.ts 'no duplicates in a full mesh'. README 'Stage 3 limits' (full mesh only).",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::fromRoute",
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/src/server.ts::BrokerStats",
+   "projects/13-message-broker/test/cluster.test.ts::startCluster"
+  ],
+  "code_example": "// real, src/server.ts\n/** A message from a peer: deliver to LOCAL subscribers only. Never forwarded to another route (one hop, no loops). */\nprivate fromRoute(meta: RouteMsgMeta, payload: Buffer): void {\n  this.counters.routeInMsgs++;\n  const groups = new Set(meta.q ?? []);\n  const members = new Map<string, Subscription[]>();\n  for (const sub of this.trie.match(meta.s)) {\n    if (sub.queue === undefined) {\n      if (meta.p) this.deliver(sub, meta.s, meta.r, meta.h, payload);\n    } else if (groups.has(sub.queue)) {\n      // collect members of the listed groups\n    }\n  }\n  // one random member per listed group; no r.write anywhere in this function\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Loops aur duplicates structurally impossible",
+   "Koi message id, TTL ya dedup state nahi",
+   "Har message max ek route hop -- latency predictable"
+  ],
+  "disadvantages": [
+   "Sirf full mesh mein sahi",
+   "N brokers par N(N-1)/2 connections",
+   "Ek broker ko kisi peer tak network na mile toh us peer ke subscribers ko kuch nahi"
+  ],
+  "common_mistakes": [
+   "Route se aaya message aage forward karna (C11)",
+   "Line ya star topology mein yeh rule use karna",
+   "Dedup ke liye message ids jodna jab structure hi kaafi hai"
+  ],
+  "follow_up_questions": [
+   "Multi-hop support karna ho toh kya chahiye (spanning tree, seen-set, TTL)?",
+   "Partial partition (A-C link down, baaki up) mein kya hoga?",
+   "Real NATS leaf nodes / gateways is problem ko kaise solve karte hain?"
+  ],
+  "concepts": [
+   "one-hop-forwarding",
+   "loop-prevention",
+   "full-mesh"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "One hop simplicity aur loop-freedom deta hai, keemat topology ki shart (full mesh) aur O(N^2) connections. Multi-hop routing flexible hai lekin loop prevention aur dedup state maangta hai.",
+   "failure_scenarios": "Partial partition: A aur C ka link toota lekin dono B se jude hain -- A ka message C ke subscribers tak nahi jaayega, kyunki B forward nahi karta aur A ke paas C ka route nahi. Code yeh detect ya report nahi karta.",
+   "alternatives": "Spanning tree par forwarding (har broker tree ke neighbours ko, aane wale link ko chhod kar); message id + seen cache; TTL counter; ya NATS jaisa gateway/leaf design.",
+   "scale_10x_100x": "Brokers 10x hon toh connections lagbhag 100x (N^2). Chhote cluster ke liye theek, bade ke liye hierarchy chahiye. Kuch measure nahi kiya.",
+   "production_improvements": "Missing route ka detection aur alert (config mein listed peer jiska route nahi bana), partition ke dauran visibility, aur bade cluster ke liye hierarchical design."
+  }
+ },
+ {
+  "id": "MB-039",
+  "project_slug": "p13-message-broker",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "How do queue groups work across the cluster so that each message reaches exactly one member in the whole cluster, and why does the origin broker make the choice?",
+  "answer_hinglish": "Problem: group 'w' ke members A, B aur C par ho sakte hain. Agar har broker apne local members mein se ek chune, toh ek message teen baar process hoga. Isliye faisla sirf ek jagah hota hai: ORIGIN broker (jahan publish aaya).\n\npublish mein: pehle local -- localGroups mein jo groups mile, unke liye pickRandom se ek local member, aur us group ko peersByGroup se delete. Local preference default hai kyunki route hop nahi lagta (C5 mutation -- local prefer na karna -- test 'a local member is preferred: nothing crosses a route for the group' ne pakda: 0 route messages). Phir remote: har route ke interest trie mein jo queue interest mile, unse peersByGroup (group -> peers jinke paas member hai). Har bache group ke liye pickRandom(peers) -- exactly EK peer (C6 mutation, 'sab peers ko bhejo', ne 2 tests tode).\n\nPhir har peer ko zyada se zyada EK RMSG, jisme p (kya tumhare plain subscribers ko dena hai) aur q (kaunse groups tumhe serve karne hain). Test 'plain subscribers and a queue group on the same peer: one RMSG carries both' route message count exact check karta hai.\n\nReceiver (fromRoute) sirf q mein likhe groups ke liye apne local members mein se ek chunta hai, aur baaki local groups ko chhoota bhi nahi. Agar receiver apne har local group ko serve karta (C9), toh jis group ka member origin par tha usko bhi doosri copy mil jaati. Test 'with no local member, each message goes to exactly ONE remote member in the whole cluster': B aur C par ek-ek member, A par 200 publishes, total exactly 200, dono ko kuch mila.\n\nHonest edge: agar chuna hua peer ka member RS+ ke baad aur RMSG se pehle chala gaya, toh fromRoute ko member nahi milta aur group woh message miss karta hai -- code comment 'at most once' kehta hai. Koi retry ya doosra peer try nahi hota.",
+  "why_needed": "Workers multiple brokers par phaile hon toh bhi 'har kaam ek hi baar' guarantee chahiye; distributed choice mein yeh sabse aasaani se tootta hai.",
+  "real_world_analogy": "Ek company ke teen offices mein support staff: ticket jis office mein aaya, wahi office tay karta hai kaun lega -- apne yahan koi ho toh woh, warna kisi ek doosre office ko 'yeh ticket tumhari team ke liye' likh kar bhejta hai. Doosra office sirf wahi teams dekhta hai jo envelope par likhi hain.",
+  "how_it_works": "origin publish: local groups -> pickRandom local member, remove from peersByGroup -> remaining groups -> pickRandom peer -> groupsForPeer -> one RMSG per peer {p, q}. receiver fromRoute: only groups in q -> pickRandom local member -> deliver.",
+  "in_this_project": "src/server.ts publish (localGroups, peersByGroup, groupsForPeer, one RMSG per peer), fromRoute (groups = new Set(meta.q)), pickRandom. Tests test/cluster.test.ts 'queue groups across the cluster' block (3 tests). Mutations C5, C6, C9.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/src/server.ts::fromRoute",
+   "projects/13-message-broker/src/server.ts::pickRandom",
+   "projects/13-message-broker/src/route.ts::RouteMsgMeta",
+   "projects/13-message-broker/test/cluster.test.ts::startCluster"
+  ],
+  "code_example": "// real, src/server.ts publish (trimmed)\n// Each queue group gets the message ONCE in the whole cluster: a local member if there is one, else one peer.\nconst groupsForPeer = new Map<Route, string[]>();\nfor (const [group, members] of localGroups) {\n  if (this.deliver(pickRandom(members), subject, reply, headerLen, payload)) delivered++;\n  peersByGroup.delete(group);\n}\nfor (const [group, peers] of peersByGroup) {\n  const peer = pickRandom(peers);\n  const list = groupsForPeer.get(peer);\n  if (list) list.push(group);\n  else groupsForPeer.set(peer, [group]);\n}\n// One RMSG per peer at most, carrying \"deliver to your plain subscribers\" and the groups it must serve.\nfor (const r of new Set([...plainPeers, ...groupsForPeer.keys()])) {\n  const meta: RouteMsgMeta = { s: subject, p: plainPeers.includes(r) };\n  if (reply !== undefined) meta.r = reply;\n  const groups = groupsForPeer.get(r);\n  if (groups) meta.q = groups;\n  if (headerLen !== undefined) meta.h = headerLen;\n  r.write(encodeRmsg(meta, payload));\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Poore cluster mein ek member per message",
+   "Local member pehle: route hop bachta hai",
+   "Ek peer ko ek hi RMSG, chahe plain aur kai groups"
+  ],
+  "disadvantages": [
+   "Peer choice random, member count ya load nahi dekhta",
+   "Chuna hua remote member beech mein gaya toh message gaya",
+   "Local members hon toh remote members ko kabhi kuch nahi milta (imbalance)"
+  ],
+  "common_mistakes": [
+   "Har broker ko khud local pick karne dena (duplicates)",
+   "Receiver ka har local group serve karna (C9)",
+   "Group ko sab peers ko bhejna (C6)"
+  ],
+  "follow_up_questions": [
+   "Local preference ki wajah se remote members idle rahein toh kya karoge?",
+   "Peer ko uske member count ke hisaab se weight karna chahiye kya?",
+   "Picked peer par member na mile toh origin ko kaise pata chalega?"
+  ],
+  "concepts": [
+   "queue-groups",
+   "distributed-choice",
+   "exactly-one-delivery"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Origin-decides model simple aur correct hai (ek decision point), lekin origin ka interest view stale ho sakta hai. Local preference latency aur route traffic bachata hai, keemat load imbalance: agar har publisher ke broker par ek member hai, toh remote members ko kuch nahi milta.",
+   "failure_scenarios": "Picked peer ka member RS- ke raste mein hote hue chala gaya: message lost. Picked peer ka route toot gaya: RMSG lost. Local member slow consumer ban kar kata: woh copy lost, doosra member try nahi hota. Sab at-most-once ke andar hai aur code isko chhupata nahi.",
+   "alternatives": "Har broker local pick kare aur ek global coordinator dedupe kare (mehnga); consistent hashing message key par; peers ko member count announce karna aur weighted pick; real nats-server bhi local member prefer karta hai.",
+   "scale_10x_100x": "Brokers aur groups badhne par peersByGroup building har publish par har route ka interest match karta hai -- O(routes x matches). Kitna mehnga, measure nahi kiya.",
+   "production_improvements": "Member count ya load ke hisaab se weighted peer pick, receiver par member na mile toh origin ko signal, aur per-group cross-broker distribution ka metric."
+  }
+ },
+ {
+  "id": "MB-040",
+  "project_slug": "p13-message-broker",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Advanced",
+  "question": "Both brokers may dial each other. How does the duplicate-connection rule decide which route survives, and why must both ends compute the same answer?",
+  "answer_hinglish": "Config mein har broker har doosre ko list kar sakta hai, toh A aur B dono ek doosre ko dial karte hain -- ek pair ke beech do TCP connections. Do routes ka matlab har message do baar jaata, aur interest do jagah. Ek ko band karna hai, aur important: dono brokers ko SAME connection band karna hai. Agar A ne pehla band kiya aur B ne doosra, toh dono band -- koi route nahi.\n\nRule handshake mein, jab RINFO se peerId pata chalta hai aur us peer ka route pehle se hai: jo connection CHHOTE server id wale broker ne dial kiya, woh bachta hai. dialerOf(x) = x.dialedBySelf ? meri id : peer ki id. winnerDialer = min(meri id, peer id). Dono ends ke paas dono ids hain aur dono jaante hain kaunsa connection kisne dial kiya, toh dono ek hi jawab nikalte hain -- symmetric. C4 mutation (rule asymmetric banaya) ne 12 tests tode, kyunki har cluster test dono taraf se dial karta hai. Test 'three brokers that all dial each other end with exactly one route per pair, and it stays that way'.\n\nDoosra case: dono connections ka dialer same hai -- matlab yeh duplicate nahi, reconnect race hai (purana connection abhi mara hua detect nahi hua aur naya aa gaya). Tab naya rakho, kyunki purana shayad dead hai.\n\nHaarne wala dialer kya karta hai: loser routeGone + destroy hota hai, aur agar woh humne dial kiya tha toh scheduleDial chalta hai. dial() dekhta hai ki dialer.peerId ka route abhi exist karta hai (doosri taraf ka jeeta connection), toh connect nahi karta, bas scheduleDial(d, false) se baad mein dobara check karta hai -- backoff badhaye bina. Isse agar jeeta hua connection kabhi toote, toh yeh side take over kar leti hai. Comment yahi kehta hai.",
+  "why_needed": "Do nodes ke beech connection dedup ek classic distributed tie-break hai; asymmetric rule se ya toh duplicate rehte hain ya dono connections band ho jaate hain.",
+  "real_world_analogy": "Do log ek saath ek doosre ko phone karte hain aur dono ko 'line busy' sunai deta hai. Rule: jiska naam alphabet mein pehle aata hai, uski call rakho. Dono ek hi rule jaante hain, toh dono ek hi call rakhte hain.",
+  "how_it_works": "handshake: peerId known -> existing route? -> dialerOf(new), dialerOf(existing), winnerDialer = min(ids) -> keepNew = same dialer (reconnect race) || new dialed by winner -> close loser -> loser's dialer polls via scheduleDial(d, false).",
+  "in_this_project": "src/server.ts handshake (duplicate rule), dial (skip if peer already connected), scheduleDial, routeGone, Route.dialedBySelf, Dialer.peerId. Test test/cluster.test.ts 'mesh formation'. Mutation C4.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::handshake",
+   "projects/13-message-broker/src/server.ts::dial",
+   "projects/13-message-broker/src/server.ts::scheduleDial",
+   "projects/13-message-broker/src/server.ts::Dialer",
+   "projects/13-message-broker/test/cluster.test.ts::startCluster"
+  ],
+  "code_example": "// real, src/server.ts handshake (trimmed)\nconst existing = this.routes.get(peerId);\nif (existing) {\n  // Both sides dialled each other. Keep the connection dialled by the SMALLER server id; both ends compute the same\n  // answer, so they close the same connection. (Same dialer on both = a reconnect race: keep the newer one.)\n  const dialerOf = (x: Route) => (x.dialedBySelf ? this.serverId : peerId);\n  const winnerDialer = this.serverId < peerId ? this.serverId : peerId;\n  const keepNew = dialerOf(r) === dialerOf(existing) || dialerOf(r) === winnerDialer;\n  const loser = keepNew ? existing : r;\n  this.routes.delete(peerId);\n  this.routeGone(loser);\n  loser.socket.destroy();\n  if (!keepNew) {\n    this.routes.set(peerId, existing);\n    return;\n  }\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Symmetric: dono ends same faisla, bina extra message ke",
+   "Reconnect race bhi handle",
+   "Haarne wala side take over ke liye tayyar rehta hai"
+  ],
+  "disadvantages": [
+   "Thodi der do connections bante hain aur ek phenka jaata hai",
+   "Polling dialer har interval par check karta hai (timer cost chhota)",
+   "Rule server ids par depend karta hai jo har restart par naye hain"
+  ],
+  "common_mistakes": [
+   "Rule jo sirf 'meri' taraf dekhta hai (asymmetric, C4)",
+   "'Pehle aaya woh rakho' -- dono ends par order alag ho sakta hai",
+   "Haarne ke baad dialer ko hamesha ke liye band kar dena"
+  ],
+  "follow_up_questions": [
+   "Agar dono connections ek saath handshake karein toh kya race hai? Single thread mein kyun safe hai?",
+   "Server id restart par badal jaye toh rule ka kya hota hai?",
+   "Ek extra 'close this one' message bhejne wala design kaisa hota?"
+  ],
+  "concepts": [
+   "tie-breaking",
+   "symmetric-decision",
+   "connection-dedup"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Deterministic tie-break (id comparison) bina coordination ke kaam karta hai; keemat yeh ki thodi der extra connection banta hai aur loser side ko poll karte rehna padta hai taaki woh take over kar sake.",
+   "failure_scenarios": "Agar rule asymmetric hota toh ya duplicates (dono rakhte) ya zero routes (dono band karte). Reconnect race mein purana dead connection rakh lete toh naya phenk dete aur route kabhi theek nahi hota -- isliye same-dialer case mein newer rakha jaata hai.",
+   "alternatives": "Sirf ek taraf dial kare (config mein ordering, jaise chhoti id wala hi dial kare); explicit 'duplicate, closing' message; ya ek central registry.",
+   "scale_10x_100x": "Brokers badhne par mesh formation mein N(N-1) dial attempts aur aadhe phenke jaate hain; chhote cluster mein theek. Measure nahi kiya.",
+   "production_improvements": "Duplicate resolution ka log line, polling interval config, aur stable server ids (restart par same) agar operational debugging mein madad chahiye."
+  }
+ },
+ {
+  "id": "MB-041",
+  "project_slug": "p13-message-broker",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "What happens when a route drops, and how do re-dial with exponential backoff and self-route detection work?",
+  "answer_hinglish": "Route toot-ne par (socket 'close' ya 'error', ya route par parse error) routeGone chalta hai: route closed, pendingRoutes aur routes se hata, aur us peer ka poora interest trie Route object ke saath chala jaata hai -- us peer ko ab kuch forward nahi hota. Agar yeh connection HUMNE dial kiya tha (dialedBySelf aur url) aur hum band nahi ho rahe, toh us url ka Dialer scheduleDial karta hai. Jo side ne connection accept kiya tha, woh re-dial nahi karti -- usko address pata hi nahi ho sakta.\n\nscheduleDial: delay = min(base x 2^attempts, base x 32), jahan base = reconnectMs (default 1000 ms, ROUTE_RECONNECT_MS env; tests mein 50). Har failed attempt par attempts++, toh delay doubling hota hai aur 32x par ruk jaata hai -- band peer par lagatar hammering nahi. Successful handshake par attempts = 0. Timer unref() kiya hua hai taaki process ko zinda na rakhe. close() mein stopping = true aur saare dialer timers clear.\n\nTest 'a broker that restarts on the same cluster port is re-dialled and gets the interest again': A ne B ko dial kiya, A par ek subscriber, B band, A ke routes 0. Naya B usi port par (nayi server id), sirf A ko address pata hai -- A re-dial karta hai, handshake par full RS+ sync, aur B par publish A ke subscriber tak pahunchta hai. C8 mutation (re-dial band) ne yeh test toda.\n\nSelf-route: agar ROUTES mein broker ka apna cluster address ho (har node ko same list dena aasaan hai), toh woh khud ko dial karega. Handshake mein peerId === serverId -- tab dialer.self = true, route band, aur dial() aur scheduleDial dono self wale dialer ko kabhi nahi chalate. Test 'a broker told to dial its own cluster port does not create a route and does not keep trying'; C10 mutation ne pakda.",
+  "why_needed": "Clusters mein nodes restart hote rehte hain; bina re-dial ke ek restart cluster ko permanently tod deta, aur bina backoff ke band node par reconnect ka toofan.",
+  "real_world_analogy": "Doosre branch office ka phone nahi lag raha: pehle 1 minute baad try, phir 2, phir 4 ... 32 minute par ruk jao, har 32 minute try karte raho. Aur agar list mein apna hi number likha hai, toh ek baar pata chalte hi use list se kaat do.",
+  "how_it_works": "socket close/error -> routeGone: remove route + its interest -> dialedBySelf && url && !stopping ? scheduleDial(d): delay = min(base*2^attempts, base*32), attempts++ -> dial -> handshake: attempts = 0, full RS+ sync. RINFO with own id -> dialer.self = true, never again.",
+  "in_this_project": "src/server.ts routeGone, scheduleDial, dial, handshake (self check, attempts reset), Dialer (attempts, timer, self), ClusterOptions.reconnectMs; src/index.ts ROUTE_RECONNECT_MS. Tests test/cluster.test.ts restart test aur self-route test. Mutations C8, C10.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::scheduleDial",
+   "projects/13-message-broker/src/server.ts::routeGone",
+   "projects/13-message-broker/src/server.ts::dial",
+   "projects/13-message-broker/src/server.ts::handshake",
+   "projects/13-message-broker/test/cluster.test.ts::startNode"
+  ],
+  "code_example": "// real, src/server.ts\nprivate scheduleDial(d: Dialer, backoff = true): void {\n  if (this.stopping || d.self || d.timer) return;\n  const base = this.opts.cluster?.reconnectMs ?? 1000;\n  const delay = Math.min(base * 2 ** d.attempts, base * 32);\n  if (backoff) d.attempts++;\n  d.timer = setTimeout(() => this.dial(d), delay);\n  d.timer.unref();\n}\n// in handshake:\nif (peerId === this.serverId) {\n  if (dialer) dialer.self = true;   // we dialled ourselves: never again\n  this.routeGone(r);\n  r.socket.destroy();\n  return;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Restart ke baad cluster apne aap theek",
+   "Backoff se band peer par load bounded",
+   "Self-route ek baar mein pakda jaata hai"
+  ],
+  "disadvantages": [
+   "Sirf dial karne wali side re-dial karti hai",
+   "Koi jitter nahi: kai brokers ek saath same schedule par retry kar sakte hain",
+   "Route ki apni PING nahi, toh half-open route sirf TCP keepalive se pakda jaata hai"
+  ],
+  "common_mistakes": [
+   "Bina backoff ke tight loop mein reconnect",
+   "Accept karne wali side se bhi re-dial karwana (address nahi pata)",
+   "Self-route ko har baar dial karte rehna"
+  ],
+  "follow_up_questions": [
+   "Backoff mein jitter kyun jodna chahiye?",
+   "Route half-open ho (peer gayab, FIN nahi) toh kitni der baad pata chalega aur kyun?",
+   "Restart ke dauran publish hue messages ka kya hota hai?"
+  ],
+  "concepts": [
+   "reconnect",
+   "exponential-backoff",
+   "self-detection"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-042",
+  "project_slug": "p13-message-broker",
+  "category": "Production Scenarios",
+  "difficulty": "Advanced",
+  "question": "How does client failover work when a broker dies, and what exactly does the failover test with the official nats client prove?",
+  "answer_hinglish": "Failover do hisson ka kaam hai. Client side: official nats client ko servers list di jaati hai; connection toot-ne par woh list ke agle server se connect karta hai aur apni saari subscriptions khud dobara bhejta hai. Broker side: kuch special nahi -- naye broker par re-subscribe normal SUB hai, jo interestUp se RS+ banata hai, aur baaki brokers ko nayi jagah pata chal jaati hai. Purane broker ke band hone par uske routes toot-te hain aur peers uska interest hata dete hain.\n\nTest 'a client with a server list fails over when its broker dies, resubscribes, and keeps receiving': 3 brokers ka mesh. Client servers [A, B] ke saath (noRandomize taaki pehle A, chhota reconnectTimeWait), 'fo' subscribe karta hai, aur C par us interest ka pahunchna wait hota hai. C par 'before' publish -- client ko milta hai. Phir A band (close). Test wait karta hai ki B par 1 connection ho (client B par aaya) aur C par peerInterest('fo') === 1 (dobara subscribe hua aur RS+ C tak pahuncha). Phir C par 'after' publish, aur client ko milta hai. Final assert: exactly ['before', 'after'] -- na kuch duplicate, na order galat.\n\nSaath mein ek aur official-client test: request/reply jahan service B par aur caller A par -- request route se B jaata hai, aur reply _INBOX ke interest se route ke through wapas A aata hai.\n\nJo yeh test NAHI dikhata: failover ke DAURAN publish hue messages ka kya hota hai. Test jaan-boojh kar wait karta hai ki interest wapas aa jaye, phir publish karta hai. A ke marne aur B par RS+ pahunchne ke beech C par publish hua message kisi ko nahi milta (at most once), aur kitne gaye ya failover kitni der leta hai -- yeh measure nahi kiya; PLAN.md ka B4 experiment isi ke liye hai.",
+  "why_needed": "High availability ka asli matlab client ka bina manual kaam ke doosre node par chale jaana hai; aur uska test honest hona chahiye ki kya saabit hua aur kya nahi.",
+  "real_world_analogy": "Aapka local post office band hua: aap list ke doosre post office mein jaakar apna address change form bharte ho, aur baaki post offices ko pata chal jaata hai. Jo chitthiyan us beech aayi, woh wapas nahi aati.",
+  "how_it_works": "client: servers [A, B] -> A dies -> reconnect to B -> re-SUB -> B interestUp -> RS+ to C. C: publish -> route interest has B -> RMSG -> B delivers.",
+  "in_this_project": "test/cluster.test.ts failover test aur cross-broker request/reply test (official nats client); src/server.ts subscribe -> interestUp, routeGone, peerInterest (test helper), close.",
+  "implementation_files": [
+   "projects/13-message-broker/test/cluster.test.ts::startCluster",
+   "projects/13-message-broker/src/server.ts::peerInterest",
+   "projects/13-message-broker/src/server.ts::interestUp",
+   "projects/13-message-broker/src/server.ts::routeGone"
+  ],
+  "code_example": "// real, test/cluster.test.ts (trimmed)\nconst nc: NatsConnection = await connect({\n  servers: [`127.0.0.1:${a!.port}`, `127.0.0.1:${b!.port}`],\n  noRandomize: true,\n  reconnectTimeWait: 50,\n  maxReconnectAttempts: 20,\n});\n// ... subscribe \"fo\", publish \"before\" on C, receive it ...\nawait a!.broker.close(200); // the client's broker dies\nawait until(() => b!.broker.stats().connections === 1, 5000); // reconnected to B\nawait until(() => c!.broker.peerInterest(\"fo\") === 1, 5000); // and re-subscribed there\npub.send(\"PUB fo 5\\r\\nafter\\r\\n\");\nawait until(() => got.includes(\"after\"), 5000);\nexpect(got).toEqual([\"before\", \"after\"]);",
+  "code_language": "typescript",
+  "advantages": [
+   "Official client ke saath end-to-end HA",
+   "Broker side koi special failover code nahi -- interest propagation hi kaafi",
+   "Cross-broker request/reply bhi saabit"
+  ],
+  "disadvantages": [
+   "Failover window ke messages jaate hain",
+   "Failover time aur loss measure nahi kiya",
+   "Client ko server list config karni padti hai (gossip nahi)"
+  ],
+  "common_mistakes": [
+   "Failover test ko 'zero loss' ka saboot samajhna",
+   "Server list mein sirf ek broker dena",
+   "Test mein interest wapas aane ka wait na karna (flaky)"
+  ],
+  "follow_up_questions": [
+   "Failover ke dauran loss kaise measure karoge (B4)?",
+   "Lame duck mode yahan kya improve karta?",
+   "Client ko server list automatically kaise mile (INFO connect_urls)?"
+  ],
+  "concepts": [
+   "failover",
+   "high-availability",
+   "interop-testing"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Client-driven failover broker ko simple rakhta hai; keemat yeh ki failover window mein messages jaate hain aur clients ko server list chahiye.",
+   "failure_scenarios": "Window: A marta hai -> client detect karta hai -> B se connect -> re-SUB -> RS+ C tak. Is beech C par publish hue messages kahin nahi jaate. Agar client ki list ke saare brokers mar jaayein toh woh maxReconnectAttempts ke baad haar jaata hai.",
+   "alternatives": "Server INFO mein cluster ke doosre URLs bhejna (real NATS connect_urls) taaki client list khud seekhe; lame duck mode jisme broker band hone se pehle clients ko bhej deta hai; durable layer agar window ka loss acceptable nahi.",
+   "scale_10x_100x": "Zyada clients ek saath fail over karein toh naya broker ek saath bahut saare CONNECT aur SUB paata hai aur har distinct subject par RS+ bhejta hai. Kitna load, measure nahi kiya.",
+   "production_improvements": "connect_urls jaisi discovery, lame duck mode, failover time aur loss ka stage 4 measurement (B4), aur reconnect storms ke liye rate limiting."
+  }
+ },
+ {
+  "id": "MB-043",
+  "project_slug": "p13-message-broker",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "What are the honest limits of this cluster -- where can messages be lost, and what failure is not handled at all?",
+  "answer_hinglish": "README ke 'Stage 3 limits' ki list, aur har ek ka matlab.\n\n1. RS+ se pehle ke messages: naya subscriber B par aaya, uska RS+ abhi A tak nahi pahuncha, aur A par publish hua -- A ke view mein B ko interest nahi, toh forward nahi hota. Tests isi liye publish se pehle hasRemoteInterest / peerInterest ka wait karte hain. At most once mein yeh 'allowed' hai, lekin application ko pata hona chahiye ki subscribe karte hi cluster-wide delivery shuru nahi hoti.\n\n2. In-flight loss: route par likha hua RMSG, broker marne par (sender ka buffer ya receiver ka unread data) kho jaata hai. Koi ack, koi retry nahi.\n\n3. Route liveness aur back-pressure nahi: routes ki apni PING/PONG nahi hai (broker routes ko PING nahi bhejta), sirf TCP keepalive. Half-open route ka pata der se chalega. Aur Route.write mein maxPending jaisa check nahi -- agar peer padhna band kare, toh us route ka write buffer bina limit badhta hai. Client side ka slow-consumer protection routes par nahi lagta.\n\n4. Full mesh only: forwarding aur interest dono ek hop. Line ya partial partition mein kuch subscribers ko messages nahi milte, aur code yeh detect nahi karta. Peer addresses ka gossip nahi -- har broker ki config mein har peer.\n\n5. Route authentication nahi: cluster port tak pahunchne wala koi bhi RINFO bhej kar peer ban sakta hai, RS+ > bhej kar saara traffic apni taraf le sakta hai, ya RMSG se kisi bhi subject par messages daal sakta hai. Isliye cluster port bhi sirf private network par, aur CLI non-loopback CLUSTER_HOST par bhi ALLOW_NON_LOOPBACK=1 maangta hai.\n\nSaath mein: queue group ka chuna hua remote member beech mein chala jaye toh message gaya; no-responders 503 remote interest stale ho toh nahi aata. Kuch bhi measure nahi kiya -- loss counts aur failover time stage 4 ke experiments hain.",
+  "why_needed": "Senior interview mein system ki limits ko khud bata paana, aur unke real-world matlab samjhana, features ginaane se zyada credibility deta hai.",
+  "real_world_analogy": "Courier network ka fine print: 'naye address par delivery registration process hone ke baad shuru', 'truck accident mein parcel ki zimmedari nahi', 'har shehar ka seedha route zaroori', aur 'depot ka gate abhi taala-free hai'.",
+  "how_it_works": "Loss windows: before RS+, in flight on a route, picked remote member gone, slow consumer drop. Unhandled: route liveness (no PING), route back-pressure (no limit), non-mesh topology, route auth.",
+  "in_this_project": "README 'Stage 3 limits'; src/server.ts Route.write (no limit), setupRoute (setKeepAlive, no ping timer), fromRoute (at most once comment), handshake (any RINFO accepted); src/index.ts cluster host loopback check.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/src/server.ts::setupRoute",
+   "projects/13-message-broker/src/server.ts::Route",
+   "projects/13-message-broker/src/server.ts::fromRoute",
+   "projects/13-message-broker/src/index.ts"
+  ],
+  "code_example": "// real, src/server.ts setupRoute (trimmed) -- keepalive only, no route PING timer\nr.socket.setNoDelay(true);\nr.socket.setKeepAlive(true, 10_000);\n// ...\n// class Route\nwrite(data: string | Buffer): void {\n  if (!this.closed) this.socket.write(data);   // no pending-bytes limit for routes\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Limits code aur README dono mein documented",
+   "Har loss window at-most-once ke andar aur explainable",
+   "Cluster port bhi secure-by-default bind"
+  ],
+  "disadvantages": [
+   "Kai loss windows, koi observability nahi ki kitne gaye",
+   "Ek slow peer broker ki memory badha sakta hai",
+   "Open cluster port poora traffic de sakta hai"
+  ],
+  "common_mistakes": [
+   "Cluster ko 'HA, no loss' bolna",
+   "Routes ko clients jaisa protected maan lena",
+   "Partial partition ko impossible maan lena"
+  ],
+  "follow_up_questions": [
+   "Route slow-consumer limit lagaoge toh limit paar hone par kya karoge -- disconnect ya drop?",
+   "Route auth ka simplest design kya hoga?",
+   "RS+ window ko application kaise handle kare?"
+  ],
+  "concepts": [
+   "failure-modes",
+   "honest-limits",
+   "distributed-systems"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Simplicity (one hop, no acks, no route ping) ne cluster ko chhota aur testable rakha; keemat ye loss windows aur unhandled failures. Har ek ka fix ek naya mechanism hai (acks, heartbeats, back-pressure, auth), jo complexity laata hai.",
+   "failure_scenarios": "Sabse khatarnak: ek peer jo route par padhna band kare -- origin broker ka route write buffer bina limit badhega aur poora broker gir sakta hai, jabki ek akela slow client ke liye yeh protection maujood hai. Doosra: route half-open -- keepalive se pakadne tak messages ek dead socket mein likhe jaate rehte hain.",
+   "alternatives": "Route ke liye wahi writableLength + maxPending check aur disconnect; route PING/PONG with maxPingsOut jaisa client ke liye hai; route token auth RINFO mein; spanning-tree forwarding non-mesh ke liye.",
+   "scale_10x_100x": "Zyada brokers aur traffic par in-flight loss ka absolute count badhta hai, aur slow route ka memory risk bhi. Kitna, measure nahi kiya -- stage 4 (B4, B5) iske liye hai.",
+   "production_improvements": "Route slow-consumer limit, route PING/PONG, route auth, missing-route detection, aur loss/failover ka measurement."
+  }
+ },
+ {
+  "id": "MB-044",
+  "project_slug": "p13-message-broker",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Which deliberate breaks (C1-C11) were used to check the stage 3 tests, and why is C7 the one that could not be caught?",
+  "answer_hinglish": "Stage 3 ke 11 rules tode gaye, 138-test suite chalaya, phir wapas kiya. README ki table (tests failed count ke saath):\n\nC1 interest ignore, har peer ko forward -> 3 tests red. C2 interest pehle unsubscribe par hi withdraw (aakhri ki jagah) -> 1. C3 naye peer ko interest sync nahi -> 2. C4 duplicate-connection rule asymmetric -> 12 (har cluster test dono taraf dial karta hai). C5 queue group mein local member prefer nahi -> 1. C6 queue group har peer ko -> 2. C8 route drop ke baad re-dial nahi -> 1. C9 receiver har local queue group serve kare, sirf listed nahi -> 1. C10 self-route detect nahi -> 1. C11 route se aaya message dobara forward (loop) -> 3. Purane M checks bhi 138-test suite par dobara chalaye gaye, sab ab bhi pakde gaye.\n\nC7: receiver 'p' flag ignore kare (hamesha plain subscribers ko de) -> 0 tests red. Yeh honestly 'not caught' likha hai. Kyun pakda nahi ja sakta: origin broker p = false tabhi bhejta hai jab usne us peer se is subject ka koi PLAIN interest nahi dekha -- yaani us peer par is subject ka koi plain subscriber hai hi nahi (RMSG sirf queue group ke liye ja raha hai). Toh receiver flag ignore karke 'plain subscribers ko do' kare, tab bhi dene ke liye koi plain subscriber nahi milta -- behaviour same. Exception sirf ek chhota window hai: peer par bilkul naya plain subscriber aaya aur uska RS+ abhi origin tak nahi pahuncha. Us window ko test mein bharosemand tarike se banana timing par depend karta.\n\nFlag phir bhi code mein hai as a statement of intent ('yeh copy sirf queue group ke liye hai'), aur README use tested claim nahi karta. Sabak: kuch mutations equivalent ya near-equivalent hote hain; unhe chhupana nahi, analysis ke saath likhna chahiye.",
+  "why_needed": "Distributed code ke tests ki taakat saabit karna aur bhi zaroori hai, aur jo mutation nahi pakda gaya uska honest analysis test suite ki limits batata hai.",
+  "real_world_analogy": "Fire drill mein ek alarm kabhi nahi baja -- jaanch se pata chala ki woh sirf us kamre ke liye hai jahan kabhi koi baithta hi nahi. Alarm galat nahi, bas test karne ka mauka nahi; report mein yahi likha.",
+  "how_it_works": "Per rule: smallest breaking edit -> npm test (138) -> count red tests -> revert. C7: analyse why 0 -> near-equivalent mutant -> document as not covered.",
+  "in_this_project": "README 'Mutation checks' (C table aur C7 paragraph); rules src/server.ts publish, fromRoute, interestDown, handshake, scheduleDial mein; pakadne wale tests test/cluster.test.ts mein.",
+  "implementation_files": [
+   "projects/13-message-broker/README.md",
+   "projects/13-message-broker/src/server.ts::fromRoute",
+   "projects/13-message-broker/src/server.ts::handshake",
+   "projects/13-message-broker/test/cluster.test.ts::startCluster"
+  ],
+  "code_example": "// real, src/server.ts fromRoute -- the line C7 removes the check from\nif (sub.queue === undefined) {\n  if (meta.p) this.deliver(sub, meta.s, meta.r, meta.h, payload);   // C7 mutant: deliver regardless of meta.p\n}\n// origin side: p is false only when this peer announced NO plain interest for the subject\nconst meta: RouteMsgMeta = { s: subject, p: plainPeers.includes(r) };",
+  "code_language": "typescript",
+  "advantages": [
+   "Distributed rules ka saboot",
+   "Equivalent mutant ka honest analysis",
+   "C4 jaisa rule jo 12 tests todta hai, central hona dikhata hai"
+  ],
+  "disadvantages": [
+   "C7 ka window test nahi hua",
+   "Haath se chune mutations",
+   "Timing-dependent cases test karna mushkil"
+  ],
+  "common_mistakes": [
+   "0-red mutation ko chhupa dena ya 'tested' bol dena",
+   "Timing-dependent test likh kar flaky suite banana",
+   "Sirf pass/fail dekhna, kitne tests red hue nahi"
+  ],
+  "follow_up_questions": [
+   "C7 ka window deterministic tarike se kaise test karoge (RS+ ko rok kar)?",
+   "Kya p flag hata dena chahiye kyunki woh almost equivalent hai?",
+   "Equivalent mutant aur test gap mein fark kaise karoge?"
+  ],
+  "concepts": [
+   "mutation-testing",
+   "equivalent-mutant",
+   "honest-reporting"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Haath se mutations sasta aur targeted hai; distributed code mein kuch rules ke paas observable effect sirf rare timing windows mein hota hai, jahan mutation check ki value kam ho jaati hai.",
+   "failure_scenarios": "C7 jaisa near-equivalent mutant future mein real bug ban sakta hai agar code badle (jaise interest view aur zyada stale ho jaye); tab bhi tests green rahenge. Isliye README mein uska analysis hai.",
+   "alternatives": "Route parser/dispatch ko inject karne layak banana taaki test RS+ ko rok sake (deterministic window); property-based tests cluster events ke random order par; Stryker.",
+   "scale_10x_100x": "Brokers badhne par timing windows zyada aur lambe ho sakte hain; har window ke liye deterministic test hook chahiye hoga.",
+   "production_improvements": "Test hooks to delay or drop specific route ops, C7 window ka deterministic test, aur mutation table ko CI mein periodic chalana."
+  }
+ },
+ {
+  "id": "MB-045",
+  "project_slug": "p13-message-broker",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a cluster test proving that a full mesh delivers each message exactly once to subscribers on every broker and that the receiving brokers forward nothing.",
+  "answer_hinglish": "Kya saabit karna hai: (1) har subscriber ko har message exactly ek baar, (2) sirf origin route messages bhejta hai, receivers 0. Do assertion milkar one-hop rule ko pakadte hain -- C11 mutation (forward again) duplicates aur receivers ke routeOutMsgs dono badha deta.\n\nSetup: startCluster(3) -- teen brokers ephemeral ports par, har broker har doosre ko addRoute karta hai (dono taraf dial, toh duplicate rule bhi chal jaata hai), aur until se wait jab tak har broker ke routes === 2.\n\nSteps: har broker par ek Raw subscriber 'SUB news 1', phir sync. Zaroori wait: until(() => a.broker.peerInterest('news') === 2) -- warna RS+ abhi raste mein ho sakta hai aur pehle messages forward nahi honge (flaky test). Phir A par ek publisher 100 messages bhejta hai aur sync karta hai.\n\nAssert: until har subscriber ke paas >= 100 'MSG news', phir thoda aur ruko (late duplicates ko aane ka mauka) aur check exactly 100 har ek par. Phir stats: A ka routeOutMsgs 200 (100 messages x 2 peers), B aur C ka 0.\n\n'>= 100 phir == 100' pattern important hai: sirf '== 100 ka wait' duplicates hone par bhi kabhi exact moment par pass ho sakta tha, aur sirf ek baar check karne se late duplicates chhoot jaate.",
+  "why_needed": "Distributed tests mein do galtiyan aam hain: propagation ka wait na karna (flaky) aur duplicates ke liye kaafi der na rukna (false green).",
+  "real_world_analogy": "Teen ghar ek WhatsApp group mein; aap 100 messages bhejte ho aur check karte ho ki har ghar ko exactly 100 mile, aur kisi ne bhi kuch forward nahi kiya.",
+  "how_it_works": "startCluster(3) -> raw sub on each -> SUB + sync -> until peerInterest === 2 -> 100 PUB on A -> until each >= 100 -> short wait -> each === 100; routeOutMsgs A 200, B 0, C 0.",
+  "in_this_project": "test/cluster.test.ts startCluster, raw, count, aur 'no duplicates in a full mesh' test; src/server.ts peerInterest, stats (routeOutMsgs), fromRoute.",
+  "implementation_files": [
+   "projects/13-message-broker/test/cluster.test.ts::startCluster",
+   "projects/13-message-broker/test/cluster.test.ts::raw",
+   "projects/13-message-broker/src/server.ts::peerInterest",
+   "projects/13-message-broker/src/server.ts::fromRoute"
+  ],
+  "code_example": "import { afterEach, expect, it } from \"vitest\";\nimport { Broker } from \"../src/server.js\";\nimport { Raw, until } from \"./helpers.js\";\n\nconst brokers: Broker[] = [];\nconst raws: Raw[] = [];\nafterEach(async () => {\n  for (const r of raws.splice(0)) r.close();\n  await Promise.all(brokers.splice(0).map((b) => b.close(500)));\n});\n\nasync function startCluster(n: number) {\n  const nodes = [];\n  for (let i = 0; i < n; i++) {\n    const broker = new Broker({ host: \"127.0.0.1\", port: 0, cluster: { port: 0, reconnectMs: 50 } });\n    const a = await broker.listen();\n    brokers.push(broker);\n    nodes.push({ broker, port: a.port, clusterPort: a.clusterPort! });\n  }\n  for (const a of nodes) for (const b of nodes) if (a !== b) a.broker.addRoute(`127.0.0.1:${b.clusterPort}`);\n  await until(() => nodes.every((x) => x.broker.stats().routes === n - 1), 5000);\n  return nodes;\n}\n\nconst count = (t: string) => (t.match(/MSG news/g) ?? []).length;\n\nit(\"exactly once everywhere, receivers forward nothing\", async () => {\n  const [a, b, c] = await startCluster(3);\n  const subs = await Promise.all([a!, b!, c!].map((n) => Raw.ready(n.port)));\n  raws.push(...subs);\n  for (const s of subs) s.send(\"SUB news 1\\r\\n\");\n  await Promise.all(subs.map((s) => s.sync()));\n  await until(() => a!.broker.peerInterest(\"news\") === 2);   // RS+ has arrived from B and C\n  const pub = await Raw.ready(a!.port);\n  raws.push(pub);\n  for (let i = 0; i < 100; i++) pub.send(`PUB news 1\\r\\n${i % 10}\\r\\n`);\n  await pub.sync();\n  await until(() => subs.every((s) => count(s.received) >= 100), 5000);\n  await new Promise((r) => setTimeout(r, 100));            // give late duplicates a chance\n  for (const s of subs) expect(count(s.received)).toBe(100);\n  expect(a!.broker.stats().routeOutMsgs).toBe(200);\n  expect(b!.broker.stats().routeOutMsgs).toBe(0);\n  expect(c!.broker.stats().routeOutMsgs).toBe(0);\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "One-hop rule ko do taraf se pakadta hai",
+   "Propagation wait se flaky nahi",
+   "Real TCP, ek process mein, ephemeral ports"
+  ],
+  "disadvantages": [
+   "Late-duplicate wait ek fixed chhota delay hai, proof nahi",
+   "Sirf full mesh test karta hai"
+  ],
+  "common_mistakes": [
+   "peerInterest ka wait na karna",
+   "Sirf subscriber counts check karna, routeOutMsgs nahi",
+   "Fixed ports use karna (parallel tests mein takraav)"
+  ],
+  "follow_up_questions": [
+   "Line topology par yahi test kya dikhayega?",
+   "Late duplicates ke liye fixed delay ki jagah kya better ho sakta hai?"
+  ],
+  "concepts": [
+   "cluster-testing",
+   "exactly-once-check",
+   "vitest"
+  ],
+  "advanced": null
+ }
+]

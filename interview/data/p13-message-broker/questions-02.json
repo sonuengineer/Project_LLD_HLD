@@ -1,0 +1,472 @@
+[
+ {
+  "id": "MB-026",
+  "project_slug": "p13-message-broker",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Walk through how publish() routes one message to plain subscribers and to queue groups. Where does the echo:false exclusion happen, and why there?",
+  "answer_hinglish": "publish() ab do phase mein kaam karta hai. Phase 1: trie.match(subject) ki copy par loop. Sabse pehle 'if (sub.client === c && !c.echo) continue' -- echo false wale publisher ki apni subscriptions yahin hat jaati hain, chahe woh plain hon ya queue member. Phir agar sub.queue undefined hai toh seedha deliver(); warna us subscription ko groups Map mein uske queue naam ki list mein daal do.\n\nPhase 2: har local group ke liye pickRandom(members) -- ek member, aur sirf usko deliver(). Har group ko ek copy, har message par naya random pick. (Stage 3 mein iske baad remote phase aata hai: jin groups ka local member mil gaya, woh peers ki list se hata diye jaate hain; baaki har group ke liye exactly ek peer -- detail MB-039 mein.)\n\nEcho exclusion grouping se PEHLE kyun? Agar baad mein karte (pehle random pick, phir 'apna hai toh skip'), toh jab random pick publisher khud hota, woh message kisi ko nahi jaata -- group ka doosra member hote hue bhi message gir jaata. Pehle hatane se publisher candidate list mein hi nahi hota, aur doosre member ko har message milta hai. Test 'a member that publishes with echo:false is never picked for its own message' 40 messages bhejta hai aur doosre member ko poore 40 milne chahiye.\n\nBaaki details: wildcard aur literal subscriptions ek group share kar sakti hain (orders.* aur orders.eu ek group 'q' mein -- 40 messages total 40). Auto-unsubscribe member par bhi chalta hai kyunki woh deliver() mein hai. UNSUB kiya member trie se hatta hai, toh agle match mein candidate hi nahi. deliver() false de (slow consumer ban gaya) toh is message ke liye group mein doosra member try NAHI hota -- woh copy gayi.",
+  "why_needed": "Queue groups ka poora correctness isi routing par tika hai: har group ko exactly ek copy, plain subscribers ko sab, aur publisher ka apna echo setting group ko na tode.",
+  "real_world_analogy": "Office mein ek announcement: har employee (plain) ko copy, aur har team (group) ko ek copy jo team ka koi ek banda uthata hai. Jisne announcement likha, woh apne aap ko candidate list se pehle hi hata deta hai.",
+  "how_it_works": "match copy -> skip own subs if !echo -> plain: deliver; queue: localGroups.get(queue).push -> for each local group: pickRandom -> deliver -> delivered count (no-responders ke liye) -> remote phase (stage 3).",
+  "in_this_project": "src/server.ts publish (localGroups Map, pickRandom), deliver. Tests test/stage2.test.ts 'queue groups' block (6 tests: one member per message, two groups, wildcard + literal, unsubscribed member, echo:false, auto-unsubscribe).",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/test/stage2.test.ts::count"
+  ],
+  "code_example": "// real, src/server.ts publish (trimmed; the remote part is left out)\nlet delivered = 0;\nconst localGroups = new Map<string, Subscription[]>();\nfor (const sub of this.trie.match(subject)) {\n  if (sub.client === c && !c.echo) continue;          // before grouping, so self is never a candidate\n  if (sub.queue === undefined) {\n    if (this.deliver(sub, subject, reply, headerLen, payload)) delivered++;\n  } else {\n    const members = localGroups.get(sub.queue);\n    if (members) members.push(sub);\n    else localGroups.set(sub.queue, [sub]);\n  }\n}\n// ...\nfor (const [group, members] of localGroups) {\n  if (this.deliver(pickRandom(members), subject, reply, headerLen, payload)) delivered++;\n  peersByGroup.delete(group);                           // stage 3: served locally, no peer gets it\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Har group ko exactly ek copy",
+   "Echo setting group distribution nahi todta",
+   "Trie ko queue groups ka pata hi nahi -- grouping publish time par"
+  ],
+  "disadvantages": [
+   "Har publish par ek naya Map",
+   "Picked member slow consumer nikla toh woh copy gayi, retry nahi",
+   "Ek hi client ki do subscriptions ek group mein ho toh uske chunne ka chance double"
+  ],
+  "common_mistakes": [
+   "Echo check pick ke baad karna (message gir jaata)",
+   "Group ko trie node par fixed member se bandhna",
+   "Plain aur queue subscriptions ko ek hi list mein random karna"
+  ],
+  "follow_up_questions": [
+   "Picked member slow consumer nikle toh doosra member try karna chahiye? Trade-off?",
+   "Groups ko trie mein precompute karoge toh kya fayda aur kya keemat?",
+   "Cluster mein local group mil jaane par peers ko kyun nahi bheja jaata?"
+  ],
+  "concepts": [
+   "queue-groups",
+   "routing",
+   "echo-suppression"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Publish-time grouping simple hai aur trie generic rehta hai; keemat har publish par ek chhota Map aur grouping loop. Precomputed groups (trie node par per-group list) match ke baad ka kaam bachate lekin insert/remove complex karte.",
+   "failure_scenarios": "Picked member slow consumer ban kar kata toh us message ki group copy gayi (at-most-once). Ek client ne ek group mein do sids se subscribe kiya toh use zyada messages milenge. Dono abhi aise hi behave karte hain.",
+   "alternatives": "Round robin per group (state chahiye), ya least-pending member (writableLength se). Local-first pick cluster mein stage 3 mein ban chuka hai.",
+   "scale_10x_100x": "Bahut bade groups par random pick O(1) hai, grouping loop O(matches). Cluster mein har route ke interest trie par ek match aur judta hai. Cost measure nahi kiya.",
+   "production_improvements": "Slow member par fallback pick, per-group delivered metrics, aur load-aware pick."
+  }
+ },
+ {
+  "id": "MB-027",
+  "project_slug": "p13-message-broker",
+  "category": "Trade-offs & Design Decisions",
+  "difficulty": "Intermediate",
+  "question": "Why is the queue member chosen with Math.random instead of round robin or 'always the first', and how do you test something random?",
+  "answer_hinglish": "Teen options the. 'Always first' sabse simple hai lekin galat: har message ek hi member ko, baaki idle -- yeh load balancing hi nahi. Yahi S2 mutation tha ('queue pick always first'), aur test ne pakda kyunki usme dono members ko kuch milna zaroori hai.\n\nRound robin barabar baantta hai, lekin state chahiye: har group ka counter, aur members jud-hat rahe hain toh index sambhalna padta hai. Group abhi publish time par match result se banta hai, trie mein koi group object hi nahi -- toh counter rakhne ki jagah nahi hai.\n\nMath.random stateless hai: har publish par members list se ek index. Lambe run mein barabar ke aas paas, aur koi shared state nahi. Keemat: short run mein barabar nahi hota, aur yeh load (kaun busy hai) nahi dekhta. Stage 3 mein locality aayi: cluster mein origin broker pehle local member chunta hai, aur local member na ho tabhi peers mein se ek random peer -- uske andar bhi pick random.\n\nRandom ko test kaise karein bina flaky hue? Test exact distribution assert nahi karta. Woh 200 messages bhejta hai aur check karta hai: (1) dono members ka total exactly 200 (koi duplicate nahi, koi loss nahi), (2) dono ko kam se kam ek mila, (3) plain subscriber ko 200. Condition (2) fail hone ki probability 2^-199 hai -- test comment mein yahi likha hai -- jo practically zero hai. Matlab assertion invariants par hai, ratio par nahi.",
+  "why_needed": "Load distribution strategy ka choice correctness, fairness aur state ke beech trade-off hai, aur random behaviour ke tests galat likho toh flaky bante hain.",
+  "real_world_analogy": "Taxi stand: 'hamesha pehli taxi' mein ek driver thak jaata hai; round robin mein kisi ko list rakhni padti hai; random mein har customer kisi bhi khaali taxi mein baith jaata hai -- bina list ke, lambe samay mein barabar.",
+  "how_it_works": "localGroups.get(queue) -> members array -> pickRandom(members) = members[Math.floor(Math.random() * members.length)] -> deliver. Test: totals exact, each member > 0, plain gets all.",
+  "in_this_project": "src/server.ts pickRandom, publish. test/stage2.test.ts first queue-group test (200 messages, comment about 2^-199). Mutation S2 (always first) isi test ne pakda. Cluster test 'each message goes to exactly ONE remote member' isi invariant style se do remote members check karta hai.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::pickRandom",
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/test/stage2.test.ts::count",
+   "projects/13-message-broker/test/cluster.test.ts"
+  ],
+  "code_example": "// real, test/stage2.test.ts (trimmed)\nfor (let i = 0; i < 200; i++) pub.send(`PUB jobs 1\\r\\nx\\r\\n`);\n// ...\nexpect(a + b).toBe(200);\nexpect(a).toBeGreaterThan(0); // random pick: all 200 to one member has probability 2^-199\nexpect(b).toBeGreaterThan(0);\nexpect(count(plain.received, /MSG jobs/g)).toBe(200);",
+  "code_language": "typescript",
+  "advantages": [
+   "Stateless, koi counter nahi",
+   "Members jud-hat jayein toh kuch sambhalna nahi",
+   "Test invariants par, flaky nahi"
+  ],
+  "disadvantages": [
+   "Short run mein uneven",
+   "Busy ya slow member ko bhi utna hi milta hai",
+   "Locality nahi"
+  ],
+  "common_mistakes": [
+   "Distribution ratio (jaise 50/50 plus minus 5) assert karna -- flaky",
+   "'Always first' ko simple samajh kar chhod dena",
+   "Seeded random ke bina random ko unit test karne ki koshish"
+  ],
+  "follow_up_questions": [
+   "Least-pending member chunna (writableLength se) kab better hoga?",
+   "Cluster mein remote peer bhi random kyun chuna jaata hai, aur uska kya asar hai?"
+  ],
+  "concepts": [
+   "load-balancing",
+   "randomized-testing",
+   "stateless-design"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-028",
+  "project_slug": "p13-message-broker",
+  "category": "Core Concepts",
+  "difficulty": "Intermediate",
+  "question": "What does the HPUB / HMSG wire format look like, and what does the parser check before it accepts a message with headers?",
+  "answer_hinglish": "Headers ek message ke saath metadata bhejne ke liye hain (jaise trace id), HTTP headers jaisa format. Wire par: HPUB <subject> [reply] <header bytes> <total bytes>\\r\\n<headers><body>\\r\\n. Header block hamesha 'NATS/1.0' se shuru hota hai, phir 'Key: value' lines, aur khaali line (\\r\\n\\r\\n) par khatam. Total = header + body. Example test se: header 'NATS/1.0\\r\\nTrace: 7\\r\\n\\r\\n' 22 bytes, body 'abc' 3 bytes, toh HPUB h rep 22 25.\n\nServer se HMSG <subject> <sid> [reply] <header bytes> <total bytes> aata hai, same layout.\n\nParser checks, sab buffer karne se pehle jahan ho sake: arguments 3 ya 4 (reply optional); dono sizes parseCount se (sirf digits); headerLen > total ya headerLen < 8 ('NATS/1.0' ki length) toh 'Invalid HPUB: bad header size'; total > maxPayload toh 'Maximum Payload Violation' -- headers bhi limit mein gine jaate hain, nats-server jaisa. Phir framer.expect(size) se Framer payload padhta hai aur CRLF check karta hai (jaise PUB), aur parser ke handlePayload mein header block ke pehle 8 bytes 'NATS/1.0' na hon toh 'Protocol Error: headers must start with NATS/1.0' -- yeh S11 mutation tha.\n\nDesign point: parser PUB aur HPUB dono ko ek hi Op 'PUB' banata hai; farak sirf headerLen (undefined ya number). Isse server ka routing code ek hi rehta hai, aur header block payload ke aage hi pada rehta hai -- koi parsing nahi, server headers ko padhta hi nahi.",
+  "why_needed": "Bina header support ke tracing ids ya content type jaisa metadata body mein ghusana padta hai, aur official client headers ke saath publish karta hai.",
+  "real_world_analogy": "Courier ka parcel ab do hisson mein: upar ek label slip (headers) aur andar saamaan (body). Bahar likha hai 'slip 22 gram, kul 25 gram'. Courier slip padhta nahi, sirf check karta hai ki slip ka pehla word sahi stamp hai.",
+  "how_it_works": "HPUB line -> parse headerLen, total -> size checks -> pending {headerLen} + framer.expect(total) -> Framer: payload + CRLF -> handlePayload: prefix check -> Op PUB with headerLen.",
+  "in_this_project": "src/parser.ts handleLine (case HPUB), handlePayload (prefix check), HEADER_PREFIX; src/framer.ts expect. Route protocol (route.ts) RMSG ke h field par bhi yahi prefix check karta hai. Tests test/parser.test.ts (HPUB parse, bad header size, prefix, total over maxPayload), test/stage2.test.ts 'headers' block.",
+  "implementation_files": [
+   "projects/13-message-broker/src/parser.ts::handleLine",
+   "projects/13-message-broker/src/parser.ts::handlePayload",
+   "projects/13-message-broker/src/parser.ts::HEADER_PREFIX",
+   "projects/13-message-broker/src/framer.ts::expect",
+   "projects/13-message-broker/test/parser.test.ts",
+   "projects/13-message-broker/test/stage2.test.ts"
+  ],
+  "code_example": "// real, src/parser.ts handleLine\ncase \"HPUB\": {\n  if (args.length !== 3 && args.length !== 4) {\n    throw new ParseError(\"Invalid HPUB: expected subject [reply] header-size total-size\");\n  }\n  const headerLen = parseCount(args[args.length - 2]!);\n  const size = parseCount(args[args.length - 1]!);\n  if (headerLen === undefined || size === undefined) throw new ParseError(\"Invalid HPUB: bad size\");\n  if (headerLen > size || headerLen < HEADER_PREFIX.length) throw new ParseError(\"Invalid HPUB: bad header size\");\n  if (size > this.limits.maxPayload) throw new ParseError(\"Maximum Payload Violation\");\n  this.pending = { subject: args[0]!, reply: args.length === 4 ? args[1] : undefined, headerLen };\n  this.framer.expect(size);\n  return;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Ek Op type, ek routing path",
+   "Size aur prefix checks fail-fast",
+   "Server headers parse nahi karta, sasta"
+  ],
+  "disadvantages": [
+   "Server header content validate nahi karta (sirf prefix)",
+   "Galat header block poora connection tod deta hai"
+  ],
+  "common_mistakes": [
+   "Total ko sirf body ka size samajhna",
+   "maxPayload sirf body par lagana",
+   "Server mein headers parse karke dobara serialize karna"
+  ],
+  "follow_up_questions": [
+   "Server headers ko kabhi padhna chahiye kya (jaise routing ke liye)?",
+   "Headers-only message (body khaali) ka wire format kya hoga?"
+  ],
+  "concepts": [
+   "nats-headers",
+   "wire-format",
+   "fail-fast"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-029",
+  "project_slug": "p13-message-broker",
+  "category": "Code-Level",
+  "difficulty": "Intermediate",
+  "question": "In deliver(), how is a message with headers turned into HMSG for one subscriber and a plain MSG for another, and how is that counted in the stats?",
+  "answer_hinglish": "Ek hi publish ke subscribers alag ho sakte hain: kisi ne CONNECT mein headers:true bheja, kisi ne nahi (purana client). Jo client headers nahi samajhta, use HMSG bhejo toh woh 'Unknown Protocol Operation' jaisa kuch dekhega ya stream desync ho jaayega. Isliye decision per target hai, deliver() mein.\n\nAgar headerLen defined hai aur target.headers true hai: head = 'HMSG subject sid [reply] headerLen total', body = poora payload (headers + body). Warna: body = headerLen undefined ho toh payload, nahi toh payload.subarray(headerLen) -- header block kaat diya, sirf asli body -- aur head = 'MSG subject sid [reply] body.length'. subarray copy nahi hai, sirf view; copy Buffer.concat mein hoti hai (jo waise bhi har frame ke liye hoti).\n\nStats: inBytes publish par payload.length (headers samet), outBytes har delivery par body.length -- jo is target ko asal mein bheja. Test 'a client that did not ask for headers gets a plain MSG with the body only' mein inBytes 25 aur outBytes 3, aur subscriber ko exactly 'MSG h 5 3\\r\\nabc\\r\\n'. Doosra test headers:true subscriber ko exact HMSG dikhata hai, aur ek headers-only (body khaali) message bhi.\n\nMutations: S3 (headers non-header client ke liye strip nahi kiye) aur S4 (HMSG un clients ko bheja jinhone nahi maanga) -- dono in tests ne pakde.",
+  "why_needed": "Ek broker par naye aur purane clients saath chalte hain; per-subscriber format decision ke bina ek feature (headers) purane clients ko tod deta.",
+  "real_world_analogy": "Ek hi chitthi do logon ko: ek ko poori envelope with routing slip (HMSG), doosre ko sirf andar ka letter (MSG), kyunki woh slip padhna jaanta hi nahi.",
+  "how_it_works": "deliver: (headerLen !== undefined && target.headers) ? HMSG with full payload : MSG with body (stripped if needed) -> concat -> pending check -> write -> outBytes += body.length.",
+  "in_this_project": "src/server.ts deliver, Client.headers, handle (CONNECT headers === true). Tests test/stage2.test.ts 'headers' block; interop.test.ts 'headers round trip'.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/src/server.ts::Client",
+   "projects/13-message-broker/test/stage2.test.ts",
+   "projects/13-message-broker/test/interop.test.ts::headers"
+  ],
+  "code_example": "// real, src/server.ts deliver (trimmed)\nif (headerLen !== undefined && target.headers) {\n  head = `HMSG ${subject} ${sub.sid}${replyPart} ${headerLen} ${payload.length}\\r\\n`;\n  body = payload;\n} else {\n  // A client that did not ask for headers gets the body only, as a plain MSG.\n  body = headerLen === undefined ? payload : payload.subarray(headerLen);\n  head = `MSG ${subject} ${sub.sid}${replyPart} ${body.length}\\r\\n`;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Purane clients nahi toot-te",
+   "Strip bina extra copy (subarray)",
+   "outBytes asli bheje bytes dikhata hai"
+  ],
+  "disadvantages": [
+   "Non-header client ko metadata nahi milta (chupchap)",
+   "Do formats ka code path, dono test karne padte hain"
+  ],
+  "common_mistakes": [
+   "Sab ko HMSG bhejna kyunki server headers support karta hai",
+   "Strip karte waqt MSG mein total size likhna (body size ki jagah)",
+   "outBytes mein headers bhi ginna jab bheje nahi"
+  ],
+  "follow_up_questions": [
+   "Agar publisher ne headers:false ke saath HPUB bheja toh kya hona chahiye? (abhi parser accept karta hai)",
+   "Header stripping se kaunsi information chupchap kho jaati hai?"
+  ],
+  "concepts": [
+   "backward-compatibility",
+   "per-subscriber-format",
+   "zero-copy-view"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-030",
+  "project_slug": "p13-message-broker",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "What is the 'no responders' 503 message, why does the server send it only when the requester sent headers:true and no_responders:true, and how does it find where to send it?",
+  "answer_hinglish": "Request/reply mein caller ek _INBOX subject par subscribe karke PUB service.subject _INBOX.x bhejta hai. Agar koi service sun hi nahi rahi, toh at-most-once mein message chupchap gir jaata hai aur caller apna poora timeout wait karta hai. 'No responders' isko theek karta hai: server ko pata hai ki deliver hua ya nahi, toh woh caller ko turant ek status message bhejta hai -- HMSG with header block 'NATS/1.0 503\\r\\n\\r\\n' aur khaali body. Official client isko 503 error mein badal deta hai; interop test mein request turant 503 code ke saath fail hoti hai, poore timeout ka intezaar nahi.\n\nKab bheja jaata hai (publish ke aakhir mein): delivered === 0 (na koi plain na koi group copy gayi) AND reply defined AND c.headers AND c.noResponders. headers kyun zaroori? Kyunki 503 khud ek HMSG hai -- jo client headers nahi samajhta use HMSG bhejna uski stream tod dega. no_responders kyun? Kyunki purane clients ko yeh message unexpected reply lagega; opt-in se sirf woh clients isse paate hain jo isko handle karte hain. Tests: dono mein se ek bhi missing ho toh kuch nahi aata; plain PUB (reply nahi) par kabhi nahi; aur koi service ne message liya toh bhi nahi. Mutations S5 (kabhi nahi bheja) aur S6 (opt-in ignore) pakde gaye.\n\nKahan bhejna hai: sendNoResponders trie.match(reply) mein requester ki APNI subscription dhoondhta hai (s.client === c), kyunki HMSG mein sid chahiye. Test mein requester SUB _INBOX.me.* 9 karta hai, toh 503 'HMSG _INBOX.me.1 9 16 16' ke saath aata hai -- wildcard inbox subscription bhi kaam karti hai. Agar requester ki koi matching subscription nahi, toh kuch nahi bheja jaata.\n\nCluster (stage 3) mein: kisi peer ko RMSG bhejna bhi delivered++ ginta hai. Matlab agar kisi peer ne us subject par interest announce kiya hai, toh origin broker 503 nahi bhejta -- chahe us peer ka subscriber beech mein chala gaya ho. Tab caller ko apna timeout hi milta hai.",
+  "why_needed": "Bina iske 'service down hai' aur 'service slow hai' mein fark nahi dikhta, aur har missing service par caller poora timeout jalata hai.",
+  "real_world_analogy": "Phone call jahan number exist hi nahi karta: bina iske aap 30 second ringing sunte; isse turant 'yeh number maujood nahi hai' message aata hai -- lekin sirf us phone par jo yeh message dikha sakta hai.",
+  "how_it_works": "publish -> delivered count -> (0 && reply && headers && noResponders) -> sendNoResponders: find own sub matching reply -> write HMSG reply sid 16 16 + 'NATS/1.0 503\\r\\n\\r\\n'.",
+  "in_this_project": "src/server.ts publish (condition), sendNoResponders, NO_RESPONDERS, Client.noResponders. Tests test/stage2.test.ts 'no responders' block (4 tests); interop.test.ts 503 test.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::sendNoResponders",
+   "projects/13-message-broker/src/server.ts::NO_RESPONDERS",
+   "projects/13-message-broker/src/server.ts::publish",
+   "projects/13-message-broker/test/stage2.test.ts",
+   "projects/13-message-broker/test/interop.test.ts"
+  ],
+  "code_example": "// real, src/server.ts\nif (delivered === 0 && reply !== undefined && c.headers && c.noResponders) this.sendNoResponders(c, reply);\n\nprivate sendNoResponders(c: Client, reply: string): void {\n  const sub = this.trie.match(reply).find((s) => s.client === c);\n  if (!sub) return;\n  c.write(Buffer.concat([Buffer.from(`HMSG ${reply} ${sub.sid} ${NO_RESPONDERS.length} ${NO_RESPONDERS.length}\\r\\n`), NO_RESPONDERS, CRLF]));\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Request turant fail, timeout nahi jalta",
+   "Opt-in se purane clients safe",
+   "Wildcard inbox subscriptions bhi chalti hain"
+  ],
+  "disadvantages": [
+   "delivered > 0 ka matlab sirf 'socket mein likha', jawab aayega yeh nahi",
+   "Requester ki matching subscription na ho toh 503 nahi milta"
+  ],
+  "common_mistakes": [
+   "Har client ko 503 bhejna, opt-in dekhe bina",
+   "Plain PUB par bhi 503 bhejna",
+   "Delivered ko 'processed' samajhna"
+  ],
+  "follow_up_questions": [
+   "Cluster mein remote interest stale ho (subscriber chala gaya, RS- raste mein) toh 503 kyun nahi aata?",
+   "Queue group ka picked member slow consumer nikle toh 503 jaana chahiye kya? Abhi kya hota hai?"
+  ],
+  "concepts": [
+   "no-responders",
+   "request-reply",
+   "opt-in-protocol"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "503 timeout bachata hai lekin sirf 'koi subscribed nahi tha' batata hai, 'service ne process kiya' nahi. Opt-in compatibility deta hai, keemat yeh ki purane clients ko fayda nahi.",
+   "failure_scenarios": "Agar picked queue member ya akela subscriber usi publish mein slow consumer ban kar kata, toh deliver() false deta hai aur delivered 0 reh sakta hai -- tab requester ko 503 milega, jo 'koi nahi sun raha' kehta hai jabki subscriber tha. Yeh code ka current behaviour hai.",
+   "alternatives": "Hamesha timeout par depend karna; ya application level health check; real nats-server bhi isi opt-in tarike se 503 bhejta hai.",
+   "scale_10x_100x": "Single node par yeh ek extra trie.match hai sirf zero-delivery requests par. Cluster mein 'zero delivery' ka faisla origin broker apne interest view se karta hai (local subs + peers ka RS+), bina peers se pooche -- sasta, lekin stale view par galat ho sakta hai.",
+   "production_improvements": "Peer side se 503 wapas bhejna jab RMSG ko wahan koi na mile, 503 events ka metric (missing services ka signal), aur slow-consumer case mein 503 ki jagah kuch alag status par vichar."
+  }
+ },
+ {
+  "id": "MB-031",
+  "project_slug": "p13-message-broker",
+  "category": "Performance & Scalability",
+  "difficulty": "Advanced",
+  "question": "Why does the slow-consumer check use socket.writableLength and not socket.bytesWritten, and why is the socket destroyed at once instead of ended?",
+  "answer_hinglish": "Check deliver() mein frame likhne se pehle hai: target.socket.writableLength + frame.length > maxPending. Do cheezein samajhni hain.\n\nwritableLength vs bytesWritten. writableLength = abhi is socket ke user-space write buffer mein kitne bytes QUEUED hain, jo kernel ne abhi nahi liye. Client padhta rahe toh yeh chhota rehta hai, padhna band kare toh badhta hai -- yahi woh memory hai jo bachani hai. bytesWritten = is connection par AB TAK kitne bytes bheje gaye, ek kabhi na ghatne wala total. Agar check bytesWritten par hota, toh har healthy, tez subscriber bhi kuch der mein maxPending total paar karke kat jaata. Isiliye test 'a subscriber that keeps up is NOT dropped, even when the total sent is far above maxPending' hai: 500 x 1 KiB messages ek 64 KiB limit ke saath, aur slowConsumers 0. Yahi S8 mutation tha (bytesWritten use kiya) aur isi test ne pakda. frame.length jodna bhi zaroori hai, taaki is frame ko likhne ke BAAD ki state check ho.\n\nDestroy vs end. fatal() errors mein end() karte hain taaki -ERR flush ho jaaye. Slow consumer mein yeh ulta padta: end() buffer ke flush hone ka intezaar karta hai, aur buffer flush ho hi nahi raha kyunki client padh nahi raha -- woh queued memory hi toh wapas chahiye. Isliye slowConsumer() drop(c, true) karta hai: subscriptions turant hatti hain aur socket turant destroy, buffer free. Honest keemat: -ERR 'Slow Consumer' likha zaroor jaata hai, lekin uske peeche queue mein, aur destroy turant -- toh client usually -ERR nahi dekhta.\n\nTest mein slow subscriber socket.pause() karta hai, publisher 8 KiB messages bhejta hai jab tak slowConsumers 1 na ho, aur phir doosra subscriber normal message paata hai.",
+  "why_needed": "Galat metric chuno toh ya toh healthy clients katenge (bytesWritten) ya memory phir bhi bhar jaayegi; aur galat close method chuno toh memory free hi nahi hogi.",
+  "real_world_analogy": "Bank account: bytesWritten aapki zindagi bhar ki total kamai hai, writableLength abhi ka unpaid bill. Credit limit unpaid bill par lagti hai, total kamai par nahi.",
+  "how_it_works": "deliver: frame build -> writableLength + frame.length > maxPending ? slowConsumer: slowConsumers++, -ERR, drop(c, true) [trie cleanup + destroy] : write.",
+  "in_this_project": "src/server.ts deliver, slowConsumer, drop; BrokerStats.slowConsumers. Tests test/stage2.test.ts 'slow consumer protection' (2 tests). Mutations S7 (no check) aur S8 (bytesWritten) dono pakde gaye.",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/src/server.ts::slowConsumer",
+   "projects/13-message-broker/src/server.ts::BrokerStats",
+   "projects/13-message-broker/test/stage2.test.ts::until"
+  ],
+  "code_example": "// real, src/server.ts deliver\nconst frame = Buffer.concat([Buffer.from(head), body, CRLF]);\nif (target.socket.writableLength + frame.length > this.opts.maxPending) {\n  this.slowConsumer(target);\n  return false;\n}\ntarget.write(frame);",
+  "code_language": "typescript",
+  "advantages": [
+   "Sahi metric: sirf queued bytes",
+   "Memory turant free",
+   "Healthy fast clients nahi katte (test se saabit)"
+  ],
+  "disadvantages": [
+   "Client ko -ERR aksar nahi dikhta",
+   "Kernel buffers mein pade bytes writableLength mein nahi dikhte, toh asli memory thodi zyada hoti hai",
+   "Ek bada burst bhi limit hit kar sakta hai"
+  ],
+  "common_mistakes": [
+   "bytesWritten ya total sent par limit lagana",
+   "Slow consumer par end() karke flush ka intezaar",
+   "frame.length jode bina check karna (limit ek frame se paar)"
+  ],
+  "follow_up_questions": [
+   "socket.write() ka false return value isi kaam ke liye use kar sakte the? Kya fark padta?",
+   "maxPending kaise tune karoge bina measurement ke?"
+  ],
+  "concepts": [
+   "slow-consumer",
+   "writable-length",
+   "memory-management"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Turant destroy memory bachata hai lekin client ko reason nahi milta; end() reason deta lekin memory nahi bachata. Yahan memory chuni gayi aur server side counter se observability.",
+   "failure_scenarios": "Healthy client jo ek bade burst ke beech kuch milliseconds peeche hai, kat sakta hai. Bahut saare connections milkar har ek maxPending ke neeche rahte hue bhi total memory bhar sakte hain (global limit nahi).",
+   "alternatives": "socket.write() ke false return par 'drain' event ka wait aur messages drop; per-subscription pending message count; global pending budget.",
+   "scale_10x_100x": "Connections 10x-100x hon toh per-client 64 MiB default ka worst case bahut bada ho jaata hai; global budget aur chhota per-client limit chahiye. Kitna -- measure nahi kiya.",
+   "production_improvements": "Global pending limit, max connections, per-client writableLength metrics, aur stage 4 B5 experiment (memory sample karte hue slow consumer)."
+  }
+ },
+ {
+  "id": "MB-032",
+  "project_slug": "p13-message-broker",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Walk through close(forceMs). What does end() give you that destroy() does not, and what is forceMs for?",
+  "answer_hinglish": "close() ke kadam, order mein. (Stage 3 mein sabse pehle: stopping = true, dialers ke timers clear, aur saare routes routeGone + destroy -- taaki band hote broker ko koi re-dial na kare aur woh khud bhi kisi ko na kare.)\n\n1. this.server.close(): naye connections lena band. Iska promise tab resolve hota hai jab saare purane connections bhi band ho jaayein, isliye ise baad mein await karte hain.\n2. Sockets ki list le kar har client par drop(c, false): routing band (closed = true, subscriptions trie se hatti, ping timer clear), lekin socket destroy NAHI. Isse close ke dauran koi naya message queue mein nahi judta.\n3. Har socket par end(). end() pehle jo bytes already write buffer mein queued hain unhe bhejta hai aur PHIR FIN. destroy() buffer ko phenk deta aur turant band karta. Isi fark se test 'messages already accepted are delivered before the connection closes' pass hota hai: 500 x 1 KiB messages queued, close() 'closed' return karta hai, aur subscriber ko poore 500 milte hain. S9 mutation (close destroys instead of flushing) isi ne pakda.\n4. Race: saare sockets ke 'close' event vs forceMs (default 5000 ms) ka timer. Sab band ho gaye toh 'closed'. Timer pehle aaya toh bache sockets destroy aur 'forced'. Timer clearTimeout se saaf.\n\nforceMs kyun: end() sirf hamari side band karta hai. Agar peer padhta nahi ya apni side kabhi band nahi karta (half-open, allowHalfOpen), toh 'close' event kabhi nahi aayega aur shutdown hamesha ke liye atak jaayega. Test ek allowHalfOpen socket ke saath close(300) chalata hai aur 'forced' expect karta hai. S10 mutation (close never forces) isi ne pakda.\n\nsrc/index.ts result ko 'stopped' log line mein likhta hai, toh operator dekh sakta hai ki shutdown clean tha ya forced.",
+  "why_needed": "Shutdown do galtiyan kar sakta hai: accepted messages phenk dena, ya ek stubborn peer ki wajah se kabhi khatam na hona. Dono ko ek saath handle karna padta hai.",
+  "real_world_analogy": "Dukaan band karna: shutter aadha neeche (naye customers nahi), andar walon ko unka saamaan de do (end flush), aur jo bina wajah baithe rahein unhe tay waqt ke baad bahar (forceMs).",
+  "how_it_works": "server.close -> drop(each, false) -> end(each) -> race(all 'close' events, forceMs timer) -> forced ? destroy all : nothing -> await serverClosed -> 'closed' | 'forced'.",
+  "in_this_project": "src/server.ts close(forceMs), drop. src/index.ts stop handler logs how. Tests test/stage2.test.ts 'graceful close' (2 tests).",
+  "implementation_files": [
+   "projects/13-message-broker/src/server.ts::close",
+   "projects/13-message-broker/src/server.ts::drop",
+   "projects/13-message-broker/src/index.ts",
+   "projects/13-message-broker/test/stage2.test.ts"
+  ],
+  "code_example": "// real, src/server.ts close (trimmed)\nconst serverClosed = new Promise<void>((resolve) => this.server.close(() => resolve()));\nconst sockets = [...this.clients].map((c) => c.socket);\nfor (const c of [...this.clients]) this.drop(c, false);\n// ... allClosed waits for every socket's 'close' event ...\nfor (const s of sockets) s.end();\nconst result = await Promise.race([allClosed.then(() => \"closed\" as const), forced]);\nclearTimeout(timer);\nif (result === \"forced\") for (const s of sockets) s.destroy();\nawait serverClosed;\nreturn result;",
+  "code_language": "typescript",
+  "advantages": [
+   "Accepted messages deliver hote hain",
+   "Shutdown ki upper bound (forceMs)",
+   "Result batata hai clean ya forced"
+  ],
+  "disadvantages": [
+   "Shutdown forceMs tak lamba ho sakta hai",
+   "Close ke dauran aaye naye publishes route nahi hote"
+  ],
+  "common_mistakes": [
+   "destroy() se shutdown karna",
+   "Bina deadline ke end() ka intezaar",
+   "Routing band kiye bina end() karna (beech mein naye frames)"
+  ],
+  "follow_up_questions": [
+   "forceMs ki value kis cheez se tay karoge?",
+   "Clients ko shutdown se pehle signal dena (jaise lame duck mode) kaise add karoge?"
+  ],
+  "concepts": [
+   "graceful-shutdown",
+   "half-close",
+   "deadline"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-033",
+  "project_slug": "p13-message-broker",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "Which deliberate breaks (S1-S11) were used to check the stage 2 tests, and what did each one prove?",
+  "answer_hinglish": "Stage 1 ki tarah, stage 2 ke har rule ko jaan-boojh ke toda, test suite chalaya, red dekha, phir wapas kiya. 11 mutations, sab pakde gaye.\n\nQueue groups: S1 queue ko ignore kiya (har member ko har message) -> 'exactly ONE member' test red (total 200 se zyada). S2 pick hamesha pehla member -> wahi test red, kyunki doosre member ko 0 mila.\n\nHeaders: S3 non-header client ke liye header strip nahi kiya -> 'plain MSG with the body only' red. S4 HMSG un clients ko bhi bheja jinhone nahi maanga -> wahi test red. S11 HPUB header prefix (NATS/1.0) check hataya -> parser test 'headers that do not start with NATS/1.0' red.\n\nNo responders: S5 503 kabhi nahi bheja -> 'immediate 503' test aur interop 503 test red. S6 opt-in ignore kiya -> 'no 503 for a client that did not opt in' red.\n\nSlow consumer: S7 check hi hataya -> 'dropped once its queued bytes pass maxPending' red (slowConsumers kabhi 1 nahi hua). S8 writableLength ki jagah bytesWritten -> 'keeps up is NOT dropped' red, kyunki total sent limit se zyada tha.\n\nGraceful close: S9 close ne end() ki jagah destroy kiya -> '500 messages delivered before close' red. S10 close ne kabhi force nahi kiya -> half-open peer test red (close kabhi resolve nahi hua / 'forced' nahi aaya).\n\nSabak: S8 jaisa mutation sirf tab pakda jaata hai jab negative test ho (healthy client NAHI katna chahiye). Sirf 'slow client katta hai' test hota toh bytesWritten version bhi green rehta. Limitation: haath se chune mutations hain, Stryker jaisa tool nahi chalaya.",
+  "why_needed": "Naye features ke tests bhi utne hi jhoothe ho sakte hain jitne purane; har stage ko apne mutations chahiye.",
+  "real_world_analogy": "Fire drill har naye floor ke liye alag: purane floors ka drill naye floor ke alarm ko test nahi karta.",
+  "how_it_works": "Per rule: smallest breaking edit -> npm test -> matching test red -> revert. Negative tests (kya NAHI hona chahiye) S4, S6, S8 jaise mutations pakadte hain.",
+  "in_this_project": "Mutations src/server.ts (publish, deliver, slowConsumer, sendNoResponders, close) aur src/parser.ts (HPUB prefix) par; pakadne wale tests test/stage2.test.ts, test/parser.test.ts aur test/interop.test.ts mein.",
+  "implementation_files": [
+   "projects/13-message-broker/test/stage2.test.ts",
+   "projects/13-message-broker/test/parser.test.ts",
+   "projects/13-message-broker/test/interop.test.ts",
+   "projects/13-message-broker/src/server.ts::deliver",
+   "projects/13-message-broker/src/server.ts::close"
+  ],
+  "code_example": "// example: mutation S8 (applied by hand, then reverted) in src/server.ts deliver\n// original:\nif (target.socket.writableLength + frame.length > this.opts.maxPending) {\n// mutant:\nif (target.socket.bytesWritten + frame.length > this.opts.maxPending) {\n// -> \"a subscriber that keeps up is NOT dropped, even when the total sent is far above maxPending\" turns red",
+  "code_language": "typescript",
+  "advantages": [
+   "Har stage 2 rule ka saboot",
+   "Negative tests ki value dikhti hai",
+   "Sasta aur targeted"
+  ],
+  "disadvantages": [
+   "Haath se chune, selection bias",
+   "Random behaviour (S2) ke liye test probability par tika hai"
+  ],
+  "common_mistakes": [
+   "Sirf positive tests likhna (S8 chhoot jaata)",
+   "Mutation ke baad revert bhool jaana",
+   "Kisi bhi test ke red hone ko kaafi maan lena bina dekhe ki sahi test red hua"
+  ],
+  "follow_up_questions": [
+   "Stage 3 (cluster) ke liye kaunse mutations sochoge?",
+   "Random pick wala test S1 aur S2 dono ko kaise pakadta hai?"
+  ],
+  "concepts": [
+   "mutation-testing",
+   "negative-tests",
+   "verification"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har stage par mutations karna discipline maangta hai lekin bugs ka asli saboot deta hai. Tool-based testing broader hai par noisy aur slow.",
+   "failure_scenarios": "Ek mutation jo koi test red na kare = gap ya equivalent mutant. Stage 2 mein koi aisa nahi mila; iska matlab yeh nahi ki gaps nahi, sirf in 11 rules par nahi.",
+   "alternatives": "Stryker, property-based tests (fast-check) parser ke liye, real nats-server ke saath differential tests.",
+   "scale_10x_100x": "Cluster stage mein rules zyada distributed honge (no duplicate in mesh, no forwarding without interest); har ek ka mutation multi-process test maangega.",
+   "production_improvements": "Mutation table README mein, CI mein periodic Stryker run, aur har feature PR ke saath uske mutations."
+  }
+ },
+ {
+  "id": "MB-034",
+  "project_slug": "p13-message-broker",
+  "category": "Advanced",
+  "difficulty": "Intermediate",
+  "question": "What do the stage 2 interop tests (queue group, headers round trip, 503) prove with the official nats client that the raw tests cannot?",
+  "answer_hinglish": "Raw tests hamara hi samjha hua wire format check karte hain. Agar maine HMSG ke arguments ka order ya 503 ka header format galat samjha, toh Raw test bhi wahi galti karega. Official nats client (2.29.3) independent hai, toh teen stage 2 interop tests teen claims check karte hain.\n\nQueue group: do connections nc.subscribe('work', {queue: 'pool'}), 100 messages. Assert: total 100, unique 100 (koi duplicate nahi), aur dono ko kuch mila. Yeh dikhata hai ki client ka SUB-with-queue format hamare parser se match karta hai aur distribution end-to-end sahi hai.\n\nHeaders round trip: client headers() object banata hai, ek key set aur ek key do baar append (Tag: one, Tag: two). Subscriber ko m.headers.get aur values se same milte hain aur body 'body'. Yeh dikhata hai ki client ka HPUB hamara parser accept karta hai, hum header block ko byte-for-byte aage bhejte hain, aur hamara HMSG client parse kar leta hai. Isme client khud headers:true maangta hai kyunki INFO headers:true kehta hai.\n\n503: nc.request('nobody.home', ..., {timeout: 5000}) -- koi subscriber nahi. Error ka code '503' hona chahiye aur test check karta hai ki yeh 1000 ms se pehle aaya. Yeh 1000 ms ek test threshold hai, latency measurement nahi: matlab sirf itna ki client ne timeout ka intezaar nahi kiya, server ka status message samjha. Isse yeh bhi saabit hota hai ki official client CONNECT mein headers aur no_responders dono bhejta hai.\n\nJo interop nahi dikhata: slow consumer aur graceful close -- official client deliberately slow nahi hota, isliye woh raw tests (socket.pause, allowHalfOpen) mein hain.",
+  "why_needed": "Protocol features ke liye 'mere tests pass' kaafi nahi; asli client ke saath chalna hi compatibility ka saboot hai.",
+  "real_world_analogy": "Naya plug socket banaya: apne banaye plug se test karna aadha saboot hai; bazaar ka plug lagao, tab pata chale standard sahi follow hua.",
+  "how_it_works": "startBroker -> official connect -> subscribe {queue} / publish {headers} / request -> assertions on data, headers, error code aur server stats.",
+  "in_this_project": "test/interop.test.ts (3 stage 2 tests: queue group, headers round trip, 503) aur helpers collect, until; src/server.ts accept (INFO headers true), deliver, sendNoResponders.",
+  "implementation_files": [
+   "projects/13-message-broker/test/interop.test.ts::headers",
+   "projects/13-message-broker/test/interop.test.ts::collect",
+   "projects/13-message-broker/src/server.ts::sendNoResponders",
+   "projects/13-message-broker/src/server.ts::accept"
+  ],
+  "code_example": "// real, test/interop.test.ts\nit(\"a request to a subject nobody listens on fails at once with 503 instead of timing out\", async () => {\n  const { client } = await setup();\n  const nc = await client();\n  const t0 = Date.now();\n  const err = await nc.request(\"nobody.home\", sc.encode(\"?\"), { timeout: 5000 }).catch((e: { code?: string }) => e);\n  expect((err as { code?: string }).code).toBe(\"503\");\n  expect(Date.now() - t0).toBeLessThan(1000);\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Independent check of HPUB/HMSG aur 503 format",
+   "Queue distribution end-to-end",
+   "Client ke CONNECT options bhi implicitly verify"
+  ],
+  "disadvantages": [
+   "Ek client version par pinned",
+   "Slow consumer aur close interop se test nahi ho sakte"
+  ],
+  "common_mistakes": [
+   "Timing threshold ko performance number bolna",
+   "Sirf raw tests se 'headers compatible' claim karna",
+   "Interop test mein duplicates check na karna (sirf count)"
+  ],
+  "follow_up_questions": [
+   "Go client se bhi yahi tests chalaoge? Kya naya pakdega?",
+   "503 test ka 1000 ms threshold flaky ho sakta hai kya?"
+  ],
+  "concepts": [
+   "interop-testing",
+   "protocol-compatibility",
+   "independent-verification"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "MB-035",
+  "project_slug": "p13-message-broker",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write an integration test proving that a subscriber which keeps reading is NOT dropped as a slow consumer, even when the total bytes sent are far above maxPending.",
+  "answer_hinglish": "Yeh negative test hai aur slow-consumer feature ka sabse important test: bina iske 'bytesWritten' wala galat implementation bhi green rehta (S8 mutation).\n\nSetup: broker maxPending 64 KiB ke saath (chhota, taaki test jaldi limit se kahin aage jaaye). Ek subscriber SUB s 1, phir sync() (PING/PONG) taaki pakka ho ki subscription register ho gayi. Ek publisher.\n\nLoop: 10 rounds, har round mein 50 messages of 1 KiB. Har round ke baad pub.sync() (server ne sab route kar diye) aur sub.sync() (subscriber ne sab padh liye). Yeh rounds zaroori hain: subscriber ko padhne ka mauka milta hai, isliye writableLength kabhi limit tak nahi pahunchta, jabki total bheja gaya data limit ka kai guna hai.\n\nAssert: subscriber ne exactly 500 'MSG s 1 1024' frames paaye, aur broker.stats().slowConsumers 0.\n\nPositive counterpart (alag test): subscriber socket.pause() kare, publisher bhejta rahe jab tak slowConsumers 1 na ho jaye (until with timeout), phir check ki connections aur subscriptions ghate aur doosra subscriber abhi bhi message paata hai. Dono milkar check ko dono taraf se baandhte hain: na kam kaatna, na zyada.\n\nProject mein yeh dono test test/stage2.test.ts ke 'slow consumer protection' block mein hain.",
+  "why_needed": "Protection features ke liye sirf 'yeh katta hai' test kaafi nahi; 'yeh NAHI katna chahiye' test ke bina galat metric pakda nahi jaata.",
+  "real_world_analogy": "Speed camera test: sirf tez gaadi ka challan katna kaafi nahi, yeh bhi check karo ki limit ke andar chalne wali gaadi ka challan NAHI katta.",
+  "how_it_works": "startBroker({maxPending}) -> Raw sub + pub -> rounds of publish + sync both -> count frames -> stats().slowConsumers === 0.",
+  "in_this_project": "test/stage2.test.ts 'slow consumer protection' block; test/helpers.ts Raw.sync aur until; src/server.ts deliver ka writableLength check.",
+  "implementation_files": [
+   "projects/13-message-broker/test/stage2.test.ts::count",
+   "projects/13-message-broker/test/helpers.ts::sync",
+   "projects/13-message-broker/src/server.ts::deliver"
+  ],
+  "code_example": "import { expect, it } from \"vitest\";\nimport { Raw, startBroker } from \"./helpers.js\";\n\nit(\"a subscriber that keeps up is NOT dropped\", async () => {\n  const { broker, port } = await startBroker({ maxPending: 64 * 1024 });\n  const sub = await Raw.ready(port);\n  const pub = await Raw.ready(port);\n  try {\n    sub.send(\"SUB s 1\\r\\n\");\n    await sub.sync();\n    const body = \"y\".repeat(1024);\n    for (let round = 0; round < 10; round++) {\n      for (let i = 0; i < 50; i++) pub.send(`PUB s ${body.length}\\r\\n${body}\\r\\n`);\n      await pub.sync();   // server has routed this round\n      await sub.sync();   // subscriber has read it\n    }\n    expect(sub.received.match(/MSG s 1 1024\\r\\n/g)).toHaveLength(500);\n    expect(broker.stats().slowConsumers).toBe(0);\n  } finally {\n    sub.close();\n    pub.close();\n    await broker.close(500);\n  }\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Galat metric (bytesWritten) pakadta hai",
+   "Deterministic: sync se padhna pakka",
+   "Positive test ke saath dono taraf ki boundary"
+  ],
+  "disadvantages": [
+   "Real network jaisa nahi (loopback, tez)",
+   "Round size badlo toh test ka meaning badal sakta hai"
+  ],
+  "common_mistakes": [
+   "Sirf positive slow-consumer test likhna",
+   "Rounds ke beech sync na karna (tab healthy client bhi kat sakta hai aur test flaky)",
+   "broker.close() na karna aur test leak"
+  ],
+  "follow_up_questions": [
+   "Agar maxPending ek message se chhota ho toh kya hoga?",
+   "Is test ko S7 (no check) mutation pakadna chahiye kya? Kyun nahi?"
+  ],
+  "concepts": [
+   "negative-testing",
+   "slow-consumer",
+   "vitest"
+  ],
+  "advanced": null
+ }
+]
