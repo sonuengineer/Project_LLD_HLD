@@ -1,6 +1,7 @@
 // A small test upstream for the experiments. Zero dependencies.
 //
 //   PORT           listen port (required)
+//   HOST           address to bind (default 127.0.0.1; for a two-host test use the machine's PRIVATE address, never 0.0.0.0)
 //   NAME           body returned by "/"                      (default "upstream")
 //   DELAY_MS       delay before answering "/"                 (default 0)
 //   KEEPALIVE_MS   server keep-alive timeout                  (default: Node's, 5000)
@@ -17,6 +18,7 @@ import http from "node:http";
 import net from "node:net";
 
 const port = Number(process.env.PORT);
+const bindHost = process.env.HOST ?? "127.0.0.1";
 const name = process.env.NAME ?? "upstream";
 const delayMs = Number(process.env.DELAY_MS ?? 0);
 const resetPercent = Number(process.env.RESET_PERCENT ?? 0);
@@ -37,7 +39,7 @@ function startRaw() {
       }
     });
   });
-  raw.listen(port, "127.0.0.1", () => console.log(JSON.stringify({ msg: "listening", port, name, raw: true })));
+  raw.listen(port, bindHost, () => console.log(JSON.stringify({ msg: "listening", port, name, raw: true })));
 }
 
 function startNode() {
@@ -69,7 +71,7 @@ function startNode() {
   });
 
   if (process.env.KEEPALIVE_MS) server.keepAliveTimeout = Number(process.env.KEEPALIVE_MS);
-  server.listen(port, "127.0.0.1", () => console.log(JSON.stringify({ msg: "listening", port, name })));
+  server.listen(port, bindHost, () => console.log(JSON.stringify({ msg: "listening", host: bindHost, port, name })));
 }
 
 if (process.env.RAW === "1") startRaw();

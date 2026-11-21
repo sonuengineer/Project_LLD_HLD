@@ -2,6 +2,7 @@
 // Numbers in `rows` are computed from `raw`; nothing is typed by hand.
 import { execFileSync, spawn } from "node:child_process";
 import http from "node:http";
+import net from "node:net";
 import {
   QUICK, freePort, load, median, pct, round, rssKiB, sleep, spread, startProxy, startUpstream,
 } from "./lib.mjs";
@@ -417,4 +418,153 @@ async function e9() {
   };
 }
 
-export const scenarios = { e1, e2, e3, e4, e5, e6, e7, e8, e9 };
+// ============================================================================================ two-host experiments
+// These run on the PROXY machine and talk to test upstreams on ANOTHER machine. The upstream machine is described only by
+// environment variables, so no address is written in this repository:
+//   REMOTE_HOST            private address of the machine running the upstreams
+//   REMOTE_FAST_PORT       upstream that answers at once
+//   REMOTE_SLOW_PORT       upstream that waits 40 ms
+//   REMOTE_REFUSED_PORT    allowed through the network and the firewall, but NOTHING listens        -> ECONNREFUSED
+//   REMOTE_REJECTED_PORT   allowed through the network, but the host firewall REJECTs it             -> EHOSTUNREACH
+//   REMOTE_BLACKHOLE_PORT  NOT allowed by the cloud network rules, which silently drop the packets  -> timeout
+function remote() {
+  const e = process.env;
+  const need = ["REMOTE_HOST", "REMOTE_FAST_PORT", "REMOTE_SLOW_PORT", "REMOTE_REFUSED_PORT", "REMOTE_REJECTED_PORT", "REMOTE_BLACKHOLE_PORT"];
+  const missing = need.filter((k) => !e[k]);
+  if (missing.length) return { skipped: `two-host experiment: set ${missing.join(", ")}` };
+  const base = (p) => `http://${e.REMOTE_HOST}:${e[p]}`;
+  return { host: e.REMOTE_HOST, fast: base("REMOTE_FAST_PORT"), slow: base("REMOTE_SLOW_PORT"), refused: base("REMOTE_REFUSED_PORT"),
+    rejected: base("REMOTE_REJECTED_PORT"), blackhole: base("REMOTE_BLACKHOLE_PORT"), ports: { fast: e.REMOTE_FAST_PORT, slow: e.REMOTE_SLOW_PORT } };
+}
+
+function tcpConnect(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const t0 = process.hrtime.bigint();
+    const s = net.connect({ host, port, timeout: timeoutMs });
+    const done = (result) => { s.destroy(); resolve({ ...result, ms: Number(process.hrtime.bigint() - t0) / 1e6 }); };
+    s.once("connect", () => done({ ok: true }));
+    s.once("timeout", () => done({ ok: false, error: "TIMEOUT" }));
+    s.once("error", (err) => done({ ok: false, error: err.code ?? err.name }));
+  });
+}
+
+// ---------------------------------------------------------------------------------------------- X1
+async function x1() {
+  const r = remote();
+  if (r.skipped) return r;
+  const samples = [];
+  for (let i = 0; i < (QUICK ? 20 : 200); i++) {
+    const c = await tcpConnect(r.host, Number(r.ports.fast), 2000);
+    if (c.ok) samples.push(c.ms);
+  }
+  samples.sort((a, b) => a - b);
+  const q = (p) => samples[Math.min(samples.length - 1, Math.floor((p / 100) * samples.length))];
+  return {
+    title: "X1 - network round trip between the two machines (TCP connect time)",
+    note: "Time to open a TCP connection from the proxy machine to the upstream machine over the private network, repeated; this is about one round trip.",
+    columns: ["samples", "min ms", "p50 ms", "p99 ms", "max ms"],
+    rows: [[samples.length, round(samples[0], 2), round(q(50), 2), round(q(99), 2), round(samples.at(-1), 2)]], raw: { samples },
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- X2
+async function x2() {
+  const r = remote();
+  if (r.skipped) return r;
+  const px = await startProxy({ UPSTREAM: r.fast });
+  const quiet = await startProxy({ UPSTREAM: r.fast, REQUEST_LOG: "false" });
+  const urls = { "direct (other machine)": r.fast, "through the proxy": px.url, "through the proxy, request log off": quiet.url };
+  const raw = [];
+  try {
+    await load({ url: px.url, connections: 8, duration: 2 });
+    await load({ url: quiet.url, connections: 8, duration: 2 });
+    for (let run = 1; run <= RUNS; run++) {
+      for (const [target, url] of Object.entries(urls)) {
+        const res = await load({ url, connections: 32, duration: SECS });
+        raw.push({ run, target, ...trim(res) });
+      }
+      for (const [target, url] of Object.entries(urls)) { // one connection at a time: shows the per-request latency, no queueing
+        const res = await load({ url, connections: 1, duration: Math.max(2, Math.round(SECS / 3)) });
+        raw.push({ run, target: target + " [1 connection]", ...trim(res) });
+      }
+    }
+  } finally {
+    await px.stop();
+    await quiet.stop();
+  }
+  const names = [...Object.keys(urls), ...Object.keys(urls).map((t) => t + " [1 connection]")];
+  const rows = names.map((target) => {
+    const xs = raw.filter((x) => x.target === target);
+    return [target, round(median(xs.map((x) => x.rps)), 0), range(xs.map((x) => x.rps)), round(median(xs.map((x) => x.p50)), 2), round(median(xs.map((x) => x.p97_5)), 2), round(median(xs.map((x) => x.p99)), 2), xs.reduce((s, x) => s + x.non2xx + x.errors, 0)];
+  });
+  return {
+    title: "X2 - what the proxy costs when the upstream is on ANOTHER machine",
+    note: `Load generator and proxy on one machine, the upstream on a second machine over the private network (the upstream no longer shares the proxy's CPU). 32 connections and 1 connection, median of ${RUNS} runs of ${SECS}s (the 1-connection runs are shorter).`,
+    columns: ["target", "req/s (median)", "req/s (min-max)", "p50 ms", "p97.5 ms", "p99 ms", "errors+non2xx"],
+    rows, raw,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- X3
+async function x3() {
+  const r = remote();
+  if (r.skipped) return r;
+  const raw = [];
+  for (const strategy of ["round-robin", "least-connections"]) {
+    for (let run = 1; run <= RUNS; run++) {
+      const px = await startProxy({ UPSTREAM: `${r.fast},${r.slow}`, STRATEGY: strategy });
+      try {
+        const res = await load({ url: px.url, connections: 32, duration: SECS });
+        await sleep(100);
+        const reqs = px.requests();
+        raw.push({ strategy, run, ...trim(res), slowShare: pct(reqs.filter((q) => q.upstream === new URL(r.slow).host).length, reqs.length) });
+      } finally {
+        await px.stop();
+      }
+    }
+  }
+  const rows = ["round-robin", "least-connections"].map((s) => {
+    const xs = raw.filter((x) => x.strategy === s);
+    return [s, round(median(xs.map((x) => x.rps)), 0), round(median(xs.map((x) => x.p50)), 1), round(median(xs.map((x) => x.p97_5)), 1), round(median(xs.map((x) => x.p99)), 1), `${round(median(xs.map((x) => x.slowShare)), 1)}%`];
+  });
+  return {
+    title: "X3 - round-robin vs least-connections, upstreams on another machine (one is 40 ms slower)",
+    note: `Same question as E2, but over the network. 32 connections, median of ${RUNS} runs of ${SECS}s per strategy.`,
+    columns: ["strategy", "req/s", "p50 ms", "p97.5 ms", "p99 ms", "slow share"], rows, raw,
+  };
+}
+
+// ---------------------------------------------------------------------------------------------- X4
+async function x4() {
+  const r = remote();
+  if (r.skipped) return r;
+  const cases = [
+    ["port the host firewall REJECTs", r.rejected, Number(new URL(r.rejected).port)],
+    ["port open in the firewall, nothing listening", r.refused, Number(new URL(r.refused).port)],
+    ["port the cloud network silently drops", r.blackhole, Number(new URL(r.blackhole).port)],
+  ];
+  const raw = [];
+  for (const [what, url, port] of cases) {
+    const tcp = await tcpConnect(r.host, port, 3500); // what the operating system itself reports, without the proxy
+    const px = await startProxy({ UPSTREAM: url, RETRIES: "0", CONNECT_TIMEOUT_MS: "2000" });
+    try {
+      const t0 = Date.now();
+      const res = await fetch(`${px.url}/`);
+      await res.text();
+      const ms = Date.now() - t0;
+      await sleep(100);
+      const q = px.requests()[0];
+      raw.push({ what, rawTcp: tcp, status: res.status, ms, proxyError: q.error });
+    } finally {
+      await px.stop();
+    }
+  }
+  const rows = raw.map((x) => [x.what, x.rawTcp.ok ? "connected" : x.rawTcp.error, round(x.rawTcp.ms, 1), x.status, x.ms, x.proxyError]);
+  return {
+    title: "X4 - three kinds of failure to reach an upstream on another machine",
+    note: "\"raw TCP\" is a plain connection attempt from this machine (3.5 s limit); the last three columns are what a client sees through the proxy (retries off, connect timeout 2000 ms).",
+    columns: ["case", "raw TCP result", "raw TCP ms", "status via proxy", "ms via proxy", "error the proxy recorded"], rows, raw,
+  };
+}
+
+export const scenarios = { e1, e2, e3, e4, e5, e6, e7, e8, e9, x1, x2, x3, x4 };
