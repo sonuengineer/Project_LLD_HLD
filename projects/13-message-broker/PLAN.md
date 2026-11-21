@@ -1,6 +1,7 @@
 # H12 -- NATS-style message broker: plan
 
-Status (2026-11-21): PLAN ONLY. Nothing in this folder is built yet.
+Status (2026-11-21): stage 1 DONE (single server, 88 tests incl. interop with the official `nats` client, 12 mutation
+checks all caught; see README.md). Stages 2-5 not started.
 
 ## Why this project, and how it differs from H5
 
@@ -71,5 +72,4 @@ running it on Render or other free tiers.
 
 ## Next step
 
-Stage 1 (single server + interop with the official client) is local only: no servers, no network rules. It can start as soon
-as you say so.
+Stage 2 (queue groups, headers, slow-consumer protection, graceful drain) is local only: no servers, no network rules.
