@@ -88,7 +88,7 @@ def apply_change(net, sl, new_ingress, before_keys: set, expect_added: set, expe
     problems = []
     if after_keys != (before_keys | expect_added) - expect_removed:
         problems.append("the resulting rule set is not exactly the expected one")
-    if {rule_key(r) for r in after.egress_security_rules} != {rule_key_egress(r) for r in sl.egress_security_rules}:
+    if {rule_key_egress(r) for r in after.egress_security_rules} != {rule_key_egress(r) for r in sl.egress_security_rules}:
         problems.append("egress rules changed")
     if problems:
         sys.exit("VERIFY FAILED: " + "; ".join(problems) + ". Restore from the backup file printed above.")
