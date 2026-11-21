@@ -1,4 +1,5 @@
 import { afterEach, describe, expect, it } from "vitest";
+import { atHash } from "../src/jwt.js";
 import { closeAll, decodeJwt, getCode, postForm, redeem, refresh, startServer, userinfo } from "./helpers.js";
 
 afterEach(closeAll);
@@ -72,6 +73,28 @@ describe("refresh tokens: rotation and reuse detection", () => {
     // The refresh token keeps the ORIGINAL grant (RFC 6749 section 6).
     const again = await refresh(s.base, narrow.body.refresh_token as string);
     expect(again.body.scope).toBe("openid profile email");
+  });
+
+  it("OIDC Core 12.2: a refresh returns a new id_token with the same iss, sub, aud, auth_time and sid, a new iat, no nonce", async () => {
+    const s = await startServer();
+    const { code, verifier } = await getCode(s.base);
+    const tok = await redeem(s.base, code, verifier);
+    const first = decodeJwt(tok.body.id_token as string).payload;
+    s.clock.t += 60_000;
+    const r = await refresh(s.base, tok.body.refresh_token as string);
+    const { header, payload } = decodeJwt(r.body.id_token as string);
+    expect(header.typ).toBe("JWT");
+    for (const c of ["iss", "sub", "aud", "auth_time", "sid"]) expect(payload[c]).toEqual(first[c]);
+    expect(payload.iat).toBe((first.iat as number) + 60);
+    expect(payload.nonce).toBeUndefined();
+    expect(payload.at_hash).toBe(atHash(r.body.access_token as string));
+  });
+
+  it("no id_token on refresh when the (narrowed) scope has no openid", async () => {
+    const { s, rt } = await tokens();
+    const r = await refresh(s.base, rt, { scope: "profile" });
+    expect(r.status).toBe(200);
+    expect(r.body.id_token).toBeUndefined();
   });
 
   it("missing refresh_token parameter -> invalid_request", async () => {

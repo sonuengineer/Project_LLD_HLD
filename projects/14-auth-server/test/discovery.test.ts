@@ -17,6 +17,7 @@ describe("discovery and JWKS", () => {
       userinfo_endpoint: `${s.base}/userinfo`,
       jwks_uri: `${s.base}/jwks`,
       revocation_endpoint: `${s.base}/revoke`,
+      end_session_endpoint: `${s.base}/logout`,
       response_types_supported: ["code"],
       code_challenge_methods_supported: ["S256"],
       id_token_signing_alg_values_supported: ["ES256"],

@@ -66,6 +66,8 @@ export interface VerifyOptions {
   audience: string;
   typ: string;
   nowSeconds: number;
+  /** Skip only the exp check (OIDC RP-initiated logout accepts an expired id_token_hint). Everything else is checked. */
+  ignoreExpiry?: boolean;
 }
 
 /**
@@ -96,7 +98,8 @@ export function verifyJwt(token: string, keys: SigningKey[], opts: VerifyOptions
   const aud = payload.aud;
   const audOk = typeof aud === "string" ? aud === opts.audience : Array.isArray(aud) && aud.includes(opts.audience);
   if (!audOk) throw new JwtError("wrong audience");
-  if (typeof payload.exp !== "number" || opts.nowSeconds >= payload.exp) throw new JwtError("expired");
+  if (typeof payload.exp !== "number") throw new JwtError("expired");
+  if (!opts.ignoreExpiry && opts.nowSeconds >= payload.exp) throw new JwtError("expired");
   return payload;
 }
 

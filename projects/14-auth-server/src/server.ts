@@ -7,7 +7,9 @@ import { SUPPORTED_SCOPES } from "./config.js";
 import { HttpError, isFormEncoded, noStore, oauthError, parseCookies, parseForm, readBody, sendHtml, sendJson } from "./http.js";
 import { atHash, generateSigningKey, JwtError, signJwt, verifyJwt } from "./jwt.js";
 import type { SigningKey } from "./jwt.js";
-import { errorPage, loginPage } from "./pages.js";
+import { StaticKeyRing } from "./keys.js";
+import type { KeyRing } from "./keys.js";
+import { errorPage, loginPage, signedOutPage } from "./pages.js";
 import { CHALLENGE_RE, DEFAULT_SCRYPT, parseSecretHash, pkceMatches, randomToken, safeEqual, sha256, verifyAgainstDummy, verifySecret } from "./secrets.js";
 import type { ScryptParams } from "./secrets.js";
 import { memoryStores } from "./store.js";
@@ -20,6 +22,8 @@ export interface Lifetimes {
   idToken: number;
   refreshToken: number;
   loginTransaction: number;
+  /** Login session (the session cookie and the server-side record that logout ends). */
+  session: number;
 }
 
 export const DEFAULT_LIFETIMES: Lifetimes = {
@@ -28,6 +32,7 @@ export const DEFAULT_LIFETIMES: Lifetimes = {
   idToken: 300,
   refreshToken: 14 * 24 * 3600,
   loginTransaction: 600,
+  session: 12 * 3600,
 };
 
 export interface AuthServerOptions {
@@ -36,6 +41,8 @@ export interface AuthServerOptions {
   config: ServerConfig;
   /** The first key signs; all keys are published in /jwks. Default: one fresh P-256 key (lost on restart). */
   keys?: SigningKey[];
+  /** Rotating keys (src/keys.ts FileKeyRing). Takes precedence over `keys`. */
+  keyRing?: KeyRing;
   stores?: Stores;
   /** Clock in milliseconds; injectable so expiry tests do not sleep. */
   now?: () => number;
@@ -46,12 +53,21 @@ export interface AuthServerOptions {
   maxLoginFailures?: number;
 }
 
+/**
+ * How long a retired signing key must stay published: the longest lifetime of a JWT it may have signed. A token
+ * signed one moment before the rotation expires exactly this long after it.
+ */
+export function keyRetentionMs(l: Lifetimes): number {
+  return Math.max(l.accessToken, l.idToken) * 1000;
+}
+
 export const TX_COOKIE = "auth_tx";
+export const SESSION_COOKIE = "auth_session";
 
 interface Ctx {
   issuer: string;
   config: ServerConfig;
-  keys: SigningKey[];
+  ring: KeyRing;
   stores: Stores;
   now: () => number;
   life: Lifetimes;
@@ -72,13 +88,14 @@ export function discoveryDocument(issuer: string): Record<string, unknown> {
     userinfo_endpoint: `${issuer}/userinfo`,
     jwks_uri: `${issuer}/jwks`,
     revocation_endpoint: `${issuer}/revoke`,
+    end_session_endpoint: `${issuer}/logout`,
     response_types_supported: ["code"],
     response_modes_supported: ["query"],
     grant_types_supported: ["authorization_code", "refresh_token"],
     subject_types_supported: ["public"],
     id_token_signing_alg_values_supported: ["ES256"],
     scopes_supported: SUPPORTED_SCOPES,
-    claims_supported: ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "name", "email"],
+    claims_supported: ["sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "sid", "name", "email"],
     code_challenge_methods_supported: ["S256"],
     token_endpoint_auth_methods_supported: ["client_secret_basic", "none"],
     revocation_endpoint_auth_methods_supported: ["client_secret_basic", "none"],
@@ -94,7 +111,7 @@ export function createAuthHandler(opts: AuthServerOptions): (req: IncomingMessag
   const ctx: Ctx = {
     issuer: opts.issuer,
     config: opts.config,
-    keys: opts.keys && opts.keys.length > 0 ? opts.keys : [generateSigningKey()],
+    ring: opts.keyRing ?? new StaticKeyRing(opts.keys && opts.keys.length > 0 ? opts.keys : [generateSigningKey()]),
     stores: opts.stores ?? memoryStores(),
     now: opts.now ?? Date.now,
     life: { ...DEFAULT_LIFETIMES, ...opts.lifetimes },
@@ -137,7 +154,7 @@ async function route(ctx: Ctx, req: IncomingMessage, res: ServerResponse): Promi
       if (allow(["GET"])) sendJson(res, 200, discoveryDocument(ctx.issuer), { "Cache-Control": "public, max-age=300" });
       return;
     case "/jwks":
-      if (allow(["GET"])) sendJson(res, 200, { keys: ctx.keys.map((k) => k.publicJwk) }, { "Cache-Control": "public, max-age=300" });
+      if (allow(["GET"])) sendJson(res, 200, { keys: ctx.ring.published(ctx.now()).map((k) => k.publicJwk) }, { "Cache-Control": "public, max-age=300" });
       return;
     case "/authorize":
       if (allow(["GET"])) handleAuthorize(ctx, url, res);
@@ -153,6 +170,9 @@ async function route(ctx: Ctx, req: IncomingMessage, res: ServerResponse): Promi
       return;
     case "/revoke":
       if (allow(["POST"])) await handleRevoke(ctx, req, res);
+      return;
+    case "/logout":
+      if (allow(["GET", "POST"])) await handleLogout(ctx, req, url, res);
       return;
     default:
       sendJson(res, 404, { error: "not_found", error_description: "no such endpoint" });
@@ -298,8 +318,13 @@ async function handleLogin(ctx: Ctx, req: IncomingMessage, res: ServerResponse):
   // The transaction is single-use: a second post of the same form cannot mint a second code.
   ctx.stores.transactions.delete(tx.id);
   ctx.failures.delete(tx.id);
-  const code = randomToken();
   const now = ctx.now();
+  // A login session per successful login. The cookie value is a secret (only its hash is stored); the sid is
+  // public and goes into the id_token, so the RP can name this session at /logout.
+  const sessionCookie = randomToken();
+  const sid = randomToken(16);
+  ctx.stores.sessions.save({ sid, cookieHash: sha256(sessionCookie), sub: user.sub, authTime: Math.floor(now / 1000), expiresAt: now + ctx.life.session * 1000 });
+  const code = randomToken();
   ctx.stores.codes.save({
     codeHash: sha256(code),
     clientId: tx.clientId,
@@ -310,8 +335,15 @@ async function handleLogin(ctx: Ctx, req: IncomingMessage, res: ServerResponse):
     codeChallenge: tx.codeChallenge,
     authTime: Math.floor(now / 1000),
     expiresAt: now + ctx.life.code * 1000,
+    sid,
   });
-  redirectWith(res, tx.redirectUri, { code, state: tx.state, iss: ctx.issuer }, { "Set-Cookie": txCookie(ctx, "", 0) });
+  redirectWith(res, tx.redirectUri, { code, state: tx.state, iss: ctx.issuer }, {
+    "Set-Cookie": [txCookie(ctx, "", 0), sessionCookieHeader(ctx, sessionCookie, ctx.life.session)],
+  });
+}
+
+function sessionCookieHeader(ctx: Ctx, value: string, maxAge: number): string {
+  return `${SESSION_COOKIE}=${value}; Path=/; HttpOnly; SameSite=Lax; Max-Age=${maxAge}${ctx.secureCookie ? "; Secure" : ""}`;
 }
 
 async function checkPassword(ctx: Ctx, username: string, password: string): Promise<UserConfig | undefined> {
@@ -422,7 +454,7 @@ function codeGrant(ctx: Ctx, client: ClientConfig, params: Map<string, string>, 
   const user = ctx.config.users.find((u) => u.sub === c.sub);
   if (!user) return oauthError(res, 400, "invalid_grant", "user no longer exists");
 
-  const family: TokenFamily = { id: randomToken(16), clientId: client.client_id, sub: c.sub, scope: c.scope, authTime: c.authTime, revoked: false };
+  const family: TokenFamily = { id: randomToken(16), clientId: client.client_id, sub: c.sub, scope: c.scope, authTime: c.authTime, revoked: false, sid: c.sid };
   ctx.stores.tokens.createFamily(family);
   ctx.stores.codes.setFamily(c.codeHash, family.id);
   sendTokens(ctx, res, client, family, c.scope, { nonce: c.nonce, withIdToken: c.scope.includes("openid") });
@@ -452,7 +484,8 @@ function refreshGrant(ctx: Ctx, client: ClientConfig, params: Map<string, string
   // The atomic step. `rt.used` above is only a fast path; with a real database two concurrent requests could
   // both pass it, and markUsed decides which one wins.
   if (!ctx.stores.tokens.markUsed(hash)) return reuseDetected(ctx, res, family.id);
-  sendTokens(ctx, res, client, family, scope, { withIdToken: false });
+  // OIDC Core 12.2: a refresh may return a new id_token (same iss, sub, aud, auth_time; new iat; no nonce).
+  sendTokens(ctx, res, client, family, scope, { withIdToken: scope.includes("openid") });
 }
 
 /**
@@ -467,8 +500,10 @@ function reuseDetected(ctx: Ctx, res: ServerResponse, familyId: string): void {
 function sendTokens(ctx: Ctx, res: ServerResponse, client: ClientConfig, family: TokenFamily, scope: string[], opts: { nonce?: string; withIdToken: boolean }): void {
   const iat = nowSec(ctx);
   const jti = randomToken(16);
+  // One key for the whole response, so access token and id_token carry the same kid even across a rotation.
+  const key: SigningKey = ctx.ring.signing(ctx.now());
   // RFC 9068 (JWT profile for access tokens): typ at+jwt, client_id claim.
-  const accessToken = signJwt(ctx.keys[0] as SigningKey, "at+jwt", {
+  const accessToken = signJwt(key, "at+jwt", {
     iss: ctx.issuer,
     sub: family.sub,
     aud: ctx.audience,
@@ -478,7 +513,7 @@ function sendTokens(ctx: Ctx, res: ServerResponse, client: ClientConfig, family:
     exp: iat + ctx.life.accessToken,
     jti,
   });
-  ctx.stores.tokens.recordAccessToken(jti, family.id);
+  ctx.stores.tokens.recordAccessToken(jti, family.id, (iat + ctx.life.accessToken) * 1000);
   const body: Record<string, unknown> = {
     access_token: accessToken,
     token_type: "Bearer",
@@ -501,7 +536,8 @@ function sendTokens(ctx: Ctx, res: ServerResponse, client: ClientConfig, family:
       at_hash: atHash(accessToken),
     };
     if (opts.nonce !== undefined) claims.nonce = opts.nonce;
-    body.id_token = signJwt(ctx.keys[0] as SigningKey, "JWT", claims);
+    if (family.sid !== undefined) claims.sid = family.sid;
+    body.id_token = signJwt(key, "JWT", claims);
   }
   noStore(res);
   sendJson(res, 200, body);
@@ -520,7 +556,7 @@ function handleUserinfo(ctx: Ctx, req: IncomingMessage, res: ServerResponse): vo
   if (!m) return bearerError(res, 401, undefined, "a Bearer access token is required");
   let claims: Record<string, unknown>;
   try {
-    claims = verifyJwt(m[1] ?? "", ctx.keys, { issuer: ctx.issuer, audience: ctx.audience, typ: "at+jwt", nowSeconds: nowSec(ctx) });
+    claims = verifyJwt(m[1] ?? "", ctx.ring.published(ctx.now()), { issuer: ctx.issuer, audience: ctx.audience, typ: "at+jwt", nowSeconds: nowSec(ctx) });
   } catch (e) {
     if (e instanceof JwtError) return bearerError(res, 401, "invalid_token", e.message);
     throw e;
@@ -559,4 +595,75 @@ async function handleRevoke(ctx: Ctx, req: IncomingMessage, res: ServerResponse)
   noStore(res);
   res.writeHead(200, { "Content-Length": 0 });
   res.end();
+}
+
+// ---- /logout (OpenID Connect RP-Initiated Logout 1.0) --------------------------------------------------------
+
+/**
+ * The RP sends the browser here with id_token_hint (REQUIRED in this server), optionally
+ * post_logout_redirect_uri (must EXACTLY match one registered for the client the id_token was issued to),
+ * state (passed back) and client_id (must equal the id_token's aud). The session named by the id_token's sid
+ * ends, every token family issued in it is revoked, and the session cookie is cleared.
+ */
+async function handleLogout(ctx: Ctx, req: IncomingMessage, url: URL, res: ServerResponse): Promise<void> {
+  let params: Map<string, string>;
+  if (req.method === "POST") {
+    if (!isFormEncoded(req)) return sendHtml(res, 400, errorPage("Invalid request", "Expected a form post."));
+    const parsed = parseForm(await readBody(req));
+    if (parsed.duplicate) return sendHtml(res, 400, errorPage("Invalid request", `Parameter ${parsed.duplicate} is repeated.`));
+    params = parsed.params;
+  } else {
+    params = new Map();
+    for (const k of new Set(url.searchParams.keys())) {
+      const all = url.searchParams.getAll(k);
+      if (all.length > 1) return sendHtml(res, 400, errorPage("Invalid request", `Parameter ${k} is repeated.`));
+      params.set(k, all[0] ?? "");
+    }
+  }
+  const bad = (msg: string): void => sendHtml(res, 400, errorPage("Logout failed", msg));
+  const hint = params.get("id_token_hint");
+  // Without a hint the spec says the OP SHOULD ask the user to confirm; this server has no confirmation page,
+  // so it refuses instead (otherwise any site could log the user out with a plain link).
+  if (!hint) return bad("id_token_hint is required.");
+  // The audience decides which client's registered logout URIs apply. Read it unverified first, then verify
+  // the whole token (signature with a PUBLISHED key, typ, iss, aud) against exactly that client.
+  let aud: unknown;
+  try {
+    aud = (JSON.parse(Buffer.from(hint.split(".")[1] ?? "", "base64url").toString("utf8")) as Record<string, unknown>).aud;
+  } catch {
+    return bad("id_token_hint is not a valid ID token.");
+  }
+  const client = typeof aud === "string" ? findClient(ctx, aud) : undefined;
+  if (!client) return bad("id_token_hint was not issued to a known client.");
+  let claims: Record<string, unknown>;
+  try {
+    // An expired id_token is accepted as a hint (OIDC RP-Initiated Logout 2): the RP usually logs out long
+    // after the 5-minute id_token has expired. Signature, typ, iss and aud are still checked.
+    claims = verifyJwt(hint, ctx.ring.published(ctx.now()), { issuer: ctx.issuer, audience: client.client_id, typ: "JWT", nowSeconds: nowSec(ctx), ignoreExpiry: true });
+  } catch (e) {
+    if (e instanceof JwtError) return bad(`id_token_hint is not valid (${e.message}).`);
+    throw e;
+  }
+  const clientId = params.get("client_id");
+  if (clientId !== undefined && clientId !== client.client_id) return bad("client_id does not match the id_token_hint.");
+  const postLogout = params.get("post_logout_redirect_uri");
+  // Same rule as redirect_uri: exact match against the registered list, never redirect to anything else.
+  if (postLogout !== undefined && !client.post_logout_redirect_uris.includes(postLogout)) {
+    return bad("post_logout_redirect_uri is not registered for this client.");
+  }
+
+  const ended = new Set<string>();
+  if (typeof claims.sid === "string") ended.add(claims.sid);
+  // The browser's own session cookie: end that session too if it belongs to the same user (normally it is the
+  // same session). A session of ANOTHER user is not touched by someone else's id_token.
+  const cookie = parseCookies(req).get(SESSION_COOKIE);
+  const cookieSession = cookie ? ctx.stores.sessions.getByCookie(sha256(cookie)) : undefined;
+  if (cookieSession && cookieSession.sub === claims.sub) ended.add(cookieSession.sid);
+  for (const sid of ended) {
+    ctx.stores.sessions.delete(sid);
+    for (const f of ctx.stores.tokens.familiesOfSession(sid)) ctx.stores.tokens.revokeFamily(f.id);
+  }
+  const clear = { "Set-Cookie": sessionCookieHeader(ctx, "", 0) };
+  if (postLogout !== undefined) return redirectWith(res, postLogout, { state: params.get("state") }, clear);
+  sendHtml(res, 200, signedOutPage(), clear);
 }

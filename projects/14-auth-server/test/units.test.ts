@@ -73,6 +73,14 @@ describe("jwt", () => {
     expect(() => verifyJwt(signJwt(k, typ, p), [k], opts(now))).toThrow(msg);
   });
 
+  it("ignoreExpiry skips ONLY the exp check (used for logout's id_token_hint)", () => {
+    const k = generateSigningKey();
+    const t = signJwt(k, "at+jwt", payload);
+    expect(verifyJwt(t, [k], { ...opts(5000), ignoreExpiry: true }).sub).toBe("u");
+    expect(() => verifyJwt(t, [k], { ...opts(5000), ignoreExpiry: true, audience: "other" })).toThrow("wrong audience");
+    expect(() => verifyJwt(signJwt(k, "at+jwt", { iss: payload.iss, aud: "api" }), [k], { ...opts(1000), ignoreExpiry: true })).toThrow("expired");
+  });
+
   it("unknown kid, malformed token and bad signature are rejected", () => {
     const k = generateSigningKey();
     const t = signJwt(k, "at+jwt", payload);
@@ -114,6 +122,8 @@ describe("config", () => {
     ["public with a secret", { ...client, client_secret_hash: hash }],
     ["unknown scope", { ...client, allowed_scopes: ["admin"] }],
     ["unknown grant", { ...client, grant_types: ["password"] }],
+    ["http post_logout_redirect_uri on a non-loopback host", { ...client, post_logout_redirect_uris: ["http://app.example.test/bye"] }],
+    ["post_logout_redirect_uri with a fragment", { ...client, post_logout_redirect_uris: ["https://app.example.test/bye#x"] }],
   ])("rejects a client with %s", (_l, c) => {
     expect(() => validateConfig({ clients: [c], users: [] })).toThrow(ConfigError);
   });
