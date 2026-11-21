@@ -185,11 +185,15 @@ export function openFileStores(dir: string, opts: { now?: () => number; fsync?: 
   for (const r of records) apply(live, r);
 
   let fd: number | undefined = openSync(path, "a", 0o600);
-  const commit = (...recs: LogRecord[]): void => {
+  /** Appends and fsyncs. Throws if the store is closed or the disk write fails. */
+  const durable = (data: string): void => {
     if (fd === undefined) throw new Error("file store is closed");
-    // Write-ahead: durable on disk first, then visible in memory. If the write throws, memory is unchanged.
-    writeSync(fd, recs.map((r) => JSON.stringify(r) + "\n").join(""));
+    writeSync(fd, data);
     if (doFsync) fsyncSync(fd);
+  };
+  const commit = (...recs: LogRecord[]): void => {
+    // Write-ahead: durable on disk first, then visible in memory. If the write throws, memory is unchanged.
+    durable(recs.map((r) => JSON.stringify(r) + "\n").join(""));
     for (const r of recs) apply(live, r);
   };
 
