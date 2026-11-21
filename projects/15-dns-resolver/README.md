@@ -197,6 +197,16 @@ skipped).
 W8 also made `tsc` fail (an unused variable), but the tests were run anyway and 2 failed. After restoring: 80/80 pass
 (plus 9 opt-in skipped), and 3 repeated full runs gave the same result.
 
+**Two more gaps, found later by reading the code while writing the interview bank** (not by a mutation):
+- `classify` has a branch for a server that sends rcode NXDOMAIN together with a CNAME (the alias exists, its target
+  does not). The fake server always sends NOERROR for a CNAME, so no test reached that branch. New test: a hook makes
+  the server send NXDOMAIN, and the chain is still followed.
+- The stub server called `handle()` from the socket callbacks with no `.catch`: an unexpected exception (a bug, not a
+  ResolveError) would have become an unhandled rejection, which ends a Node process by default. Now an exception from
+  the resolver becomes SERVFAIL (tested with a resolver that throws), and any other rejection only counts as `dropped`.
+
+Suite now: 82 tests + 9 opt-in.
+
 ## NOT implemented yet (honest list)
 
 - **DNSSEC validation.** The real fix for spoofing; record types like DS/RRSIG decode as raw rdata.
@@ -220,7 +230,7 @@ W8 also made `tsc` fail (an unused variable), but the tests were run anyway and 
 
 ```
 npm install
-npm test                          # 80 tests (+9 opt-in); fake network only, no internet needed
+npm test                          # 82 tests (+9 opt-in); fake network only, no internet needed
 INTEROP_NSLOOKUP=1 npm test       # also run Windows nslookup.exe against the stub server on 127.0.0.1:53
 LIVE_DNS=1 npm test               # also resolve real names from the real root servers (needs outbound UDP/TCP 53)
 npm run build

@@ -1,6 +1,6 @@
 # A6 -- Build your own DNS resolver: plan
 
-Status (2026-11-21): stages 1-4 DONE. 80 tests (+9 opt-in: live root servers, live nslookup.exe); 41 mutation checks, 36 caught at first, 4 gaps closed with new tests, 1 equivalent mutant explained in README.md. Live test against the real roots passed once (6/6). Interview bank in interview/data/p15-dns-resolver/.
+Status (2026-11-21): stages 1-4 DONE. 82 tests (+9 opt-in: live root servers, live nslookup.exe); 41 mutation checks, 36 caught at first, 4 gaps closed with new tests, 1 equivalent mutant explained in README.md; 2 more gaps found by code reading and fixed (see README). Live test against the real roots passed once (6/6). Interview bank in interview/data/p15-dns-resolver/.
 
 ## Why this project
 

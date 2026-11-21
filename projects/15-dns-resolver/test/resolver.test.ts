@@ -150,6 +150,17 @@ describe("resolver: CNAME, NXDOMAIN, NODATA", () => {
     expect(names(r.answers)).toEqual(["dangling.alpha.test 5"]);
   });
 
+  it("a server that sends rcode NXDOMAIN together with the CNAME: the chain is still followed", async () => {
+    // RFC 6604: the rcode of a CNAME response describes the LAST name. Our fake server sends NOERROR for a CNAME, so
+    // this hook makes it behave like servers that send NXDOMAIN for a dangling alias.
+    fake.get(ALPHA1_IP).hook = ({ query, reply }) =>
+      query.questions[0]!.name === "dangling.alpha.test" ? { ...reply, header: { ...reply.header, rcode: RCODE.NXDOMAIN } } : undefined;
+    const r = await resolver().resolve("dangling.alpha.test", TYPE.A);
+    expect(r.rcode).toBe(RCODE.NXDOMAIN);
+    expect(names(r.answers)).toEqual(["dangling.alpha.test 5"]);
+    expect(asked(ALPHA1_IP)).toEqual(["dangling.alpha.test 1 udp", "nothing.alpha.test 1 udp"]);
+  });
+
   it("NXDOMAIN from the root for a TLD that does not exist", async () => {
     const r = await resolver().resolve("www.nosuchtld", TYPE.A);
     expect(r.rcode).toBe(RCODE.NXDOMAIN);

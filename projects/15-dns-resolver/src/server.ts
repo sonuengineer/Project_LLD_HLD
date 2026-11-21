@@ -92,7 +92,7 @@ export class DnsServer {
       udp.on("message", (buf, rinfo) => {
         void this.handle(buf, "udp").then((out) => {
           if (out) udp.send(out, rinfo.port, rinfo.address);
-        });
+        }, () => this.counters.dropped++); // a bug (e.g. an answer that cannot be encoded) drops one reply, not the process
       });
       this.udp = udp;
       this.tcp = tcp;
@@ -117,7 +117,7 @@ export class DnsServer {
       for (const frame of reader.feed(chunk)) {
         void this.handle(frame, "tcp").then((out) => {
           if (out && !s.destroyed) s.write(frameTcp(out));
-        });
+        }, () => this.counters.dropped++);
       }
     });
   }
@@ -165,7 +165,14 @@ export class DnsServer {
       this.counters.notimp++;
       return encodeMessage(base(RCODE.NOTIMP, [q]));
     }
-    const res = await this.opts.resolver.resolve(q.name, q.type);
+    let res;
+    try {
+      res = await this.opts.resolver.resolve(q.name, q.type);
+    } catch {
+      // Resolver.resolve already maps its own errors to SERVFAIL; anything else is a bug. The client still gets an
+      // answer, and the process does not die from an unhandled rejection in the socket callback.
+      res = { rcode: RCODE.SERVFAIL, answers: [], authority: [], queries: 0 };
+    }
     if (res.rcode === RCODE.SERVFAIL) this.counters.servfail++;
     const reply = base(res.rcode, [q]);
     reply.answers = res.answers;

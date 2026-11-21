@@ -148,6 +148,16 @@ describe("stub server", () => {
   });
 });
 
+describe("stub server: a resolver bug", () => {
+  it("an unexpected exception from the resolver becomes SERVFAIL, not a crash (gap found while writing the interview bank)", async () => {
+    const broken = { resolve: async () => Promise.reject(new TypeError("bug")) } as unknown as Resolver;
+    const s = new DnsServer({ resolver: broken, port: 0 });
+    const reply = decodeMessage((await s.handle(encodeMessage(buildQuery(3, "x.test", TYPE.A, true)), "udp"))!);
+    expect(reply.header).toMatchObject({ id: 3, rcode: RCODE.SERVFAIL });
+    expect(s.stats().servfail).toBe(1);
+  });
+});
+
 describe("stub server: bind guard", () => {
   it("refuses a non-loopback address unless allowNonLoopback is set", async () => {
     const s = new DnsServer({ resolver: new Resolver(), host: "0.0.0.0", port: 0 });
