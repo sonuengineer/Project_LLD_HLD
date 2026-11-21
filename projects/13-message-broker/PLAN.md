@@ -72,6 +72,33 @@ Network: cluster and client ports opened only between the servers' PRIVATE addre
 Persistence / JetStream, real NATS route or leaf-node compatibility, TLS, accounts and multi-tenancy, a public endpoint,
 running it on Render or other free tiers.
 
+## Stage 4 run plan (written 2026-11-21, nothing on the servers yet)
+
+Done locally: `bench/` (B1-B7, raw JSON results, generated SUMMARY.md), dry-run on the PC. The dry run found a bug in
+the TOOL, not the broker: B5 waited for the paused subscriber to see its socket close, which a paused socket never does.
+B5 now reads the drop from the broker's own counter; an in-process probe confirmed the broker drops at the limit.
+
+Server steps (only after your OK):
+
+| # | Step | Where | Undo |
+|---|---|---|---|
+| 1 | Record a "before" snapshot: listening ports, iptables INPUT, running containers (A1), free memory | all three | -- |
+| 2 | Ship the built code with `git archive` (no `.git`, no secrets) to `~/h12` | all three | `rm -rf ~/h12` |
+| 3 | Node.js: A2 already has `/opt/node`. On micro (x64) and A1 (arm64): official tarball, SHA-256 checked, unpacked into `~/h12/node` -- no system-wide install | micro, A1 | removed with `~/h12` |
+| 4 | Oracle security list: three tagged rules (`h12-bench-a2`, `h12-bench-a1`, `h12-bench-micro`), TCP 19001-19002, each from ONE private address (/32), with `oci_seclist_rule.py` (dry run, backup, verification) | Oracle network | `remove --tag ... --apply` |
+| 5 | iptables: ACCEPT TCP 19001-19002 from the other two private addresses, inserted before the REJECT rule; not saved, so a reboot also removes them | all three | `iptables -D` the same rules |
+| 6 | Brokers: `nice -n 19` plain processes (no systemd unit), client port 19001, cluster port 19002, bound to the PRIVATE address, `MAX_PENDING` default | micro, A1 (remote); A2's broker is started by the bench | kill the process |
+| 7 | Run B1-B7 from A2 (`REMOTE_NODES=<micro>:19001:19002,<a1>:19001:19002`); B5 and B1 stay on A2 only; B2 downloads the official nats-server release (checksum checked) into `~/h12` on A2 | A2 | -- |
+| 8 | Stop everything, remove rules (step 4 + 5), delete `~/h12` on micro and A1, compare with the "before" snapshot | all three | -- |
+| 9 | Results: raw files into `bench/reference-results/`, README "Measured" section generated from them, dated server log in `deployment/` | repo | -- |
+
+Expected time on the servers: about 1 hour, most of it the 10-minute soak (B7) and the 3 runs of each experiment.
+A1 (NeoCBS) gets only a low-priority broker process, two not-saved iptables rules and a temporary folder, and is
+checked against its snapshot afterwards, exactly like the H11 two-host run.
+
+If you prefer A1 untouched: micro + A2 only, and the third node is a second broker process on A2 (weaker: two of the three
+brokers share a machine, so B3/B4/B6 cross a real network for only one of the two peers).
+
 ## Next step
 
-Stage 4: first the bench tools locally (no servers), then the server run, which needs your OK for the topology above.
+Your answer to: may the run use all three servers (micro + A2 + A1, as above), or micro + A2 only?

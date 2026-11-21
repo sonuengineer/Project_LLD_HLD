@@ -66,6 +66,8 @@ export interface BrokerStats {
   routes: number;
   routeInMsgs: number;
   routeOutMsgs: number;
+  /** Interest entries announced by all peers together (leak check: must fall back when their clients leave). */
+  remoteInterest: number;
 }
 
 interface Subscription {
@@ -248,7 +250,9 @@ export class Broker {
   }
 
   stats(): BrokerStats {
-    return { connections: this.clients.size, subscriptions: this.trie.size, routes: this.routes.size, ...this.counters };
+    let remoteInterest = 0;
+    for (const r of this.routes.values()) remoteInterest += r.interestByKey.size;
+    return { connections: this.clients.size, subscriptions: this.trie.size, routes: this.routes.size, remoteInterest, ...this.counters };
   }
 
   /** Peer ids of the established routes (tests use it to wait for the mesh). */

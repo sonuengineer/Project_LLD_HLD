@@ -122,8 +122,10 @@ describe("interest propagation and forwarding", () => {
     await s1.sync();
     await new Promise((r) => setTimeout(r, 100));
     expect(a!.broker.hasRemoteInterest("t")).toBe(true);
+    expect(a!.broker.stats().remoteInterest).toBe(1); // two subscriptions on B, ONE announced interest
     s2.close(); // disconnect, not UNSUB
     await until(() => !a!.broker.hasRemoteInterest("t"));
+    expect(a!.broker.stats().remoteInterest).toBe(0);
   });
 
   it("wildcard interest is matched on the sending side", async () => {

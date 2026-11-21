@@ -12,6 +12,7 @@
  *   CLUSTER_HOST         default: same as HOST
  *   ROUTES               comma list of peers to dial, host:port each (every node may list every other one)
  *   ROUTE_RECONNECT_MS   first re-dial delay, doubles up to 32x, default 1000
+ *   STATS_INTERVAL_MS    if set, print one JSON stats line (counters + RSS) per interval; 0 or unset = off
  *   ALLOW_NON_LOOPBACK   must be "1" to bind anything but loopback (client OR cluster address). There is NO
  *                        authentication yet, so only ever bind a PRIVATE address, never a public one.
  */
@@ -59,6 +60,13 @@ const broker = new Broker({
 
 const addr = await broker.listen();
 console.log(JSON.stringify({ event: "listening", ...addr, serverId: broker.serverId }));
+
+const statsMs = intEnv("STATS_INTERVAL_MS", 0);
+if (statsMs > 0) {
+  setInterval(() => {
+    console.log(JSON.stringify({ event: "stats", t: Date.now(), rssKiB: Math.round(process.memoryUsage().rss / 1024), ...broker.stats() }));
+  }, statsMs).unref();
+}
 
 let stopping = false;
 const stop = (signal: string) => {
