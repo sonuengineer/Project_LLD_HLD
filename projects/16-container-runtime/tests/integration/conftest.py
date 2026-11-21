@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -49,8 +50,24 @@ def no_leftovers():
     """Every test must leave no cgroup of ours and no mount of ours behind."""
     yield
     if sys.platform == "linux" and os.path.isdir("/sys/fs/cgroup/minibox"):
-        left = [d for d in os.listdir("/sys/fs/cgroup/minibox") if os.path.isdir(f"/sys/fs/cgroup/minibox/{d}")]
-        assert not left, f"cgroups left behind: {left}"
+        base = "/sys/fs/cgroup/minibox"
+        left = [d for d in os.listdir(base) if os.path.isdir(f"{base}/{d}")]
+        # Kill what a failed test left running BEFORE failing it, so one broken test (or a deliberate
+        # mutation) cannot leave containers running on the server and break every later test.
+        for d in left:
+            with open(f"{base}/{d}/cgroup.kill", "w") as f:
+                f.write("1")
+        deadline = time.monotonic() + 10
+        while any(os.path.isdir(f"{base}/{d}") for d in left) and time.monotonic() < deadline:
+            time.sleep(0.05)      # the host-side minibox process sees INIT die and removes its cgroup
+        for d in left:            # ... unless that process itself is gone (then nobody else will)
+            if os.path.isdir(f"{base}/{d}"):
+                os.rmdir(f"{base}/{d}")
+        try:
+            os.rmdir(base)
+        except OSError:
+            pass
+        assert not left, f"cgroups left behind (killed now): {left}"
     if sys.platform == "linux":
         with open("/proc/self/mounts") as f:
             ours = [line for line in f if "/state/" in line or "minibox" in line]

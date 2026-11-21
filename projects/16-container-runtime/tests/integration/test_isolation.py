@@ -130,6 +130,13 @@ def test_host_environment_does_not_leak(box, monkeypatch):
     assert "FOO=bar" in r.stdout and "HOSTNAME=envbox" in r.stdout
 
 
+def test_sigpipe_has_its_default_action_in_the_command(box):
+    # Python ignores SIGPIPE; an ignored signal survives exec. 'yes' must die quietly from SIGPIPE
+    # when 'head' closes the pipe, not get EPIPE and complain.
+    r = box.run("yes | head -n 1; echo done")
+    assert r.stdout.split() == ["y", "done"] and r.stderr == "", r.stderr
+
+
 def test_workdir(box):
     assert box.run(["/bin/pwd"], "-w", "/etc").stdout.strip() == "/etc"
 

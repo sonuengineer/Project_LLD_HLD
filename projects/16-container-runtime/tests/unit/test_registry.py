@@ -217,3 +217,30 @@ def test_authorization_header_is_not_forwarded_on_redirect():
                                                                 "https://cdn.example/blob")
     assert new.get_header("Authorization") is None
     assert req.get_header("Authorization") == "Bearer secret"
+
+
+def test_urllib_fetch_marks_the_token_unredirected(monkeypatch):
+    # drives OUR urllib_fetch: the Request it builds is passed through urllib's redirect logic
+    import io
+    import urllib.request
+    seen = {}
+
+    class Resp(io.BytesIO):
+        status = 200
+        headers = {"Content-Type": "application/json"}
+
+    def fake_urlopen(req, timeout=None):
+        seen["original"] = req.get_header("Authorization")
+        seen["accept"] = req.get_header("Accept")
+        redirected = urllib.request.HTTPRedirectHandler().redirect_request(
+            req, None, 307, "Temporary Redirect", {}, "https://cdn.example/blob")
+        seen["redirected"] = redirected.get_header("Authorization")
+        seen["redirected_accept"] = redirected.get_header("Accept")
+        return Resp(b"{}")
+
+    monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+    r = registry.urllib_fetch("https://registry.example/v2/x/manifests/1",
+                              {"Authorization": "Bearer secret", "Accept": "application/json"})
+    assert r.status == 200 and r.body == b"{}"
+    assert seen == {"original": "Bearer secret", "accept": "application/json", "redirected": None,
+                    "redirected_accept": "application/json"}

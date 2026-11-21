@@ -187,7 +187,7 @@ def test_symlink_in_layer_cannot_redirect_a_later_file_outside(tmp_path):
     outside.mkdir()
     root = tmp_path / "rootfs"
     apply_layer(write(tmp_path, "l0.tar", make_tar([("symlink", "link", str(outside))])), str(root))
-    with pytest.raises((UnsafePath, Exception)):
+    with pytest.raises(UnsafePath):
         apply_layer(write(tmp_path, "l1.tar", make_tar([("file", "link/pwned", "x")])), str(root))
     assert not (outside / "pwned").exists()
 

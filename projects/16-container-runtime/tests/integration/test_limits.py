@@ -31,9 +31,11 @@ def test_no_flags_means_no_limits(box, tmp_path):
 
 
 def test_container_runs_in_its_own_cgroup(box):
-    r = box.run("cat /proc/self/cgroup", "--name", "cg-path")
-    # no cgroup namespace (see README), so the full host path is visible
-    assert r.stdout.strip() == "0::/minibox/cg-path"
+    # no cgroup namespace (see README), so the full host path is visible. Repeated, because the bug
+    # this guards against (the command forked before INIT joined the cgroup) is a race.
+    for i in range(10):
+        r = box.run("cat /proc/self/cgroup", "--name", f"cg-path-{i}")
+        assert r.stdout.strip() == f"0::/minibox/cg-path-{i}", f"run {i}: {r.stdout!r}"
 
 
 def test_spawning_past_pids_max_fails(box, tmp_path):
