@@ -213,6 +213,12 @@ describe("wire: name compression", () => {
     buf[19] = 0xff; // target 255, beyond 20 bytes but also forward
     expect(() => readName(buf, 18)).toThrow(WireError);
   });
+
+  it("half a pointer as the very last byte is rejected by readName itself (added after mutation W3)", () => {
+    // without the check, the missing second byte reads as 0, the pointer goes to offset 0 (a root byte) and the
+    // name "decodes" with an end offset past the buffer
+    expect(() => readName(Buffer.from([0, 0xc0]), 1)).toThrow(/truncated: compression pointer/);
+  });
 });
 
 describe("wire: limits and malformed input", () => {
@@ -249,6 +255,19 @@ describe("wire: limits and malformed input", () => {
     expect(cb.readUInt16BE(at)).toBe(16); // 1 + 13 label bytes + a pointer to "test"
     cb.writeUInt16BE(5, at);
     expect(() => decodeMessage(cb)).toThrow(WireError);
+  });
+
+  it("rdata with bytes left over after the name is rejected, not read as the next record (added after mutation W7)", () => {
+    const m = buildQuery(1, "a.test", TYPE.NS);
+    m.answers.push(rr("a.test", TYPE.NS, { kind: "NS", host: "ns.a.test" }));
+    m.answers.push(rr("a.test", TYPE.A, { kind: "A", address: "192.0.2.1" }));
+    const buf = encodeMessage(m);
+    const at = 12 + 12 + 10; // rdlength of the NS record
+    const rdlength = buf.readUInt16BE(at);
+    // insert 2 junk bytes at the end of the NS rdata and grow rdlength by 2
+    const junk = Buffer.concat([buf.subarray(0, at + 2 + rdlength), Buffer.from([0xaa, 0xbb]), buf.subarray(at + 2 + rdlength)]);
+    junk.writeUInt16BE(rdlength + 2, at);
+    expect(() => decodeMessage(junk)).toThrow(/NS rdata used/);
   });
 
   it("a count larger than the packet is a clean error, not a huge allocation", () => {

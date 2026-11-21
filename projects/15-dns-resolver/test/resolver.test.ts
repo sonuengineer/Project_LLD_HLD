@@ -83,6 +83,21 @@ describe("resolver: walking down from the root", () => {
     expect(r.queries).toBeLessThanOrEqual(40);
     expect(r.reason).toMatch(/deeper than|budget|no address/);
   });
+
+  // The delegation-loop test above is stopped by EITHER limit, so removing one of them alone was not caught
+  // (mutations R8 and R9). These two tests pin each limit separately.
+  it("the query budget alone: maxQueries 2 cannot finish a 3-query lookup", async () => {
+    const r = await resolver({ maxQueries: 2 }).resolve("www.alpha.test", TYPE.A);
+    expect(r.rcode).toBe(RCODE.SERVFAIL);
+    expect(r.reason).toMatch(/budget of 2/);
+    expect(r.queries).toBe(2);
+  });
+
+  it("the nesting limit alone: maxDepth 0 forbids the nested NS lookup that beta.test needs", async () => {
+    const r = await resolver({ maxDepth: 0 }).resolve("www.beta.test", TYPE.A);
+    expect(r.rcode).toBe(RCODE.SERVFAIL);
+    expect(r.reason).toMatch(/deeper than 0/);
+  });
 });
 
 describe("resolver: CNAME, NXDOMAIN, NODATA", () => {

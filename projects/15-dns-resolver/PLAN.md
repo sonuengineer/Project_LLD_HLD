@@ -1,6 +1,6 @@
 # A6 -- Build your own DNS resolver: plan
 
-Status (2026-11-21): stage 1 in progress.
+Status (2026-11-21): stages 1-4 DONE. 80 tests (+9 opt-in: live root servers, live nslookup.exe); 41 mutation checks, 36 caught at first, 4 gaps closed with new tests, 1 equivalent mutant explained in README.md. Live test against the real roots passed once (6/6). Interview bank in interview/data/p15-dns-resolver/.
 
 ## Why this project
 
@@ -58,3 +58,15 @@ runs over UDP with a TCP fallback, and the security thinking behind cache poison
 
 DNSSEC validation, EDNS(0) (we never send OPT; a query's OPT is ignored), DNS over TLS/HTTPS, zone transfers,
 authoritative serving of real zones, IPv6 transport.
+
+## Decisions changed or added while building (2026-11-21)
+
+- **Interop with nslookup needs port 53.** The plan said `nslookup example.com 127.0.0.1 -port=N`. On this Windows
+  build (10.0.26200) nslookup ignores `-port` and `set port`: listeners on 53 and N showed packets only on 53. So the
+  always-on interop test uses packets captured from nslookup.exe, and the live nslookup run is opt-in
+  (`INTEROP_NSLOOKUP=1`) and binds 127.0.0.1:53.
+- **Live cross-check uses the OS resolver, not c-ares, by default.** `node:dns` c-ares chose 127.0.0.1 as its server
+  here and got ECONNREFUSED. A records are compared with `dns.lookup` (getaddrinfo); the c-ares MX/NXDOMAIN checks run
+  only with `LIVE_DNS_CHECK_SERVER=<ip>`.
+- **Stage 3 was split from stage 2 differently than planned:** the cache class came with stage 2 (the resolver needs it
+  for zone cuts and glue); its TTL and negative-caching tests came with stage 3.
