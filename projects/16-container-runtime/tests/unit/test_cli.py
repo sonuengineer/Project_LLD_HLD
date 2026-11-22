@@ -29,6 +29,11 @@ def test_defaults():
     a = cli.parse_args(["run", "--rootfs", "/img", "--", "true"])
     assert a.hostname == "minibox" and a.state_dir == "/run/minibox" and a.name is None
     assert a.env == [] and a.workdir == "/" and a.stats_file is None
+    assert a.net == "none"                                          # isolated unless asked
+
+
+def test_net_veth():
+    assert cli.parse_args(["run", "--rootfs", "/img", "--net", "veth", "--", "true"]).net == "veth"
 
 
 def test_no_overlay_and_env():
@@ -43,6 +48,7 @@ def test_no_overlay_and_env():
     ["run", "--rootfs", "/img", "--memory", "lots", "--", "true"],
     ["run", "--rootfs", "/img", "--pids", "0", "--", "true"],
     ["run", "--rootfs", "/img", "--cpus", "0", "--", "true"],
+    ["run", "--rootfs", "/img", "--net", "host", "--", "true"],     # host networking: not offered
     ["run", "--rootfs", "/img", "--cpus", "0.001", "--", "true"],   # below the kernel's 1 ms quota
     ["run", "--rootfs", "/img", "--hostname", "bad_name!", "--", "true"],
     ["run", "--rootfs", "/img", "--hostname", "-x", "--", "true"],

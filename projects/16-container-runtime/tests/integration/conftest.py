@@ -68,6 +68,14 @@ def no_leftovers():
         except OSError:
             pass
         assert not left, f"cgroups left behind (killed now): {left}"
+    if sys.platform == "linux" and os.path.isdir("/sys/class/net"):
+        links = [n for n in os.listdir("/sys/class/net") if n.startswith("mbx")]
+        if links:                 # delete them first, so one failure does not spread to later tests
+            from minibox.rtnetlink import Netlink
+            with Netlink() as nl:
+                for n in links:
+                    nl.delete_link(n, missing_ok=True)
+        assert not links, f"veth host ends left behind (deleted now): {links}"
     if sys.platform == "linux":
         with open("/proc/self/mounts") as f:
             ours = [line for line in f if "/state/" in line or "minibox" in line]

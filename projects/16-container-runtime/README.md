@@ -11,10 +11,11 @@ sudo python3 -m minibox run --rootfs ~/images/alpine/rootfs --hostname box1 --me
     -- /bin/sh -c 'hostname; echo "I am PID $$"; ps'
 ```
 
-Status (2026-11-21): stages 1-3 done, tested and measured on `portfolio-a2` (Ubuntu 24.04, arm64, kernel 7.0,
-cgroup v2). Stage 4 (veth + bridge + NAT) deliberately NOT done; the container gets an empty network namespace with
-only loopback (PLAN.md explains why). 140 unit tests (run anywhere) + 52 integration tests (Linux + root), 29
-mutation checks. Server steps and timeline: `SERVER_RUN.md`.
+Status (2026-11-22): stages 1-3 done, tested and measured on `portfolio-a2` (Ubuntu 24.04, arm64, kernel 7.0,
+cgroup v2). Stage 4a done (2026-11-22): `--net veth` gives the container an `eth0` on a private /30 to the host, over
+rtnetlink, with no NAT, no default route and no iptables rule. Stage 4b (bridge + NAT + port publishing) NOT done
+(PLAN.md explains why). Default is still loopback only. 164 unit tests (run anywhere) + 63 integration tests (Linux +
+root), 29 + 11 mutation checks. Server steps and timeline: `SERVER_RUN.md`.
 
 ## Read this first: it is NOT a security boundary
 
@@ -223,6 +224,58 @@ disappears with the container, and minibox then deletes the dirs: every write is
 container creates overlayfs's OWN whiteout in `upper/` (a 0/0 character device -- a different format from the layer
 tar's `.wh.` files; tested). `--no-overlay` writes straight into `--rootfs` instead.
 
+## Stage 4a: a veth pair to the host (`--net veth`, no NAT)
+
+```
+host network namespace                       container network namespace (INIT's)
+mbx1a2b3c4d  10.200.N.1/30  <--- veth --->   eth0  10.200.N.2/30     (only route: 10.200.N.0/30)
+                                             lo    127.0.0.1
+```
+
+A **veth pair** is a virtual cable: two interfaces, a packet sent into one comes out of the other. Put one end in the
+container's network namespace and the other in the host's, and the two can talk. That is the first half of what
+docker's default network does; docker then plugs the host ends into a bridge (`docker0`) and adds a MASQUERADE rule so
+containers reach the internet. minibox stops before that half on purpose:
+
+- **No default route in the container.** The only route is the connected /30, so any other destination fails at once
+  with `Network unreachable` (tested with `192.0.2.1`, a documentation address): no packet leaves the container, so
+  there is nothing for the host to forward or NAT.
+- **No bridge, no NAT, no iptables rule.** On `portfolio-a2` the FORWARD chain and the nat table belong to Docker;
+  stage 4a touches neither (the before/after snapshot of both tables is identical, `SERVER_RUN.md`).
+- Each container gets its own /30 from `10.200.0.0/16`. Two containers cannot reach each other (different /30s, no
+  route between them; tested). The host reaches the container on `10.200.N.2` (a TCP test connects to `nc` in the
+  container) and the container reaches the host on `10.200.N.1`, subject to the host's own INPUT rules (A2's accept
+  ICMP, so the ping test works; they reject new TCP from anywhere but port 22/80/443).
+
+**How it is set up -- rtnetlink, not `ip`.** `ip link add` talks to the kernel through a netlink socket; minibox does
+the same with a stdlib `socket.AF_NETLINK` (`minibox/rtnetlink.py`, about 230 lines): a 16-byte `nlmsghdr`, a family
+header (`ifinfomsg` for links, `ifaddrmsg` for addresses), then type-length-value attributes padded to 4 bytes that
+nest. The veth request nests the peer's own `ifinfomsg` + name + `IFLA_NET_NS_PID` inside
+`IFLA_LINKINFO -> IFLA_INFO_DATA -> VETH_INFO_PEER`, so the kernel creates `eth0` directly inside the container's
+namespace; it never exists on the host. Every request asks for an ACK, and a negative error in the ACK becomes
+`OSError(errno)`. Unit tests compare the bytes against layouts written out by hand from the kernel headers; the
+kernel accepting them on A2 is the real check.
+
+**Order** (the hard part is that two processes in two namespaces must take turns):
+
+1. INIT unshares its namespaces (net included), brings up `lo`, writes `n` on a second pipe.
+2. The host waits for that byte (EOF = INIT died: setup fails with 125). Under an `flock` on `/run/minibox-net.lock` it
+   lists the host's IPv4 addresses over netlink, picks the first /30 that overlaps none of them, creates the pair
+   (peer inside INIT's namespace by PID), addresses and raises its end, and writes `STATE/NAME/net.json`
+   (like `docker inspect`). It sends the /30 to INIT on the first pipe.
+3. INIT addresses and raises `eth0`, then mounts, `pivot_root`, exec.
+4. On exit the host deletes its end; deleting one end of a pair deletes both.
+
+Three details (the first two were forced by tests):
+
+- **The host deletes its end itself.** The kernel also deletes the pair when the container's namespace dies -- but a
+  namespace dies only when nothing holds it: `nsenter`, `ip netns` or a monitoring agent with `/proc/PID/ns/net` open
+  keeps it (and the veth) alive after the container is gone. A test holds that file open (N5).
+- **The lock.** Without it, two containers that start together both list the addresses before either adds one and
+  pick the same /30; a test starts 8 at once (N7, red in 3 of 3 runs without the lock).
+- Overlap, not equality: if the host itself sits in a network that covers the pool (say `10.0.0.0/8`), no /30 is free
+  and minibox refuses rather than add a route that shadows part of the host's real network (unit tested).
+
 ## Mutation checks (2026-11-21, on portfolio-a2)
 
 Each rule was broken on purpose IN THE COPY ON THE SERVER (never in the repo), the relevant tests were run as root,
@@ -279,11 +332,39 @@ and the clean tree was shipped again. A check passes when at least one test turn
 Before every mutation the clean tree was shipped again. After the mutation runs the clean tree passed the full suite
 (192/192: 140 unit + 52 integration, 18:20 UTC); code and tests did not change after that run.
 
+### Network mutation checks (2026-11-22, stage 4a, on portfolio-a2)
+
+Same method (each break applied to a scratch copy, never the repo). Tests run: the 11 network integration tests +
+the 22 network/rtnetlink unit tests (33). After each run the server was checked for leftover `mbx*` links and for an
+`eth0` in the host namespace: none, every time.
+
+| # | Deliberate break | Failed |
+|---|---|---|
+| N1 | INIT never configures its side (no address, link down) | 3 + 1 error |
+| N2 | container `eth0` not set up | 3 + 1 error |
+| N3 | host end not set up | 3 + 1 error |
+| N4 | host end gets no address | 4 + 2 errors |
+| N5 | host end not deleted at cleanup (left to the kernel) | 1 (the test that holds the namespace open) |
+| N6 | allocator ignores the host's addresses | 6 + 1 error |
+| N7 | no allocation lock | 2 + 1 error (red in 3 of 3 runs) |
+| N8 | peer created in the HOST namespace (`IFLA_NET_NS_PID` dropped) | 12 |
+| N9 | a negative error in the netlink ACK ignored | 2 |
+| N10 | rtattr padding dropped | 13 |
+| N11 | host does not wait for INIT's "namespace ready" byte | 3 |
+
+11 of 11 caught. Two of them only after a test was added: N5 (the first version only checked that the link was gone
+after a normal exit, which the kernel also does on its own) and N7 (needed parallel starts). M13 above was re-run
+with the renamed pipe (`to_init`): 2, 1, 3 failed in three runs, fork bomb deselected. The clean tree then passed
+227/227 (164 unit + 63 integration, 13:45 UTC).
+
 ## NOT implemented (honest list)
 
 - Security hardening: user namespaces (rootless), capability dropping, seccomp, AppArmor/SELinux, read-only rootfs,
   `no_new_privs`, masking `/proc/kcore` and friends. See the first section: this is NOT a security boundary.
-- Networking beyond loopback (stage 4: veth pair, bridge, NAT, port publishing). Not done, see PLAN.md.
+- Stage 4b: a bridge, NAT (MASQUERADE), a default route, DNS (`/etc/resolv.conf`), port publishing (`-p`), IPv6.
+  With `--net veth` the container reaches the host and nothing else. See PLAN.md for why NAT was left out.
+- `/run/minibox-net.lock` stays after use (an empty file on tmpfs; deleting a lock file others may be waiting on is
+  itself a race). It was removed by hand on A2 after the run.
 - A cgroup namespace (the container sees its full cgroup path) and `/sys`.
 - If minibox itself is SIGKILLed, nobody cleans up: the container keeps running and its cgroup and state dir stay.
   There is no `minibox gc`/`ps`/`stop`/`exec` -- one foreground command per container.
@@ -305,15 +386,18 @@ Before every mutation the clean tree was shipped again. After the mutation runs 
 ## Run it
 
 ```
-python -m pytest tests/unit                       # anywhere (Windows too): 140 tests, 5 skip on Windows (symlinks, POSIX modes)
+python -m pytest tests/unit                       # anywhere (Windows too): 164 tests, 5 skip on Windows (symlinks, POSIX modes)
 sudo python3 -m minibox pull alpine:3.20 --dest ~/h16/images/alpine
-sudo MINIBOX_TEST_ROOTFS=$HOME/h16/images/alpine/rootfs python3 -m pytest      # Linux + root: + 52 integration tests
+sudo MINIBOX_TEST_ROOTFS=$HOME/h16/images/alpine/rootfs python3 -m pytest      # Linux + root: + 63 integration tests
+sudo python3 -m minibox run --rootfs ~/h16/images/alpine/rootfs --net veth --name web -- nc -l -p 8080 &
+cat /run/minibox/web/net.json                     # container_ip, e.g. 10.200.0.2/30; then: echo hi | nc 10.200.0.2 8080
 sudo python3 bench/limits.py --rootfs ... --state-dir ... --out bench/reference-results/<label>
 python3 bench/limits.py --render bench/reference-results/<label> --update-readme README.md
 ```
 
 Options of `run`: `--rootfs` (required), `--hostname`, `--memory`, `--pids`, `--cpus`, `--name`, `--no-overlay`,
-`--state-dir` (default `/run/minibox`), `--stats-file`, `--env/-e K=V`, `--workdir/-w`, then `--` and the command.
+`--state-dir` (default `/run/minibox`), `--stats-file`, `--env/-e K=V`, `--workdir/-w`, `--net none|veth` (default
+`none`), then `--` and the command.
 
 ## Files
 
@@ -326,6 +410,8 @@ Options of `run`: `--rootfs` (required), `--hostname`, `--memory`, `--pids`, `--
 | `minibox/image.py` | digests, tar member checks, whiteouts, `apply_layer` |
 | `minibox/registry.py` | references, bearer token, index -> platform manifest, blobs, verification, `pull` |
 | `minibox/libc.py` | ctypes: mount, umount2, pivot_root |
+| `minibox/rtnetlink.py` | netlink messages and attributes; veth create, address, link up, delete, address dump |
+| `minibox/network.py` | `--net veth`: /30 allocation (with lock), host side, container side, removal |
 | `bench/limits.py` | the measurements above, raw JSON + generated tables |
-| `tests/unit/` | 140 tests, no root, no Linux needed (fake cgroup dirs, fixture layer tars, a fake registry) |
-| `tests/integration/` | 52 tests, real namespaces/mounts/cgroups; a fixture kills and removes anything a failed test left |
+| `tests/unit/` | 164 tests, no root, no Linux needed (fake cgroup dirs, fixture layer tars, a fake registry, a fake netlink socket) |
+| `tests/integration/` | 63 tests, real namespaces/mounts/cgroups/veth; a fixture kills and removes anything a failed test left (incl. `mbx*` links) |

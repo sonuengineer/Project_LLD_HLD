@@ -1,8 +1,8 @@
 # H16 (A1 "Build your own Docker") -- minibox: plan
 
-Status (2026-11-21): stages 1-3 DONE and tested on `portfolio-a2` (Linux, root); stage 2 limits measured there;
-stage 4 (networking beyond loopback) NOT done, see "Stage 4 decision". Details and numbers in README.md, server steps
-in SERVER_RUN.md.
+Status (2026-11-22): stages 1-3 DONE and tested on `portfolio-a2` (Linux, root); stage 2 limits measured there;
+stage 4a (veth pair to the host, no NAT) DONE and tested there on 2026-11-22; stage 4b (bridge + NAT) NOT done, see
+"Stage 4 decision". Details and numbers in README.md, server steps in SERVER_RUN.md.
 
 ## Why this project
 
@@ -30,7 +30,12 @@ filesystem, and cgroup limits -- and what it is NOT (a security boundary, when r
 - **The mount plan is data.** `mounts.build_plan` returns a list of steps (Mount / Mkdir / Mknod / Symlink);
   `apply_plan` executes them. The order and every flag are unit tested on any OS; the effect is integration tested.
 - **Network: a new, empty network namespace with only loopback (brought up with an ioctl).** Isolation by default;
-  no host network sharing. Stage 4 would add a veth pair.
+  no host network sharing. `--net veth` (stage 4a) adds a veth pair, opt-in.
+- **veth over rtnetlink with a stdlib socket, not by running `ip`.** Same reason as ctypes for mount: the kernel
+  interface stays visible, and nothing depends on iproute2 being installed (the container image is not used for it).
+  The peer is created directly in INIT's namespace (`IFLA_NET_NS_PID`), so there is no moment where a half-set-up
+  `eth0` exists on the host. Host does the host half, INIT does its own half (no `setns` needed); two pipes make them
+  take turns.
 - **cgroup v2 through files, one leaf per container under `/sys/fs/cgroup/minibox/`.** No systemd, no libcgroup.
   The leaf is joined BEFORE INIT forks anything (a pipe makes INIT wait), so no process ever runs unlimited.
   `memory.swap.max = 0` is always written with `--memory` (the server has 4 GB swap; without it "64M" is not 64M).
@@ -52,9 +57,10 @@ filesystem, and cgroup limits -- and what it is NOT (a security boundary, when r
 | 1 | PID, UTS, mount, IPC, net namespaces; pivot_root into a rootfs; fresh /proc; minimal /dev; INIT as PID 1 reaping zombies and forwarding signals; exit codes like docker (code, 128+N, 125/126/127) | `tests/integration/test_isolation.py`, `tests/unit/test_mounts.py`, `tests/unit/test_cli.py` |
 | 2 | cgroup v2 memory.max (+ swap 0), pids.max, cpu.max; per-container cgroup created and removed; stats read back | `tests/integration/test_limits.py`, `tests/unit/test_cgroups.py`, `bench/limits.py` (measured) |
 | 3 | overlayfs root (image read-only, per-container upper discarded); `minibox pull` from Docker Hub with anonymous token, digest + diff_id verification, whiteouts | `tests/integration/test_overlay.py`, `tests/unit/test_image.py`, `tests/unit/test_registry.py` |
-| 4 | network namespace + veth + bridge + NAT | NOT done (see below) |
+| 4a | `--net veth`: veth pair, host end 10.200.N.1/30, container `eth0` 10.200.N.2/30, no default route, no iptables | `tests/integration/test_network.py`, `tests/unit/test_rtnetlink.py`, `tests/unit/test_network.py`, mutations N1-N11 |
+| 4b | bridge + NAT + default route + port publishing | NOT done (see below) |
 
-## Stage 4 decision (networking): not done
+## Stage 4 decision (networking): 4a done, 4b not done
 
 Checked on `portfolio-a2` (read only): Docker is installed there and owns the FORWARD chain (policy DROP, then
 `DOCKER-USER`, `DOCKER-FORWARD`, then a REJECT), and the nat table has Docker's MASQUERADE rule. A bridge + NAT for
@@ -63,6 +69,17 @@ minibox would need new FORWARD and POSTROUTING rules inserted into chains Docker
 things, and the brief says to leave networking out rather than risk that. So: the container gets its own network
 namespace with only `lo` (up, `ping 127.0.0.1` works, tested), and nothing else. A veth pair WITHOUT NAT (host <->
 container on a private /30, no iptables at all) would be possible and is the first step if this is picked up again.
+
+2026-11-22: that first step was done as stage 4a (`--net veth`). It needs no iptables rule because the container has
+no default route: only the host's INPUT chain sees its packets (A2's accepts ICMP), never FORWARD or nat. The
+before/after snapshot of A2 includes `iptables -S`, `iptables -t nat -S`, links, addresses and routes: identical.
+
+Stage 4b would add: a bridge `mbx0` with the host ends as ports (containers on one /24 instead of one /30 each), a
+default route via the bridge address, `iptables -t nat -A POSTROUTING -s <pool> ! -o mbx0 -j MASQUERADE`, FORWARD
+accept rules for the bridge (inserted into `DOCKER-USER` or ahead of Docker's chains, tagged with a comment, never
+saved), `/etc/resolv.conf` inside the container, and DNAT for `-p HOST:CONTAINER`. Still not done for the same reason
+as above: those rules live in chains Docker manages on a shared server. The safe way to do it is a server with no
+Docker on it, or a throwaway VM.
 
 ## Not in scope
 

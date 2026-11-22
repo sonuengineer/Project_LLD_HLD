@@ -2,7 +2,7 @@
 
     sudo python3 -m minibox run --rootfs DIR [--hostname box1] [--memory 64M] [--pids 32] [--cpus 0.5]
                                 [--name NAME] [--no-overlay] [--state-dir DIR] [--stats-file F]
-                                [--env K=V ...] [--workdir /] -- CMD [ARGS...]
+                                [--env K=V ...] [--workdir /] [--net none|veth] -- CMD [ARGS...]
     python3 -m minibox pull alpine:3.20 --dest DIR [--platform linux/arm64]
 """
 from __future__ import annotations
@@ -75,6 +75,8 @@ def build_parser() -> argparse.ArgumentParser:
     r.add_argument("--stats-file", help="write limits read back + cgroup counters as JSON at exit")
     r.add_argument("--env", "-e", action="append", default=[], metavar="KEY=VALUE")
     r.add_argument("--workdir", "-w", default="/")
+    r.add_argument("--net", choices=("none", "veth"), default="none",
+                   help="none: loopback only (default); veth: also eth0 on a private /30 to the host, no NAT")
     r.add_argument("command", nargs=argparse.REMAINDER, help="-- CMD [ARGS...]")
 
     pl = sub.add_parser("pull", help="pull an image from a registry into DIR/rootfs")
@@ -117,5 +119,5 @@ def main(argv: list[str] | None = None) -> int:
     from .container import Config, run
     cfg = Config(rootfs=args.rootfs, command=args.command, hostname=args.hostname, limits=args.limits,
                  overlay=args.overlay, state_dir=args.state_dir, name=args.name, stats_file=args.stats_file,
-                 env=args.env, workdir=args.workdir)
+                 env=args.env, workdir=args.workdir, network=args.net)
     return run(cfg)

@@ -28,6 +28,8 @@ from dataclasses import dataclass, field
 from . import mounts
 from .cgroups import Cgroup, Limits
 
+NETWORK_MODES = ("none", "veth")
+
 EXIT_SETUP_FAILED = 125
 EXIT_NOT_EXECUTABLE = 126
 EXIT_NOT_FOUND = 127
@@ -48,6 +50,7 @@ class Config:
     stats_file: str | None = None
     env: list[str] = field(default_factory=list)
     workdir: str = "/"
+    network: str = "none"        # "none": loopback only; "veth": + eth0 on a private /30 to the host
     # Internals, switched only by tests to prove what each rule protects against:
     use_pivot_root: bool = True
     reap_zombies: bool = True
@@ -83,6 +86,9 @@ def run(cfg: Config) -> int:
         print(f"minibox: rootfs {rootfs} is not a directory", file=sys.stderr)
         return EXIT_SETUP_FAILED
     env = container_env(cfg)
+    if cfg.network not in NETWORK_MODES:
+        print(f"minibox: unknown network mode {cfg.network!r}", file=sys.stderr)
+        return EXIT_SETUP_FAILED
 
     overlay = None
     state = os.path.join(os.path.abspath(cfg.state_dir), name)
@@ -90,37 +96,53 @@ def run(cfg: Config) -> int:
     started = time.monotonic()
     exit_code = EXIT_SETUP_FAILED
     init_pid = 0
+    link = None                                     # network.VethLink once the host end exists
     owned = {"cgroup": False, "state": False}     # never clean up another container's cgroup/dirs
     try:
+        if cfg.overlay or cfg.network != "none":
+            os.makedirs(state, mode=0o700)          # fails if the name is already in use
+            owned["state"] = True
         if cfg.overlay:
             overlay = mounts.OverlayDirs(lower=rootfs, upper=os.path.join(state, "upper"),
                                          work=os.path.join(state, "work"), merged=os.path.join(state, "merged"))
-            os.makedirs(state, mode=0o700)          # fails if the name is already in use
-            owned["state"] = True
             for d in (overlay.upper, overlay.work, overlay.merged):
                 os.mkdir(d, 0o755)
         plan = mounts.build_plan(rootfs, overlay)
         cgroup.create(cfg.limits)                   # fails if the name is already in use
         owned["cgroup"] = True
 
-        ready_r, ready_w = os.pipe()
+        # to_init: host -> INIT ("you are in the cgroup", then the /30 if --net veth)
+        # from_init: INIT -> host ("my network namespace exists"), only with --net veth
+        to_init_r, to_init_w = os.pipe()
+        from_init_r, from_init_w = os.pipe() if cfg.network == "veth" else (-1, -1)
         os.unshare(os.CLONE_NEWPID)
         init_pid = os.fork()
         if init_pid == 0:                           # ---- INIT, PID 1 in the new namespace
-            os.close(ready_w)
-            os.read(ready_r, 1)                     # wait until the host put us into the cgroup
-            os.close(ready_r)
+            os.close(to_init_w)
+            if from_init_r >= 0:
+                os.close(from_init_r)
+            os.read(to_init_r, 1)                   # wait until the host put us into the cgroup
             code = EXIT_SETUP_FAILED
             try:
-                code = init_main(cfg, plan, env)
+                code = init_main(cfg, plan, env, to_init_r, from_init_w)
             except BaseException as e:              # never return into the host's code path
                 print(f"minibox: container setup failed: {e}", file=sys.stderr)
             finally:
                 os._exit(code)
-        os.close(ready_r)
+        os.close(to_init_r)
         cgroup.add_pid(init_pid)                    # before INIT can fork: every child is limited too
-        os.write(ready_w, b"x")
-        os.close(ready_w)
+        os.write(to_init_w, b"x")
+        if cfg.network == "veth":
+            from . import network
+            os.close(from_init_w)
+            if os.read(from_init_r, 1) != b"n":     # EOF: INIT died before unsharing its network
+                raise RuntimeError("container exited before its network namespace was ready")
+            os.close(from_init_r)
+            link = network.setup_host_side(init_pid)
+            with open(os.path.join(state, "net.json"), "w") as f:
+                json.dump(link.as_dict(), f, indent=1, sort_keys=True)
+            os.write(to_init_w, f"{link.subnet}\n".encode())
+        os.close(to_init_w)
 
         if cfg.forward_signals:
             def forward(sig, _frame):
@@ -146,15 +168,28 @@ def run(cfg: Config) -> int:
         if init_pid:
             for sig in FORWARDED_SIGNALS:
                 signal.signal(sig, signal.SIG_DFL)
-        cleanup(cfg, cgroup if owned["cgroup"] else None, state if owned["state"] else None, started, exit_code)
+        cleanup(cfg, cgroup if owned["cgroup"] else None, state if owned["state"] else None, started, exit_code,
+                link)
 
 
-def cleanup(cfg: Config, cgroup: Cgroup | None, state: str | None, started: float, exit_code: int) -> None:
+def cleanup(cfg: Config, cgroup: Cgroup | None, state: str | None, started: float, exit_code: int,
+            link=None) -> None:
+    if link is not None:
+        # The kernel deletes a veth pair when the namespace holding one end dies, but that happens
+        # asynchronously (a workqueue) after the last process exits. Deleting our end now means
+        # 'minibox returned' really implies 'the interface is gone'.
+        from . import network
+        try:
+            network.remove_host_side(link.host_if)
+        except OSError as e:    # still remove the cgroup and state below
+            print(f"minibox: could not delete {link.host_if}: {e}", file=sys.stderr)
     if cgroup is not None and os.path.isdir(cgroup.path):
         cgroup.kill()        # normally empty already: PID 1 exiting kills its whole namespace
         if cfg.stats_file:
             stats = cgroup.stats()
             stats.update(exit_code=exit_code, wall_s=round(time.monotonic() - started, 3))
+            if link is not None:
+                stats["net"] = link.as_dict()
             with open(cfg.stats_file, "w") as f:
                 json.dump(stats, f, indent=1, sort_keys=True)
         cgroup.remove()
@@ -180,17 +215,37 @@ def bring_up_loopback() -> None:
         fcntl.ioctl(s.fileno(), siocsifflags, struct.pack("16sH22x", b"lo", flags | iff_up))
 
 
-def setup_container(cfg: Config, plan: mounts.Plan) -> None:
+def read_line(fd: int, limit: int = 256) -> str:
+    buf = b""
+    while not buf.endswith(b"\n"):
+        chunk = os.read(fd, 64)
+        if not chunk or len(buf) > limit:
+            raise RuntimeError("host closed the setup pipe before sending the network")
+        buf += chunk
+    return buf.decode().strip()
+
+
+def setup_container(cfg: Config, plan: mounts.Plan, to_init_r: int = -1, from_init_w: int = -1) -> None:
     """Everything between 'new namespaces' and 'exec', in the order it must happen."""
     os.unshare(os.CLONE_NEWNS | os.CLONE_NEWUTS | os.CLONE_NEWIPC | os.CLONE_NEWNET)
     socket.sethostname(cfg.hostname)
     bring_up_loopback()
+    if cfg.network == "veth":
+        import ipaddress
+
+        from . import network
+        os.write(from_init_w, b"n")                 # the host can now put a veth end into our netns
+        os.close(from_init_w)
+        network.setup_container_side(ipaddress.IPv4Network(read_line(to_init_r)))
+    if to_init_r >= 0:
+        os.close(to_init_r)                         # CMD must not inherit the setup pipe
     mounts.apply_plan(plan)
     mounts.enter_root(plan.new_root, use_pivot_root=cfg.use_pivot_root)
 
 
-def init_main(cfg: Config, plan: mounts.Plan, env: dict[str, str]) -> int:
-    setup_container(cfg, plan)
+def init_main(cfg: Config, plan: mounts.Plan, env: dict[str, str], to_init_r: int = -1,
+              from_init_w: int = -1) -> int:
+    setup_container(cfg, plan, to_init_r, from_init_w)
 
     cmd_pid = os.fork()
     if cmd_pid == 0:                                # ---- CMD, PID 2

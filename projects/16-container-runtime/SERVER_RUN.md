@@ -106,3 +106,36 @@ contents, `/opt/node` still there.
 | 18:20:32 | clean tree, full suite: 192 passed (140 unit + 52 integration) |
 | 18:24:22 | cleanup: `~/h16` deleted, no cgroups, no mounts, no processes |
 | 18:24:23 | after-snapshot identical to the before-snapshot |
+
+## 6. Second run: stage 4a networking (2026-11-22, 13:35-13:47 UTC)
+
+Same server, same rules: everything under `~/h16`, nothing installed, cleaned up afterwards, compared with a
+before-snapshot. Because this stage touches networking, the snapshot was extended: listening ports, `ip -br link`,
+`ip -4 -br addr`, `ip -4 route`, the full `iptables -S` and `iptables -t nat -S`, `net.ipv4.ip_forward`, running
+containers, Caddy / Docker / sshd state, failed units, the home folder, and the minibox paths
+(`/sys/fs/cgroup/minibox`, `/run/minibox`, `/run/minibox-net.lock`).
+
+Read-only findings that shaped the design (from the before-snapshot):
+
+- INPUT accepts ICMP and RELATED/ESTABLISHED, and rejects new TCP except 22/80/443. So: the container can ping the host
+  end; the host can open TCP to the container (the replies are ESTABLISHED); the container cannot open TCP to the host.
+- FORWARD policy is DROP (Docker's chains, then a REJECT) and `ip_forward` is 1 (Docker turned it on). minibox adds
+  no default route in the container, so nothing ever reaches FORWARD.
+- Nothing on the server is in `10.200.0.0/16` (checked on the unmasked snapshot; 0 matches).
+
+Steps: pytest wheels shipped into `~/h16/vendor` (13:36:10), code shipped with tar, alpine:3.20 pulled by minibox as
+the `ubuntu` user (digests verified). Network tests: first run 7 passed, 2 failed because the tests read
+`/sys/class/net` inside the container and minibox does not mount `/sys` (test bug, fixed to use `/proc/net/dev` and
+`ip link`); then 9/9. Full suite 225/225 (13:37). The 11 network mutations (13:38-13:41, the first attempt did not run
+at all: the runner called WSL's `bash` instead of Git Bash) found N5 and N7 not caught; two tests were added; both then
+red in 3 of 3 runs. Final: all 11 caught (13:42-13:44), clean full suite 227/227 (13:45).
+
+**My mistake, no harm:** re-checking M13 with the renamed pipe, I first ran limits + isolation WITHOUT deselecting the
+fork bomb test -- the rule from incident 4 above. It did no harm only because that version of the mutation (INIT's
+read removed, the host's write kept) made every container fail at setup with `Broken pipe` before any command ran.
+Checked at once (13:45:37): load 0.63, 183 processes, services active, no failed units, no cgroups left. The real
+M13 (both sides removed) was then run with `-k 'not fork_bomb'`.
+
+Cleanup (13:47:16): no minibox processes, `~/h16` and `/run/minibox-net.lock` deleted. After-snapshot compared with
+the before-snapshot (header time and load line excluded): **identical** -- the same links (no `mbx*`, no stray
+`eth0`), addresses, routes, filter and nat rules, `ip_forward`, services and home folder. Load average 0.38.
