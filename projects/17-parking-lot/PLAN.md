@@ -1,7 +1,9 @@
 # B1 Parking Lot (low-level design): plan
 
 Status (2026-11-22): stage 1 DONE (domain model, allocation and pricing strategies, park / exit / quote,
-availability; 75 tests, 18 mutation checks all caught). Stages 2 and 3 not started.
+availability; 75 tests, 18 mutation checks all caught). Stage 2 DONE (two-phase reserve / confirm and begin / commit
+exit, async gates with timeout, the race shown with naive gates and fixed, Observer with a delivery queue, free-spot
+index; 125 tests, 37 mutation checks all caught). Stage 3 not started.
 
 ## Why this project
 
@@ -34,6 +36,23 @@ tests that prove the rules.
   - Singleton for the lot: it would make tests share one global lot and block "two lots in one process". The lot is
     an ordinary object the caller creates and passes around.
   - A Level class: it would only wrap an array; a spot knows its level.
+- **Stage 2: concurrency by a synchronous claim, not a lock.** The lot's methods stay synchronous; JavaScript runs one
+  synchronous block at a time, so a check and the change it guards cannot be split by other code. Gates do the slow,
+  async device work BETWEEN two lot calls while holding a claim: `reserve` (spot reserved, plate taken) ... `confirm`
+  or `cancel`; `beginExit` (ticket locked, fee fixed) ... `commitExit` or `abortExit`. Recommended over a mutex around
+  the whole gate operation because a mutex would serialise every gate behind the slowest printer, and over
+  "check, await, act" because that is the bug (reproduced in `test/gates.test.ts` with naive gates). This only holds
+  inside one Node process; several processes sharing a database would need the claim in the database (a conditional
+  UPDATE or a unique constraint), which is the same idea moved to where the state lives.
+- **Stage 2: the spot gets a third state, `reserved`.** Still guarded methods, not the State pattern (no state has
+  behaviour of its own).
+- **Stage 2: Observer with a queue.** Events are queued and delivered in order, after the lot's change is complete;
+  a throwing listener is reported and skipped. Without the queue, a listener that changes the lot inside its handler
+  makes later listeners receive the newer event first and end on a stale count (tested).
+- **Stage 2: strategies ask an index, not a list.** `choose(vehicle, free)` where `free.nearest(size)` is a min-heap
+  per size with lazy deletion. park() goes from O(spots) to O(sizes x log spots). The interface change was worth it:
+  a strategy now says only WHICH SIZE it prefers, and the randomized test checks every choice against the stage 1
+  full scan. Not measured on large lots; the claim is the complexity, not a benchmark.
 - **Unguessable ticket ids (`crypto.randomUUID`).** A ticket id is what lets a car out; a counter would let anyone
   guess another car's ticket (and a counter based on the active count even repeats -- mutation M18).
 
@@ -42,7 +61,7 @@ tests that prove the rules.
 | Stage | What | Status |
 |---|---|---|
 | 1 | Spots, vehicles, layout, two allocation strategies, hourly pricing with grace period, park / quote / exit, availability board, plate normalisation, error codes, demo | DONE 2026-11-22 |
-| 2 | Concurrency: async entry and exit gates; show the check-then-act race (two gates, one free spot) with a test that fails, then fix it (reserve the spot synchronously before the first await, or a per-lot lock); Observer for display boards; a free-spot index per size instead of scanning every spot | not started |
+| 2 | Concurrency: async entry and exit gates; the check-then-act race (two gates, one free spot; one ticket, two exits) reproduced with naive gates, fixed with synchronous claims; device timeout with AbortSignal; Observer for display boards; a free-spot index per size instead of scanning every spot | DONE 2026-11-22 |
 | 3 | Payment and edge cases: pay-then-exit window (ticket paid, must leave within N minutes), lost ticket (flat fee, find by plate), a fake payment gateway that can fail (no real money, no real credentials), daily cap pricing; class diagram on the portfolio page; interview bank of about 100 questions | not started |
 
 ## Not in scope

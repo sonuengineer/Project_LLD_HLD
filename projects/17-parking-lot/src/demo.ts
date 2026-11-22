@@ -1,47 +1,67 @@
 // A scripted day at a small lot, on a ManualClock, so the output is the same on every run.
 // Run: npm run build && npm run demo
-import { HOUR_MS, HourlyPricing, MINUTE_MS, ManualClock, ParkingError, ParkingLot, type Availability } from "./index.js";
+import {
+  DisplayBoard,
+  EntryGate,
+  ExitGate,
+  HOUR_MS,
+  HourlyPricing,
+  MINUTE_MS,
+  ManualClock,
+  ParkingError,
+  ParkingLot,
+  type EntryDevice,
+  type ExitDevice,
+} from "./index.js";
 
 const money = (minor: number) => (minor / 100).toFixed(2);
-const board = (rows: Availability[]) =>
-  rows.map((r) => `  level ${r.level} ${r.size.padEnd(7)} ${r.free}/${r.total} free`).join("\n");
+const why = (e: unknown) => (e instanceof ParkingError ? e.code : String(e));
 
 const clock = new ManualClock(Date.UTC(2026, 10, 22, 9, 0));
 const lot = new ParkingLot({
   layout: [
-    ["small", "compact", "compact", "large"],
+    ["small", "compact", "large"],
     ["compact", "large"],
   ],
   pricing: new HourlyPricing({ motorcycle: 2000, car: 5000, truck: 10000 }, { graceMinutes: 10 }),
   clock,
 });
+const board = new DisplayBoard(lot);
+lot.subscribe((row) => console.log(`  [board] L${row.level} ${row.size} -> ${row.free}/${row.total} free`));
 
-console.log("Opening:\n" + board(lot.availability()));
+// Printers and barriers that take a few milliseconds; the one at gate B jams once.
+let jams = 1;
+const printer = (gate: string): EntryDevice => ({
+  issue: async (t) => {
+    await new Promise((r) => setTimeout(r, 5));
+    if (gate === "B" && jams-- > 0) throw new Error("paper jam");
+    console.log(`  [gate ${gate}] ticket printed for ${t.plate}, spot ${t.spotId}`);
+  },
+});
+const barrier: ExitDevice = { open: async (q) => console.log(`  [exit] ${q.ticket.plate} pays ${money(q.feeMinor)}`) };
+const gateA = new EntryGate(lot, printer("A"));
+const gateB = new EntryGate(lot, printer("B"));
+const exitGate = new ExitGate(lot, barrier);
 
-const bike = lot.park("KA01 AB 1111", "motorcycle");
-const car = lot.park("mh-12-cd-2222", "car");
-const truck = lot.park("DL3C EF 3333", "truck");
-console.log(`\nParked: ${bike.plate} -> ${bike.spotId}, ${car.plate} -> ${car.spotId}, ${truck.plate} -> ${truck.spotId}`);
+console.log("Opening board:\n" + board.render());
 
-try {
-  lot.park("MH12CD2222", "car");
-} catch (e) {
-  if (e instanceof ParkingError) console.log(`Same car again: ${e.code}`);
+console.log("\nFive cars arrive at once at two gates; four spots fit a car; gate B's printer jams once:");
+const arrivals = await Promise.allSettled([
+  gateA.enter("MH12AB1111", "car"),
+  gateB.enter("MH12AB2222", "car"),
+  gateA.enter("MH12AB3333", "car"),
+  gateB.enter("MH12AB4444", "car"),
+  gateA.enter("MH12AB5555", "car"),
+]);
+arrivals.forEach((r, i) => console.log(`  car ${i + 1}: ${r.status === "fulfilled" ? `in at ${r.value.spotId}` : `refused (${why(r.reason)})`}`));
+
+console.log("\nCar 1 tries to leave through two exits with a copied ticket, after 2 h 8 min:");
+clock.advance(2 * HOUR_MS + 8 * MINUTE_MS);
+const first = arrivals[0];
+if (first.status === "fulfilled") {
+  const [a, b] = await Promise.allSettled([exitGate.leave(first.value.id), exitGate.leave(first.value.id)]);
+  console.log(`  exit 1: ${a.status === "fulfilled" ? `left, fee ${money(a.value.feeMinor)}` : why(a.reason)}`);
+  console.log(`  exit 2: ${b.status === "fulfilled" ? "left" : `refused (${why(b.reason)})`}`);
 }
 
-clock.advance(8 * MINUTE_MS);
-const r1 = lot.exit(bike.id);
-console.log(`\n${r1.ticket.plate} leaves after 8 min (grace is 10): fee ${money(r1.feeMinor)}`);
-
-clock.advance(2 * HOUR_MS);
-const r2 = lot.exit(car.id);
-console.log(`${r2.ticket.plate} leaves after 2 h 8 min: 3 started hours x 50.00 = ${money(r2.feeMinor)}`);
-
-try {
-  lot.exit(car.id);
-} catch (e) {
-  if (e instanceof ParkingError) console.log(`Same ticket again: ${e.code}`);
-}
-
-console.log(`\nStill inside: ${lot.activeTickets.map((t) => `${t.plate} (${t.spotId})`).join(", ")}`);
-console.log("Board now:\n" + board(lot.availability()));
+console.log("\nBoard now:\n" + board.render());

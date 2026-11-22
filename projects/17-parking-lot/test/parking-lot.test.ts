@@ -3,6 +3,8 @@ import { nearestFirst, type AllocationStrategy } from "../src/allocation.js";
 import { ManualClock } from "../src/clock.js";
 import { ParkingLot, normalizePlate, type LotLayout } from "../src/parking-lot.js";
 import { HOUR_MS, HourlyPricing, MINUTE_MS, type PricingStrategy } from "../src/pricing.js";
+import type { FreeSpots } from "../src/free-index.js";
+import { ParkingSpot } from "../src/spot.js";
 
 const T0 = Date.UTC(2026, 10, 22, 9, 0);
 const pricing = new HourlyPricing({ motorcycle: 2000, car: 5000, truck: 10000 }, { graceMinutes: 10 });
@@ -109,22 +111,32 @@ describe("park", () => {
   });
 
   it.each([
-    ["undefined", () => undefined],
-    ["a spot that does not fit", (_v: unknown, _c: unknown) => "not-a-spot"],
+    ["undefined while a spot is free", () => undefined],
+    ["something that is not a spot", () => "not-a-spot"],
+    ["a spot that does not fit", (_v: unknown, f: FreeSpots) => f.nearest("small")],
+    ["a spot of another lot", () => new ParkingSpot("L0-1", 0, 0, "compact")],
   ])("rejects a strategy that returns %s, changing nothing", (_label, choose) => {
     const bad = { name: "bad", choose } as unknown as AllocationStrategy;
-    const { lot } = makeLot([["compact"]], { allocation: bad });
+    const { lot } = makeLot([["small", "compact"]], { allocation: bad });
     const before = state(lot);
     expect(code(() => lot.park("A1", "car"))).toBe("STRATEGY_BUG");
     expect(state(lot)).toBe(before);
   });
 
+  it("reports LOT_FULL, not a strategy bug, when nothing fits (the strategy is not even asked)", () => {
+    let asked = 0;
+    const counting: AllocationStrategy = { name: "counting", choose: () => (asked++, undefined) };
+    const { lot } = makeLot([["small"]], { allocation: counting });
+    expect(code(() => lot.park("A1", "car"))).toBe("LOT_FULL");
+    expect(asked).toBe(0);
+  });
+
   it("rejects a strategy that returns an occupied spot, changing nothing", () => {
     // The strategy remembers a spot it saw earlier and returns it again after it was taken.
-    let remembered: unknown;
+    let remembered: ParkingSpot | undefined;
     const sticky: AllocationStrategy = {
       name: "sticky",
-      choose: (_v, c) => (remembered ??= c[0]) as never,
+      choose: (_v, f) => (remembered ??= f.nearest("compact")),
     };
     const { lot } = makeLot([["compact", "compact"]], { allocation: sticky });
     lot.park("A1", "car");

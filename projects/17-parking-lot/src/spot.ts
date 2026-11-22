@@ -1,10 +1,16 @@
 import { ParkingError } from "./errors.js";
 import type { SpotSize } from "./types.js";
 
-// A spot is free or held by exactly one ticket. Two states and two transitions, so a field plus guarded methods
-// is enough; the State pattern would add a class per state for no behaviour difference.
+// free -> reserved (a gate claimed it, the car is not through the barrier yet)
+// reserved -> occupied (the car is in)
+// reserved | occupied -> free (gate failed and cancelled / car left)
+export type SpotState = "free" | "reserved" | "occupied";
+
+// Three states, three guarded transitions. Still a field and methods rather than the State pattern: no state has
+// behaviour of its own, only "which transition is allowed", and each method checks exactly that.
 export class ParkingSpot {
-  private ticketId: string | null = null;
+  private current: SpotState = "free";
+  private holder: string | null = null;
 
   constructor(
     readonly id: string,
@@ -13,26 +19,39 @@ export class ParkingSpot {
     readonly size: SpotSize,
   ) {}
 
+  get state(): SpotState {
+    return this.current;
+  }
+
   get isFree(): boolean {
-    return this.ticketId === null;
+    return this.current === "free";
   }
 
   get heldBy(): string | null {
-    return this.ticketId;
+    return this.holder;
   }
 
-  occupy(ticketId: string): void {
-    if (this.ticketId !== null) {
-      throw new ParkingError("SPOT_STATE", `spot ${this.id} is already occupied`);
+  reserve(ticketId: string): void {
+    if (this.current !== "free") {
+      throw new ParkingError("SPOT_STATE", `spot ${this.id} is ${this.current}, cannot reserve`);
     }
-    this.ticketId = ticketId;
+    this.current = "reserved";
+    this.holder = ticketId;
   }
 
-  // Release needs the ticket that holds the spot, so a bug elsewhere cannot free someone else's spot.
+  confirm(ticketId: string): void {
+    if (this.current !== "reserved" || this.holder !== ticketId) {
+      throw new ParkingError("SPOT_STATE", `spot ${this.id} is not reserved by ticket ${ticketId}`);
+    }
+    this.current = "occupied";
+  }
+
+  // Needs the holding ticket, so a bug elsewhere cannot free someone else's spot.
   release(ticketId: string): void {
-    if (this.ticketId !== ticketId) {
+    if (this.current === "free" || this.holder !== ticketId) {
       throw new ParkingError("SPOT_STATE", `spot ${this.id} is not held by ticket ${ticketId}`);
     }
-    this.ticketId = null;
+    this.current = "free";
+    this.holder = null;
   }
 }
