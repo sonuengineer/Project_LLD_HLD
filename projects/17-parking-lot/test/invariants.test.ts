@@ -4,7 +4,9 @@ import { ManualClock } from "../src/clock.js";
 import { DisplayBoard } from "../src/display-board.js";
 import { ParkingError } from "../src/errors.js";
 import { EntryGate, ExitGate, type EntryDevice, type ExitDevice } from "../src/gates.js";
-import { ParkingLot, type LotLayout, type Ticket } from "../src/parking-lot.js";
+import { ParkingLot, type LotLayout, type Receipt, type Ticket } from "../src/parking-lot.js";
+import { FakePaymentGateway } from "../src/fake-gateway.js";
+import type { PaymentGateway } from "../src/payment.js";
 import { HourlyPricing, MINUTE_MS } from "../src/pricing.js";
 import { VEHICLE_TYPES, fits, type VehicleType } from "../src/types.js";
 
@@ -128,15 +130,31 @@ describe("random concurrent gates", () => {
       const pendingCall = (kind: Call["kind"], ticketId: string) =>
         new Promise<void>((resolve, reject) => pending.push({ kind, ticketId, resolve: () => resolve(), reject }));
       const entryDevice: EntryDevice = { issue: (t) => pendingCall("entry", t.id) };
-      const exitDevice: ExitDevice = { open: (q) => pendingCall("exit", q.ticket.id) };
+      // Counted inside the device: an exit's device call comes after the payment's await, not at leave() time.
+      const exitDevice: ExitDevice = {
+        open: (q) => {
+          exitCalls++;
+          return pendingCall("exit", q.ticket.id);
+        },
+      };
+      // Card readers at the exits: mostly approve; sometimes decline, fail, or charge and lose the answer.
+      const fake = new FakePaymentGateway();
+      const gateway: PaymentGateway = {
+        charge: (req, signal) => {
+          const r = rand();
+          fake.enqueue(r < 0.75 ? "approve" : r < 0.85 ? "decline" : r < 0.93 ? "lose-response" : "fail");
+          return fake.charge(req, signal);
+        },
+      };
       const entries = [0, 1, 2].map(() => new EntryGate(lot, entryDevice));
-      const exits = [0, 1].map(() => new ExitGate(lot, exitDevice));
+      const exits = [0, 1].map(() => new ExitGate(lot, exitDevice, { gateway, payment: { retryDelayMs: 0 } }));
+      const receipts: Receipt[] = [];
 
+      let exitCalls = 0;
       const ops: Promise<{ kind: string; ok: boolean; code?: string }>[] = [];
       const track = (kind: string, p: Promise<unknown>) =>
         ops.push(p.then(() => ({ kind, ok: true }), (e: unknown) => ({ kind, ok: false, code: (e as ParkingError).code })));
       let entryCalls = 0;
-      let exitCalls = 0;
 
       for (let step = 0; step < 400; step++) {
         clock.advance(Math.floor(rand() * 30 * MINUTE_MS));
@@ -146,9 +164,7 @@ describe("random concurrent gates", () => {
           track("entry", pick(rand, entries).enter(`P${Math.floor(rand() * 12)}`, pick(rand, VEHICLE_TYPES)));
           entryCalls += pending.length - before;
         } else if (r < 0.55 && lot.activeTickets.length > 0) {
-          const before = pending.length;
-          track("exit", pick(rand, exits).leave(pick(rand, lot.activeTickets).id));
-          exitCalls += pending.length - before;
+          track("exit", pick(rand, exits).leave(pick(rand, lot.activeTickets).id).then((rc) => receipts.push(rc)));
         } else if (pending.length > 0) {
           const call = pending.splice(Math.floor(rand() * pending.length), 1)[0]!;
           if (rand() < 0.15) call.reject(new Error("device fault"));
@@ -168,15 +184,24 @@ describe("random concurrent gates", () => {
       checkInvariants(lot, board);
 
       for (const res of results) {
-        if (!res.ok) expect(["LOT_FULL", "ALREADY_PARKED", "DEVICE_FAILED", "TICKET_BUSY"]).toContain(res.code);
+        if (!res.ok) {
+          expect(["LOT_FULL", "ALREADY_PARKED", "DEVICE_FAILED", "TICKET_BUSY", "PAYMENT_DECLINED", "PAYMENT_UNKNOWN"]).toContain(res.code);
+        }
       }
-      // A device ran exactly for the operations that got a claim: successes and device failures, nothing else.
+      // Money: every charge the provider made is recorded on a ticket exactly once (no double charge, nothing
+      // charged without the lot knowing), and every car that left paid its full fee.
+      const recorded = [...receipts.flatMap((rc) => rc.payments), ...lot.activeTickets.flatMap((t) => lot.paymentsFor(t.id))];
+      expect(recorded.reduce((n, p) => n + p.amountMinor, 0)).toBe(fake.totalChargedMinor());
+      expect(new Set(recorded.map((p) => p.paymentId)).size).toBe(recorded.length);
+      for (const rc of receipts) expect(rc.paidMinor).toBe(rc.feeMinor);
+      // A device ran exactly for the operations that got a claim and paid: successes and device failures.
       const ran = (kind: string) => results.filter((x) => x.kind === kind && (x.ok || x.code === "DEVICE_FAILED")).length;
       expect(ran("entry")).toBe(entryCalls);
       expect(ran("exit")).toBe(exitCalls);
       // The run reached the interesting cases.
       const codes = new Set(results.map((x) => x.code));
-      expect(codes.has("LOT_FULL") && codes.has("DEVICE_FAILED")).toBe(true);
+      expect(codes.has("LOT_FULL") && codes.has("DEVICE_FAILED") && codes.has("PAYMENT_DECLINED")).toBe(true);
+      expect(receipts.some((rc) => rc.paidMinor > 0)).toBe(true);
     });
   }
 });

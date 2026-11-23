@@ -95,8 +95,11 @@ describe("beginExit / commitExit / abortExit", () => {
     expect(lot.quote(t.id)).toBe(5000);
     expect(code(() => lot.beginExit(t.id))).toBe("TICKET_BUSY");
     expect(code(() => lot.exit(t.id))).toBe("TICKET_BUSY");
+    expect(code(() => lot.commitExit(t.id))).toBe("PAYMENT_REQUIRED"); // the barrier rule
+    expect(lot.statusOf(t.id)).toBe("exiting");
+    lot.recordPayment(t.id, "pay_1");
     const r = lot.commitExit(t.id);
-    expect(r).toMatchObject({ exitAt: T0 + HOUR_MS, feeMinor: 5000, durationMs: HOUR_MS });
+    expect(r).toMatchObject({ exitAt: T0 + HOUR_MS, feeMinor: 5000, paidMinor: 5000, durationMs: HOUR_MS });
     expect(lot.statusOf(t.id)).toBeUndefined();
     expect(lot.availability()[0]!.free).toBe(2);
   });

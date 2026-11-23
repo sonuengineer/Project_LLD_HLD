@@ -3,7 +3,9 @@
 Status (2026-11-22): stage 1 DONE (domain model, allocation and pricing strategies, park / exit / quote,
 availability; 75 tests, 18 mutation checks all caught). Stage 2 DONE (two-phase reserve / confirm and begin / commit
 exit, async gates with timeout, the race shown with naive gates and fixed, Observer with a delivery queue, free-spot
-index; 125 tests, 37 mutation checks all caught). Stage 3 not started.
+index; 125 tests, 37 mutation checks all caught). Stage 3 DONE 2026-11-23 (payments through a fake provider with
+idempotent retries, pay-then-exit window, lost ticket, daily cap; 171 tests; 63 mutation checks, 2 survivors were
+test gaps and are closed).
 
 ## Why this project
 
@@ -53,6 +55,20 @@ tests that prove the rules.
   per size with lazy deletion. park() goes from O(spots) to O(sizes x log spots). The interface change was worth it:
   a strategy now says only WHICH SIZE it prefers, and the randomized test checks every choice against the stage 1
   full scan. Not measured on large lots; the claim is the complexity, not a benchmark.
+- **Stage 3: payment is one more lock, and the barrier rule lives in the lot.** beginPayment / beginExit fix the
+  amount; recordPayment records exactly that amount; commitExit refuses while anything is due. Recommended over
+  "the gate checks the payment" because then every gate (and every bug in one) would be a way out without paying.
+- **Stage 3: one idempotency key per lock, reused on every retry.** Lost answers are the normal failure of a
+  network call; a new key per retry is the classic double charge (mutation P2). Decline = final, anything else =
+  unknown and retried; after the last attempt the outcome is reported as unknown, not as "failed", because it may
+  have succeeded.
+- **Stage 3: only a fake provider.** The interface is what a real one would plug into; nothing here talks to a
+  real payment service, and no credentials exist. Reconciliation of unknown outcomes is out of scope.
+- **Stage 3: pay-then-exit prices the stay as of the payment for a window, then charges only the difference.**
+  Simpler than a separate "paid until" state, and correct because the fee never goes down for a longer stay
+  (tested over 3 days with and without a cap).
+- **Stage 3: a lost ticket gets a replacement and the old id is killed.** "Lost" may mean stolen; keeping the old id
+  valid would let the thief drive out on it.
 - **Unguessable ticket ids (`crypto.randomUUID`).** A ticket id is what lets a car out; a counter would let anyone
   guess another car's ticket (and a counter based on the active count even repeats -- mutation M18).
 
@@ -62,7 +78,7 @@ tests that prove the rules.
 |---|---|---|
 | 1 | Spots, vehicles, layout, two allocation strategies, hourly pricing with grace period, park / quote / exit, availability board, plate normalisation, error codes, demo | DONE 2026-11-22 |
 | 2 | Concurrency: async entry and exit gates; the check-then-act race (two gates, one free spot; one ticket, two exits) reproduced with naive gates, fixed with synchronous claims; device timeout with AbortSignal; Observer for display boards; a free-spot index per size instead of scanning every spot | DONE 2026-11-22 |
-| 3 | Payment and edge cases: pay-then-exit window (ticket paid, must leave within N minutes), lost ticket (flat fee, find by plate), a fake payment gateway that can fail (no real money, no real credentials), daily cap pricing; class diagram on the portfolio page; interview bank of about 100 questions | not started |
+| 3 | Payment and edge cases: fake payment gateway with idempotent retries (no real money, no credentials), pay station, card reader at the exit, barrier rule in the lot, pay-then-exit window, lost ticket (replacement + penalty, old id dead), daily cap pricing; interview bank and portfolio page | DONE 2026-11-23 |
 
 ## Not in scope
 

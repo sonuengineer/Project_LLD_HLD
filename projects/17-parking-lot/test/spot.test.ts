@@ -42,6 +42,18 @@ describe("ParkingSpot", () => {
     expect(() => s.confirm("t1")).toThrow(expect.objectContaining(err));
   });
 
+  it("transfer moves an occupied spot to a new ticket, only from its holder", () => {
+    const s = spot();
+    expect(() => s.transfer("t1", "t2")).toThrow(expect.objectContaining(err)); // free
+    s.reserve("t1");
+    expect(() => s.transfer("t1", "t2")).toThrow(expect.objectContaining(err)); // only reserved
+    s.confirm("t1");
+    expect(() => s.transfer("x", "t2")).toThrow(expect.objectContaining(err)); // not the holder
+    expect(s.heldBy).toBe("t1");
+    s.transfer("t1", "t2");
+    expect([s.state, s.heldBy]).toEqual(["occupied", "t2"]);
+  });
+
   it("refuses release when free or with the wrong ticket, and stays held", () => {
     const s = spot();
     expect(() => s.release("t1")).toThrow(expect.objectContaining(err));

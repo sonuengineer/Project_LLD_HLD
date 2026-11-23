@@ -1,5 +1,7 @@
 import { ParkingError } from "./errors.js";
 import type { ExitQuote, ParkingLot, Receipt, Ticket } from "./parking-lot.js";
+import { chargeWithRetry, type PaymentGateway, type RetryOptions } from "./payment.js";
+import { withTimeout } from "./timeout.js";
 import type { VehicleType } from "./types.js";
 
 // The hardware at a gate. Both calls are async (a printer, a barrier motor) and may fail or hang. The signal is
@@ -9,31 +11,19 @@ export interface EntryDevice {
 }
 
 export interface ExitDevice {
-  open(quote: ExitQuote, signal: AbortSignal): Promise<void>; // show the fee, open the barrier
+  open(quote: ExitQuote, signal: AbortSignal): Promise<void>; // show the receipt, open the barrier
 }
 
 export interface GateOptions {
-  timeoutMs?: number; // default 10 s
+  timeoutMs?: number; // device timeout, default 10 s
+}
+
+export interface ExitGateOptions extends GateOptions {
+  gateway?: PaymentGateway; // card reader at the gate; without one, only paid (or free) tickets can leave
+  payment?: RetryOptions;
 }
 
 const DEFAULT_TIMEOUT_MS = 10_000;
-
-async function withTimeout(work: (signal: AbortSignal) => Promise<void>, timeoutMs: number): Promise<void> {
-  const controller = new AbortController();
-  let timer: NodeJS.Timeout | undefined;
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => {
-      controller.abort();
-      reject(new Error(`device did not answer within ${timeoutMs} ms`));
-    }, timeoutMs);
-  });
-  try {
-    // async wrapper: a device that throws synchronously becomes a rejection like any other failure.
-    await Promise.race([(async () => work(controller.signal))(), timeout]);
-  } finally {
-    clearTimeout(timer);
-  }
-}
 
 // Entry: claim first (synchronous, atomic), then the slow device, then confirm. If the device fails or hangs, the
 // claim is cancelled and the spot is free again. A second gate never sees the claimed spot as free, so it never
@@ -61,16 +51,16 @@ export class EntryGate {
   }
 }
 
-// Exit: lock the ticket and fix the fee first, then the barrier, then commit. A copy of the same ticket at another
-// exit gets TICKET_BUSY instead of a second open barrier. If the barrier fails, the exit is aborted and the ticket
-// is valid again (the car is still inside).
+// Exit: lock the ticket and fix the bill, charge what is due (same idempotency key on every retry), open the
+// barrier, commit. A copy of the same ticket at another exit gets TICKET_BUSY. On any failure the exit is aborted
+// and the car is still inside; a payment that already went through stays recorded, so the next try owes nothing.
 export class ExitGate {
   private readonly timeoutMs: number;
 
   constructor(
     private readonly lot: ParkingLot,
     private readonly device: ExitDevice,
-    options: GateOptions = {},
+    private readonly options: ExitGateOptions = {},
   ) {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   }
@@ -78,9 +68,21 @@ export class ExitGate {
   async leave(ticketId: string): Promise<Receipt> {
     const quote = this.lot.beginExit(ticketId);
     try {
+      if (quote.dueMinor > 0) {
+        if (this.options.gateway === undefined) {
+          throw new ParkingError("PAYMENT_REQUIRED", `${quote.dueMinor} due; pay at a pay station first`);
+        }
+        const paymentId = await chargeWithRetry(
+          this.options.gateway,
+          { idempotencyKey: quote.paymentKey, amountMinor: quote.dueMinor, reference: quote.ticket.id },
+          this.options.payment,
+        );
+        this.lot.recordPayment(ticketId, paymentId);
+      }
       await withTimeout((signal) => this.device.open(quote, signal), this.timeoutMs);
     } catch (cause) {
       this.lot.abortExit(ticketId);
+      if (cause instanceof ParkingError) throw cause; // PAYMENT_REQUIRED / _DECLINED / _UNKNOWN
       throw new ParkingError("DEVICE_FAILED", "exit device failed; the ticket is still valid", { cause });
     }
     return this.lot.commitExit(ticketId);

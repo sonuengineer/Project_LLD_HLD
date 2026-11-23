@@ -24,9 +24,10 @@ describe("nearestFirst", () => {
     expect(nearestFirst.choose("car", free({ large, compact: at(1, 0, "compact") }))).toBe(large);
   });
 
-  it("compares the position when the level is the same", () => {
-    const compact = at(0, 2, "compact");
-    expect(nearestFirst.choose("car", free({ compact, large: at(0, 5, "large") }))).toBe(compact);
+  it("compares the position when the level is the same (a nearer large beats a further compact)", () => {
+    // The large spot comes AFTER compact in size order, so only a real position comparison picks it.
+    const large = at(0, 2, "large");
+    expect(nearestFirst.choose("car", free({ compact: at(0, 5, "compact"), large }))).toBe(large);
   });
 
   it("never offers a size the vehicle does not fit", () => {

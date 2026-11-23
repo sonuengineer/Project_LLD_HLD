@@ -46,6 +46,14 @@ export class ParkingSpot {
     this.current = "occupied";
   }
 
+  // Lost ticket: the car stays, the spot moves to the replacement ticket.
+  transfer(fromTicketId: string, toTicketId: string): void {
+    if (this.current !== "occupied" || this.holder !== fromTicketId) {
+      throw new ParkingError("SPOT_STATE", `spot ${this.id} is not occupied by ticket ${fromTicketId}`);
+    }
+    this.holder = toTicketId;
+  }
+
   // Needs the holding ticket, so a bug elsewhere cannot free someone else's spot.
   release(ticketId: string): void {
     if (this.current === "free" || this.holder !== ticketId) {

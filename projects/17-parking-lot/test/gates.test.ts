@@ -4,6 +4,7 @@ import { ParkingError } from "../src/errors.js";
 import { EntryGate, ExitGate, type EntryDevice, type ExitDevice } from "../src/gates.js";
 import { ParkingLot, type ExitQuote, type Ticket } from "../src/parking-lot.js";
 import { HOUR_MS, HourlyPricing } from "../src/pricing.js";
+import { FakePaymentGateway } from "../src/fake-gateway.js";
 import { fits, type VehicleType } from "../src/types.js";
 
 const T0 = Date.UTC(2026, 10, 22, 9, 0);
@@ -195,14 +196,17 @@ describe("ExitGate", () => {
     const t = lot.park("A1", "car");
     clock.advance(HOUR_MS);
     const device = new FakeDevice();
-    const p1 = new ExitGate(lot, device).leave(t.id);
-    const p2 = new ExitGate(lot, device).leave(t.id);
+    const gateway = new FakePaymentGateway();
+    const p1 = new ExitGate(lot, device, { gateway }).leave(t.id);
+    const p2 = new ExitGate(lot, device, { gateway }).leave(t.id);
     await expect(p2).rejects.toMatchObject({ code: "TICKET_BUSY" });
+    await flush();
     expect(device.calls).toHaveLength(1);
     expect((device.calls[0]!.arg as ExitQuote).feeMinor).toBe(5000); // the device shows the fee
     device.calls[0]!.resolve();
     expect((await p1).feeMinor).toBe(5000);
     expect(lot.statusOf(t.id)).toBeUndefined();
+    expect(gateway.totalChargedMinor()).toBe(5000); // charged once
   });
 
   it("barrier failure: the car is still inside and the ticket works again", async () => {

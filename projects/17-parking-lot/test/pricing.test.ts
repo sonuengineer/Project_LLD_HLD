@@ -46,6 +46,38 @@ describe("HourlyPricing grace period", () => {
   });
 });
 
+describe("HourlyPricing daily cap", () => {
+  const p = new HourlyPricing(rates, { dailyCapHours: 8 });
+  const DAY = 24 * HOUR_MS;
+
+  it("charges hourly up to the cap, then the cap for the rest of the day", () => {
+    expect(p.fee("car", T0, T0 + 7 * HOUR_MS + 1)).toBe(8 * 5000);
+    expect(p.fee("car", T0, T0 + 8 * HOUR_MS)).toBe(8 * 5000);
+    expect(p.fee("car", T0, T0 + DAY)).toBe(8 * 5000);
+  });
+
+  it("starts counting again after each full day from entry", () => {
+    expect(p.fee("car", T0, T0 + DAY + 1)).toBe(9 * 5000);
+    expect(p.fee("car", T0, T0 + DAY + 3 * HOUR_MS)).toBe(11 * 5000);
+    expect(p.fee("car", T0, T0 + 2 * DAY + 10 * HOUR_MS)).toBe(24 * 5000);
+  });
+
+  it("never charges less for a longer stay (checked every 7 minutes over 3 days, with and without a cap)", () => {
+    for (const pricing of [p, new HourlyPricing(rates, { graceMinutes: 10 }), new HourlyPricing(rates, { graceMinutes: 30, dailyCapHours: 1 })]) {
+      let last = 0;
+      for (let ms = 0; ms <= 3 * DAY; ms += 7 * MINUTE_MS) {
+        const fee = pricing.fee("car", T0, T0 + ms);
+        expect(fee).toBeGreaterThanOrEqual(last);
+        last = fee;
+      }
+    }
+  });
+
+  it.each([0, 25, 2.5])("rejects dailyCapHours %s", (bad) => {
+    expect(() => new HourlyPricing(rates, { dailyCapHours: bad })).toThrow(expect.objectContaining({ code: "INVALID_RATE" }));
+  });
+});
+
 describe("HourlyPricing validation", () => {
   it.each([
     ["negative", -1],
