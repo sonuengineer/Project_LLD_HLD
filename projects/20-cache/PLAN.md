@@ -5,7 +5,18 @@ sweep, single-flight `getOrLoad` with per-caller abort and load versions against
 tested against a naive reference model with seeded random steps; deliberate breaks, see README "Mutation checks").
 Stage 2 DONE (stale-while-revalidate, negative caching, load context, `TwoLevelCache` with a Redis L2 and pub/sub
 invalidation; the model test extended to both; real-Redis tests; mutation checks re-run over stages 1 and 2).
-Stage 3 not started.
+Stage 3 DONE in code (Express `cachedJson`, NestJS `@CachedRoute`, framework-free `@Cached`; real apps; 175 tests;
+17 stage-3 mutation checks, all caught); interview bank and portfolio page follow.
+
+Stage 3 decisions (one recommendation each):
+- **Cache handler DATA, not HTTP bytes.** Intercepting and replaying `res.write` breaks on streaming, headers and
+  status codes; a producer that returns a value is simple to cache and to test.
+- **The key function is required.** There is no safe default: a URL-only key would hand one user's data to another.
+  With coalescing only the first request's producer runs, so the key must capture everything it reads.
+- **The request's disconnect signal goes into getOrLoad**, reusing stage 1's rule (a load is aborted only when every
+  waiter left) instead of new cancellation logic.
+- **`@Cached` is a framework-free legacy method decorator** (works in NestJS and plain classes); the Nest route
+  helper is an interceptor INSTANCE (no DI), like ratelimit-kit's guard.
 
 ## Why this project
 
@@ -99,7 +110,7 @@ exactly what each rule does and where it breaks.
 |---|---|---|
 | 1 | `LruCache`: max entries + max weight, O(1) get/set/delete, peek/has/clear/size; TTL (default + per entry, lazy expiry, optional unref'd sweep, close); single-flight `getOrLoad` (shared errors not cached, per-caller abort, load aborted when all leave, load versions against stale writes); stats and events; randomized test against a naive model; mutation checks | DONE 2026-11-23 |
 | 2 | Stale-while-revalidate (serve the old value for a grace period while one background load refreshes it), negative caching (cache "not found" for a short separate TTL; errors deliberately not cached), load context, `TwoLevelCache` (L1 in process, Redis L2 shared between replicas, codec, prefix, SET NX + tombstones, pub/sub invalidation with re-subscribe clearing L1, outage = L1 + loader) | DONE 2026-11-23 |
-| 3 | Express / NestJS helpers (cache a route's response or a service method, keyed by request), interview bank, portfolio page | not started |
+| 3 | Express / NestJS helpers (cache a route's response or a service method, keyed by request), interview bank, portfolio page | code DONE 2026-11-23; bank + portfolio in progress |
 
 ## Not in scope
 

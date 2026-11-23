@@ -13,7 +13,54 @@ tests ran against Redis 7.4.12 each time), including the randomized model test e
 and negative caching; 99 deliberate breaks over stages 1 and 2, every one that changes behaviour caught, the same 3
 equivalent ones as stage 1 explained (see "Mutation checks"). The real-Redis test found a cross-replica race, fixed
 with SET NX + tombstones (see `TwoLevelCache`). Per-operation cost measured on one PC for stage 1 only (see
-"Overhead"). Stage 3 not started (see PLAN.md). Not published to npm.
+"Overhead"). **Stage 3 done**: Express and NestJS helpers (cache a route's JSON or a service method) tested with
+real apps -- 175 tests in total; 17 stage-3 breaks, all caught (3 only after unit tests for the "client already
+gone" paths were added). Not published to npm.
+
+## In an Express or NestJS app (stage 3)
+
+The helpers cache the **data** a handler produces, not the HTTP bytes (replaying intercepted writes is fragile:
+streaming, headers, status codes). Both work with an `LruCache<string, V>` or a `TwoLevelCache<V>`.
+
+```ts
+// Express -- cache-kit/express (Node http types only; tested with Express 4.21.2)
+import { cachedJson } from "cache-kit/express";
+
+app.get("/products/:id", cachedJson(productCache,
+  { key: (req) => `product:${req.params.id}`, ttlMs: 60_000 },
+  (req, signal) => db.products.find(req.params.id, { signal })));
+
+// NestJS -- cache-kit/nestjs (platform-express; @nestjs/common and rxjs are optional peer dependencies)
+import { Cached, CachedRoute } from "cache-kit/nestjs";
+
+@Get(":id")
+@CachedRoute(productCache, { key: (req) => `product:${(req as any).params.id}` })
+find(@Param("id") id: string) { return this.products.find(id); }   // runs only on a miss
+
+class ProductService {                                              // or cache the service method
+  @Cached(productCache, { key: (id: string) => `product:${id}`, ttlMs: 60_000 })
+  async find(id: string) { return db.products.find(id); }
+}
+```
+
+- `X-Cache: hit | miss | bypass` on every response. "hit" = this request did not run the producer (from the
+  cache, from Redis, or from a load another request started); "bypass" = the key function returned `undefined`.
+- **The key is required and must contain everything the producer reads** -- with coalescing, ONLY THE FIRST
+  request's producer runs, and every request with the same key gets its result. Per-user data needs the user in
+  the key (tested: alice, bob, alice -> miss, miss, hit with alice's own data). `@Cached` runs the method with the
+  first caller's `this` and arguments, so the key must capture instance differences too (a test shows the wrong
+  key on purpose: tenant b gets tenant a's config).
+- 20 concurrent requests for one key run the producer once (tested). A null / undefined result is answered 404 and
+  is cached like any value (negative caching applies if the cache has it); `notFound` changes the rule.
+- A producer error is not cached (cache-kit never caches errors): Express `next(err)` / Nest's exception layer,
+  and the next request runs the producer again.
+- The request's disconnect signal is passed to `getOrLoad`: a client that goes stops waiting; when EVERY client
+  waiting for a load has gone, the load's own signal is aborted (pass it to your DB driver / fetch). Nothing is
+  written to, and `next(err)` is not called for, a client that has gone.
+- `@Cached` is framework-free (a legacy TypeScript method decorator, the kind NestJS uses; needs
+  `experimentalDecorators`). A method gets no AbortSignal, so a caller cannot abandon the shared call.
+- Two Express instances sharing a `TwoLevelCache` over one real Redis: A loads, B answers from Redis without
+  running its producer (tested).
 
 ## Use it
 
@@ -239,7 +286,7 @@ Keys are strings. L1 is your `LruCache` (its TTL, grace, negative caching and li
 
 ## What the tests show
 
-`npm test` -- 151 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files):
+`npm test` -- 175 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files; stage 3 added 24):
 
 | File | Proves |
 |---|---|
@@ -253,6 +300,10 @@ Keys are strings. L1 is your `LruCache` (its TTL, grace, negative caching and li
 | `two-level.test.ts` | stage 2, `TwoLevelCache` against an in-memory fake Redis (exact control of time, failures and message delivery): L1 -> L2 -> loader with prefixed keys and the TTL; **replica B served from L2 without its loader**, its L1 copy expiring with the Redis copy; min(PTTL, call TTL); PTTL 0 = miss; an L1 hit touches no Redis; 50 concurrent misses -> 1 Redis read + 1 load; negatives through L2; a refresh reads L2 first; nobody waiting -> no load; **delete / set on A invalidate B**, A ignores its own message; Redis TTL from the L1 default; an invalidation or local delete during a load stops the Redis write; **both race orders (set, delete) with held messages: NX / tombstone refuse the late write**; tombstone lifetime; set overwrites a tombstone; **a disconnected subscriber misses messages, the reconnect clears L1**; malformed messages; channel names; close() waits for writes (incl. a slow one) and unsubscribes; codec (JSON round trip and its losses, custom codec, decode failure = miss + overwrite, encode failure incl. non-string results); **outage**: Redis down, Redis hanging (timeout, real 30 ms timer), subscribe failing, Redis back; TTL rounding; a throwing handler; invalid options (35) |
 | `adapters.test.ts` | stage 2, the ioredis adapters against stand-ins: messages for the channel only; the first `ready` ignored, after a reconnect onResubscribed only once the new SUBSCRIBE is confirmed; unsubscribe and a failed subscribe remove the listeners; MULTI errors and an aborted MULTI are errors; SET argument mapping for PX / NX (5) |
 | `redis-l2.test.ts` | stage 2, **a real Redis** (skipped with a printed notice if unreachable): the adapter's GET + PTTL MULTI and SET PX / NX replies; a load on A served from Redis on B (PTTL checked); delete on A reaches B's L1 over pub/sub, Redis holds a tombstone; set on A -> B reads the new value; **the race, 20 rounds, Redis always keeps A's value**; B's subscriber connection killed with CLIENT KILL -> reconnect, L1 cleared, invalidations arrive again; nothing listening on the port and a connection killed mid-run -> L1 + loader, set / delete false, no crash; all keys of the run deleted afterwards (8) |
+| `express-helper.test.ts` | stage 3, a real Express 4 app: miss then hit (producer once), ttlMs passed on (miss, hit, miss on an injected clock), keys separate, **per-user key: users never see each other's data**, no key = bypass, **20 concurrent requests -> 1 producer call**, null -> 404 and cached, an error not cached and handled by the app, **all clients gone -> the load's signal aborted; one left -> the load goes on**; **two Express instances on one real Redis: B answers from Redis without running its producer** (9) |
+| `nestjs-helper.test.ts` | stage 3, a real NestJS 10 app: `@CachedRoute` miss then hit (handler not run on a hit), 10 concurrent requests -> 1 handler run, null -> 404, an error not cached (500, then the handler runs again); `@Cached` on a service method used by a controller (5) |
+| `cached.test.ts` | stage 3, `@Cached` without a framework: key by arguments and `this` kept, 10 concurrent calls -> 1, undefined key = uncached, errors not cached, the first caller's `this` (wrong key on purpose), ttlMs passed on, only methods (6) |
+| `adapters-unit.test.ts` | stage 3, with a fake response: requestSignal aborts on an early close but not after a finished response; nothing written to a response destroyed during the load; no `next(err)` for a client that has gone (4) |
 
 ## Mutation checks (stage 1, 2026-11-23)
 
@@ -411,6 +462,30 @@ the grace), which with `staleMs` 0 is the stage-1 expiry.
 Caught by exactly one test (stage 2): R6, R8, R9, R10, R11, R12, R16, N5, N6, N8, C2, C4, X2, X5, X6, X14, X15, X16,
 X17, X19, X20, X22, X24, X25.
 
+## Mutation checks, stage 3 (2026-11-23)
+
+One break at a time in the framework helpers, full suite (175 tests, real Redis on), reverted; runner outside the repo, started from `H:\`, killing the whole process tree on a timeout. 17 breaks, **all caught**. The first run left 3 survivors -- C4, E1, E2: the "client already gone" paths, invisible over a real socket because writing to a closed connection is silently dropped -- and `test/adapters-unit.test.ts` (a fake response object) was added for them. The 99 stage 1 + 2 breaks were not re-run: stage 3 changed none of the core files (`cache.ts`, `two-level.ts`, `events.ts`).
+
+| # | Break | Failed |
+|---|---|---|
+| C1 | every request reported as a hit (ran flag never set) | 8 |
+| C2 | no key does not bypass (caches under undefined) | 1 |
+| C3 | the request's signal not passed to getOrLoad | 1 |
+| C4 | requestSignal aborts even after a finished response | 1 |
+| C5 | ttlMs / staleMs not passed by the HTTP helpers | 1 |
+| C6 | default not-found rule broken (null is a 200) | 2 |
+| E1 | express: sends to a client that has gone | 1 |
+| E2 | express: next(err) even when the client has gone | 2 |
+| E3 | express: no X-Cache header | 7 |
+| E4 | express: not-found answered 200 with the value | 1 |
+| E5 | express: errors swallowed (request hangs) | 1 |
+| N1 | nest: no X-Cache header | 2 |
+| N2 | nest: not-found returned as a value | 1 |
+| D1 | @Cached: undefined key still cached | 1 |
+| D2 | @Cached: `this` lost in the cached call | 2 |
+| D3 | @Cached: ttlMs not passed | 1 |
+| D4 | @Cached: decorates non-methods silently | 1 |
+
 ## Overhead
 
 `npm run bench` (`bench/overhead.mjs`): ns per operation on a cache holding 10 000 entries, single thread, 1 000 000
@@ -482,7 +557,9 @@ concurrency, memory per entry, Linux.
   caching (`CLIENT TRACKING`), which would replace the pub/sub channel with server-pushed invalidations; Redis
   Streams instead of pub/sub (a durable log a reconnecting replica could replay).
 - A clear across replicas; L2 for non-string keys.
-- Express / NestJS helpers -- stage 3.
+- HTTP caching semantics in the helpers: no `Cache-Control` / `ETag` / `Vary` / conditional requests, no caching
+  of non-JSON or streamed responses (they cache handler DATA by design). NestJS on Fastify, an Express 5 test:
+  not done.
 - Sliding expiry (TTL refreshed on read), LFU / W-TinyLFU admission, a size estimate that walks objects.
 - Not published to npm; use it from this repo (copy or a local path dependency).
 
@@ -503,7 +580,11 @@ npm run bench   # per-operation cost, writes bench/reference-results/<date>-<pla
 | `src/cache.ts` | `LruCache` (LRU, weight, TTL, sweep, single-flight `getOrLoad`, stale-while-revalidate, negative caching, load context, stats) |
 | `src/events.ts` | `CacheEvent`, `EvictionReason`, `emit` (a throwing handler is ignored) |
 | `src/two-level.ts` | `TwoLevelCache`, the `L2Client` / `L2Subscriber` interfaces, ioredis adapters, `jsonCodec`, `TOMBSTONE` |
-| `src/index.ts` | entry point |
+| `src/index.ts` | entry point (core; no framework) |
+| `src/cached.ts` | `@Cached` method decorator (stage 3, framework-free) |
+| `src/adapters/http.ts` | `Loadable`, `requestSignal`, `loadForRequest`, the key / not-found rules (stage 3) |
+| `src/adapters/express.ts` | `cachedJson` (`cache-kit/express`) |
+| `src/adapters/nestjs.ts` | `@CachedRoute`, `CachedRouteInterceptor`, re-exports `@Cached` (`cache-kit/nestjs`) |
 | `test/support.ts` | manual clock, deferred promise, event recorder |
 | `test/fake-redis.ts` | in-memory Redis for unit tests: TTLs on the test clock, down / hang modes, held pub/sub messages |
 | `bench/overhead.mjs` | per-operation cost; results in `bench/reference-results/` |

@@ -5,3 +5,6 @@ export {
   TOMBSTONE, TwoLevelCache, ioredisL2Client, ioredisSubscriber, jsonCodec,
   type Codec, type L2Client, type L2Op, type L2Subscriber, type TwoLevelCacheOptions, type TwoLevelEvent, type TwoLevelStats,
 } from "./two-level.js";
+export { Cached, type CachedOptions } from "./cached.js";
+// Framework helpers are separate entry points: cache-kit/express and cache-kit/nestjs.
+export { type CachedResponseOptions, type CacheKeyFn, type CacheStatus, type Loadable } from "./adapters/http.js";
