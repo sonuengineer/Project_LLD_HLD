@@ -5,10 +5,53 @@ window counter** (about N per window), either in memory (one process) or **atomi
 number of app instances share one limit. You pass your own Redis client; the package has no runtime dependency.
 The Lua scripts are project 1's (`projects/01-rate-limiter`), reused unchanged.
 
-Status (2026-11-23): **stage 1 done** -- 39 tests pass (Windows, Node 20), 9 of them against a real Redis 7
-(the repo's `infra/docker-compose.yml` Redis); mutation checks below. Stage 2 (Express / NestJS adapters, headers)
-and stage 3 (Redis-down behaviour, multi-instance load test, interview bank) are planned in [PLAN.md](PLAN.md),
-not built.
+Status (2026-11-23): **stages 1 and 2 done** -- 77 tests pass (Windows, Node 20), 10 of them against a real
+Redis 7 (the repo's `infra/docker-compose.yml` Redis), including two Express instances sharing one limit through
+Redis; Express middleware and a NestJS decorator tested with real apps; mutation checks below. Stage 3 (Redis-down
+behaviour, a load test, interview bank) is planned in [PLAN.md](PLAN.md), not built.
+
+## In an Express or NestJS app (stage 2)
+
+```ts
+// Express -- ratelimit-kit/express (Node http types only: Express 4 and 5; tested with 4.21.2)
+import { keyByIp, rateLimit } from "ratelimit-kit/express";
+
+app.use("/api", rateLimit(apiLimit, { key: keyByIp({ trustedProxies: 1 }) })); // behind ONE nginx / load balancer
+app.post("/login", express.json(), rateLimit(loginLimit, { key: (req) => `email:${req.body?.email?.toLowerCase()}` }), login);
+
+// NestJS -- ratelimit-kit/nestjs (platform-express; @nestjs/common is an optional peer dependency; tested with 10.4.15)
+import { RateLimit } from "ratelimit-kit/nestjs";
+
+@Controller("auth")
+export class AuthController {
+  @Post("login")
+  @RateLimit(loginIpLimit)                                                    // per IP
+  @RateLimit(loginUserLimit, { key: (req) => `email:${(req as any).body?.email}` }) // AND per account
+  login(@Body() dto: LoginDto) { /* ... */ }
+}
+```
+
+- Every limited response carries `RateLimit-Limit`, `RateLimit-Remaining` and `RateLimit-Reset` (seconds, rounded
+  up; the names of the IETF "RateLimit header fields" draft). A denied request gets **429** with `Retry-After`
+  (seconds, at least 1) and `{"error":"rate_limited",...}`; the route / handler does not run. `headers: false` keeps
+  the headers off allowed responses (the 429 always has them).
+- `key` returns `undefined` -> this limiter does not apply (a per-user limit on an anonymous request). Stacked
+  limiters all apply; the first denial wins.
+- `cost(req)` -> units per request (a bulk endpoint can cost 5).
+- A store error (Redis down) or a throwing key function goes to Express's `next(err)` / Nest's exception layer; the
+  route does not run. Choosing fail-open vs fail-closed per limit is stage 3.
+- NestJS: `@RateLimit` attaches a guard INSTANCE that holds its limiter (no dependency injection); on a controller
+  it is one limit shared by all its routes.
+
+**Who is the client? (`keyByIp`, `clientIp`, `ipKey`)** -- the part that decides whether the limit can be bypassed:
+- `X-Forwarded-For` is written by every hop INCLUDING the client. Trusting its left-most entry lets anyone send a
+  fake address per request and never be limited. Default `trustedProxies: 0`: the header is ignored, the socket
+  address is the client (tested: 5 requests with 5 forged addresses -> 2 allowed, 3 denied).
+- Behind your own proxies, `trustedProxies: n` takes the n-th entry from the RIGHT (the ones your proxies appended);
+  with fewer entries than n, the left-most available (like Express's `trust proxy` = n).
+- IPv4-mapped IPv6 (`::ffff:1.2.3.4`) is the same client as `1.2.3.4`. IPv6 is keyed per **/64**: one subscriber
+  usually controls a whole /64 and could otherwise rotate addresses for a fresh limit each time. A zone id
+  (`fe80::1%eth0`) is dropped. Not an IP -> `undefined` (not limited by IP).
 
 ## Use it
 
@@ -100,7 +143,7 @@ Two precision details make this hold:
 
 ## What the tests show
 
-`npm test` -- 39 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
+`npm test` -- 77 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
 infra/docker-compose.yml up -d redis`) or `REDIS_URL`; without it they are SKIPPED with a printed notice, never
 silently passed. All numbers below are from runs WITH Redis.
 
@@ -109,21 +152,24 @@ silently passed. All numbers below are from runs WITH Redis.
 | `algorithms.test.ts` | token bucket: burst then exact retry, lazy refill (half a token is not enough), never above capacity, multi-unit cost and a denial taking nothing, clock backwards neither adds nor removes tokens, independent keys, invalid options; sliding window: limit per window, the previous window weighted (7.5 of 10 at 25%; retry 3000 ms), two windows back no longer count, denied requests not counted (incl. 1 ms before the window ends), invalid options; luaToString (17) |
 | `limiter.test.ts` | prefixes, validation before the store is touched (empty key, 513 chars, cost 0 / 1.5 / above the limit), the 512 / cost = limit boundaries; MemoryStore LRU eviction (and that it resets the dropped client), a day-idle key equals a fresh one, 100 000 keys bounded to 1000, invalid maxKeys (13) |
 | `redis.test.ts` | real Redis: parity over 3 seeds x 200 steps for each algorithm, atomicity (3 clients, 300 requests, capacity 50 -> exactly 50; sliding window 200 -> exactly 40), Redis TIME by default and a key expiry set, NOSCRIPT after `SCRIPT FLUSH`, other errors not retried, the empty time argument without a clock, an unexpected reply rejected (9) |
+| `ip.test.ts` | clientIp: forged X-Forwarded-For ignored by default, 1 and 2 trusted proxies, repeated headers, fewer entries than proxies, invalid counts; ipKey: IPv4, mapped IPv6 (both cases), /64 grouping incl. leading zeros, `::`, `::1`, zone ids, one /64 = one client, non-IPs; the headers (rounding, Retry-After at least 1) (24) |
+| `express.test.ts` | real Express 4 app: limit then 429 with headers and the route not run, forged X-Forwarded-For gives no fresh limit, one trusted proxy, per-user key and `undefined` = not limited, two stacked limiters, cost, `headers: false`, a store error and a throwing key fn reach the error handler; **two Express instances sharing one Redis: 30 concurrent requests over both -> exactly 10 allowed** (10) |
+| `nestjs.test.ts` | real NestJS 10 app: headers then 429 with Retry-After and the handler not run, an undecorated route untouched, stacked per-IP + per-user decorators with anonymous skip, a decorator on a controller shared by its routes (4) |
 
 ### Mutation checks (2026-11-23)
 
 One deliberate bug at a time, full suite with Redis, reverted (runner kept outside the repo, started from `H:\`).
 
-24 breaks; **23 caught**, 1 equivalent (cannot be caught by design). One earlier break, M3 (the memory store ignores its expiry), survived the first run and showed the expiry check was redundant -- it was removed (see MemoryStore); L3 survived the first run and got a sharper test (a partly full bucket).
+Run on the stage 2 code against all 77 tests: 39 breaks (24 stage-1 + 15 adapter); **37 caught, 2 equivalent** (cannot be caught by design). From the first stage-1 run: M3 (the memory store ignored its expiry) survived and showed the expiry was redundant -- removed; L3 survived and got a sharper test.
 
 | # | Break | Failed |
 |---|---|---|
 | L1 | stored tokens not rounded like Lua tostring | 1 |
 | L2 | refill not capped at capacity | 3 |
 | L3 | a clock going backwards changes tokens | 1 |
-| L4 | needs MORE than cost tokens | 6 |
+| L4 | needs MORE than cost tokens | 12 |
 | L5 | retry rounded down | 1 |
-| L6 | a new bucket starts empty | 8 |
+| L6 | a new bucket starts empty | 18 |
 | S1 | previous window not weighted | 2 |
 | S2 | limit exclusive | 4 |
 | S3 | denied requests are counted | 2 |
@@ -135,21 +181,37 @@ One deliberate bug at a time, full suite with Redis, reverted (runner kept outsi
 | Q1 | prefix not applied | 5 |
 | Q2 | cost above the limit not rejected | 1 |
 | Q3 | key length limit off by one | 1 |
-| R1 | NOSCRIPT not handled | 3 |
+| R1 | NOSCRIPT not handled | 2 |
 | R2 | every error retried as if NOSCRIPT | 1 |
 | R3 | reply shape not checked | 1 |
 | R4 | always sends the app's clock instead of Redis TIME | 1 |
 | U1 | Lua: refill not capped | 1 |
 | U2 | Lua: denied request still counted in the sliding window | 1 |
 | U3 | Lua: no expiry on the token bucket key | 1 |
+| H1 | client IP from the LEFT-most X-Forwarded-For (client-controlled) | 4 |
+| H2 | trusted proxy count off by one | 5 |
+| H3 | IPv4-mapped IPv6 not normalised | 3 |
+| H4 | IPv6 keyed per full address instead of /64 | 7 |
+| H5 | IPv6 zone id not stripped | 0 |
+| H6 | Retry-After may be 0 | 1 |
+| H7 | RateLimit-Reset rounded down | 1 |
+| E1 | express: 429 without headers when headers:false | 1 |
+| E2 | express: undefined key not skipped | 1 |
+| E3 | express: cost option ignored | 1 |
+| E4 | express: store errors swallowed (request hangs) | 2 |
+| E5 | express: 403 instead of 429 | 8 |
+| N1 | nest: undefined key not skipped | 1 |
+| N2 | nest: no headers on the 429 | 1 |
+| N3 | nest: 403 instead of 429 | 3 |
 
-S6 is EQUIVALENT: both candidates for the retry are already >= 1 ms (`elapsed < window`, `needed > 0`), so `max(retry, 1)` never changes the value; it is kept to mirror the Lua script. U1-U3 break the Lua script itself (not the TypeScript): the parity, expiry and atomicity tests against the real Redis catch them. Caught by exactly one test (deleting it would hide them): L1, L3, L5, M2, Q2, Q3, R2, R3, R4, U1, U2, U3.
+Equivalent: **S6** -- both candidates for the retry are already >= 1 ms (`elapsed < window`, `needed > 0`), so `max(retry, 1)` never changes the value (kept to mirror the Lua). **H5** -- a zone id (`%eth0`) only ever sits in the LAST group of an address and the /64 key keeps the first four, so stripping it never changes a key (kept for clarity). U1-U3 break the Lua script itself; the tests against the real Redis catch them.
 
-## NOT implemented (after stage 1)
+## NOT implemented (after stage 2)
 
-- Express / NestJS adapters and the standard `RateLimit-*` / `Retry-After` headers (stage 2).
-- Behaviour when Redis is down (stage 3): today the error from the Redis client reaches the caller; whether to fail
+- Behaviour when Redis is down (stage 3): today the error reaches the framework's error handling; whether to fail
   open or closed is the app's decision for now.
+- NestJS on Fastify, an Express 5 test, other frameworks (Koa, Hono): not done.
+- The combined `RateLimit` / `RateLimit-Policy` fields of newer drafts of the header spec: not sent.
 - Not measured: throughput / latency per check (project 1 measured its Lua scripts from Python; not repeated here).
 - node-redis adapter: documented, not tested.
 - Redis Cluster: NOT tested. The token bucket uses one declared key per client. The sliding window builds two more
@@ -178,4 +240,7 @@ npm run build   # dist/ (copies the Lua scripts next to the JS)
 | `src/redis-store.ts` | `RedisStore`, `RedisScriptClient`, `ioredisClient` |
 | `src/limiter.ts` | `RateLimiter`, `Store` |
 | `src/types.ts` | `Decision`, `Algorithm`, `RateLimitError` |
+| `src/adapters/http.ts` | `clientIp`, `ipKey`, `keyByIp`, `rateLimitHeaders` (shared by both adapters) |
+| `src/adapters/express.ts` | `rateLimit` middleware (`ratelimit-kit/express`) |
+| `src/adapters/nestjs.ts` | `@RateLimit`, `RateLimitGuard` (`ratelimit-kit/nestjs`) |
 | `scripts/copy-lua.mjs` | copies the Lua scripts into `dist/` on build |

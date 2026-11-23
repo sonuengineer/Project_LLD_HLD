@@ -2,7 +2,8 @@
 
 Status (2026-11-23): stage 1 DONE (token bucket + sliding window counter, in memory and atomically in Redis via Lua,
 bring-your-own Redis client; parity between the TypeScript and the Lua versions tested against a real Redis).
-Stages 2 and 3 not started.
+Stage 2 DONE (Express middleware, NestJS decorator, safe client-IP extraction, headers; real apps; two Express
+instances sharing one Redis limit). Stage 3 not started.
 
 ## Why this project
 
@@ -33,13 +34,19 @@ workers): the inbound half of the toolkit, next to `projects/18-resilience` for 
   are a memory attack; dropping a key resets that client (documented trade-off). Expiry was removed after a
   mutation check showed it changed no decision.
 - **A cost above the limit is an error**, not a denial with a retry time that can never work.
+- **Stage 2: X-Forwarded-For is ignored unless you say how many proxies you trust**, and then read from the right.
+  The left-most entry is client-controlled; trusting it makes every limit bypassable. IPv6 keyed per /64.
+- **Stage 2: the NestJS decorator attaches a guard instance** (`UseGuards(new RateLimitGuard(limiter))`), so it
+  needs no DI and no decorator metadata; stacking several decorators stacks guards.
+- **Stage 2: adapters are separate entry points** written against Node's http types (Express not imported at
+  runtime); same layout as resilience-kit.
 
 ## Stages
 
 | Stage | What | Status |
 |---|---|---|
 | 1 | Algorithms (TypeScript + Lua), MemoryStore, RedisStore (EVALSHA, NOSCRIPT, Redis TIME), RateLimiter (prefix, validation), parity + atomicity tests against a real Redis | DONE 2026-11-23 |
-| 2 | Express middleware and NestJS guard + `@RateLimit()` decorator; key strategies (IP behind a proxy, user id, route); standard `RateLimit-*` and `Retry-After` headers; tested with real apps | not started |
+| 2 | Express middleware and NestJS `@RateLimit()` decorator; key strategies (IP behind a proxy, IPv6 /64, user id, skip); `RateLimit-*` and `Retry-After` headers; tested with real apps and two Express instances on one Redis | DONE 2026-11-23 |
 | 3 | Redis down: fail-open vs fail-closed per limit, protected by resilience-kit's circuit breaker and timeout; a load test across several app instances on one Redis; interview bank; portfolio page | not started |
 
 ## Not in scope
