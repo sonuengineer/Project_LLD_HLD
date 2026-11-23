@@ -428,6 +428,24 @@ export const PROJECTS: ProjectInfo[] = [
       },
     ],
   },
+  {
+    num: 16, slug: "p17-parking-lot", dir: "projects/17-parking-lot", name: "Parking Lot (low-level design)",
+    tagline: "The classic LLD interview question taken past the whiteboard: classes and strategies, gates that run at the same time, and payment retries that reuse one idempotency key.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "Vitest"],
+    features: [
+      "Spot sizes with one ordered rule for what fits; allocation and pricing as swappable strategies (smallest fit vs nearest; hourly with grace period and daily cap); money as integers in minor units",
+      "Every operation checks everything before it changes anything, so an error always means nothing happened (tested by comparing the whole lot before and after)",
+      "The check-then-act race reproduced with naive gates (two barriers for one spot, a copied ticket at two exits), then fixed with synchronous claims: reserve / confirm / cancel and begin / commit / abort exit, devices with a timeout and AbortSignal",
+      "Display boards as observers with a delivery queue, so a listener that changes the lot can never leave a board on a stale count",
+      "A min-heap per spot size with lazy deletion instead of scanning every spot; every choice checked against the full scan in randomized tests (not benchmarked)",
+      "Payments through a fake card provider only (no real money, no credentials): one idempotency key reused on every retry, decline vs unknown outcome, the barrier rule enforced by the lot, pay-then-exit window, lost ticket replaced with the old one invalidated. Not built: reconciliation, so an unknown outcome that was really charged can lead to a second charge (documented)",
+      "63 deliberate code breaks in the last round: 61 caught, the 2 survivors were test gaps and are closed",
+    ],
+    tests: "171 passing (incl. randomized runs with 3 entry + 2 exit gates, devices and a card provider failing at random: for each seed the provider's total charged equals the lot's total recorded)",
+    run: "cd projects/17-parking-lot && npm ci && npm test && npm run build && npm run demo",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);

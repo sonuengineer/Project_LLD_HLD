@@ -87,11 +87,14 @@ ExitGate.leave:   lot.beginExit() --charge if due--> lot.recordPayment() --barri
 - **Idempotency key.** Each lock gets a fresh random `paymentKey`; every retry of that payment sends the SAME key.
   If the provider charged but the answer was lost, the retry gets the first payment back instead of a second
   charge (tested with `lose-response`, and in the randomized test: total charged by the provider == total recorded
-  by the lot, every time).
+  by the lot, for its 5 fixed seeds).
 - **Decline vs unknown.** A decline is final (`PAYMENT_DECLINED`, no retry). Any other error is "outcome unknown":
   retried up to 3 times with a timeout each; still failing -> `PAYMENT_UNKNOWN`, the lock is released and nothing is
   recorded. The money MAY have been taken in that case; finding out needs the provider's records (reconciliation),
-  which is NOT built.
+  which is NOT built. **Known double-charge path:** if the attempts go fail, fail, lose-response, the provider has
+  charged but the lot recorded nothing; the next payment try gets a new lock and a NEW key, so the customer is
+  charged again. Only reconciliation (or keeping the unresolved key and asking the provider about it first) closes
+  this. Not built; the randomized test's 5 seeds never produce that sequence.
 - **Paid at the gate, then the barrier failed:** the exit is aborted but the payment stays recorded, so the next try
   owes nothing (tested: one charge across both tries).
 
