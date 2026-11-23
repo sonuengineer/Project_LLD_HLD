@@ -3,7 +3,9 @@
 Status (2026-11-23): stage 1 DONE (LRU with max entries and max weight, TTL with lazy expiry and an optional unref'd
 sweep, single-flight `getOrLoad` with per-caller abort and load versions against stale writes, stats and events;
 tested against a naive reference model with seeded random steps; deliberate breaks, see README "Mutation checks").
-Stages 2 and 3 not started.
+Stage 2 DONE (stale-while-revalidate, negative caching, load context, `TwoLevelCache` with a Redis L2 and pub/sub
+invalidation; the model test extended to both; real-Redis tests; mutation checks re-run over stages 1 and 2).
+Stage 3 not started.
 
 ## Why this project
 
@@ -56,16 +58,51 @@ exactly what each rule does and where it breaks.
 - **Stats are counters, events are for things the cache does by itself** (evictions, loads, rejects, aborts). Hits
   and misses are counters only: an event per read would cost every call. A throwing event handler is ignored.
 
+## Stage 2 decisions (one recommendation each)
+
+- **Stale grace per entry: fresh until `expiresAt`, served stale by `getOrLoad` until `deadAt`.** Lazy expiry,
+  purge and the "expired" eviction reason all use `deadAt`; with `staleMs` 0 the two are equal and stage 1 is
+  unchanged (the model test passes on both).
+- **`get` / `peek` / `has` treat a stale entry as absent** (and keep it for `getOrLoad`). Recommended over returning
+  it: `get` cannot refresh (no loader), so a stale `get` would make `ttlMs` meaningless for every non-loading caller.
+- **The refresh is an ordinary flight** (same map, same version check), so it cannot overwrite a newer
+  `set` / `delete` / `clear`, a dead-entry miss joins it, and "one refresh at a time" is the stage-1 single flight.
+  It starts with one permanent waiter (the cache), so a caller that joins and aborts cannot abort it.
+- **A failed refresh keeps the stale value; the next stale read retries.** Recommended over dropping the entry (the
+  whole point of the grace is to ride out a slow or failing backend) and over a backoff (more state; listed as not
+  implemented).
+- **Negative caching: a predicate on LOADED values + its own max TTL, no grace.** `min(normal TTL, negativeTtlMs)`
+  so a shorter call TTL or a short Redis remainder still wins. Errors are not cached at all: recommended over
+  opt-in error caching, which turns a transient error into an outage of the key.
+- **A load context (`ttlMs`, `refresh`, `isCurrent()`) as the loader's second argument.** Backward compatible, and it
+  is exactly what an L2 needs (set the TTL from Redis's PTTL; do not write Redis once the load is no longer current).
+  Recommended over special-casing Redis inside `LruCache`.
+- **`TwoLevelCache` wraps an `LruCache` instead of `LruCache` growing an `l2` option.** The L2 is async (set /
+  delete must await Redis), the L1 stays synchronous; the Redis read runs inside the L1 load, so single flight,
+  stale-while-revalidate and negative caching apply to it unchanged.
+- **Redis holds only the fresh TTL; the stale grace is per replica.** The L1 copy of a Redis hit gets Redis's PTTL.
+- **Writes after a load are `SET NX`, `delete` writes a tombstone.** Found by the real-Redis test (see README): a
+  late write from a load on another connection overwrote a newer `set`. Recommended over a Lua compare-and-set with
+  version keys (more moving parts, a version per key) and over "delayed double delete" (a sleep, still a window).
+- **Pub/sub for invalidation, L1 cleared on every re-subscribe, short L1 TTL as the safety net.** Recommended over
+  Redis Streams (durable but needs consumer bookkeeping per replica) and RESP3 client tracking (needs RESP3 and a
+  client that supports it). The ioredis adapter clears only after Redis confirms the new SUBSCRIBE.
+- **Redis never fails a read**: every call bounded by `l2TimeoutMs` (250 ms default), failures become misses and
+  `l2-error` events; `set` / `delete` resolve a boolean instead of throwing. Recommended over throwing: the DB write
+  already succeeded, a 500 for a cache problem would be wrong; the boolean and the event let the caller log it.
+- **Bring your own client, tiny structural interfaces, ioredis adapters** (as projects/19-rate-limit); ioredis
+  5.4.1 is a dev dependency only.
+
 ## Stages
 
 | Stage | What | Status |
 |---|---|---|
 | 1 | `LruCache`: max entries + max weight, O(1) get/set/delete, peek/has/clear/size; TTL (default + per entry, lazy expiry, optional unref'd sweep, close); single-flight `getOrLoad` (shared errors not cached, per-caller abort, load aborted when all leave, load versions against stale writes); stats and events; randomized test against a naive model; mutation checks | DONE 2026-11-23 |
-| 2 | Stale-while-revalidate (serve the old value for a grace period while one background load refreshes it), negative caching (cache "not found" / errors for a short separate TTL), a Redis-backed L2 adapter (L1 in process, L2 shared between replicas; invalidation between them) | not started |
+| 2 | Stale-while-revalidate (serve the old value for a grace period while one background load refreshes it), negative caching (cache "not found" for a short separate TTL; errors deliberately not cached), load context, `TwoLevelCache` (L1 in process, Redis L2 shared between replicas, codec, prefix, SET NX + tombstones, pub/sub invalidation with re-subscribe clearing L1, outage = L1 + loader) | DONE 2026-11-23 |
 | 3 | Express / NestJS helpers (cache a route's response or a service method, keyed by request), interview bank, portfolio page | not started |
 
 ## Not in scope
 
-Cross-process consistency beyond what stage 2's L2 gives, write-through / write-behind to a database, LFU or
+Cross-process consistency beyond what stage 2's L2 gives (see README "Known" for the remaining windows), write-through / write-behind to a database, LFU or
 W-TinyLFU admission (what Caffeine does), HTTP caching semantics (Cache-Control, ETag) -- a reverse proxy or CDN
 does that better.

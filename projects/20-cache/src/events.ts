@@ -12,6 +12,10 @@ export type CacheEvent<K> =
   | { readonly type: "reject"; readonly key: K; readonly weight: number }
   | { readonly type: "load"; readonly key: K }
   | { readonly type: "load-error"; readonly key: K; readonly error: unknown }
+  // Stale-while-revalidate: a stale read started a background refresh (instead of "load").
+  | { readonly type: "refresh"; readonly key: K }
+  // A background refresh failed (instead of "load-error"). The stale value is still served until its grace ends.
+  | { readonly type: "refresh-error"; readonly key: K; readonly error: unknown }
   // Every caller waiting for this load aborted, so the load's signal was aborted.
   | { readonly type: "load-abort"; readonly key: K };
 
