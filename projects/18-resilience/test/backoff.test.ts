@@ -31,15 +31,16 @@ describe("exponentialBackoff", () => {
 
   it("stays within its range for 10 000 random draws and every retry number up to 40", () => {
     const b = exponentialBackoff({ initialMs: 50, maxMs: 5000, jitter: "full" });
+    // Collect violations and assert once: 30 000 separate expect() calls made this test slow on a busy machine.
+    const bad: string[] = [];
     for (let n = 1; n <= 40; n++) {
       const ceiling = Math.min(5000, 50 * 2 ** (n - 1));
       for (let i = 0; i < 250; i++) {
         const d = b.delayMs(n, Math.random);
-        expect(d).toBeGreaterThanOrEqual(0);
-        expect(d).toBeLessThan(ceiling);
-        expect(Number.isInteger(d)).toBe(true);
+        if (!(d >= 0 && d < ceiling && Number.isInteger(d))) bad.push(`retry ${n}: ${d}`);
       }
     }
+    expect(bad).toEqual([]);
   });
 
   it.each([

@@ -2,7 +2,7 @@ import { exponentialBackoff, type Backoff, type BackoffOptions } from "./backoff
 import type { RetryBudget } from "./budget.js";
 import { emit, type Observable } from "./events.js";
 import { sleep as realSleep } from "./sleep.js";
-import type { Operation, Policy } from "./types.js";
+import { NEVER, type Operation, type Policy } from "./types.js";
 
 export type GiveUpReason = "attempts" | "not-retryable" | "budget" | "deadline" | "retry-after-too-long";
 
@@ -38,8 +38,6 @@ export interface RetryOptions extends Observable {
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   now?: () => number;
 }
-
-const NEVER = new AbortController().signal;
 
 // Runs an operation again after a failure, with growing, jittered waits.
 //
@@ -78,7 +76,7 @@ export class RetryPolicy implements Policy {
         if (signal?.aborted) throw signal.reason; // the caller gave up: stop, do not count it against the budget
 
         const giveUp = (reason: GiveUpReason): never => {
-          o.onGiveUp?.({ attempts: attempt, reason, error });
+          quietly(() => o.onGiveUp?.({ attempts: attempt, reason, error }));
           emit(o.onEvent, { type: "give-up", policy: o.name ?? "retry", attempts: attempt, reason, error });
           throw error;
         };
@@ -90,16 +88,27 @@ export class RetryPolicy implements Policy {
 
         let delayMs = this.backoff.delayMs(attempt, random);
         const asked = o.retryAfterMs?.(error);
-        if (asked !== undefined && Number.isFinite(asked) && asked > delayMs) {
+        // Infinity counts as "too long" (a 400-digit Retry-After parses to Infinity); only NaN is ignored.
+        if (asked !== undefined && !Number.isNaN(asked) && asked > delayMs) {
           if (asked > (o.maxRetryAfterMs ?? 60_000)) giveUp("retry-after-too-long");
           delayMs = Math.ceil(asked);
         }
         if (o.deadlineMs !== undefined && now() + delayMs - startedAt >= o.deadlineMs) giveUp("deadline");
 
-        o.onRetry?.({ attempt, delayMs, error });
+        quietly(() => o.onRetry?.({ attempt, delayMs, error }));
         emit(o.onEvent, { type: "retry", policy: o.name ?? "retry", attempt, delayMs, error });
         await sleep(delayMs, signal); // rejects at once if the caller aborts while we wait
       }
     }
+  }
+}
+
+// onRetry / onGiveUp are logging hooks: one that throws must not replace the caller's error or end the retries
+// (same rule as onEvent and the breaker's onStateChange).
+function quietly(callback: () => void): void {
+  try {
+    callback();
+  } catch {
+    // ignored on purpose
   }
 }

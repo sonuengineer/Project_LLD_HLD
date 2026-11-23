@@ -7,3 +7,14 @@ export type Operation<T> = (signal: AbortSignal) => Promise<T>;
 export interface Policy {
   execute<T>(operation: Operation<T>, signal?: AbortSignal): Promise<T>;
 }
+
+// The signal policies hand to the operation when the caller gave none. ONE shared instance that never aborts, so a
+// policy can recognise it and skip adding abort listeners to it: with many concurrent calls those listeners piled up
+// on this one signal and Node printed a (false) MaxListenersExceededWarning (found while writing the interview bank;
+// test in wrap.test.ts).
+export const NEVER: AbortSignal = new AbortController().signal;
+
+// The caller's signal, or undefined when there is nothing to listen to.
+export function listenable(signal: AbortSignal | undefined): AbortSignal | undefined {
+  return signal === NEVER ? undefined : signal;
+}

@@ -108,6 +108,25 @@ describe("Bulkhead", () => {
     await pb;
   });
 
+  it("a waiter aborted right after its slot was handed over does not run, and passes the slot on", async () => {
+    const b = new Bulkhead({ maxConcurrent: 1, maxQueue: 2 });
+    const c = controllable();
+    const pa = b.execute(c.op("a"));
+    const ctrl = new AbortController();
+    const pw = b.execute(c.op("waiter"), ctrl.signal).catch((e: unknown) => e);
+    const pn = b.execute(c.op("next"));
+    // Runs after the bulkhead released a's slot to the waiter, before the waiter wakes up (reaction order).
+    void c.promise("a").then(() => ctrl.abort(new Error("gave up")));
+    c.finish("a").ok();
+    await pa;
+    expect(await pw).toMatchObject({ message: "gave up" });
+    await flush();
+    expect(c.started).toEqual(["a", "next"]); // the waiter never ran; the slot went on
+    c.finish("next").ok();
+    await pn;
+    expect([b.running, b.queued]).toEqual([0, 0]);
+  });
+
   it("a waiter that gets its slot removes its abort listener from the caller's signal (no leak)", async () => {
     const b = new Bulkhead({ maxConcurrent: 1, maxQueue: 1 });
     const c = controllable();

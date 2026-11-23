@@ -103,6 +103,26 @@ describe("RetryPolicy", () => {
     expect(giveUps[0]!.reason).toBe("retry-after-too-long");
   });
 
+  it("an absurdly long Retry-After (Infinity, e.g. 400 digits) gives up too; NaN is ignored", async () => {
+    const inf = recorder({ retryAfterMs: () => Infinity });
+    await expect(inf.policy.execute(flaky(1).op)).rejects.toThrow("fail 1");
+    expect(inf.giveUps[0]!.reason).toBe("retry-after-too-long");
+    const nan = recorder({ retryAfterMs: () => Number.NaN });
+    expect(await nan.policy.execute(flaky(1).op)).toBe("ok");
+    expect(nan.sleeps).toEqual([100]);
+  });
+
+  it("a throwing onRetry / onGiveUp neither ends the retries nor replaces the caller's error", async () => {
+    const boom = () => {
+      throw new Error("logger down");
+    };
+    const ok = new RetryPolicy({ sleep: async () => {}, onRetry: boom });
+    expect(await ok.execute(flaky(2).op)).toBe("ok");
+    const f = flaky(10);
+    const gaveUp = new RetryPolicy({ sleep: async () => {}, onGiveUp: boom });
+    expect(await gaveUp.execute(f.op).catch((e: unknown) => e)).toBe(f.errors[2]);
+  });
+
   it("deadline: no retry that would start after it", async () => {
     let t = 0;
     const { policy, sleeps, giveUps } = recorder({

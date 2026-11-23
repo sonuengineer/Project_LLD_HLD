@@ -21,6 +21,10 @@ describe("parseRetryAfter", () => {
     expect(parseRetryAfter(header, now)).toBe(ms);
   });
 
+  it("a 400-digit delay parses to Infinity (the retry policy then gives up, see retry.test.ts)", () => {
+    expect(parseRetryAfter("9".repeat(400), now)).toBe(Infinity);
+  });
+
   it.each([null, undefined, "", "-5", "1.5", "soon"])("%j -> undefined", (header) => {
     expect(parseRetryAfter(header, now)).toBeUndefined();
   });
@@ -152,7 +156,8 @@ describe("over real HTTP (loopback server + fetch)", () => {
 
   it("hang, hang, 200: each attempt times out on its own and the third succeeds", async () => {
     const s = await serve([hang, hang, json({ ok: 3 })]);
-    expect(await client({}, 150)(s.url)).toEqual({ ok: 3 });
+    // 1000 ms per attempt: the third (answering) request must fit in it even on a busy machine (150 ms did not).
+    expect(await client({}, 1000)(s.url)).toEqual({ ok: 3 });
     expect(s.hits()).toBe(3);
   });
 
@@ -195,7 +200,7 @@ describe("over real HTTP (loopback server + fetch)", () => {
   it("bulkhead: a server that hangs can hold at most 2 sockets; the rest are refused at once", async () => {
     const s = await serve([hang]);
     const bulkhead = new Bulkhead({ maxConcurrent: 2 });
-    const timeout = new TimeoutPolicy({ ms: 300 });
+    const timeout = new TimeoutPolicy({ ms: 1500 }); // long enough for both requests to reach the server under load
     const calls = Array.from({ length: 6 }, () =>
       bulkhead.execute((sig) => timeout.execute((t) => getJson(s.url, t), sig)).catch((e: unknown) => e),
     );

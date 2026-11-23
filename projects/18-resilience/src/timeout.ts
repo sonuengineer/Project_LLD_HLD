@@ -1,6 +1,6 @@
 import { TimeoutError } from "./errors.js";
 import { emit, type Observable } from "./events.js";
-import type { Operation, Policy } from "./types.js";
+import { listenable, type Operation, type Policy } from "./types.js";
 
 export interface TimeoutOptions extends Observable {
   ms: number;
@@ -20,7 +20,8 @@ export class TimeoutPolicy implements Policy {
     this.ms = options.ms;
   }
 
-  async execute<T>(operation: Operation<T>, signal?: AbortSignal): Promise<T> {
+  async execute<T>(operation: Operation<T>, callerSignal?: AbortSignal): Promise<T> {
+    const signal = listenable(callerSignal); // never listen on the shared never-aborting signal
     signal?.throwIfAborted();
     const controller = new AbortController();
     const onCallerAbort = () => controller.abort(signal!.reason);

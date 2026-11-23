@@ -1,4 +1,4 @@
-import type { Operation, Policy } from "./types.js";
+import { NEVER, type Operation, type Policy } from "./types.js";
 
 // Compose policies, OUTERMOST FIRST: wrap(a, b, c).execute(op) runs a( b( c( op ) ) ).
 //
@@ -26,4 +26,3 @@ export function wrap(...policies: Policy[]): Policy {
   };
 }
 
-const NEVER = new AbortController().signal;

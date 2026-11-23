@@ -38,7 +38,9 @@ describe("mapResilienceError", () => {
     expect(mapResilienceError(error)).toBeUndefined();
   });
 
-  it("the body never contains the dependency's own error message", () => {
+  // Narrow check: the mapped body is a fixed text, not built from the error. (The broader protection is that
+  // HttpError does not store the upstream body at all, and unmapped errors are not answered by this code.)
+  it("the timeout body is fixed text, not built from the error's details", () => {
     const body = JSON.stringify(mapResilienceError(new TimeoutError(1234))!.body);
     expect(body).not.toContain("1234");
   });

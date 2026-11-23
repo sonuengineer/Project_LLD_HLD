@@ -1,6 +1,6 @@
 import { BrokenCircuitError } from "./errors.js";
 import { emit, type Observable } from "./events.js";
-import type { Operation, Policy } from "./types.js";
+import { NEVER, type Operation, type Policy } from "./types.js";
 
 export type CircuitState = "closed" | "open" | "half-open";
 
@@ -21,8 +21,6 @@ export interface CircuitBreakerOptions extends Observable {
   onStateChange?: (change: StateChange) => void;
   now?: () => number; // test hook, default Date.now
 }
-
-const NEVER = new AbortController().signal;
 
 // closed:    calls go through; outcomes are recorded in a sliding window of the last `windowSize` calls. Once at
 //            least `minimumCalls` are in it and the failure rate reaches the threshold -> open.
@@ -102,9 +100,18 @@ export class CircuitBreaker implements Policy {
       this.record(generation, "success");
       return result;
     } catch (error) {
-      const isFailure = this.options.isFailure ?? (() => true);
-      this.record(generation, signal?.aborted ? "ignored" : isFailure(error) ? "failure" : "success");
+      this.record(generation, signal?.aborted ? "ignored" : this.classify(error));
       throw error;
+    }
+  }
+
+  // A user-supplied isFailure that throws counts the call as a failure. Without this, its exception skipped
+  // record(): a half-open probe never released its slot and the breaker stayed half-open, rejecting everything.
+  private classify(error: unknown): "failure" | "success" {
+    try {
+      return (this.options.isFailure ?? (() => true))(error) ? "failure" : "success";
+    } catch {
+      return "failure";
     }
   }
 

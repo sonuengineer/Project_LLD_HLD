@@ -17,16 +17,17 @@ export default function Home() {
   return (
     <div>
       <section className="py-6">
-        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Sixteen backend projects, built from first principles</h1>
+        <h1 className="text-3xl font-bold tracking-tight sm:text-4xl">Seventeen backend projects, built from first principles</h1>
         <p className="mt-4 max-w-3xl text-lg text-slate-600 dark:text-slate-400">
           Rate limiting, a Redis-compatible database, job queues, webhooks, a Kafka-style log, multi-tenant SaaS,
           object storage, real-time collaboration, payments, a durable workflow engine, a reverse proxy with a load
           balancer, a clustered NATS-style message broker, an OAuth 2.0 / OpenID Connect server, a recursive DNS
-          resolver, a container runtime, and a parking lot as a low-level design exercise (classes, concurrency,
-          payments). The first ten are Python 3.12, FastAPI, Postgres and Redis, each with tests, Docker Compose,
-          measured benchmarks and twelve design documents. Of the last six, five are TypeScript on Node and one is plain
-          Python, none with runtime dependencies; the proxy, the broker and the container runtime were measured on real
-          servers.
+          resolver, a container runtime, a parking lot as a low-level design exercise (classes, concurrency,
+          payments), and a resilience library (timeouts, retries, circuit breaker, bulkhead) with Express and NestJS
+          adapters. The first ten are Python 3.12, FastAPI, Postgres and Redis, each with tests, Docker Compose,
+          measured benchmarks and twelve design documents. Of the last seven, six are TypeScript on Node and one is
+          plain Python, none with runtime dependencies; the proxy, the broker and the container runtime were measured on
+          real servers.
         </p>
         <div className="mt-6 flex flex-wrap gap-3">
           <a href={href("/interview")} className="rounded-md bg-sky-600 px-4 py-2 text-white hover:bg-sky-700">Interview prep{total ? ` (${total} questions)` : ""}</a>

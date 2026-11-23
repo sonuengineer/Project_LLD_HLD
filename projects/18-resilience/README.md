@@ -6,7 +6,7 @@ circuit breaker that stops calling a dependency that is down, and a bulkhead tha
 once. The core imports no framework, so the same code runs in an Express handler, a NestJS service, a worker or a
 script. No runtime dependencies.
 
-Status (2026-11-23): **stages 1-3 done** -- 172 tests pass (Windows, Node 20), including tests against a real HTTP
+Status (2026-11-23): **stages 1-3 done** -- 179 tests pass (Windows, Node 20), including tests against a real HTTP
 server on loopback, a real Express 4 app and a real NestJS 10 app; per-call overhead measured against cockatiel
 (see "Overhead"); all deliberate breaks of the last round caught (see "Mutation checks"). Not published to npm.
 
@@ -82,7 +82,7 @@ each line below is a test in `test/wrap.test.ts`:
 | Placement | Right | Wrong, and what the test shows |
 |---|---|---|
 | timeout inside retry | hang, hang, ok -> ok: every attempt has its own deadline | timeout outside: one deadline for all attempts AND the waits; the 3rd attempt never happens |
-| breaker inside retry | 4 calls x 3 failed attempts = 12 outcomes: the breaker opens | breaker outside: 4 outcomes, it stays closed while the dependency is down |
+| breaker inside retry | every failed attempt is recorded: the 10th (during the 4th call) opens it, later attempts are rejected | breaker outside: 4 outcomes, it stays closed while the dependency is down |
 | breaker -> retry with `isRetryableHttp` | an open breaker stops the retry at once (0 retries) | -- |
 | bulkhead inside retry | a call in backoff does not hold a slot; another call gets through | bulkhead outside: the sleeping call holds the slot, the next call is rejected |
 
@@ -155,7 +155,7 @@ their point; an immediate retry would hit the same open breaker or full bulkhead
 |---|---|---|
 | `failureRateThreshold` | 0.5 | open when failures / calls in the window reach this |
 | `windowSize` | 20 | count-based sliding window: the last N recorded calls |
-| `minimumCalls` | 10 | no decision before this many calls (1 failure of 1 call must not open it) |
+| `minimumCalls` | 10 (or `windowSize` if smaller) | no decision before this many calls (1 failure of 1 call must not open it) |
 | `openMs` | 30 s | fail fast for this long, then let a probe through |
 | `halfOpenMaxCalls` | 1 | probes allowed at once AND successes needed to close; a finished probe's slot is not reused |
 | `isFailure(error)` | every error | false = the dependency answered correctly (404, validation): counts as a SUCCESS |
@@ -175,25 +175,29 @@ their point; an immediate retry would hit the same open breaker or full bulkhead
 hold at most its own slots, not every socket in the process (tested over HTTP: 6 calls to a hanging server, 2 reach
 it and time out, 4 are refused at once).
 - A finishing call hands its slot DIRECTLY to the oldest waiter; the running count never drops in between, so a
-  newcomer arriving at that moment cannot start ahead of someone who waited (test "no barging", mutation K4).
+  newcomer arriving at that moment cannot start ahead of someone who waited (test "no barging", mutation K4). The
+  first version of that test did NOT test barging: its newcomer arrived before the slot was released, so it was
+  refused whatever the release logic did. The test now schedules the newcomer in a reaction on the finishing
+  operation's own promise, which runs after the bulkhead's release and before the waiter wakes (promise reactions
+  run in registration order) -- the only moment barging can happen.
 - A waiter whose caller aborts leaves the queue and rejects with the caller's reason; a waiter that gets its slot
   removes its abort listener (mutation K7).
 - `running` and `queued` for metrics.
 
 ## What the tests show
 
-`npm test` -- 172 tests in `test/`:
+`npm test` -- 179 tests in `test/`:
 
 | File | Proves |
 |---|---|
 | `timeout.test.ts` | sleep (waits, cancellable, no timer left); timeout: result, error pass-through (incl. a sync throw), TimeoutError AND the signal aborted with it, rejects even if the operation ignores the signal, a late answer changes nothing, caller abort (reason, signal, no timer), already-aborted caller never calls the operation, listener removed on every call, invalid ms (15) |
 | `backoff.test.ts` | none / full / equal values, defaults and the cap at retry 50 (no overflow), 10 000 random draws stay in range and are integers, invalid options (9) |
 | `budget.test.ts` | token arithmetic, the half threshold, never below 0, no float drift; a 1000-call simulation and recovery (see below) (10) |
-| `retry.test.ts` | success, fail-fail-succeed with waits 100 and 200, the last error unchanged, maxAttempts 1, non-retryable (no budget change), attempt numbers, Retry-After longer / shorter / too long, deadline, budget give-up and refill, caller abort during the call and during the wait (fake timers, no timer left), defaults with an injected random, a custom Backoff, the real sleep, invalid options (20) |
-| `breaker.test.ts` | closed: pass-through, minimumCalls, exactly at the threshold, below it, the window slides, non-failures count as success, aborted calls not recorded; open: no call, retryAfterMs; lazy half-open; one probe vs a second call; probe success -> empty window; probe failure -> a new openMs; 3 probes needed and slots not reused; aborted probe frees its slot; stale results from earlier generations (3 cases); throwing onStateChange; sync throw; defaults; invalid options (28) |
-| `bulkhead.test.ts` | limit and immediate rejection, FIFO queue then rejection, slot freed on failure and sync throw, no barging, aborted waiter leaves the queue, abort listener removed at hand-off, already-aborted caller, the caller's signal passed on, 400 random steps (never above the limit, every accepted call runs exactly once), invalid options (12) |
-| `http.test.ts` | parseRetryAfter (11 cases), isRetryableHttp (14, incl. breaker / bulkhead rejections); against a real `node:http` server on 127.0.0.1 with `fetch`: 503-503-200, 404 not retried, 429 + `Retry-After: 1` waits 1000 ms, all 503 -> the HttpError, a hanging server -> TimeoutError AND the server sees the connection close, hang-hang-200, caller abort mid-request (server sees the close, no retry), a breaker opened by 503s (20 calls while open reach the server 0 times; after openMs one probe closes it), 404s do not open a breaker, a bulkhead in front of a hanging server (2 reach it, 4 refused), connection refused with a budget (36) |
-| `wrap.test.ts` | order of execution, the caller's signal reaches the operation, a caller abort through 4 layers, a timeout deep inside aborts the operation's signal; the 4 placement experiments in "Composition"; one event handler for all policies (exact event sequence and names), default names, a throwing handler changes nothing (13) |
+| `retry.test.ts` | success, fail-fail-succeed with waits 100 and 200, the last error unchanged, maxAttempts 1, non-retryable (no budget change), attempt numbers, Retry-After longer / shorter / too long / Infinity (gives up) / NaN (ignored), throwing onRetry / onGiveUp contained, deadline, budget give-up and refill, caller abort during the call and during the wait (fake timers, no timer left), defaults with an injected random, a custom Backoff, the real sleep, invalid options (22) |
+| `breaker.test.ts` | closed: pass-through, minimumCalls, exactly at the threshold, below it, the window slides, non-failures count as success, aborted calls not recorded; open: no call, retryAfterMs; lazy half-open; one probe vs a second call; probe success -> empty window; probe failure -> a new openMs; 3 probes needed and slots not reused; aborted probe frees its slot; stale results from earlier generations (3 cases); throwing onStateChange; a throwing isFailure counts as a failure and cannot leave it stuck half-open; sync throw; defaults; invalid options (29) |
+| `bulkhead.test.ts` | limit and immediate rejection, FIFO queue then rejection, slot freed on failure and sync throw, no barging, aborted waiter leaves the queue, a waiter aborted right after the hand-off does not run and passes the slot on, abort listener removed at hand-off, already-aborted caller, the caller's signal passed on, 400 random steps (never above the limit, every accepted call runs exactly once), invalid options (13) |
+| `http.test.ts` | parseRetryAfter (11 cases + a 400-digit value -> Infinity), isRetryableHttp (14, incl. breaker / bulkhead rejections); against a real `node:http` server on 127.0.0.1 with `fetch`: 503-503-200, 404 not retried, 429 + `Retry-After: 1` waits 1000 ms, all 503 -> the HttpError, a hanging server -> TimeoutError AND the server sees the connection close, hang-hang-200, caller abort mid-request (server sees the close, no retry), a breaker opened by 503s (20 calls while open reach the server 0 times; after openMs one probe closes it), 404s do not open a breaker, a bulkhead in front of a hanging server (2 reach it, 4 refused), connection refused with a budget (37) |
+| `wrap.test.ts` | order of execution, the caller's signal reaches the operation, a caller abort through 4 layers, a timeout deep inside aborts the operation's signal; the 4 placement experiments in "Composition"; one event handler for all policies (exact event sequence and names), default names, a throwing handler changes nothing (15) |
 | `http-status.test.ts` | the 503 / 504 mapping, Retry-After never 0 (rounding cases), unmapped errors left alone (incl. an upstream 401), the body does not contain the dependency's message; requestSignal: one signal per response, aborts on an early close, not after a finished response (15) |
 | `express.test.ts` | real Express 4.21.2 app in front of a real upstream: pass-through (signal not aborted afterwards), hang -> 504, breaker -> 503 + Retry-After without calling the upstream, unmapped errors reach the app's own handler, an upstream 404 / 401 is NOT passed on by Express's default handler, a client disconnect cancels the upstream request, loadShedding (3rd concurrent request 503, slot freed after the response and after a disconnect) (8) |
 | `nestjs.test.ts` | real NestJS 10.4.15 app (platform-express): pass-through with `@RequestSignal()`, hang -> 504 and breaker -> 503 + Retry-After through the filter, full bulkhead -> 503, other errors keep Nest's own 500, an upstream 401 not passed on, a client disconnect aborts the signal and cancels the upstream request (6) |
@@ -299,12 +303,16 @@ runs, and the clean suite never failed (8 of 8 runs). The stage 2 numbers and th
 `H:\` runs; the stage 1 table further up came from a lowercase-path run, so the re-run is the one to trust. Lesson: a noisy
 mutation count can make a break look caught when it is not -- check unexpected failures by name.
 
-**Stage 3 (2026-11-23, against the 172 tests, from `H:\`):** 22 new breaks, all caught at the first run, plus the 59
-earlier breaks re-run on the stage 3 code (B4 and B6 rewritten for the new event lines): all caught. 81 in total.
+**Stage 3 (2026-11-23):** 22 new breaks (W, E, A, H) were all caught at their first run (against the 172 tests of
+that moment). After the review fixes (F1-F5) and the load-hardened tests, EVERYTHING was re-run on the final code
+against the final 179 tests, from `H:\`: **86 breaks, all caught.** The numbers below are from that final run
+(the earlier counts were lower in places only because the newer tests catch more; e.g. B5 is now also caught by the
+hanging-probe and throwing-isFailure tests). One check (F3) crashed with an out-of-memory error of the busy machine
+during the run, was re-run alone, and is caught.
 
 | # | Break | Failed |
 |---|---|---|
-| W1 | wrap applies policies in reverse order | 6 |
+| W1 | wrap applies policies in reverse order | 7 |
 | W2 | wrap drops the caller's signal | 2 |
 | W3 | wrap passes the outer signal instead of each layer's own | 2 |
 | E1 | a throwing event handler is not contained | 1 |
@@ -321,17 +329,21 @@ earlier breaks re-run on the stage 3 code (B4 and B6 rewritten for the new event
 | A5 | breaker 503 without Retry-After | 8 |
 | A6 | Retry-After may be 0 | 1 |
 | A7 | timeout mapped to 503 | 3 |
-| A8 | loadShedding frees the slot only on finish (not on a disconnect) | 1 |
+| A8 | loadShedding frees the slot only on finish (not on a disconnect) | 2 |
 | A9 | the Nest filter writes no response | 3 |
 | A10 | `@RequestSignal()` returns a signal that never aborts | 1 |
 | A11 | the error body leaks the dependency's message | 2 |
 | H1 | `HttpError` field named `status` again | 3 |
+| F1 | policies listen on the shared never-aborting signal again | 1 |
+| F2 | a throwing onRetry / onGiveUp is not contained | 1 |
+| F3 | a throwing isFailure is not contained | 1 |
+| F4 | an Infinity Retry-After is ignored instead of giving up | 1 |
+| F5 | a waiter aborted right after the hand-off still runs | 1 |
 
-Earlier breaks on the stage 3 code: B1 1, B2 10, B3 2, B4 7, B5 12, B6 2, B7 1, B8 2, B9 2, B10 1, B11 2, B12 3,
-B13 1, B14 1, B15 2, B16 1, B17 1, B18 1; K1 13, K2 9, K3 2, K4 1, K5 1, K6 1, K7 1, K8 1, K9 3; R1 10, R2 2, R3 1,
-R4 3, R5 8, R6 1, R7 2, R8 2, R9 12, R10 3, R11 4, R12 1, R13 4, R14 1, R15 2, R16 1, R17 1, R18 6, R19 4, R20 2,
-R21 3, R22 1, R23 1, R24 1, R25 17, R26 1, R27 8, R28 1, R29 3, R30 1, R31 2, R32 1.
-
+Earlier breaks on the final code: B1 1, B2 10, B3 2, B4 7, B5 14, B6 3, B7 1, B8 4, B9 2, B10 1, B11 2, B12 3,
+B13 1, B14 1, B15 4, B16 1, B17 1, B18 1; K1 14, K2 9, K3 3, K4 1, K5 1, K6 1, K7 1, K8 1, K9 3; R1 12, R2 2, R3 1,
+R4 4, R5 10, R6 1, R7 2, R8 2, R9 13, R10 3, R11 4, R12 1, R13 4, R14 1, R15 2, R16 1, R17 1, R18 7, R19 4, R20 2,
+R21 4, R22 4, R23 1, R24 1, R25 20, R26 1, R27 8, R28 1, R29 3, R30 1, R31 2, R32 1.
 The tests that catch A3, A4 and A6 (and one of A1's) were added before this run, after listing what the first
 adapter tests did not cover (a unit test for `requestSignal`, a test that unknown errors reach the app's own
 handler, Retry-After rounding). Whether those breaks would have survived without them was not checked.
@@ -342,7 +354,10 @@ handler, Retry-After rounding). Whether those breaks would have survived without
 100 000 calls per round after 20 000 warm-up calls, median of 5 rounds. Same settings on both sides (retry 3
 attempts, a breaker with a 10 s open time, a bulkhead of 10, a 10 s timeout; cockatiel's cooperative timeout and a
 consecutive-failures breaker). This measures the WRAPPER, not resilience behaviour; any real network call costs
-far more. Raw results with every round: `bench/reference-results/2026-11-23-win32-run1.json` and `-run2.json`.
+far more. Raw results with every round: `bench/reference-results/2026-11-23-win32-run1.json` and `-run2.json`
+(the script writes `<date>-<platform>.json` at the very end; the two files were renamed by hand. A first attempt at
+run 2 was lost: its output was piped through `Select-Object -First 11` in PowerShell, which stopped node before it
+wrote the file -- so the file then still held run 1. Caught by checking the file, re-run without the pipe).
 
 Windows 11 PC, AMD Ryzen 5 4500, Node 20.20.1, cockatiel 3.2.1 -- two runs, ns per call:
 
@@ -360,6 +375,44 @@ call); retry, breaker and bulkhead add a few hundred ns. Ours was about 4x cheap
 the bulkhead is a tie (run 2 has cockatiel ahead). WHY cockatiel's timeout costs more was not investigated, and
 cockatiel does more than this library in places (events, cancellation tokens, more breaker kinds) -- this is a cost
 comparison, not a verdict. One machine, two runs.
+
+## Found while writing the interview bank (after stage 3)
+
+Five agents wrote the interview bank from the code; each was asked to report anything that looked wrong. Real
+bugs, fixed with a test each (mutations F1-F5 prove each test guards its fix):
+
+| # | Finding | Fix |
+|---|---|---|
+| F1 | With no caller signal, every policy passed one shared never-aborting signal down, and every concurrent timeout / queued bulkhead call added an abort listener to it: at 11 concurrent calls Node printed `MaxListenersExceededWarning` (no real leak -- the listeners were removed -- but a false alarm in production logs) | one exported `NEVER` signal that the timeout and the bulkhead never listen on; test: 50 concurrent calls, no warning |
+| F2 | `onRetry` / `onGiveUp` were not guarded: a throwing logging callback replaced the caller's error or ended the retries | guarded like `onEvent` |
+| F3 | a user `isFailure` that throws skipped the recording: a half-open probe never released its slot and the breaker stayed half-open, rejecting every call | a throwing `isFailure` counts as a failure |
+| F4 | a 400-digit `Retry-After` parses to Infinity, which the retry IGNORED (retrying on normal backoff) instead of giving up like it does for 3600 | Infinity counts as too long; only NaN is ignored |
+| F5 | a queued caller that aborted in the instant after the bulkhead handed it a slot still ran its operation, with an aborted signal | re-check after waking: give the slot on, do not run |
+
+Also from the reviews: a test named "10 000 x 0.1" that checked 50 x 0.1 (renamed); a test named "the body never
+contains the dependency's message" that only checked a timeout's number (renamed to what it checks); this README
+said "12 outcomes" where the breaker opens on the 10th; "the hanging probe needs a timeout inside" was reasoning
+only (now a test in `wrap.test.ts`).
+
+**Flaky under load (fixed in the tests).** With the PC at 100% CPU from other programs, full runs failed 1-3 tests
+that pass alone: three relied on tight real-time margins (150 ms and 300 ms timeouts against a real server; the
+Express and Nest disconnect tests shared a 200 ms-timeout route, so the timeout could close the upstream request
+before the test's client disconnected), one made 30 000 `expect` calls in a loop, and Nest's start-up exceeded
+vitest's 5 s hook timeout. Fixed by wider margins (1000 / 1500 ms, a separate long-timeout route for the disconnect
+tests), one `expect` over collected violations, and `vitest.config.ts` timeouts of 20 s. After that: 4 of 4 full
+runs green, two of them at 100% CPU. The mutation tables above were produced with the hardened tests.
+
+Known and NOT changed:
+- `deadlineMs` is soft: it stops a retry from STARTING after the deadline; the total can overshoot by one attempt.
+- Reading `breaker.state` is not a pure read: it can move open -> half-open and emit the state-change event.
+- The adapters' "headers already sent" branches (Express: `next(error)`, Nest: `res.destroy()`) have no test.
+- Error handling relies on `instanceof`. If the library is loaded twice (two copies in node_modules, or the
+  lowercase drive path finding above), an open breaker's error would look retryable and the adapters would answer
+  500 instead of 503 / 504. There is no `name`-based fallback.
+- `isRetryableHttp` treats every non-HttpError as retryable, including a `TypeError` from a bug in your own code
+  (fetch's network error is also a `TypeError`), and knows nothing about idempotency: do not retry a non-idempotent
+  POST without an idempotency key.
+- The bulkhead's 503 always says `Retry-After: 1`.
 
 ## NOT implemented (after stage 3)
 

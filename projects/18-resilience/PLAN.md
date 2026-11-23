@@ -4,7 +4,8 @@ Status (2026-11-23): stage 1 DONE (timeout, retry with backoff and jitter, retry
 a real loopback HTTP server; 32 mutation checks all caught). Stage 2 DONE (circuit breaker with generations, bulkhead
 with direct hand-off; 130 tests; 27 new mutation checks, 1 survivor closed with a test). Stage 3 DONE (wrap and the
 order experiments, one event stream, Express and NestJS adapters tested against real apps, overhead measured vs
-cockatiel; 172 tests).
+cockatiel; then 5 bugs found by the interview-bank reviewers fixed with tests, and the timing-sensitive tests
+hardened for a busy machine; 179 tests; final mutation run 86 breaks, all caught).
 
 ## Why this project
 

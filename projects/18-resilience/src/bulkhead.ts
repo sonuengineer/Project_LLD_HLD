@@ -1,6 +1,6 @@
 import { BulkheadRejectedError } from "./errors.js";
 import { emit, type Observable, type ResilienceEventHandler } from "./events.js";
-import type { Operation, Policy } from "./types.js";
+import { listenable, NEVER, type Operation, type Policy } from "./types.js";
 
 export interface BulkheadOptions extends Observable {
   maxConcurrent: number; // calls running at once
@@ -13,8 +13,6 @@ interface Waiter {
   signal?: AbortSignal;
   onAbort?: () => void;
 }
-
-const NEVER = new AbortController().signal;
 
 // Limits how many calls to ONE dependency run at once, so a slow dependency can use up at most its own slots and
 // not every connection / worker in the process (the name comes from a ship's watertight compartments).
@@ -56,7 +54,12 @@ export class Bulkhead implements Policy {
     if (this.active < this.maxConcurrent) {
       this.active++;
     } else if (this.queue.length < this.maxQueue) {
-      await this.waitForSlot(signal); // resolves with the slot already ours
+      await this.waitForSlot(listenable(signal)); // resolves with the slot already ours
+      if (signal?.aborted) {
+        // Aborted between getting the slot and waking up: give the slot on, do not run.
+        this.release();
+        throw signal.reason;
+      }
     } else {
       emit(this.onEvent, { type: "bulkhead-rejected", policy: this.name, running: this.active, queued: this.queue.length });
       throw new BulkheadRejectedError(this.maxConcurrent, this.maxQueue);

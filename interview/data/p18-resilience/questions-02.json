@@ -1,0 +1,1280 @@
+[
+ {
+  "id": "RES-027",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Beginner",
+  "question": "Node.js is single-threaded. What does a bulkhead's maxConcurrent actually limit, and why is that still a concurrency problem?",
+  "answer_hinglish": "`maxConcurrent` threads ko limit nahi karta -- woh limit karta hai ki ek dependency ke kitne calls ek saath IN FLIGHT hain, yaani kitne promises abhi settle nahi hue. Node ek thread pe JavaScript chalata hai, lekin I/O concurrent hota hai: 200 incoming requests aayi, har ek ne `fetch` kiya, toh 200 sockets ek saath khule hain aur 200 promises pending hain. Thread ek hai, concurrent calls 200.\n\nProblem tab hota hai jab woh dependency hang karne lage. Har call timeout tak socket pakad ke baitha rehta hai, memory aur connection pool bharta jaata hai, aur doosri healthy dependencies ke calls ko bhi jagah nahi milti. Ek slow SMS provider poore process ko slow kar deta hai.\n\nBulkhead isko rokta hai: `Bulkhead({ maxConcurrent: 2 })` ka matlab hai is dependency ke maximum 2 calls ek saath chalenge. Teesra call ya toh queue mein wait karega (agar `maxQueue` > 0) ya turant `BulkheadRejectedError` paayega, bina operation chalaye. Toh hanging dependency sirf apne 2 slots kha sakti hai, poora process nahi.\n\nImplementation mein ek simple counter `active` hai. `execute()` mein check `this.active < this.maxConcurrent` aur `this.active++` ek hi synchronous block mein hote hain -- beech mein koi `await` nahi -- isliye do calls ek hi slot nahi le sakte. Single thread yahan help karta hai: lock ki zaroorat nahi, bas check aur update ke beech await nahi hona chahiye.",
+  "why_needed": "Interview mein log sochte hain Node mein concurrency limit ka matlab nahi. Asal mein Node ka strength hi bahut saare concurrent I/O calls hain, aur wahi weakness ban jaata hai jab ek dependency hang kare.",
+  "real_world_analogy": "Ship ke watertight compartments (bulkhead naam wahi se aaya, code comment bhi yahi kehta hai): ek compartment mein paani aaye toh sirf woh doobta hai, poora jahaz nahi.",
+  "how_it_works": "`active` counter in-flight calls ginta hai. Naya call: slot free hai toh `active++` aur chalao; nahi toh queue mein jagah hai toh `waitForSlot()`; nahi toh event `bulkhead-rejected` emit karke `BulkheadRejectedError` throw. Call khatam hone par `finally { this.release() }` slot chhodta (ya aage deta) hai.",
+  "in_this_project": "`src/bulkhead.ts` mein `Bulkhead.execute`. `test/http.test.ts` ka test 'bulkhead: a server that hangs can hold at most 2 sockets' ek real loopback server ke saamne 6 calls bhejta hai jo hang karta hai: 2 server tak pahunchte hain aur 1500 ms TimeoutPolicy se (pehle 300 ms tha; busy machine par flaky tha, isliye widen kiya) `TimeoutError` paate hain, 4 turant `BulkheadRejectedError` paate hain, aur `s.hits()` 2 hota hai. `running` aur `queued` getters metrics ke liye hain.",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::Bulkhead",
+   "projects/18-resilience/test/http.test.ts",
+   "projects/18-resilience/src/errors.ts::BulkheadRejectedError"
+  ],
+  "code_example": "// real, src/bulkhead.ts Bulkhead.execute (trimmed)\nsignal?.throwIfAborted();\nif (this.active < this.maxConcurrent) {\n  this.active++;\n} else if (this.queue.length < this.maxQueue) {\n  await this.waitForSlot(listenable(signal)); // resolves with the slot already ours\n  if (signal?.aborted) {\n    // Aborted between getting the slot and waking up: give the slot on, do not run.\n    this.release();\n    throw signal.reason;\n  }\n} else {\n  emit(this.onEvent, { type: \"bulkhead-rejected\", policy: this.name, running: this.active, queued: this.queue.length });\n  throw new BulkheadRejectedError(this.maxConcurrent, this.maxQueue);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Ek hanging dependency poore process ke sockets/memory nahi kha sakti",
+   "Rejection turant aur sasta hai: operation chalta hi nahi",
+   "Lock ki zaroorat nahi, synchronous check-and-increment kaafi hai"
+  ],
+  "disadvantages": [
+   "Limit sirf ek process ke andar hai: 3 replicas = 3 x maxConcurrent",
+   "Sahi `maxConcurrent` value guess karni padti hai; adaptive limit implement nahi hai"
+  ],
+  "common_mistakes": [
+   "Sochna ki single thread = ek time pe ek request",
+   "Check aur `active++` ke beech `await` daal dena",
+   "Har call pe naya Bulkhead banana -- tab limit kabhi lagti hi nahi"
+  ],
+  "follow_up_questions": [
+   "`maxConcurrent` ki value kaise choose karoge?",
+   "Bulkhead aur connection pool (jaise undici ka) mein kya farak hai?",
+   "Queue rakhni chahiye ya turant reject?"
+  ],
+  "concepts": [
+   "bulkhead",
+   "in-flight-calls",
+   "event-loop",
+   "isolation"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-028",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "In the bulkhead, why does a finishing call hand its slot directly to the oldest waiter instead of just decrementing the running count?",
+  "answer_hinglish": "Kyunki 'pehle slot chhodo, phir waiter jaag ke le lega' ke beech ek gap hai, aur us gap mein koi naya call (newcomer) slot chheen sakta hai. Isko barging kehte hain: jo queue mein wait kar raha tha woh peeche reh gaya, aur jo abhi aaya woh aage nikal gaya. FIFO ka promise toot jaata hai, aur heavy load mein ek waiter baar baar starve ho sakta hai.\n\nGap kahan se aata hai? Waiter ek promise pe `await` kar raha hai. Jab release hota hai aur waiter ka promise resolve hota hai, uska continuation turant nahi chalta -- woh microtask queue mein jaata hai. Us beech mein koi aur microtask ya reaction chal sakta hai jo `execute()` call kare. Agar `active` pehle hi gir gaya hota, toh newcomer ko `active < maxConcurrent` true dikhta aur woh slot le leta.\n\nIs project ka `release()` isliye counter ko chhuta hi nahi jab koi waiter hai: `this.queue.shift()` se sabse purana waiter nikalta hai, uska abort listener hatata hai, aur `next.resolve()` karta hai -- comment kehta hai 'the slot passes to the waiter; active stays the same'. Waiter jab jaagta hai toh slot pehle se uska hai; `waitForSlot` ka comment bhi yahi kehta hai 'resolves with the slot already ours'. `active` sirf tab ghatta hai jab queue khaali ho.\n\nIsko test 'no barging' prove karta hai, aur mutation K4 ('release frees the slot, the waiter re-takes it later') ussi ek test se pakda gaya.",
+  "why_needed": "Fairness aur predictable latency: queue mein jo pehle aaya woh pehle chale. Bina hand-off ke FIFO queue sirf naam ki FIFO hai.",
+  "real_world_analogy": "Bank counter pe token system: clerk free hua toh agla token number khud bulata hai. Agar clerk bas 'main free hoon' bol de aur log khud aayein, toh jo darwaze ke paas khada hai (newcomer) line wale se pehle pahunch jaayega.",
+  "how_it_works": "`release()`: queue khaali -> `active--`. Queue mein koi -> `shift()` (oldest), `removeEventListener('abort', ...)`, `resolve()`. Running count release aur waiter ke start ke beech kabhi nahi girta, isliye beech mein aane wala `execute()` slot full dekhta hai aur queue mein peeche lagta hai (ya queue full ho toh reject).",
+  "in_this_project": "`src/bulkhead.ts::release`. `test/bulkhead.test.ts` mein 'no barging: a newcomer arriving right after the slot is released goes behind the waiter' -- `maxConcurrent: 1, maxQueue: 1`, aur assertion `c.started` order `[\"a\", \"waiter\", \"newcomer\"]`. README ke stage 2 mutation table mein K4 = 1 failed test. PLAN.md ka decision: 'the bulkhead hands a slot directly to the next waiter'.",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::release",
+   "projects/18-resilience/test/bulkhead.test.ts::controllable",
+   "projects/18-resilience/PLAN.md"
+  ],
+  "code_example": "// real, src/bulkhead.ts\nprivate release(): void {\n  const next = this.queue.shift();\n  if (next === undefined) {\n    this.active--;\n    return;\n  }\n  if (next.onAbort !== undefined) next.signal!.removeEventListener(\"abort\", next.onAbort);\n  next.resolve(); // the slot passes to the waiter; `active` stays the same\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Strict FIFO: waiter starve nahi hota",
+   "Running count kabhi limit se upar nahi jaata aur beech mein galat 'free' nahi dikhta",
+   "Simple: ek counter, ek array"
+  ],
+  "disadvantages": [
+   "`queue.shift()` array pe O(n) hai (bade queue ke liye linked list behtar)",
+   "Hand-off aur waiter ke jaagne ke beech caller abort kare, iske liye alag re-check chahiye (pehle missing tha: operation aborted signal ke saath chal jaata, README F5; ab slot aage pass hota hai)"
+  ],
+  "common_mistakes": [
+   "Release mein `active--` aur waiter mein `active++` -- yahi barging bug hai (K4)",
+   "Sochna ki single thread mein beech mein kuch chal hi nahi sakta",
+   "Hand-off pe abort listener hatana bhool jaana (K7)"
+  ],
+  "follow_up_questions": [
+   "Is gap ko test mein deterministically kaise create karoge?",
+   "Kya LIFO kabhi behtar hota hai?",
+   "`queue` ko linked list kyun banana chahoge?"
+  ],
+  "concepts": [
+   "direct-hand-off",
+   "fifo",
+   "barging",
+   "fairness",
+   "microtasks"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-029",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Walk me through the 'no barging' test. How does it schedule a newcomer exactly in the gap between release and the waiter starting, without any timers?",
+  "answer_hinglish": "Test promise reaction order ka use karta hai. Setup: `Bulkhead({ maxConcurrent: 1, maxQueue: 1 })`. `pa = b.execute(op a)` -- slot le leta hai. `pw = b.execute(op waiter)` -- queue mein. Ab test `c.promise(\"a\").then(() => { newcomer = b.execute(op newcomer) })` register karta hai.\n\nKey point: bulkhead ke `execute` ne `return await operation(...)` mein a ke promise pe PEHLE reaction register kiya tha (jab a start hua). Test ka `.then` baad mein register hua. Jab test `c.finish(\"a\").ok()` karta hai, promise a resolve hota hai aur uske reactions REGISTRATION ORDER mein chalte hain. Pehle bulkhead ka continuation: `finally` -> `release()` -> waiter ko hand-off (`next.resolve()`), lekin waiter ka continuation sirf microtask queue mein jaata hai, abhi chala nahi. Phir turant test ka reaction chalta hai -- yahi gap hai -- aur newcomer `execute()` call karta hai.\n\nSahi code mein `active` abhi bhi 1 hai, toh newcomer queue mein jaata hai (`b.queued` 1). Phir waiter ka continuation chalta hai aur waiter start hota hai. Assertion: `c.started` pehle `[\"a\", \"waiter\"]`, phir waiter finish karo toh `[\"a\", \"waiter\", \"newcomer\"]`.\n\nK4 mutation mein release `active--` karta aur waiter jaag ke slot leta. Tab newcomer ko gap mein `active` 0 dikhta, woh turant start hota, aur started order galat ho jaata. Koi `setTimeout` nahi, koi sleep nahi -- isliye test deterministic hai, flaky nahi. `flush()` (setImmediate) sirf pending microtasks drain karne ke liye hai.",
+  "why_needed": "Concurrency bugs timing se dikhte hain. Agar test random delays pe depend kare toh bug 'kabhi kabhi' pakda jaata hai. Reaction order se gap ko exact jagah pe hit karna test ko reliable banata hai.",
+  "real_world_analogy": "Do log ek hi doorbell ke liye wait kar rahe hain: jo pehle bell pe kaan lagaye baitha hai (pehla registered listener) woh pehle react karega. Test ne jaan-boojh ke newcomer ko doosra listener banaya taaki woh exactly 'pehla react kar chuka, waiter abhi utha nahi' wale moment pe aaye.",
+  "how_it_works": "Native promise ke `.then` reactions FIFO order mein microtasks bante hain. `await p` (native promise) bhi p pe directly reaction register karta hai. Bulkhead ka await a start hote hi register hua, test ka `.then` baad mein -- isliye bulkhead pehle. Waiter ka `await this.waitForSlot()` ek alag promise pe hai; uska resolve sirf naya microtask enqueue karta hai, jo test ke reaction ke BAAD chalta hai.",
+  "in_this_project": "`test/bulkhead.test.ts` mein test ka comment khud explain karta hai: 'The bulkhead awaits a's promise first, so its release runs first; this reaction runs right after it, BEFORE the waiter's continuation.' Helper `controllable()` operations ko haath se finish karne deta hai aur `started` order record karta hai. README: K4 caught by 1 test (stage 2 aur stage 3 re-run dono mein 1).",
+  "implementation_files": [
+   "projects/18-resilience/test/bulkhead.test.ts::controllable",
+   "projects/18-resilience/test/bulkhead.test.ts::flush",
+   "projects/18-resilience/src/bulkhead.ts::waitForSlot"
+  ],
+  "code_example": "// real, test/bulkhead.test.ts (trimmed)\nconst b = new Bulkhead({ maxConcurrent: 1, maxQueue: 1 });\nconst pa = b.execute(c.op(\"a\"));\nconst pw = b.execute(c.op(\"waiter\"));\nlet newcomer: Promise<string> | undefined;\nvoid c.promise(\"a\").then(() => {\n  newcomer = b.execute(c.op(\"newcomer\")); // runs right after release, before the waiter wakes\n});\nc.finish(\"a\").ok();\nawait pa;\nawait flush();\nexpect(c.started).toEqual([\"a\", \"waiter\"]);\nexpect(b.queued).toBe(1); // the newcomer waits",
+  "code_language": "typescript",
+  "advantages": [
+   "Deterministic: same order har run mein",
+   "Bug ko exact gap pe hit karta hai, sirf 'end state' check nahi",
+   "Mutation K4 isse pakda gaya"
+  ],
+  "disadvantages": [
+   "Test promise internals (reaction order) pe depend karta hai -- padhne wale ko samjhaana padta hai",
+   "Sirf ek test K4 pakadta hai; usko delete karo toh bug chhup jaayega"
+  ],
+  "common_mistakes": [
+   "Barging test mein random `setTimeout` delays use karna",
+   "Sirf final results check karna, start order nahi",
+   "Sochna ki `await Promise.resolve()` aur `setImmediate` same cheez hain"
+  ],
+  "follow_up_questions": [
+   "Agar bulkhead `await` ki jagah `.then` chain use kare toh kya order badlega?",
+   "Is test ko fake timers ke saath likhna kyun zaroori nahi?",
+   "Ek aur test likho jo LIFO (K6) pakde."
+  ],
+  "concepts": [
+   "promise-reaction-order",
+   "microtasks",
+   "deterministic-testing",
+   "barging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Deterministic reaction-order test vs stress test: yeh test ek specific interleaving prove karta hai; project mein saath mein ek '400 random steps' test bhi hai jo invariant (kabhi limit se upar nahi, har accepted call exactly once) check karta hai. Dono milke cover karte hain.",
+   "failure_scenarios": "Agar koi future refactor bulkhead mein extra `await` daale (jaise async logging) toh reaction order badal sakta hai aur test ka gap shift ho jaayega -- test fail ho sakta hai ya worse, gap miss karke pass ho sakta hai.",
+   "alternatives": "Model checking / exhaustive interleaving tools (Node mein common nahi), ya fake scheduler. Yahan simple reaction order kaafi tha.",
+   "scale_10x_100x": "Load badhne se gap ki probability badhti hai: 10x-100x traffic pe barging rare nahi rehta, starvation real problem ban jaati hai. Isliye design-level guarantee (direct hand-off) zaroori hai, timing pe bharosa nahi.",
+   "production_improvements": "Test ke saath ek comment (already hai) aur mutation run (K4) CI mein; production mein `queued` aur wait-time metric dekh ke starvation detect karna."
+  }
+ },
+ {
+  "id": "RES-030",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "A caller is waiting in the bulkhead's queue and its HTTP client disconnects. What happens, step by step?",
+  "answer_hinglish": "Waiter queue se nikal jaata hai, kabhi run nahi hota, aur caller ke reason ke saath reject hota hai. Uski queue wali jagah turant free ho jaati hai, toh koi naya call usko le sakta hai.\n\nStep by step: `waitForSlot(signal)` ek promise banata hai aur agar signal diya gaya hai toh `waiter.onAbort` set karta hai, `signal.addEventListener(\"abort\", waiter.onAbort, { once: true })`. Client disconnect hua -- Express adapter ka `requestSignal()` response ke `close` pe (agar response finish nahi hua) `ClientClosedError` ke saath abort karta hai. `onAbort` chalta hai: `this.queue.indexOf(waiter)`, `splice` se hatao, aur `reject(signal.reason)`. Execute mein `await this.waitForSlot()` throw karta hai -- aur yeh `try/finally` se PEHLE hai, isliye `release()` nahi chalta. Sahi bhi hai: waiter ne kabhi slot liya hi nahi tha, `active` usne badhaya nahi.\n\nUlta case bhi handle hai: agar waiter ko pehle slot mil gaya (hand-off), toh `release()` uska abort listener hata deta hai. Warna listener signal ki poori life tak pada rehta (K7 leak).\n\nAur beech ka case: slot hand-off ho gaya, lekin waiter ke jaagne se PEHLE caller abort kar de (listener already hat chuka). Pehle aisa waiter phir bhi apna operation chala deta tha, aborted signal ke saath -- yeh interview bank likhte waqt mila (README F5). Ab `execute()` jaagne ke baad `signal?.aborted` dobara check karta hai: aborted hai toh `release()` (slot agle waiter ko ya free) aur caller ka reason throw, operation nahi chalta. Test: 'a waiter aborted right after its slot was handed over does not run, and passes the slot on', mutation F5.\n\nAur agar caller PEHLE se aborted hai, `signal?.throwIfAborted()` sabse pehle line hai -- woh slot ya queue jagah leta hi nahi (mutation K8).\n\nKyun zaroori? Jo client chala gaya uske liye wait karna aur phir dependency ko call karna pure waste hai, aur ek real caller ki queue jagah bhi kha raha hai.",
+  "why_needed": "Disconnect hue clients ka kaam karna load badhata hai bina kisi faayde ke. Queue bounded hai, toh mare hue waiters zinda waiters ki jagah block karte.",
+  "real_world_analogy": "Restaurant waiting list: koi bina bataye chala gaya aur host ko pata chal gaya, toh uska naam list se kaat do -- table uske liye hold mat karo.",
+  "how_it_works": "Abort listener `{ once: true }` ke saath. `onAbort`: indexOf + splice + reject. Hand-off pe `removeEventListener`. Rejection `waitForSlot` se aata hai, try block ke bahar, isliye `release()` (aur galat `active--`) nahi hota.",
+  "in_this_project": "`src/bulkhead.ts::waitForSlot`. Tests: 'a queued caller that aborts leaves the queue, never runs, and its place is free' (`b.queued` 0 aur naya call 'b' us jagah aata hai), 'an already-aborted caller is refused before taking a slot', 'a waiter aborted right after its slot was handed over does not run, and passes the slot on' (F5). Mutations: K5 (aborted waiter stays in the queue) 1 test, K8 1 test. `src/adapters/express.ts::requestSignal` disconnect ko signal mein badalta hai.",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::waitForSlot",
+   "projects/18-resilience/test/bulkhead.test.ts",
+   "projects/18-resilience/src/adapters/express.ts::requestSignal"
+  ],
+  "code_example": "// real, src/bulkhead.ts\nprivate waitForSlot(signal?: AbortSignal): Promise<void> {\n  return new Promise<void>((resolve, reject) => {\n    const waiter: Waiter = { resolve, reject, signal };\n    if (signal !== undefined) {\n      waiter.onAbort = () => {\n        const i = this.queue.indexOf(waiter);\n        if (i >= 0) this.queue.splice(i, 1);\n        reject(signal.reason);\n      };\n      signal.addEventListener(\"abort\", waiter.onAbort, { once: true });\n    }\n    this.queue.push(waiter);\n  });\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Mare hue requests queue ki jagah nahi khaate",
+   "Caller ko uska apna reason milta hai (jaise ClientClosedError), generic error nahi",
+   "Listener cleanup dono raston pe (abort ya hand-off)"
+  ],
+  "disadvantages": [
+   "Signal na diya ho toh waiter queue chhod hi nahi sakta -- queue wait ka koi timeout implement nahi hai",
+   "indexOf + splice O(n)"
+  ],
+  "common_mistakes": [
+   "Waiter ke reject path mein `release()` chala dena (active galat ghat jaayega)",
+   "Hand-off pe listener na hatana (K7)",
+   "Request ka `close` sunna response ki jagah (adapter ka A2 mutation)"
+  ],
+  "follow_up_questions": [
+   "Queue wait ke liye timeout kaise add karoge?",
+   "Agar hand-off ke turant baad abort ho toh kya hoga?",
+   "Signal na ho toh kya risk hai?"
+  ],
+  "concepts": [
+   "cancellation",
+   "abort-signal",
+   "bounded-queue",
+   "listener-cleanup"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-031",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What are breaker 'generations' and which three stale-result scenarios do they protect against?",
+  "answer_hinglish": "Generation ek counter hai jo har state change pe badhta hai (`transition()` mein `this.generation++`). Har call start hote waqt current generation yaad rakhta hai (`const generation = this.generation`), aur khatam hone par `record(generation, ...)` sirf tab kuch karta hai jab breaker abhi bhi ussi generation mein ho. Warna result 'stale' hai aur ignore.\n\nProblem yeh hai ki calls async hain aur slow ho sakte hain. Ek call closed state mein shuru hua, 5 second laga, aur us beech breaker open ho gaya ya half-open bhi. Uska result 'dependency ab kaisi hai' ke baare mein kuch nahi batata. Teen cases, teeno tested:\n\n1. Closed mein shuru hua, breaker open hone ke BAAD fail hua. Bina generation ke yeh failure open timer ko push back kar sakta (ya kuch bhi record karta). Test: open at t0, slow call t0+900 pe fail, t0+1000 pe breaker phir bhi half-open hai jaisa planned tha.\n2. Closed mein shuru hua, half-open ke dauraan SUCCEED hua. Bina generation ke yeh probe gina jaata aur breaker close ho jaata bina kisi real probe ke. Test: state half-open hi rehti hai; phir real probe fail -> open.\n3. Closed mein shuru hua, half-open ke dauraan FAIL hua. Bina generation ke yeh breaker reopen kar deta jabki real probe abhi chal raha hai. Test: state half-open rehti hai, real probe succeed -> closed.\n\nREADME ke hisaab se mutation B9 ('no generation check') 2 tests ne pakda.",
+  "why_needed": "Async world mein 'jab call shuru hua' aur 'jab result aaya' ke beech state badal sakti hai. Purane zamaane ka result naye zamaane ki state ko corrupt na kare -- yeh classic stale-write problem hai.",
+  "real_world_analogy": "Election ke baad aaya postal vote: counting band ho chuki, naya round shuru. Woh vote purane round ka hai, naye round ke result mein nahi gina jaata.",
+  "how_it_works": "`execute`: `const generation = this.generation` operation se pehle. `record()` ki pehli line: `if (generation !== this.generation) return;`. `transition()` har change pe generation++ karta hai, isliye closed->open, open->half-open, half-open->closed/open sab purane calls ko invalidate karte hain. Ek detail: refresh() bhi transition karta hai (open->half-open), toh woh bhi nayi generation hai.",
+  "in_this_project": "`src/breaker.ts` mein `generation` field, `execute`, `record`, `transition`. `test/breaker.test.ts` ka describe 'CircuitBreaker: stale results (generations)' teen tests ke saath, helper `deferred()` se slow call haath se finish hota hai. README 'Generations' paragraph aur PLAN.md decision 'generations instead of trusting every late result'.",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::generation",
+   "projects/18-resilience/src/breaker.ts::record",
+   "projects/18-resilience/test/breaker.test.ts::deferred",
+   "projects/18-resilience/README.md"
+  ],
+  "code_example": "// real, src/breaker.ts (trimmed)\nconst generation = this.generation;\ntry {\n  const result = await operation(signal ?? NEVER);\n  this.record(generation, \"success\");\n  return result;\n} catch (error) { /* ... */ }\n\nprivate record(generation: number, outcome: \"success\" | \"failure\" | \"ignored\"): void {\n  if (generation !== this.generation) return; // started in an earlier state: stale\n  // ...\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Ek integer compare -- bahut sasta",
+   "Teeno race conditions ek hi mechanism se band",
+   "Har state change automatic purane calls ko invalidate karta hai"
+  ],
+  "disadvantages": [
+   "Stale result poori tarah ignore hota hai, uski information (dependency abhi bhi fail kar rahi thi) kho jaati hai",
+   "Closed state ke andar hi purane calls valid rehte hain (generation sirf state change pe badhta hai)"
+  ],
+  "common_mistakes": [
+   "Timestamp compare karna generation ki jagah (clock aur ordering issues)",
+   "Sirf half-open ke liye check lagana aur open timer wala case bhool jaana",
+   "Stale probe ka `probesInFlight--` karna -- naye half-open mein counter galat ho jaayega"
+  ],
+  "follow_up_questions": [
+   "Generation counter overflow ho sakta hai kya?",
+   "Closed state ke andar kisi purane call ka result window mein jaana theek kyun hai?",
+   "Yeh idea DB mein kahan dikhta hai (optimistic locking, fencing tokens)?"
+  ],
+  "concepts": [
+   "generations",
+   "stale-results",
+   "fencing",
+   "circuit-breaker",
+   "async-race"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Generation approach simple hai lekin coarse: closed state ek hi generation hai, toh closed mein shuru aur closed mein khatam hone wala 30 second purana call bhi window mein jaata hai. Per-call timestamps se 'too old' results drop kar sakte, lekin complexity badhti hai. Practical answer: TimeoutPolicy breaker ke andar, toh koi call itna purana hota hi nahi.",
+   "failure_scenarios": "Agar koi `transition()` mein `generation++` hata de (B9) toh teeno scenarios wapas aate hain: open timer slide hota hai, fake probe se close, ya fake failure se reopen. 2 tests usko pakadte hain.",
+   "alternatives": "Fencing token (distributed locks mein), optimistic concurrency version column (DB mein), ya har call ko cancel kar dena jab state change ho. Cancel aggressive hai -- closed mein chal rahe calls ko kill karna galat hoga.",
+   "scale_10x_100x": "Zyada traffic pe slow calls zyada hote hain jo state change cross karte hain, toh stale results ki frequency badhti hai -- generation check ki value badhti hai, cost same rehti hai (ek compare).",
+   "production_improvements": "Stale results ka count metric (abhi emit nahi hota) debugging mein help karega: 'kitne results ignore hue' se pata chalta hai timeouts kitne loose hain."
+  }
+ },
+ {
+  "id": "RES-032",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How does the half-open state limit probes, and why is a finished probe's slot not reused?",
+  "answer_hinglish": "Half-open mein `halfOpenMaxCalls` (default 1) probes allowed hain, aur breaker close karne ke liye utne hi SUCCESSES chahiye. Check hai `this.probesInFlight + this.probeSuccesses >= this.halfOpenMaxCalls` -- true ho toh call ko `BrokenCircuitError { state: \"half-open\", retryAfterMs: 0 }` milta hai, operation chalta hi nahi.\n\nFinished successful probe ka slot reuse kyun nahi? Kyunki formula mein `probeSuccesses` bhi gina jaata hai. Maan lo `halfOpenMaxCalls: 3`. 3 probes chal rahe hain. Ek succeed hua: `probesInFlight` 2, `probeSuccesses` 1, total 3 -- naya call phir bhi reject. Agar slot reuse hota, toh ek fast probe khatam hote hi naya probe aata, phir naya... aur half-open mein actual traffic 3 se zyada ho jaata. Half-open ka matlab hai 'recovering dependency pe sirf ek chhota controlled sample bhejo'. Total probes = exactly `halfOpenMaxCalls`, na kam na zyada.\n\nPhir outcomes: koi bhi probe fail -> turant `transition(\"open\")` (naya openMs, nayi generation, baaki in-flight probes stale ho jaate hain). Saare succeed -> `transition(\"closed\")` with empty window. Aborted probe (caller gaya) -> sirf `probesInFlight--`, koi decision nahi, slot free.\n\nTest 'halfOpenMaxCalls 3: needs 3 successful probes; the 4th concurrent call is rejected' yeh sab check karta hai, aur README mutation B7 ('a finished probe's slot is reused') 1 test se pakda gaya.",
+  "why_needed": "Recovering service fragile hoti hai. Half-open mein unlimited traffic bhejna usko phir gira sakta hai; probe count fix rakhna load ko bounded rakhta hai.",
+  "real_world_analogy": "Bridge repair ke baad: pehle 3 trucks bhejo test ke liye. Pehla truck paar ho gaya toh chauthe ko mat bhejo jab tak baaki 2 bhi paar na ho jaayein -- tabhi bridge public ke liye khulega.",
+  "how_it_works": "`execute` half-open branch: limit check, phir `probesInFlight++`. `record` half-open branch: `probesInFlight--`; failure -> open; success -> `++probeSuccesses >= halfOpenMaxCalls` -> closed; ignored -> kuch nahi. `transition(\"half-open\")` dono counters 0 karta hai.",
+  "in_this_project": "`src/breaker.ts::probesInFlight` aur `probeSuccesses`. Tests: 'half-open: one probe goes through, a second concurrent call is rejected', 'halfOpenMaxCalls 3 ...', 'a probe whose caller aborted frees its slot without deciding anything', 'an error that is not a failure, in half-open, counts as a successful probe'. Mutations (final run): B6 (limit not enforced) 3, B7 1, B8 (failed probe does not reopen) 4, B14 (probe slot never freed) 1.",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::probesInFlight",
+   "projects/18-resilience/src/breaker.ts::probeSuccesses",
+   "projects/18-resilience/test/breaker.test.ts"
+  ],
+  "code_example": "// real, src/breaker.ts (trimmed)\nif (this.current === \"half-open\") {\n  if (this.probesInFlight + this.probeSuccesses >= this.halfOpenMaxCalls) {\n    this.rejected(\"half-open\");\n    throw new BrokenCircuitError(\"half-open\", 0);\n  }\n  this.probesInFlight++;\n}\n// in record(), half-open:\nthis.probesInFlight--;\nif (outcome === \"failure\") this.transition(\"open\");\nelse if (outcome === \"success\" && ++this.probeSuccesses >= this.halfOpenMaxCalls) this.transition(\"closed\");",
+  "code_language": "typescript",
+  "advantages": [
+   "Recovering dependency pe exactly N calls, bounded",
+   "Ek failure turant reopen -- conservative",
+   "Aborted probe deadlock nahi banata"
+  ],
+  "disadvantages": [
+   "Half-open mein baaki calls reject hote hain (retryAfterMs 0), toh thoda traffic fail hota hai recovery ke dauraan",
+   "Ek hanging probe slot hamesha ke liye pakad leta hai jab tak andar timeout na ho"
+  ],
+  "common_mistakes": [
+   "Slot reuse karna (B7) -- half-open mein unlimited traffic",
+   "Aborted probe ko failure ginna -- client gaya toh dependency phir open",
+   "Half-open entry pe counters reset na karna"
+  ],
+  "follow_up_questions": [
+   "halfOpenMaxCalls 1 vs 5 -- trade-off kya hai?",
+   "Half-open mein reject hue calls ko 503 dena chahiye ya queue karna?",
+   "Probe hang ho jaaye toh kya hoga?"
+  ],
+  "concepts": [
+   "half-open",
+   "probes",
+   "circuit-breaker",
+   "controlled-recovery"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-033",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "The breaker, bulkhead and retry budget all live in process memory. What does that mean when the API runs as three replicas?",
+  "answer_hinglish": "Har replica ke paas apna breaker, apna bulkhead, apna budget hoga -- teen independent copies. README 'NOT implemented' mein yeh seedha likha hai: 'Three API replicas have three of each (each replica learns on its own that a dependency is down).' Distributed state (jaise Redis mein shared breaker) PLAN mein 'Not in scope' hai.\n\nPractical matlab:\n1. Breaker: dependency down hui toh har replica ko khud `minimumCalls` (default 10) failures dekhne padenge open hone se pehle. 3 replicas = roughly 3 x itne failed calls dependency tak jaayenge. Aur load balancer traffic baantta hai, toh har replica ka window dheere bharta hai.\n2. Bulkhead: `maxConcurrent: 20` ka matlab fleet level pe 60 concurrent calls. Agar dependency ne kaha 'max 30 concurrent', toh per-replica value 10 rakhni padegi -- aur autoscaling pe yeh math badal jaata hai.\n3. Budget: har replica ka bucket alag drain hota hai. Outage mein har replica ke shuru ke kuch retries jaayenge (simulation mein per budget 3 extra attempts), phir har ek single attempt pe aa jaata hai.\n4. Half-open probes: har replica apna probe bhejega, toh recovering dependency pe 3 probes aayenge.\n\nKya yeh bura hai? Hamesha nahi. Per-process state fast hai (bench mein breaker ~229-247 ns per call, koi network hop nahi), aur shared store ka failure (Redis down) breaker ko hi break nahi karta. Zyaadatar systems (resilience4j bhi default mein) per-instance state hi rakhte hain. Lekin limits fleet-level sochni padti hain, per-replica nahi.",
+  "why_needed": "Interview mein yeh pakka poocha jaata hai: 'tumhara rate/limit multiple servers pe kaise kaam karega?' Honest answer: yahan implement nahi hai, aur iska impact kya hai.",
+  "real_world_analogy": "Teen branches wala bank jahan har branch ka apna 'yeh customer fraud hai' register hai: ek branch ko pata chala toh baaki do ko khud seekhna padega.",
+  "how_it_works": "State class fields mein hai: `CircuitBreaker` ke `ring`, `current`, `openedAt`; `Bulkhead` ka `active` aur `queue`; `RetryBudget` ka `tokens`. Koi persistence ya sync nahi. Har process ka module-level singleton alag object hai.",
+  "in_this_project": "README ka usage example kehta hai 'One set of policies PER DEPENDENCY, created once (module level / a singleton service)' -- matlab per process ek set. `src/breaker.ts`, `src/bulkhead.ts`, `src/budget.ts` mein koi I/O nahi. Multi-replica behaviour test ya measure nahi kiya gaya.",
+  "implementation_files": [
+   "projects/18-resilience/README.md",
+   "projects/18-resilience/PLAN.md",
+   "projects/18-resilience/src/breaker.ts::CircuitBreaker",
+   "projects/18-resilience/src/budget.ts::RetryBudget"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Koi network hop nahi, per-call cost sau ns ke order mein",
+   "Shared store ke failure se breaker khud nahi toot-ta",
+   "Har replica apne network path ko judge karta hai (ek replica ka bad link sirf usko affect kare)"
+  ],
+  "disadvantages": [
+   "Fleet-level limits manually divide karni padti hain",
+   "Har replica alag se seekhta hai: zyada failed calls aur zyada probes",
+   "Autoscaling pe effective limits silently badalte hain"
+  ],
+  "common_mistakes": [
+   "`maxConcurrent` ko fleet ki limit samajhna",
+   "Sochna ki ek replica ka open breaker sabko protect karega",
+   "Shared Redis breaker ko 'free upgrade' samajhna -- har call pe network hop aur naya failure mode"
+  ],
+  "follow_up_questions": [
+   "Shared breaker banaoge toh Redis down hone par kya karoge?",
+   "Autoscaling 3 se 30 replicas: bulkhead value kaise set karoge?",
+   "Per-replica breaker kab BEHTAR hai shared se?"
+  ],
+  "concepts": [
+   "per-process-state",
+   "multi-replica",
+   "fleet-limits",
+   "not-implemented"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Per-process: fast, simple, independent failure. Shared (Redis): fleet ek saath seekhti hai aur exact global limits, lekin har call pe network latency, Redis ek naya single point of failure, aur consistency questions (do replicas ek saath half-open probe bhejein?).",
+   "failure_scenarios": "Redis-shared breaker mein Redis slow ho toh har protected call slow -- protection hi bottleneck. Per-process mein ek replica ka breaker open aur baaki closed ho sakte hain (agar sirf uska network path kharab hai) -- jo actually sahi bhi ho sakta hai.",
+   "alternatives": "Service mesh / sidecar (Envoy outlier detection, circuit breaking) jo per-host level pe kaam karta hai; client-side load balancer jo bad hosts eject kare; ya central rate limiter dependency ke saamne. Is project mein inme se kuch nahi hai.",
+   "scale_10x_100x": "10x replicas: per-replica bulkhead value 10x chhoti karni padegi, warna dependency pe 10x concurrency. Breaker discovery cost bhi 10x (har replica minimumCalls failures). 100x pe shared ya mesh-level control almost zaroori ho jaata hai.",
+   "production_improvements": "Metrics `running`/`queued`/`breaker-state` per replica aggregate karke dashboard; bulkhead limits config se (replica count ke hisaab se); agar zaroori ho toh breaker state ko advisory roop mein share karna (local decision, remote hint)."
+  }
+ },
+ {
+  "id": "RES-034",
+  "project_slug": "p18-resilience",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "What is a retry storm, and how does the RetryBudget turn 3000 attempts into 1003 in the project's simulation?",
+  "answer_hinglish": "Retry storm: dependency down hai, aur har client 3 attempts karta hai, toh dependency ko 3x traffic milta hai EXACTLY tab jab woh sabse kamzor hai. `budget.ts` ka comment yahi kehta hai, aur layers ho toh 3 x 3 x 3 = 27x. Recover hone ki koshish karti service pe yeh load usko phir gira deta hai.\n\n`RetryBudget` gRPC ka retry throttling scheme hai: bucket `maxTokens` (default 10) se full shuru. Har failed attempt -1 token, har success +`tokenRatio` (default 0.1). Retry sirf tab allowed jab tokens > maxTokens / 2, yaani > 5. Ek budget per dependency, saare calls share karte hain.\n\nSimulation (`budget.test.ts`, deterministic, koi timer nahi): 1000 calls, `maxAttempts: 3`, dependency hamesha down.\n- Bina budget: 1000 x 3 = 3000 attempts.\n- Budget ke saath: call 1 -- fail (9), retry, fail (8), retry, fail (7): 3 attempts. Call 2 -- fail (6) retry, fail (5): ab 5 half se UPAR nahi, toh give up: 2 attempts. Baaki 998 calls -- har ek fail karke token 0 tak jaata hai (never below 0), 1 attempt each. Total 3 + 2 + 998 = 1003.\n\nMatlab outage mein extra load sirf 3 attempts ka tha; baaki system ek attempt per call pe aa gaya, jaise retries off ho gaye. Aur yeh automatic hai: koi 'outage detected' flag nahi, sirf success ratio. Real sockets pe bhi same shape: 20 calls closed port pe = 23 connection attempts (`http.test.ts`).\n\nNote: budget retries ko kam karta hai, calls ko nahi -- har call phir bhi ek attempt karta hai. Calls band karna breaker ka kaam hai.",
+  "why_needed": "Retry transient errors ke liye achha hai, sustained outage ke liye zehar. Budget dono cases ko bina config change ke alag handle karta hai.",
+  "real_world_analogy": "Office mein sab log ek hi printer pe 'print' teen baar dabate hain jab woh jam hai -- jam aur bura. Rule: 'jab tak printer theek se chal raha hai tab tak dobara try karo, warna ek baar dabao aur jao.'",
+  "how_it_works": "Tokens > max/2 ka check `canRetry()`. RetryPolicy mein order: shouldRetry (non-retryable ho toh budget untouched) -> `budget.onFailure()` -> maxAttempts check -> `canRetry()` check. Success pe `budget.onSuccess()`. Token min 0, max `maxTokens` pe clamp.",
+  "in_this_project": "`src/budget.ts::RetryBudget`, `src/retry.ts::RetryPolicy`. `test/budget.test.ts` ka `simulate()` helper aur describe 'retry storm: 1000 calls to a dependency that is down'. README table: no budget 3000, with `RetryBudget()` 1003. `test/http.test.ts` 'server down (connection refused) with a shared budget' -> 23. Mutations R13 (threshold inclusive) 4, R19 (budget not checked) 4.",
+  "implementation_files": [
+   "projects/18-resilience/src/budget.ts::RetryBudget",
+   "projects/18-resilience/src/retry.ts::RetryPolicy",
+   "projects/18-resilience/test/budget.test.ts::simulate",
+   "projects/18-resilience/test/http.test.ts"
+  ],
+  "code_example": "// real, test/budget.test.ts (trimmed)\nit(\"with a budget the extra load stops after a few retries: 1003 attempts\", async () => {\n  // Call 1: fail (9), retry, fail (8), retry, fail (7) -> 3 attempts. Call 2: fail (6), retry, fail (5): no more\n  // retries (5 is not above half) -> 2 attempts. The other 998 calls: 1 attempt each. 3 + 2 + 998 = 1003.\n  const r = await simulate(new RetryBudget(), 1000, () => false);\n  expect(r).toEqual({ attempts: 1003, succeeded: 0 });\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Outage mein load ~1x pe aa jaata hai, 3x nahi",
+   "Self-healing: successes se retries wapas",
+   "Transient blips (zyada successes ke beech kuch failures) normal retry paate hain"
+  ],
+  "disadvantages": [
+   "Per process budget: N replicas = N buckets, har ek ke shuru ke retries",
+   "Calls phir bhi dependency tak jaate hain -- breaker ki zaroorat khatam nahi hoti",
+   "Recovery ke baad retries wapas aane mein dozens of successes lagte hain"
+  ],
+  "common_mistakes": [
+   "Har call ke liye naya budget banana (kabhi drain nahi hoga)",
+   "Non-retryable errors (404) se budget drain karna (R17)",
+   "Sochna ki budget breaker ka replacement hai"
+  ],
+  "follow_up_questions": [
+   "Budget aur breaker dono kyun chahiye?",
+   "tokenRatio 0.1 ka matlab kya hai success-rate ke terms mein?",
+   "Multiple layers (gateway, service, client) sab retry karein toh kya karoge?"
+  ],
+  "concepts": [
+   "retry-storm",
+   "retry-budget",
+   "grpc-throttling",
+   "load-amplification"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Budget vs fixed 'max retries per second': PLAN ke hisaab se budget chuna kyunki woh success rate ke saath adapt karta hai. Fixed rate low traffic pe bahut generous aur high traffic pe bahut strict ho sakta hai.",
+   "failure_scenarios": "Budget sirf ek process ka hai. 50 replicas outage mein = 50 x 3 initial extra attempts -- chhota, lekin zero nahi. Aur agar koi layer budget ke bina retry kare toh woh multiply karegi.",
+   "alternatives": "Retry-After honour karna (already hai), sirf ek layer pe retry (edge pe nahi), hedging nahi karna outage mein, ya server-side load shedding (`loadShedding` middleware) jo 503 dekar retries ko hint de.",
+   "scale_10x_100x": "10x traffic pe budget aur fast drain/refill hota hai (ratio-based), toh behaviour same rehta hai -- yahi design ka point hai. 100x replicas pe initial burst add hota hai; tab per-replica maxTokens chhota ya shared budget socho.",
+   "production_improvements": "Budget `available` ko gauge metric banao, give-up reason 'budget' ko counter -- outage mein yeh pehle dikhega. Layers ke beech retry policy document karo: sirf innermost client retry kare."
+  }
+ },
+ {
+  "id": "RES-035",
+  "project_slug": "p18-resilience",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "How is the breaker's count-based sliding window implemented, and why is each update O(1)?",
+  "answer_hinglish": "Window ek ring buffer hai: `ring: boolean[]` jiska size `windowSize` (default 20) hai, `true` = failure. Saath mein teen numbers: `next` (agla likhne ka index), `count` (kitne slots bhare hain, max windowSize) aur `failures` (window mein kitne true). Failure rate = `failures / count`.\n\n`record()` mein closed state ka naya outcome aata hai toh:\n1. Agar window full hai (`count === windowSize`), toh `ring[next]` sabse purana outcome hai jo ab bahar jaayega -- agar woh failure tha toh `failures--`. Warna `count++`.\n2. `ring[next] = failed`, aur failed ho toh `failures++`.\n3. `next = (next + 1) % windowSize`.\n4. Check: `count >= minimumCalls && failures / count >= threshold` -> open.\n\nHar step constant time hai -- poora array kabhi scan nahi hota, kyunki `failures` running total hai jo aane-jaane wale outcome se adjust hota hai. Isliye har call pe cost window size se independent hai.\n\nClose hone par (`transition(\"closed\")`) `ring.fill(false)`, `next`, `count`, `failures` sab 0 -- empty window, purani failures bhool jaao (mutation B10 'window not reset on close' 1 test se pakda).\n\nDhyan do: window sirf CLOSED state mein bharta hai; open/half-open mein record() pehle hi return kar deta hai. Aur 'sliding' test: windowSize 4, threshold 0.75 -- [boom, boom, ok, ok] 2/4, phir [ok, ok] se dono failures bahar 0/4, phir boom boom 2/4 closed, ek aur boom 3/4 = 75% open. Mutation B1 'old failures never leave the window' isi test se pakda gaya.",
+  "why_needed": "Breaker har call pe chalta hai, toh window update sasta hona chahiye. Ring buffer + running counter memory fixed aur time constant rakhta hai.",
+  "real_world_analogy": "Cricket mein 'last 20 balls ka strike rate': naya ball aaya toh 21st purana ball list se nikal jaata hai. Har ball pe poori list dobara nahi ginte, bas jo gaya usko ghatao aur jo aaya usko jodo.",
+  "how_it_works": "Fixed-size array + write pointer modulo size. Eviction implicit hai: overwrite se pehle purana value padh ke counter adjust. `count` alag rakha hai taaki window bharne se pehle (count < windowSize) rate sahi nikle aur `minimumCalls` check ho sake.",
+  "in_this_project": "`src/breaker.ts::record` aur fields `ring`, `next`, `count`, `failures`; `failureRate` getter metrics ke liye. README overhead table (ek Windows PC, Node 20.20.1, no-op operation): circuit breaker 229 / 247 ns per call do runs mein. PLAN: 'count-based sliding window for the breaker (last N calls, ring buffer)'.",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::record",
+   "projects/18-resilience/src/breaker.ts::ring",
+   "projects/18-resilience/test/breaker.test.ts",
+   "projects/18-resilience/bench/reference-results/2026-11-23-win32-run1.json"
+  ],
+  "code_example": "// real, src/breaker.ts record() closed-state part\nconst failed = outcome === \"failure\";\nif (this.count === this.windowSize) {\n  if (this.ring[this.next]) this.failures--; // the oldest outcome falls out of the window\n} else {\n  this.count++;\n}\nthis.ring[this.next] = failed;\nif (failed) this.failures++;\nthis.next = (this.next + 1) % this.windowSize;\nif (this.count >= this.minimumCalls && this.failures / this.count >= this.threshold) this.transition(\"open\");",
+  "code_language": "typescript",
+  "advantages": [
+   "O(1) per call, fixed memory",
+   "Simple aur testable (B1, B10 mutations pakde)",
+   "Count-based window resilience4j ka bhi default hai (PLAN)"
+  ],
+  "disadvantages": [
+   "Low traffic pe window mein ghanton purane outcomes reh sakte hain -- time-based window implement nahi hai",
+   "Slow calls ka alag rate nahi (README NOT implemented)"
+  ],
+  "common_mistakes": [
+   "Har call pe array scan karke failures ginna",
+   "Window full hone se pehle `windowSize` se divide karna (rate galat kam dikhega)",
+   "Close pe window reset na karna -- purani failures turant reopen kar dengi"
+  ],
+  "follow_up_questions": [
+   "Time-based window kaise banaoge?",
+   "minimumCalls > windowSize kyun reject hota hai?",
+   "Window open state mein kyun nahi bharta?"
+  ],
+  "concepts": [
+   "ring-buffer",
+   "sliding-window",
+   "circuit-breaker",
+   "o1-update"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-036",
+  "project_slug": "p18-resilience",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "How does the breaker go from open to half-open without a timer?",
+  "answer_hinglish": "Lazily: koi `setTimeout` nahi chalta. Breaker sirf `openedAt` (open hone ka time) yaad rakhta hai. Jab bhi koi breaker ko 'dekhta' hai -- `execute()` ya `state` getter -- `refresh()` chalta hai: agar state open hai aur `now() - openedAt >= openMs`, toh `transition(\"half-open\")`. Matlab open->half-open ka transition agle call pe hota hai, ghadi pe nahi.\n\nKyun? PLAN.md ka decision: 'Nothing runs in the background, and an idle breaker costs nothing.' Timer approach mein har breaker ka ek timer hota jo process ko zinda rakh sakta hai (tests mein 'timer left' problems), cleanup karna padta, aur jis breaker pe koi traffic hi nahi uske liye bhi kaam hota. Lazy check ek subtraction hai.\n\nIska ek side effect: open state mein `retryAfterMs` bhi isi se nikalta hai -- `Math.max(0, openedAt + openMs - now())`. Test: open hone ke 400 ms baad call karo (openMs 1000) toh `retryAfterMs` 600 milta hai, aur operation 0 baar call hota hai.\n\nTest 'after openMs it is half-open (checked lazily, no timer)': 999 ms advance -> abhi open; 1 ms aur -> half-open, aur `onStateChange` ko `{ from: \"open\", to: \"half-open\" }` milta hai. Time test hook `now` se control hota hai, fake timers ki zaroorat nahi.\n\nEk baat yaad rakho: `state` getter read karna bhi transition (aur event) trigger kar sakta hai -- yeh pure read nahi hai.",
+  "why_needed": "Background timers resource leak, test flakiness aur cleanup bugs laate hain. Lazy evaluation same behaviour deta hai bina in problems ke.",
+  "real_world_analogy": "Parking meter jo khud bell nahi bajata; jab warden aata hai tab dekhta hai 'time khatam hua kya'. Koi nahi aaya toh kuch hone ki zaroorat bhi nahi.",
+  "how_it_works": "`openedAt = now()` `transition(\"open\")` mein set hota hai. `refresh()`: `if (current === \"open\" && now() - openedAt >= openMs) transition(\"half-open\")`. `>=` hai, isliye exactly openMs pe half-open. Probe failure pe naya `openedAt` (B15 'reopen keeps the old open time' 4 tests in the final run).",
+  "in_this_project": "`src/breaker.ts::refresh`, `execute` aur `state` getter dono isko call karte hain. `now` option ek test hook hai (default `Date.now`). Test 'defaults: window 20, minimum 10, 50%, 30 s' mein 29 999 ms pe open, 30 000 pe half-open. Mutation B5 ('never goes half-open') final run mein 14 tests ne pakda (stage 2 mein 12; hanging-probe aur throwing-isFailure tests bhi ab ise pakadte hain).",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::refresh",
+   "projects/18-resilience/test/breaker.test.ts",
+   "projects/18-resilience/PLAN.md"
+  ],
+  "code_example": "// real, src/breaker.ts\nprivate refresh(): void {\n  if (this.current === \"open\" && this.now() - this.openedAt >= this.openMs) this.transition(\"half-open\");\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Koi timer leak ya cleanup nahi",
+   "Idle breaker zero cost",
+   "Time inject karke deterministic tests"
+  ],
+  "disadvantages": [
+   "Half-open transition (aur uska event) sirf traffic aane par dikhta hai -- dashboard pe 'open' der tak dikh sakta hai",
+   "`state` getter side effect karta hai"
+  ],
+  "common_mistakes": [
+   "Har open pe `setTimeout` lagana aur clear bhool jaana",
+   "`>` vs `>=` ka off-by-one",
+   "Probe failure pe `openedAt` update na karna"
+  ],
+  "follow_up_questions": [
+   "Agar koi traffic hi na aaye toh breaker kab half-open hoga?",
+   "retryAfterMs client ko Retry-After header mein kaise jaata hai?",
+   "Getter mein side effect theek hai kya?"
+  ],
+  "concepts": [
+   "lazy-evaluation",
+   "half-open",
+   "no-timers",
+   "test-hooks"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-037",
+  "project_slug": "p18-resilience",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "Why does RetryBudget count tokens in thousandths, and why does the failing attempt pay before the canRetry() check?",
+  "answer_hinglish": "Do alag decisions hain.\n\n1. Thousandths: `SCALE = 1000`. `maxTokens` 10 andar 10000 hai, `tokenRatio` 0.1 andar 100. Saari arithmetic integers mein, toh floating point drift nahi. Float mein 50 x 0.1 = 5.000000000000002 aata hai (test comment yahi likhta hai), aur threshold check `tokens > max / 2` hai -- 5.000000000000002 > 5 true ho jaata, jabki exactly 5 pe retry band hona chahiye. Integers mein 50 x 100 = 5000, exact. gRPC bhi thousandths use karta hai. Side effect: `tokenRatio` max 3 decimals; 0.0001 round hoke 0 hota hai aur constructor `RangeError` deta hai (tested).\n\n2. Failure pehle charge: RetryPolicy mein order hai `budget.onFailure()` -> `maxAttempts` check -> `budget.canRetry()`. Matlab jo attempt abhi fail hua uska token pehle katega, phir decide hoga retry karna hai ya nahi. Consequence: retry ke liye tokens > threshold + 1 hone chahiye jab failure aaye. README: 'right after canRetry() turns true again, the next single failure is still not retried.'\n\nKyun yeh order? Failure ek real signal hai dependency ki health ka -- usko account na karna galat hoga. Aur outage simulation ka 1003 isi order se aata hai: call 2 pe fail (6) -> retry, fail (5) -> stop.\n\nTests: '50 x 0.1 is exactly 5', '1000 x 0.001 is exactly 1', aur recovery test jisme 5.1 tokens pe blip retry NAHI hota (5.1 - 1 = 4.1), lekin 6.2 pe hota hai (5.2 > 5).",
+  "why_needed": "Threshold-based logic floats ke saath edge pe galat decision leta hai. Aur budget ka order decide karta hai ki outage mein exactly kitne extra attempts jaate hain.",
+  "real_world_analogy": "Paise ko paise mein nahi, paise mein ginte ho (Rs 10.10 ko 1010 paise) taaki rounding kabhi galat total na de. Aur bill pehle katta hai, phir dekhte ho balance mein agla order ka paisa hai ya nahi.",
+  "how_it_works": "`this.max = Math.round(maxTokens * SCALE)`, `this.ratio = Math.round(tokenRatio * SCALE)`. `onSuccess`: `min(max, tokens + ratio)`. `onFailure`: `max(0, tokens - SCALE)`. `canRetry`: `tokens > max / 2` (strict). `available` getter `tokens / SCALE` return karta hai.",
+  "in_this_project": "`src/budget.ts::SCALE`, `RetryBudget`; `src/retry.ts` mein order. `test/budget.test.ts` 'no drift' aur 'retries come back by themselves once the dependency recovers'. Mutations: R13 (threshold inclusive) 4, R14 (refill not capped) 1, R15 (goes negative) 2.",
+  "implementation_files": [
+   "projects/18-resilience/src/budget.ts::SCALE",
+   "projects/18-resilience/src/budget.ts::canRetry",
+   "projects/18-resilience/src/retry.ts::RetryPolicy",
+   "projects/18-resilience/test/budget.test.ts"
+  ],
+  "code_example": "// real, src/budget.ts (trimmed)\nconst SCALE = 1000;\nthis.max = Math.round(maxTokens * SCALE);\nthis.ratio = Math.round(tokenRatio * SCALE);\nif (this.ratio === 0) throw new RangeError(\"tokenRatio must be at least 0.001\");\n\ncanRetry(): boolean { return this.tokens > this.max / 2; }\nonSuccess(): void { this.tokens = Math.min(this.max, this.tokens + this.ratio); }\nonFailure(): void { this.tokens = Math.max(0, this.tokens - SCALE); }\n\n// real, src/retry.ts: the order\no.budget?.onFailure();\nif (attempt >= this.maxAttempts) giveUp(\"attempts\");\nif (o.budget !== undefined && !o.budget.canRetry()) giveUp(\"budget\");",
+  "code_language": "typescript",
+  "advantages": [
+   "Exact arithmetic, threshold edge pe bhi deterministic",
+   "gRPC ke behaviour se match",
+   "Failure ka signal kabhi miss nahi hota"
+  ],
+  "disadvantages": [
+   "tokenRatio 3 decimals tak limited",
+   "Recovery ke baad retries thoda der se wapas aate hain (extra 1 token ki wajah se)"
+  ],
+  "common_mistakes": [
+   "Budget ko float mein rakhna aur `>=` use karna",
+   "canRetry pehle check karna aur failure baad mein charge -- extra retry milega",
+   "Non-retryable error ka bhi token kaatna"
+  ],
+  "follow_up_questions": [
+   "Agar order ulta karo (check pehle, charge baad mein) toh 1000-call simulation mein kitne attempts honge?",
+   "Max 0 ya negative tokenRatio kyun reject?",
+   "BigInt ki zaroorat kabhi padegi?"
+  ],
+  "concepts": [
+   "fixed-point-arithmetic",
+   "retry-budget",
+   "float-drift",
+   "ordering"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Integer fixed-point vs float: integers exact hain lekin precision fix (0.001). Is use case ke liye kaafi hai. Charge-before-check conservative hai: recovery pe retries thoda late, lekin outage mein extra load kam.",
+   "failure_scenarios": "Agar koi refactor charge ko check ke baad le jaaye toh har call ko ek extra retry milega threshold ke aas paas -- simulation ka 1003 badal jaayega aur test fail hoga (yahi us test ka value hai).",
+   "alternatives": "Token bucket by time (rate-based), AIMD style adaptive retry, ya client-side 'retry ratio' (jaise kuch libraries: retries <= 10% of requests). Budget success-ratio based hai, time-based nahi.",
+   "scale_10x_100x": "Scale se arithmetic nahi badalta; per-call do integer ops. Zyada traffic pe bucket fast drain/refill hota hai, behaviour ratio-based rehta hai.",
+   "production_improvements": "`available` ko gauge ke roop mein export karo; `tokenRatio` ko dependency ke normal error rate ke hisaab se tune karo (0.1 ka matlab roughly: har 10 successes ek failure 'afford' ho sakta hai)."
+  }
+ },
+ {
+  "id": "RES-038",
+  "project_slug": "p18-resilience",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "The breaker's isFailure returns false for a 404. Why does the project count that call as a SUCCESS instead of ignoring it?",
+  "answer_hinglish": "`isFailure(error)` ka sawaal hai: 'kya yeh error batata hai ki dependency UNHEALTHY hai?' 404, validation error -- dependency ne sahi jawab diya, bas jawab 'nahi mila' tha. Toh woh health window mein SUCCESS gina jaata hai: `isFailure(error) ? \"failure\" : \"success\"`. Error phir bhi caller ko rethrow hota hai -- breaker sirf apni bookkeeping badalta hai, result nahi.\n\nIgnore kyun nahi? PLAN.md ka reason: 'a service answering 404 to everything is healthy, and ignoring those calls would let a few 5xx decide alone.' Example: 100 calls, 95 ka jawab 404, 5 ka 503. Agar 404 ignore karo toh window mein sirf 5 entries, sab failure -- 100% failure rate (minimumCalls poora hone par) aur breaker open, jabki service 95% time sahi jawab de rahi thi. Success ginne se rate 5% aata hai, jo sach hai.\n\nDefault `isFailure` har error ko failure maanta hai. Real use mein `isFailure: isRetryableHttp` do -- woh network errors, timeouts, 408, 429, 5xx (501 chhod ke) ko failure, baaki 4xx ko non-failure maanta hai. README usage example mein yahi hai: 'a 404 is not \"down\"'.\n\nHalf-open mein bhi same: non-failure error ek successful probe hai (test 'an error that is not a failure, in half-open, counts as a successful probe' -> closed).\n\nEk edge jo interview bank likhte waqt mila (README F3): agar user ka `isFailure` khud THROW kare, toh pehle `record()` chalta hi nahi tha -- half-open probe apna slot kabhi release nahi karta aur breaker half-open mein atak jaata, har call reject. Ab `classify()` throwing isFailure ko failure maanta hai; test 'an isFailure that throws counts as a failure; in half-open it does not leave the breaker stuck', mutation F3.\n\nMutations: B12 'isFailure ignored' 3 tests, B13 'non-failures ignored instead of counted as success' 1 test -- B13 exactly yahi design decision check karta hai.",
+  "why_needed": "Galat classification se breaker ya toh healthy service ko kaat deta hai (false open) ya ek chhote sample se decide karta hai. Dono production incidents hain.",
+  "real_world_analogy": "Doctor se 'kya aapke paas yeh dawai hai?' poocha, jawab 'nahi'. Doctor bimaar nahi hai -- usne sahi jawab diya. Usko 'unavailable' list mein daalna galat hoga.",
+  "how_it_works": "Catch block mein: caller aborted -> 'ignored'; warna `classify(error)`: `isFailure(error)` true -> 'failure', false -> 'success', throw kare -> 'failure'. 'success' window mein `false` likhta hai, `failures` nahi badhta, `count` badhta hai.",
+  "in_this_project": "`src/breaker.ts` `execute` ka catch block aur option `isFailure`. `src/http.ts::isRetryableHttp` doosra role bhi nibhata hai. Tests: 'errors that are not failures count as successes (the dependency answered)' -- 10 x 404, state closed, failureRate 0; `test/http.test.ts` '404s do not open a breaker that uses isRetryableHttp as isFailure' -- 10 real 404s, closed, server ne 10 hits dekhe.",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::isFailure",
+   "projects/18-resilience/src/http.ts::isRetryableHttp",
+   "projects/18-resilience/test/breaker.test.ts",
+   "projects/18-resilience/PLAN.md",
+   "projects/18-resilience/src/breaker.ts::classify"
+  ],
+  "code_example": "// real, src/breaker.ts execute() catch\n} catch (error) {\n  this.record(generation, signal?.aborted ? \"ignored\" : this.classify(error));\n  throw error;\n}\n\n// a user isFailure that throws counts the call as a failure (fix F3)\nprivate classify(error: unknown): \"failure\" | \"success\" {\n  try {\n    return (this.options.isFailure ?? (() => true))(error) ? \"failure\" : \"success\";\n  } catch {\n    return \"failure\";\n  }\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Failure rate dependency ki asli health dikhata hai",
+   "Ek function (`isRetryableHttp`) retry aur breaker dono ke liye consistent",
+   "Error caller tak unchanged jaata hai"
+  ],
+  "disadvantages": [
+   "Default 'every error' naive hai -- user ko `isFailure` dena yaad rakhna padta hai",
+   "Business errors jo actually dependency bug hain (galat 400) bhi healthy gine jaayenge"
+  ],
+  "common_mistakes": [
+   "Default isFailure ke saath breaker lagana aur 404s se open ho jaana",
+   "Non-failures ko ignore karna (B13)",
+   "Breaker ka error swallow kar dena isFailure false hone par"
+  ],
+  "follow_up_questions": [
+   "Agar dependency har request pe 400 de rahi ho (uska bug) toh breaker kya karega?",
+   "429 ko failure maanna chahiye?",
+   "Kya slow-but-successful calls failure hone chahiye?"
+  ],
+  "concepts": [
+   "failure-classification",
+   "circuit-breaker",
+   "isFailure",
+   "health-signal"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-039",
+  "project_slug": "p18-resilience",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "The breaker is half-open and its single probe never finishes. What happens, and how does the project tell you to prevent it?",
+  "answer_hinglish": "Breaker hamesha ke liye half-open mein phas jaata hai. Probe ne slot le liya (`probesInFlight` 1), `halfOpenMaxCalls` 1 hai, toh har naya call `BrokenCircuitError { state: \"half-open\", retryAfterMs: 0 }` paata hai. Probe ka result kabhi nahi aata, toh `record()` kabhi nahi chalta: na close, na reopen, aur koi timer bhi nahi jo bachaye (transitions lazy hain). Dependency theek ho jaaye tab bhi traffic band rahega.\n\nREADME seedha kehta hai: 'A probe that never finishes keeps its slot forever: put a TimeoutPolicy inside the breaker.' Recommended order retry -> breaker -> bulkhead -> timeout mein timeout breaker ke ANDAR hai. Toh hanging probe ko TimeoutPolicy abort karta hai aur `TimeoutError` se reject karta hai; breaker usko failure maanta hai (isRetryableHttp TimeoutError ko retryable/failure kehta hai), `transition(\"open\")`, naya openMs, aur kuch der baad naya probe.\n\nNote: caller ka abort bhi slot free karta hai -- agar probe ka caller (jaise HTTP client) disconnect kare, toh outcome 'ignored', `probesInFlight--`, slot free, koi decision nahi. Lekin yeh bharosa karne layak nahi: background job ka caller kabhi abort nahi karega.\n\nYahi baat slow calls ke liye bhi: breaker mein slow-call rate nahi hai (README NOT implemented), toh slow calls ko failure banane ka tareeka bhi andar wala timeout hi hai.",
+  "why_needed": "Breaker ka poora recovery path probe ke result pe tika hai. Result na aaye toh recovery kabhi nahi hoti -- silent, permanent outage.",
+  "real_world_analogy": "Toll booth pe ek test car bheji 'bridge theek hai kya?' aur woh kabhi wapas nahi aayi na koi khabar. Jab tak koi deadline nahi, booth hamesha band rahega.",
+  "how_it_works": "Half-open limit check `probesInFlight + probeSuccesses >= halfOpenMaxCalls`. Slot sirf `record()` mein free hota hai (success/failure/ignored). Andar ka TimeoutPolicy `Promise.race` se ms ke baad reject karta hai aur operation ka signal abort karta hai, toh record() guaranteed chalta hai.",
+  "in_this_project": "README CircuitBreaker section ki last bullet aur 'Composition: why this order'. `src/wrap.ts` ka comment order samjhaata hai. `src/timeout.ts::TimeoutPolicy`. Ab iska dedicated test hai (pehle sirf reasoning thi; review ke baad add hua): `test/wrap.test.ts` 'a half-open probe that hangs blocks the breaker forever; a timeout INSIDE the breaker turns it into a failure' -- bina timeout ke state half-open atka rehta hai, timeout andar ho toh open (naya openMs). Related: 'a probe whose caller aborted frees its slot without deciding anything' aur mutation B14 ('probe slot never freed') 1 test.",
+  "implementation_files": [
+   "projects/18-resilience/README.md",
+   "projects/18-resilience/src/breaker.ts::probesInFlight",
+   "projects/18-resilience/src/timeout.ts::TimeoutPolicy",
+   "projects/18-resilience/src/wrap.ts::wrap",
+   "projects/18-resilience/test/wrap.test.ts"
+  ],
+  "code_example": "// README usage: the timeout is the innermost policy, inside the breaker\nconst sms = wrap(\n  new RetryPolicy({ name: \"sms-retry\", maxAttempts: 3, budget: new RetryBudget(), shouldRetry: isRetryableHttp }),\n  new CircuitBreaker({ name: \"sms-breaker\", isFailure: isRetryableHttp }),\n  new Bulkhead({ name: \"sms-pool\", maxConcurrent: 20, maxQueue: 50 }),\n  new TimeoutPolicy({ name: \"sms-timeout\", ms: 2000 }), // per attempt\n);",
+  "code_language": "typescript",
+  "advantages": [
+   "Ek simple rule (timeout andar) se poora failure mode band",
+   "Timeout slow calls ko bhi failure banata hai -- slow-call rate ki kami poori"
+  ],
+  "disadvantages": [
+   "Library khud enforce nahi karti; galat order mein user phas sakta hai",
+   "Breaker ka khud ka probe timeout nahi hai"
+  ],
+  "common_mistakes": [
+   "Breaker bina timeout ke lagana",
+   "Timeout ko breaker ke BAHAR rakhna -- breaker ka probe slot phir bhi hold hoga",
+   "Operation ko signal pass na karna -- timeout reject karega lekin socket khula rahega"
+  ],
+  "follow_up_questions": [
+   "Breaker mein built-in probe timeout add karna chahiye kya?",
+   "Timeout ki value openMs se kaise relate karti hai?",
+   "Probe hang ka test (wrap.test.ts) kya assert karta hai?"
+  ],
+  "concepts": [
+   "half-open",
+   "hanging-probe",
+   "timeouts",
+   "composition-order"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-040",
+  "project_slug": "p18-resilience",
+  "category": "Failure Scenarios",
+  "difficulty": "Beginner",
+  "question": "A dependency starts hanging and six requests hit it at once through a bulkhead of 2. What do the six callers see?",
+  "answer_hinglish": "Do callers ko `TimeoutError` milta hai aur chaar ko turant `BulkheadRejectedError`. Yahi `test/http.test.ts` ka real test hai: ek loopback `node:http` server jo kabhi jawab nahi deta, `Bulkhead({ maxConcurrent: 2 })` (default `maxQueue` 0) aur har call ke andar `TimeoutPolicy({ ms: 1500 })` (pehle 300 ms tha; 100% CPU par dono requests server tak time par nahi pahunchti thin, toh widen kiya). 6 calls ek saath. Results: 4 `BulkheadRejectedError`, 2 `TimeoutError`, aur server ne sirf 2 hits dekhe.\n\nKyun yeh achha hai? Bina bulkhead ke saare 6 (ya 600) requests socket khol ke 1500 ms (ya poora default timeout) tak latakte. Process ke sockets, memory, aur event loop pe kaam badhta. Bulkhead ke saath hanging dependency 'sirf apne slots' kha sakti hai. Rejected callers ko turant pata chal jaata hai, aur Express adapter usko 503 + `Retry-After: 1` mein badal deta hai (`mapResilienceError`), toh client ko clear signal milta hai.\n\nTimeout bhi zaroori hai: bina timeout ke woh 2 slots hamesha ke liye pakde rahenge aur bulkhead permanently full -- har naya call reject. Isliye timeout bulkhead ke andar.\n\nAgar `maxQueue` > 0 hota, toh extra calls queue mein wait karte aur slot free hone par (timeout ke baad) chalte -- lekin unka bhi wahi hashr hota agar dependency abhi bhi hang hai.",
+  "why_needed": "Ek dependency ka hang poore service ka outage na bane -- failure ko contain karna bulkhead ka poora point hai.",
+  "real_world_analogy": "Ek counter wala chai stall jahan 2 log hi line mein khade ho sakte hain. Chaiwala gayab hai; 2 log wait karke thak ke jaate hain, baaki 4 ko door se hi 'abhi nahi' sunai deta hai -- woh kahin aur chale jaate hain.",
+  "how_it_works": "Pehle 2 calls `active++`, baaki 4 ke liye `active` 2 hai aur queue length 0 = maxQueue, toh reject branch. 1500 ms baad TimeoutPolicy operation ka signal abort karta hai (fetch cancel, server connection close dekhta hai) aur reject karta hai; bulkhead ka `finally` slot release karta hai.",
+  "in_this_project": "Test 'bulkhead: a server that hangs can hold at most 2 sockets; the rest are refused at once' `test/http.test.ts` mein. README 'What each policy does' -> Bulkhead: 'tested over HTTP: 6 calls to a hanging server, 2 reach it and time out, 4 are refused at once'. Adapter mapping `src/adapters/http-status.ts::mapResilienceError`.",
+  "implementation_files": [
+   "projects/18-resilience/test/http.test.ts",
+   "projects/18-resilience/src/bulkhead.ts::Bulkhead",
+   "projects/18-resilience/src/adapters/http-status.ts::mapResilienceError"
+  ],
+  "code_example": "// real, test/http.test.ts (trimmed)\nconst bulkhead = new Bulkhead({ maxConcurrent: 2 });\nconst timeout = new TimeoutPolicy({ ms: 1500 }); // long enough for both requests to reach the server under load\nconst calls = Array.from({ length: 6 }, () =>\n  bulkhead.execute((sig) => timeout.execute((t) => getJson(s.url, t), sig)).catch((e: unknown) => e),\n);\nconst results = await Promise.all(calls);\nexpect(results.filter((e) => e instanceof BulkheadRejectedError)).toHaveLength(4);\nexpect(results.filter((e) => e instanceof TimeoutError)).toHaveLength(2);\nexpect(s.hits()).toBe(2);",
+  "code_language": "typescript",
+  "advantages": [
+   "Fail fast: 4 callers ko turant jawab",
+   "Hanging dependency ka blast radius 2 sockets",
+   "Real HTTP pe tested, mock pe nahi"
+  ],
+  "disadvantages": [
+   "Rejected requests fail hote hain bhale hi dependency jaldi theek ho jaaye",
+   "Sahi maxConcurrent ka pata load test se hi chalta hai"
+  ],
+  "common_mistakes": [
+   "Bulkhead ke andar timeout na lagana -- slots permanently pakde",
+   "maxQueue bahut bada rakhna -- queue hi naya pile-up ban jaata hai",
+   "Rejection ko 500 bana dena, 503 + Retry-After ki jagah"
+  ],
+  "follow_up_questions": [
+   "Queue add karoge toh is test ka result kaise badlega?",
+   "Rejected calls ko retry karna chahiye?",
+   "Breaker yahan kab kaam aayega?"
+  ],
+  "concepts": [
+   "bulkhead",
+   "fail-fast",
+   "blast-radius",
+   "timeouts"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-041",
+  "project_slug": "p18-resilience",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "A client disconnects while its call is running through the breaker. Why is that call not recorded, and what would go wrong if it were?",
+  "answer_hinglish": "Kyunki caller ka abort dependency ke baare mein kuch nahi batata. Code: catch mein `signal?.aborted ? \"ignored\" : ...`. Ignored outcome closed state mein window ko chhuta hi nahi, aur half-open mein sirf `probesInFlight--` karta hai -- slot free, koi decision nahi.\n\nAgar record hota toh kya bigadta? Socho ek mobile app ke users network badalne pe disconnect karte hain, ya load balancer ka idle timeout. Har disconnect `requestSignal` ko abort karta hai, aur operation (fetch) `AbortError` ke saath fail hota hai. Agar yeh failures gine jaate, toh 'clients jaldi chale gaye' wala pattern breaker ko open kar deta -- healthy dependency kaat di jaati, aur BAAKI users ko 503 milta. Ek client-side problem server-side outage ban jaata. Half-open mein aur bura: ek aborted probe breaker ko phir open kar deta.\n\nDoosri taraf, ek aborted call ko success ginna bhi galat hoga -- hume pata hi nahi dependency ne kya kiya. Isliye teesra outcome 'ignored'.\n\nAlready-aborted caller ka case alag hai: `signal?.throwIfAborted()` execute ki pehli line hai, operation chalta hi nahi aur kuch record nahi hota (test 'an already-aborted caller: not called, not recorded', mutation B18).\n\nTests: 'a call whose caller aborted is not recorded' -- 10 aborted calls, state closed, failureRate 0; 'a probe whose caller aborted frees its slot without deciding anything' -- state half-open rehti hai, agla call probe ban ke close karta hai. Mutation B11 ('calls of aborted callers recorded') 2 tests.",
+  "why_needed": "Breaker ka signal saaf hona chahiye. Client behaviour (disconnects) ko dependency health samajhna false opens ka classic source hai.",
+  "real_world_analogy": "Restaurant ka customer order dekar chala gaya; kitchen ne khana banaya ya nahi, pata nahi. Kitchen ko 'fail' mark karna galat, 'pass' mark karna bhi galat -- us order ko rating mein ginte hi nahi.",
+  "how_it_works": "Teen-valued outcome: success / failure / ignored. Aborted check sirf catch path mein hai: agar operation abort ke bawajood SUCCESS de de, toh woh success record hota hai (dependency ne sach mein jawab diya). Generation check pehle hota hai, toh stale aborted calls kuch nahi karte.",
+  "in_this_project": "`src/breaker.ts` `execute` catch aur `record` ka 'ignored' branch. Abort source production mein `src/adapters/express.ts::requestSignal` ya Nest ka `@RequestSignal()` hota hai. Tests `test/breaker.test.ts` mein. README: 'A call whose caller aborted is not recorded at all; an aborted probe frees its slot without deciding anything.'",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::record",
+   "projects/18-resilience/test/breaker.test.ts",
+   "projects/18-resilience/src/adapters/express.ts::requestSignal"
+  ],
+  "code_example": "// real, src/breaker.ts record() (trimmed)\nif (this.current === \"half-open\") {\n  this.probesInFlight--;                       // an ignored probe only frees its slot\n  if (outcome === \"failure\") this.transition(\"open\");\n  else if (outcome === \"success\" && ++this.probeSuccesses >= this.halfOpenMaxCalls) this.transition(\"closed\");\n  return;\n}\nif (this.current !== \"closed\" || outcome === \"ignored\") return;",
+  "code_language": "typescript",
+  "advantages": [
+   "Client disconnects false opens nahi karte",
+   "Aborted probe deadlock nahi banata",
+   "Success-despite-abort sahi information ke roop mein record hota hai"
+  ],
+  "disadvantages": [
+   "Agar dependency ki slowness hi disconnects ka kaaran hai (client thak ke gaya), woh signal kho jaata hai -- isliye andar timeout chahiye jo caller se chhota ho",
+   "Teen-valued outcome code ko thoda complex banata hai"
+  ],
+  "common_mistakes": [
+   "Har error ko failure ginna, AbortError bhi",
+   "Aborted probe pe slot free na karna",
+   "Sochna ki caller ka abort aur TimeoutPolicy ka abort same hain -- timeout ka abort andar ka signal hai, caller ka nahi, aur woh failure gina jaata hai"
+  ],
+  "follow_up_questions": [
+   "TimeoutPolicy ka abort breaker ke liye 'ignored' kyun nahi hai?",
+   "Agar saare clients 1 s pe disconnect karein aur dependency 2 s leti ho toh breaker kya dekhega?",
+   "Retry mein bhi aborted failures budget pe kyun nahi jaate?"
+  ],
+  "concepts": [
+   "cancellation",
+   "failure-classification",
+   "circuit-breaker",
+   "false-positives"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Ignore karna dependency ki slowness ka ek signal kho deta hai. Trade-off isliye theek hai kyunki slowness ko capture karne ka sahi tool andar ka TimeoutPolicy hai, jiska timeout caller ke patience se chhota hona chahiye.",
+   "failure_scenarios": "Breaker ke andar timeout na ho aur dependency itni slow ho ki saare clients usse pehle chale jaayein: har call 'ignored', breaker kabhi open nahi hota, aur dependency pe load jaata rehta hai. Silent failure.",
+   "alternatives": "Aborted calls ko alag 'slow' bucket mein ginna, ya slow-call rate threshold (resilience4j style) -- dono is project mein implement nahi hain.",
+   "scale_10x_100x": "Zyada traffic pe disconnect rate absolute terms mein badhta hai; agar recorded hota toh false opens 10x-100x zyada common hote. Ignore rule scale pe aur valuable hai.",
+   "production_improvements": "Ignored calls ka counter metric (abhi nahi hai) aur caller-abort vs timeout ka ratio dashboard pe -- isse pata chalega timeouts sahi tune hain ya nahi."
+  }
+ },
+ {
+  "id": "RES-042",
+  "project_slug": "p18-resilience",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "A dependency was down long enough to drain the retry budget, and now it has recovered. How quickly do retries come back, and how do the breaker and budget interact during recovery?",
+  "answer_hinglish": "Budget ke numbers README mein measured hain (deterministic simulation, `budget.test.ts`): 100 failing calls ne bucket 0 kar diya. Recovery ke baad 51 successes = 5.1 tokens, aur `canRetry()` true ho jaata hai (5.1 > 5). LEKIN agla single failure abhi bhi retry nahi hota: failing attempt pehle token kaat-ta hai, 5.1 - 1 = 4.1, check fail. Total 72 successes (51 + 21 = 6.2 tokens) ke baad ek blip retry hota hai: 6.2 - 1 = 5.2 > 5. Toh default settings pe retries 'wapas' aane ke liye ~72 successful calls chahiye.\n\nBreaker ke saath interaction (recommended order retry -> breaker -> ...): jab breaker open hai, calls `BrokenCircuitError` paate hain. `isRetryableHttp` usko non-retryable kehta hai, aur non-retryable errors budget ko chhoote nahi -- toh open breaker na budget drain karta hai na refill. Refill sirf real successes se hota hai, jo breaker close hone ke baad aate hain. Sequence: dependency down -> retries budget drain karte hain, failures window bharte hain -> breaker open (calls band) -> openMs baad probe -> success -> closed, empty window -> successes budget refill karte hain -> ~72 successes baad retries normal.\n\nKya yeh slow hai? Intentionally conservative hai: recovery ke turant baad dependency fragile hoti hai, aur early retries usko phir gira sakte hain. Low-traffic service pe 72 calls minutes le sakte hain -- tab tak blips retry nahi honge. Agar yeh unacceptable ho toh `tokenRatio` badhao (faster refill) -- trade-off outage mein thoda zyada extra load.\n\nYeh poora interaction ek integrated test mein nahi hai; budget recovery aur breaker recovery alag alag tested hain.",
+  "why_needed": "Senior interview mein 'outage ke baad kya hota hai' utna hi important hai jitna 'outage mein kya hota hai'. Recovery dynamics galat ho toh service oscillate karti hai.",
+  "real_world_analogy": "Injury ke baad cricketer: fitness test pass (probe) karke team mein wapas, lekin pehle kuch matches mein usko full overs nahi dete jab tak form (tokens) wapas na aaye.",
+  "how_it_works": "Budget: success +0.1, failure -1, retry only if > 5 AFTER charging the failure. Breaker: probe success -> closed with empty window. Retry ke andar breaker hai, toh BrokenCircuitError retry loop tak aata hai aur `shouldRetry: isRetryableHttp` usko 'not-retryable' bana deta hai -- budget untouched (`retry.ts` mein shouldRetry check onFailure se pehle).",
+  "in_this_project": "`test/budget.test.ts` 'retries come back by themselves once the dependency recovers' (51, blip not retried, +21 -> 6.2, blip retried). README: 'After recovery, 51 successes make canRetry() true again, and 72 in total make a single failure retried again.' `src/http.ts::isRetryableHttp` breaker rejection ko false deta hai; `test/wrap.test.ts` 'an open breaker inside retry (with isRetryableHttp) stops the retry at once'.",
+  "implementation_files": [
+   "projects/18-resilience/test/budget.test.ts",
+   "projects/18-resilience/src/budget.ts::RetryBudget",
+   "projects/18-resilience/src/http.ts::isRetryableHttp",
+   "projects/18-resilience/src/retry.ts::RetryPolicy"
+  ],
+  "code_example": "// real, test/budget.test.ts (trimmed)\nawait simulate(budget, 100, () => false); // drained to 0\nexpect(budget.canRetry()).toBe(false);\nawait simulate(budget, 51, () => true); // 51 successes x 0.1 = 5.1 tokens\nexpect(budget.canRetry()).toBe(true);\nconst policy = new RetryPolicy({ budget, sleep: async () => {} });\nawait expect(policy.execute(blipOnce())).rejects.toThrow(\"blip\"); // 5.1 - 1 = 4.1: not retried\nawait simulate(budget, 21, () => true);\nexpect(budget.available).toBeCloseTo(6.2, 10);\nexpect(await policy.execute(blipOnce())).toBe(\"ok\"); // 6.2 - 1 = 5.2 > 5: retried",
+  "code_language": "typescript",
+  "advantages": [
+   "Recovery ke baad gradual ramp: fragile dependency pe extra load nahi",
+   "Open breaker budget ko distort nahi karta (non-retryable)",
+   "Sab automatic, koi manual reset nahi"
+  ],
+  "disadvantages": [
+   "Low traffic pe retries ghanton tak 'off' reh sakte hain",
+   "Per-process: har replica alag refill hota hai",
+   "Integrated breaker+budget recovery ka test nahi hai"
+  ],
+  "common_mistakes": [
+   "Breaker ko retry ke bahar rakhna -- tab budget aur breaker dono ka signal bigadta hai",
+   "Sochna ki canRetry() true = agla failure retry hoga",
+   "Recovery ke baad budget manually reset karna -- storm wapas"
+  ],
+  "follow_up_questions": [
+   "tokenRatio 0.5 karo toh recovery aur outage dono kaise badlenge?",
+   "Budget ko time ke saath bhi refill karna chahiye?",
+   "Breaker close hote hi traffic spike kaise handle karoge?"
+  ],
+  "concepts": [
+   "recovery-dynamics",
+   "retry-budget",
+   "circuit-breaker",
+   "composition"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Conservative recovery (charge-before-check, slow refill) vs fast recovery. Is project ne conservative chuna. Faster refill ka cost: agla outage start hone par zyada retries jaayenge pehle budget drain ho.",
+   "failure_scenarios": "Flapping dependency (30 s up, 30 s down): budget kabhi refill hi nahi hota, retries permanently off -- jo shayad sahi hai. Breaker open/close oscillate karega; har close ke baad window empty hai toh minimumCalls failures ke baad phir open.",
+   "alternatives": "Time-based refill (tokens per second), budget reset on breaker close, ya adaptive concurrency (Netflix concurrency-limits style). Inme se kuch implement nahi hai.",
+   "scale_10x_100x": "10x traffic: 72 successes jaldi aate hain, recovery fast. 100x replicas: har replica ko apne 72 chahiye, lekin har ek ko traffic ka 1/100 milta hai -- recovery slow ho sakti hai. Yeh per-process state ki hidden cost hai.",
+   "production_improvements": "Dashboard pe budget `available`, breaker state, aur give-up reasons ek saath; alert jab budget 'budget' give-ups dependency recovery ke X minute baad bhi chal rahe hon. tokenRatio ko traffic profile ke hisaab se per dependency tune karo."
+  }
+ },
+ {
+  "id": "RES-043",
+  "project_slug": "p18-resilience",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "In the stage 2 mutation run one break survived: K7. What was it, why did no test catch it, and how was it fixed?",
+  "answer_hinglish": "Symptom: stage 2 mein 27 deliberate breaks lagaye, 26 pakde gaye. K7 survive kiya: 'abort listener not removed on hand-off'. Matlab jab queued waiter ko slot milta hai, `release()` uska `abort` listener caller ke signal se nahi hatata. Poori test suite green rahi.\n\nInvestigation: K7 kya bigadta hai? Listener `{ once: true }` ke saath hai aur `onAbort` mein `indexOf` -1 aata hai kyunki waiter already queue se shift ho chuka. Toh agar baad mein abort ho bhi jaaye, `reject()` ek already-resolved promise pe chalta hai -- no-op. Koi visible behaviour change nahi: result same, order same, counts same. Isliye koi assertion fail nahi hua. README ke shabdon mein: 'a leak with no visible effect'.\n\nCause: leak hai. Ek long-lived signal (jaise ek worker ka shutdown signal jo har job ko pass hota hai) pe har queued call ek closure chhodta jaayega jo waiter aur bulkhead ko pakde rakhta hai. Memory dheere dheere badhti hai, aur Node 'MaxListenersExceededWarning' de sakta hai.\n\nFix: ek test add kiya jo signal ke `addEventListener` aur `removeEventListener` ko spy karta hai, aur assert karta hai `removed` == `added` hand-off ke baad. Ab K7 ek test se pakda jaata hai (stage 3 re-run mein bhi 1). Suite 129 se 130 tests.\n\nLesson: 'tests pass' ka matlab 'behaviour sahi' hai, 'resources sahi' nahi. Leaks ke liye directly resource count karo -- listeners, timers (timeout tests bhi 'no timer left' check karte hain).",
+  "why_needed": "Mutation testing ka asli value survivors mein hai: woh batate hain test suite kahan andha hai. Interview mein 'meri ek test gap kaise mili' ek strong story hai.",
+  "real_world_analogy": "Ghar se nikalte waqt gas band karna bhool gaye, lekin burner already bujha hua tha -- aaj kuch nahi hua. Check karne ka tareeka: 'kya khana bana' nahi, 'kya knob band hai' dekhna.",
+  "how_it_works": "Spy: signal ke methods ko wrap karke har call record karo, phir original call karo. Hand-off ke baad `removed` array `added` ke barabar hona chahiye. Mutation runner har break ko akela lagata, poori suite chalata, revert karta hai.",
+  "in_this_project": "Fix `src/bulkhead.ts::release` mein ek line hai: `if (next.onAbort !== undefined) next.signal!.removeEventListener(\"abort\", next.onAbort);`. Test: `test/bulkhead.test.ts` 'a waiter that gets its slot removes its abort listener from the caller's signal (no leak)'. README 'Stage 2 ... The survivor was K7 ... A test that spies on the signal's listeners was added; K7 is now caught.'",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::release",
+   "projects/18-resilience/test/bulkhead.test.ts",
+   "projects/18-resilience/README.md"
+  ],
+  "code_example": "// real, test/bulkhead.test.ts (trimmed)\nconst s = ctrl.signal;\nconst added: unknown[] = [];\nconst removed: unknown[] = [];\nconst add = s.addEventListener.bind(s);\nconst remove = s.removeEventListener.bind(s);\ns.addEventListener = ((type: string, fn: never, o?: never) => (added.push(fn), add(type, fn, o))) as never;\ns.removeEventListener = ((type: string, fn: never, o?: never) => (removed.push(fn), remove(type, fn, o))) as never;\nconst pw = b.execute(c.op(\"waiter\"), s);\nexpect(added).toHaveLength(1);\nc.finish(\"a\").ok();\nawait pa;\nawait flush();\nexpect(removed).toEqual(added); // removed at hand-off, not left behind",
+  "code_language": "typescript",
+  "advantages": [
+   "Leak ab ek deterministic test se pakda jaata hai",
+   "Test cheap hai, koi heap snapshot nahi",
+   "Mutation run ne gap dikhaaya, guess nahi"
+  ],
+  "disadvantages": [
+   "Spy test implementation detail (listener API) pe depend karta hai",
+   "Sirf ek test K7 pakadta hai"
+  ],
+  "common_mistakes": [
+   "`{ once: true }` ko cleanup samajhna -- once sirf FIRE hone ke baad hatata hai",
+   "Sirf behaviour assert karna, resources nahi",
+   "Survivor ko 'equivalent mutant' bolke ignore karna bina sooche"
+  ],
+  "follow_up_questions": [
+   "Production mein yeh leak kaise detect karoge?",
+   "Kaunse doosre resources ke liye 'no leak' tests hain is project mein?",
+   "Equivalent mutant aur real survivor mein farak kaise karoge?"
+  ],
+  "concepts": [
+   "mutation-testing",
+   "memory-leak",
+   "event-listeners",
+   "test-gaps"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-044",
+  "project_slug": "p18-resilience",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The first stage 2 mutation run gave unstable counts: the same break failed 1 test, then 6. How was that tracked down?",
+  "answer_hinglish": "Symptom: same mutation, do runs, alag failed counts -- 1, phir 6. Mutation testing ka poora matlab hi deterministic count hai, toh yeh red flag tha.\n\nInvestigation: extra failures ke NAAM padhe. Sab ek jaise the: 'expected BulkheadRejectedError to be an instance of BulkheadRejectedError'. Yeh absurd lagta hai -- same naam ki class ka instance nahi? Matlab do ALAG class objects the jinka naam same tha. Yaani error classes ka module do baar load hua tha: ek copy ne error throw kiya, doosri copy ke against `instanceof` check hua, aur prototype chain match nahi hui.\n\nCause: runner vitest ko lowercase drive path (`h:\\...`) se start kar raha tha. Windows pe paths case-insensitive hain, lekin module cache path string pe key hota hai -- `h:\\project\\...\\errors.ts` aur `H:\\project\\...\\errors.ts` do alag modules ban gaye. Uppercase `H:\\` se same breaks ne 3 mein se 3 runs mein same counts diye, aur clean suite kabhi fail nahi hua (8 of 8 runs).\n\nFix: runs `H:\\` se chalaye; stage 2 numbers aur stage 1 re-run unhi se hain. Stage 1 wala original table lowercase run se tha, isliye README kehta hai re-run hi trust karo. B1 parking lot project ke commit mein bhi yahi artefact 13 counts inflate kar raha tha.\n\nLesson README se: 'a noisy mutation count can make a break look caught when it is not -- check unexpected failures by name.' Kyunki agar break ko sirf duplicate-module artefact pakad raha hai, toh woh actually survivor hai.\n\nCode impact bhi samjho: `isRetryableHttp` `instanceof BrokenCircuitError` use karta hai. Agar production bundle mein library do baar load ho (do versions), wahi bug real ho jaayega.",
+  "why_needed": "Flaky tooling se galat confidence aata hai. Interview mein debugging story jisme 'error message dhyan se padha' aur root cause environment nikla -- yeh senior signal hai.",
+  "real_world_analogy": "Do photocopy ek hi form ki, alag machine se -- dikhne mein same, lekin stamp match nahi karta kyunki office sirf original pe lage stamp ko maanta hai.",
+  "how_it_works": "JS `instanceof` prototype chain mein `Class.prototype` object identity check karta hai. Module do baar evaluate hua = do class objects = do prototypes. ESM loader module ko resolved URL/path se cache karta hai; case alag = key alag.",
+  "in_this_project": "`src/errors.ts::BulkheadRejectedError` aur `src/http.ts::isRetryableHttp` (instanceof based). README section 'A test-environment finding.' Fix code mein nahi, test environment (run from `H:\\`) mein. Mutation runner repo ke bahar rakha gaya.",
+  "implementation_files": [
+   "projects/18-resilience/src/errors.ts::BulkheadRejectedError",
+   "projects/18-resilience/src/http.ts::isRetryableHttp",
+   "projects/18-resilience/README.md"
+  ],
+  "code_example": "// illustrative: why two copies of a module break instanceof\n// copyA = await import(\"H:/project/projects/18-resilience/src/errors.ts\")\n// copyB = await import(\"h:/project/projects/18-resilience/src/errors.ts\")   // a second module instance\nconst e = new copyA.BulkheadRejectedError(2, 0);\ne instanceof copyA.BulkheadRejectedError; // true\ne instanceof copyB.BulkheadRejectedError; // false: a different class object with the same name\ne.name === \"BulkheadRejectedError\";       // true: a name check would not notice",
+  "code_language": "typescript",
+  "advantages": [
+   "Root cause error message se mila, guess se nahi",
+   "Numbers ko trust karne se pehle repeatability check (3/3, 8/8)",
+   "README honestly batata hai kaunsa table kis run se hai"
+  ],
+  "disadvantages": [
+   "Fix environment discipline pe depend karta hai (uppercase path), code pe nahi",
+   "Same issue production mein duplicate package versions se aa sakta hai -- library usko handle nahi karti"
+  ],
+  "common_mistakes": [
+   "Unstable counts ko 'average' le lena",
+   "Failures ke naam na padhna, sirf count dekhna",
+   "Sochna Windows path case kabhi matter nahi karta"
+  ],
+  "follow_up_questions": [
+   "`instanceof` ki jagah `error.name` check karna chahiye kya? Trade-off?",
+   "Production mein duplicate module copies kaise detect karoge?",
+   "Mutation testing ko CI mein reliable kaise banaoge?"
+  ],
+  "concepts": [
+   "instanceof",
+   "module-identity",
+   "flaky-tooling",
+   "mutation-testing",
+   "windows-paths"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "`instanceof` strict aur type-safe hai lekin module identity pe depend karta hai. `name` ya brand symbol (`Symbol.for`) check cross-copy kaam karta hai lekin spoofable aur loose hai. Project ne instanceof rakha aur environment fix kiya.",
+   "failure_scenarios": "Monorepo mein do packages library ki alag copies bundle karein: ek ka `BrokenCircuitError` doosre ke `isRetryableHttp` ko retryable lagega -- open breaker ke against retry storm. Yeh real failure mode hai jo is artefact ne dikhaaya.",
+   "alternatives": "`Symbol.for('resilience-kit.BrokenCircuitError')` brand, `Symbol.hasInstance` override, ya package manager dedupe/peer dependency. Inme se kuch implement nahi hai.",
+   "scale_10x_100x": "Bade monorepo (10x packages) mein duplicate copies ki probability badhti hai; CI mein `npm ls`/dedupe check useful.",
+   "production_improvements": "Mutation runner ko normalized path (realpath) se chalana; CI mein ek 'known failures by name' diff; agar library publish ho toh brand-based checks socho."
+  }
+ },
+ {
+  "id": "RES-045",
+  "project_slug": "p18-resilience",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "A test expected a failure to be retried right after budget.canRetry() turned true again, and it failed. Was the test wrong or the code?",
+  "answer_hinglish": "Test galat tha, code sahi -- aur yeh finding README mein record hai: 'right after canRetry() turns true again, the next single failure is still not retried (found by a test that expected otherwise; the test now states it).'\n\nSymptom: recovery test mein budget drain karke 0, phir 51 successes (5.1 tokens), `canRetry()` true. Test ne socha ab ek blip (pehla attempt fail, doosra ok) retry hoga aur 'ok' milega. Lekin promise 'blip' error se reject hua.\n\nInvestigation: retry.ts mein order padho: `shouldRetry` -> `budget.onFailure()` -> `maxAttempts` check -> `budget.canRetry()`. Blip ka pehla attempt fail hua, PEHLE token kata: 5.1 - 1 = 4.1. Phir `canRetry()`: 4.1 > 5? Nahi. Give up with reason 'budget'. `canRetry()` ka true hona sirf 'abhi is moment pe' tha, agle failure ke charge ke baad nahi.\n\nDecision: code ko badlein ya test ko? Order intentional hai: failure real health signal hai, usko account karke decide karna conservative hai, aur outage simulation ka 1003 isi order pe based hai. Toh test ko sach bolne ke liye badla: ab woh assert karta hai ki 5.1 pe blip NOT retried, phir 21 successes aur (6.2, `toBeCloseTo(6.2, 10)`), aur tab blip retried (6.2 - 1 = 5.2 > 5). README ka 'after 51 ... 72 in total' wahi hai.\n\nLesson: jab test aur code disagree karein, pehle decide karo intended behaviour kya hai, phir jo galat hai usko theek karo. Aur us decision ko test mein comment ke saath likho taaki agla developer same confusion na kare.",
+  "why_needed": "API ka naam (`canRetry`) ek promise jaisa lagta hai jo woh nahi deta. Aise semantics gaps production mein galat alerts aur galat expectations banate hain.",
+  "real_world_analogy": "ATM balance Rs 510 dikhata hai aur minimum balance Rs 500 hai, toh lagta hai Rs 100 nikal sakte ho -- lekin transaction fee pehle kat-ti hai, toh nahi nikal sakte.",
+  "how_it_works": "`canRetry()` sirf `tokens > max / 2` hai, side-effect free. Retry decision `onFailure()` ke BAAD hota hai, toh effectively retry ke liye failure ke waqt tokens > threshold + 1 chahiye.",
+  "in_this_project": "`test/budget.test.ts` 'retries come back by themselves once the dependency recovers' -- comment: 'But the failing attempt itself costs a token BEFORE the check: 5.1 - 1 = 4.1, so a blip is still not retried.' `src/retry.ts::RetryPolicy` order. README RetryBudget paragraph.",
+  "implementation_files": [
+   "projects/18-resilience/test/budget.test.ts",
+   "projects/18-resilience/src/retry.ts::RetryPolicy",
+   "projects/18-resilience/src/budget.ts::canRetry"
+  ],
+  "code_example": "// real, src/retry.ts: the order that decided it\nif (o.shouldRetry !== undefined && !o.shouldRetry(error, attempt)) giveUp(\"not-retryable\");\no.budget?.onFailure();\nif (attempt >= this.maxAttempts) giveUp(\"attempts\");\nif (o.budget !== undefined && !o.budget.canRetry()) giveUp(\"budget\");",
+  "code_language": "typescript",
+  "advantages": [
+   "Intended behaviour ab test mein documented hai",
+   "Outage numbers (1003) consistent rehte hain",
+   "onGiveUp reason 'budget' debugging mein seedha batata hai kyun"
+  ],
+  "disadvantages": [
+   "`canRetry()` ka naam misleading ho sakta hai",
+   "Recovery ke baad retries der se aate hain"
+  ],
+  "common_mistakes": [
+   "Failing test dekh ke turant code 'fix' kar dena",
+   "`canRetry()` ko 'next failure will be retried' samajhna",
+   "Float compare `toBe(6.2)` -- test `toBeCloseTo` use karta hai kyunki `available` division hai"
+  ],
+  "follow_up_questions": [
+   "Kya `canRetry()` ka naam badalna chahiye?",
+   "onGiveUp event se yeh production mein kaise dikhega?",
+   "Order ulta karne se outage simulation ka number kya hoga?"
+  ],
+  "concepts": [
+   "test-vs-code",
+   "retry-budget",
+   "semantics",
+   "debugging"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-046",
+  "project_slug": "p18-resilience",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "Your breaker keeps opening although the dependency is up; most of its errors are HTTP 404. How do you investigate and fix it?",
+  "answer_hinglish": "Sabse likely cause: breaker default `isFailure` ke saath bana hai, jo HAR error ko failure maanta hai. Dependency 'record not found' pe 404 deti hai, `HttpError(404)` throw hota hai, aur breaker ki window mein woh failure gina jaata hai. 50% se zyada lookups missing records ke hon toh `minimumCalls` ke baad breaker open, aur ab saare calls -- valid wale bhi -- `BrokenCircuitError` paate hain.\n\nInvestigate kaise:\n1. Events: `onEvent` handler mein `breaker-state` events log ho rahe hain (`from: closed, to: open`). Open hone ke time ke aas-paas dekho kaunse errors aaye.\n2. `breaker.failureRate` getter metric mein dalo -- closed state ka current window rate.\n3. Dependency ke errors ka `upstreamStatus` breakdown dekho: agar zyada 404/400/422 hain aur 5xx kam, toh classification galat hai.\n\nFix: `new CircuitBreaker({ isFailure: isRetryableHttp })`. `isRetryableHttp` network errors, timeouts, 408, 429, 5xx (501 chhod ke) ko failure maanta hai, baaki 4xx ko nahi. Ab 404 window mein SUCCESS gina jaata hai (dependency ne sahi jawab diya), lekin caller ko 404 wala `HttpError` phir bhi milta hai.\n\nProof: `test/http.test.ts` '404s do not open a breaker that uses isRetryableHttp as isFailure' -- real server 10 baar 404, breaker closed, server ne 10 hits dekhe. Aur README ka usage example khud `isFailure: isRetryableHttp` ke saath hai, comment 'a 404 is not \"down\"'.",
+  "why_needed": "Galat failure classification breaker ka sabse common production bug hai: healthy service kaat di jaati hai aur outage tumhare hi breaker ne create kiya.",
+  "real_world_analogy": "Smoke detector jo toast ke dhuaan pe bhi bajta hai -- dhire dhire log usko band kar dete hain. Sensor ko sahi cheez detect karni chahiye.",
+  "how_it_works": "Default `isFailure` = `() => true`. Custom `isFailure(error) === false` -> outcome 'success'. Window ka failures count sirf real health failures pe badhta hai.",
+  "in_this_project": "`src/breaker.ts` option `isFailure` (comment: 'A 404 or a validation error is the dependency answering correctly'), `src/http.ts::isRetryableHttp`, `src/events.ts` ka `breaker-state` event, `failureRate` getter. Test `test/http.test.ts` mein.",
+  "implementation_files": [
+   "projects/18-resilience/src/http.ts::isRetryableHttp",
+   "projects/18-resilience/src/breaker.ts::failureRate",
+   "projects/18-resilience/src/events.ts::ResilienceEvent",
+   "projects/18-resilience/test/http.test.ts"
+  ],
+  "code_example": "// real, README usage (trimmed)\nnew CircuitBreaker({ name: \"sms-breaker\", isFailure: isRetryableHttp, onEvent }), // a 404 is not \"down\"\n\n// real, src/http.ts\nexport function isRetryableHttp(error: unknown): boolean {\n  if (error instanceof BrokenCircuitError || error instanceof BulkheadRejectedError) return false;\n  if (!(error instanceof HttpError)) return true;\n  const s = error.upstreamStatus;\n  return s === 408 || s === 429 || (s >= 500 && s !== 501);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Ek option se fix, code change nahi",
+   "Events aur failureRate se diagnose possible",
+   "Retry aur breaker ka classification consistent"
+  ],
+  "disadvantages": [
+   "Default unsafe hai -- user ko yaad rakhna padta hai",
+   "Dependency agar galti se 4xx de (uska bug) toh breaker nahi bachayega"
+  ],
+  "common_mistakes": [
+   "Default isFailure production mein chhod dena",
+   "404 ko catch karke swallow karna taaki breaker na dekhe -- caller ko galat result milega",
+   "Breaker ko 'flaky' bolke uska threshold 0.9 kar dena bina root cause ke"
+  ],
+  "follow_up_questions": [
+   "429 failure hai ya nahi -- breaker ke liye?",
+   "Kaunse metrics dashboard pe rakhoge breaker ke liye?",
+   "Agar dependency 200 ke andar error body bheje toh?"
+  ],
+  "concepts": [
+   "failure-classification",
+   "observability",
+   "circuit-breaker",
+   "http-errors"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-047",
+  "project_slug": "p18-resilience",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Add a queue timeout to the Bulkhead: a call that waits longer than maxWaitMs for a slot is rejected and leaves the queue. Write the change and a test.",
+  "answer_hinglish": "Aaj bulkhead ka waiter sirf do tarah queue chhod sakta hai: slot mil jaaye ya caller abort kare. Agar caller signal na de, ya de lekin kabhi abort na kare, toh woh unlimited wait karega. Queue timeout (`maxWaitMs`) yeh gap bharta hai -- is project mein implement NAHI hai, yeh exercise hai.\n\nDesign:\n1. `BulkheadOptions` mein `maxWaitMs?: number` (validate: positive finite).\n2. `Waiter` mein `timer` field.\n3. `waitForSlot` mein ek common `leave(reason)` function: queue se splice, timer clear, abort listener remove, reject. Abort aur timeout dono `leave` call karte hain -- toh dono cleanup ek jagah, K7 jaisa leak dono raston pe band.\n4. `release()` hand-off pe timer bhi clear kare (warna timer chalega aur already-resolved promise pe reject -- no-op, lekin timer process ko zinda rakhta hai: leak).\n5. Rejection error: `BulkheadRejectedError` reuse kiya, taaki adapters ka 503 mapping aur `isRetryableHttp` ka 'not retryable' automatic kaam kare. Alternative: naya `BulkheadTimeoutError` -- clearer metrics, lekin har jagah mapping update.\n\nImportant: timeout rejection `await this.waitForSlot()` se aata hai, try/finally ke bahar, toh `release()` nahi chalta -- sahi, kyunki waiter ne slot kabhi liya nahi.\n\nTests (fake timers): (a) waiter 100 ms baad reject, `queued` 0, operation kabhi nahi chala, slot owner khatam hone par `running` 0; (b) slot time pe mil gaya toh koi timer pending nahi (`vi.getTimerCount()` 0) -- yeh leak test hai, K7 se seekha hua.",
+  "why_needed": "Bounded queue bina bounded wait ke latency ko unbounded chhod deta hai. Caller ka SLA 2 s hai toh 10 s queue mein baithna bekaar hai.",
+  "real_world_analogy": "Doctor ki waiting room: token mila lekin agar 30 minute mein number nahi aaya toh receptionist bol deti hai 'aaj nahi ho paayega, kal aao' -- unlimited baithne nahi deti.",
+  "how_it_works": "Har waiter ka apna setTimeout. Teen exits: hand-off (release clears timer + listener), abort (leave), timeout (leave). Har exit baaki do mechanisms ko clean karta hai.",
+  "in_this_project": "Change `src/bulkhead.ts` mein `BulkheadOptions`, `Waiter`, `waitForSlot`, `release`. Existing tests `test/bulkhead.test.ts` (controllable helper, listener spy test) pattern follow karo. README NOT implemented list mein queue timeout explicitly nahi hai, lekin code mein maxWaitMs jaisa koi option nahi hai.",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::waitForSlot",
+   "projects/18-resilience/src/bulkhead.ts::release",
+   "projects/18-resilience/test/bulkhead.test.ts"
+  ],
+  "code_example": "// illustrative exercise solution -- NOT in the repo\n// src/bulkhead.ts: options + waiter\nexport interface BulkheadOptions extends Observable {\n  maxConcurrent: number;\n  maxQueue?: number;\n  maxWaitMs?: number; // NEW: longest a call may wait for a slot\n}\ninterface Waiter {\n  resolve: () => void;\n  reject: (reason: unknown) => void;\n  signal?: AbortSignal;\n  onAbort?: () => void;\n  timer?: ReturnType<typeof setTimeout>; // NEW\n}\n// constructor: this.maxWaitMs = options.maxWaitMs;\n// if (this.maxWaitMs !== undefined && !(Number.isFinite(this.maxWaitMs) && this.maxWaitMs > 0)) throw new RangeError(\"maxWaitMs must be > 0\");\n\nprivate waitForSlot(signal?: AbortSignal): Promise<void> {\n  return new Promise<void>((resolve, reject) => {\n    const waiter: Waiter = { resolve, reject, signal };\n    const leave = (reason: unknown) => {\n      const i = this.queue.indexOf(waiter);\n      if (i >= 0) this.queue.splice(i, 1);\n      if (waiter.timer !== undefined) clearTimeout(waiter.timer);\n      if (waiter.onAbort !== undefined) signal!.removeEventListener(\"abort\", waiter.onAbort);\n      reject(reason);\n    };\n    if (signal !== undefined) {\n      waiter.onAbort = () => leave(signal.reason);\n      signal.addEventListener(\"abort\", waiter.onAbort, { once: true });\n    }\n    if (this.maxWaitMs !== undefined) {\n      waiter.timer = setTimeout(() => leave(new BulkheadRejectedError(this.maxConcurrent, this.maxQueue)), this.maxWaitMs);\n    }\n    this.queue.push(waiter);\n  });\n}\n\nprivate release(): void {\n  const next = this.queue.shift();\n  if (next === undefined) { this.active--; return; }\n  if (next.onAbort !== undefined) next.signal!.removeEventListener(\"abort\", next.onAbort);\n  if (next.timer !== undefined) clearTimeout(next.timer); // NEW\n  next.resolve();\n}\n\n// test/bulkhead.test.ts (new tests; import vi and afterEach(() => vi.useRealTimers()))\nit(\"a queued call that waits longer than maxWaitMs is rejected and leaves the queue\", async () => {\n  vi.useFakeTimers();\n  const b = new Bulkhead({ maxConcurrent: 1, maxQueue: 1, maxWaitMs: 100 });\n  let finishA!: () => void;\n  const pa = b.execute(() => new Promise<void>((r) => (finishA = r)));\n  let ran = false;\n  const pw = b.execute(async () => { ran = true; }).catch((e: unknown) => e);\n  expect(b.queued).toBe(1);\n  await vi.advanceTimersByTimeAsync(100);\n  expect(await pw).toBeInstanceOf(BulkheadRejectedError);\n  expect(b.queued).toBe(0);\n  finishA();\n  await pa;\n  expect(ran).toBe(false);\n  expect(b.running).toBe(0);\n});\n\nit(\"a waiter that gets its slot in time leaves no timer behind\", async () => {\n  vi.useFakeTimers();\n  const b = new Bulkhead({ maxConcurrent: 1, maxQueue: 1, maxWaitMs: 100 });\n  let finishA!: () => void;\n  const pa = b.execute(() => new Promise<void>((r) => (finishA = r)));\n  const pw = b.execute(async () => \"w\");\n  finishA();\n  await pa;\n  expect(await pw).toBe(\"w\");\n  expect(vi.getTimerCount()).toBe(0);\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Waiting time bounded: caller ke SLA se match",
+   "Ek `leave()` se saare exits ka cleanup consistent",
+   "Existing 503 mapping reuse"
+  ],
+  "disadvantages": [
+   "Har queued call ka ek timer -- thoda overhead",
+   "Same error type se metrics mein 'queue full' aur 'waited too long' alag nahi dikhte (event mein reason add karna padega)"
+  ],
+  "common_mistakes": [
+   "Hand-off pe timer clear na karna (timer leak)",
+   "Timeout pe `release()` call karna -- active galat ghatega",
+   "Timer aur abort dono fire hon toh double cleanup crash -- indexOf guard zaroori"
+  ],
+  "follow_up_questions": [
+   "Naya error type banaoge ya existing reuse? Kyun?",
+   "maxWaitMs aur andar ke TimeoutPolicy ka relation kya hona chahiye?",
+   "Queue wait time ka histogram kaise emit karoge?"
+  ],
+  "concepts": [
+   "bulkhead",
+   "queue-timeout",
+   "timers",
+   "cleanup",
+   "coding-exercise"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Error reuse (BulkheadRejectedError) vs naya type: reuse se adapters aur isRetryableHttp bina change kaam karte hain; naya type observability behtar karta hai. Per-waiter timer vs ek sweeper timer: per-waiter simple aur precise, sweeper lakhs waiters pe sasta.",
+   "failure_scenarios": "Timer aur hand-off same tick mein: agar timer pehle chala toh waiter queue se nikla aur release agle waiter ko deta hai; agar hand-off pehle hua toh timer clear. `indexOf` guard aur clearTimeout dono raston ko safe banate hain.",
+   "alternatives": "Caller khud `AbortSignal.timeout(ms)` pass kare (koi library change nahi) -- yeh aaj bhi possible hai! Isliye trade-off: built-in option convenience hai, zaroorat nahi. Ya deadline propagation: caller ka remaining budget pass karo.",
+   "scale_10x_100x": "Bade queues (hazaron waiters) pe per-waiter timers aur O(n) splice mehenge -- linked list aur ek timer wheel socho.",
+   "production_improvements": "`bulkhead-rejected` event mein `reason: \"queue-full\" | \"wait-timeout\"`, aur queue wait time metric. Default maxWaitMs caller ke timeout se chhota."
+  }
+ },
+ {
+  "id": "RES-048",
+  "project_slug": "p18-resilience",
+  "category": "Coding Exercises",
+  "difficulty": "Senior/System Design",
+  "question": "The breaker's window is count-based only. Write a time-based window (last N seconds, in buckets) that the breaker could use instead, with a test showing old failures expire without new calls.",
+  "answer_hinglish": "Count-based window ki problem low traffic pe hai: PLAN kehta hai 'at low traffic the window can hold old outcomes'. 20 calls ka window, aur ghante mein 5 calls aati hain -- toh window mein 4 ghante purani failures baithi hain, aur ek naya failure breaker open kar sakta hai kyunki purani failures abhi bhi gini ja rahi hain. Time-based window 'last 10 seconds' ka rate deta hai, chahe kitne bhi calls hon. README: time-based window implement NAHI hai -- yeh exercise hai.\n\nDesign: bucketed ring (resilience4j ka time-based window bhi aise hi kaam karta hai -- generic knowledge, project se nahi). `buckets` count (jaise 10) aur `bucketMs` (jaise 1000) = 10 second window. Har bucket mein `calls`, `failures` aur `epochs[i]` -- woh kaunse time-slot ka data hold kar raha hai. Record: `epoch = floor(now / bucketMs)`, index `epoch % buckets`; agar `epochs[i] !== epoch` toh bucket purana hai, reset karo. Totals: sirf woh buckets jodo jinka `epoch - epochs[i] < buckets`. Isse expiry LAZY hai -- koi timer nahi, breaker ki 'no timer' philosophy ke saath consistent.\n\nBreaker integration: `record()` ke closed branch mein ring buffer ki jagah `window.record(failed)`, phir `const { calls, failures } = window.totals()` aur same check `calls >= minimumCalls && failures / calls >= threshold`. `transition(\"closed\")` mein `window.reset()`. 'ignored' aur generation logic waise hi.\n\nCost: totals() O(buckets) har call pe -- 10 buckets pe negligible; running sums se O(1) bhi kar sakte ho lekin expiry ke waqt adjust karna padega.",
+  "why_needed": "Breaker ka decision 'abhi' ki health pe hona chahiye. Low-traffic dependencies (nightly jobs, rare admin APIs) pe count window 'abhi' ko nahi dikhata.",
+  "real_world_analogy": "'Last 20 deliveries ka rating' vs 'last 10 din ka rating'. Agar mahine mein 3 deliveries hon, toh pehla wala 6 mahine purani shikayatein dikhayega.",
+  "how_it_works": "Bucket epoch tagging: bucket overwrite tab hota hai jab naya epoch uske index pe aaye. Stale buckets read time pe skip hote hain (`epoch - epochs[i] >= buckets`). Initial `epochs = -1`, aur calls 0 hain toh accidental inclusion harmless.",
+  "in_this_project": "Aaj `src/breaker.ts` mein `ring`, `next`, `count`, `failures` count-based window hain aur `now` test hook already hai -- time-based window usi `now` ko use kar sakta hai. Tests `test/breaker.test.ts` ke `make()` helper ki tarah `now: () => t` se time control. README NOT implemented: 'The breaker's window is count-based only (no time-based window)'.",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::record",
+   "projects/18-resilience/src/breaker.ts::transition",
+   "projects/18-resilience/test/breaker.test.ts",
+   "projects/18-resilience/PLAN.md"
+  ],
+  "code_example": "// illustrative exercise solution -- NOT in the repo\nexport class TimeWindow {\n  private readonly calls: number[];\n  private readonly failures: number[];\n  private readonly epochs: number[]; // which time slot each bucket currently holds\n  constructor(private readonly buckets: number, private readonly bucketMs: number, private readonly now: () => number = Date.now) {\n    this.calls = new Array<number>(buckets).fill(0);\n    this.failures = new Array<number>(buckets).fill(0);\n    this.epochs = new Array<number>(buckets).fill(-1);\n  }\n  record(failed: boolean): void {\n    const epoch = Math.floor(this.now() / this.bucketMs);\n    const i = epoch % this.buckets;\n    if (this.epochs[i] !== epoch) {\n      this.epochs[i] = epoch; // the bucket held an older slot: start it fresh\n      this.calls[i] = 0;\n      this.failures[i] = 0;\n    }\n    this.calls[i]!++;\n    if (failed) this.failures[i]!++;\n  }\n  totals(): { calls: number; failures: number } {\n    const epoch = Math.floor(this.now() / this.bucketMs);\n    let calls = 0;\n    let failures = 0;\n    for (let i = 0; i < this.buckets; i++) {\n      if (epoch - this.epochs[i]! < this.buckets) {\n        calls += this.calls[i]!;\n        failures += this.failures[i]!;\n      }\n    }\n    return { calls, failures };\n  }\n  reset(): void {\n    this.epochs.fill(-1);\n    this.calls.fill(0);\n    this.failures.fill(0);\n  }\n}\n\n// in CircuitBreaker.record(), closed branch, instead of the ring buffer:\n//   this.window.record(outcome === \"failure\");\n//   const { calls, failures } = this.window.totals();\n//   if (calls >= this.minimumCalls && failures / calls >= this.threshold) this.transition(\"open\");\n// in transition(\"closed\"): this.window.reset();\n\n// test\nit(\"old failures leave a time window even when no new calls arrive\", () => {\n  let t = 0;\n  const w = new TimeWindow(10, 1000, () => t); // the last 10 s\n  for (let i = 0; i < 5; i++) w.record(true);\n  expect(w.totals()).toEqual({ calls: 5, failures: 5 });\n  t = 9_999;\n  expect(w.totals().failures).toBe(5); // still inside the 10 s\n  t = 10_000;\n  expect(w.totals()).toEqual({ calls: 0, failures: 0 }); // expired, no call needed\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Low traffic pe bhi rate 'abhi' ka hai",
+   "Lazy expiry, koi timer nahi",
+   "Breaker ke existing `now` hook se testable"
+  ],
+  "disadvantages": [
+   "Bucket granularity: expiry bucketMs steps mein hoti hai, smooth nahi",
+   "totals() O(buckets) per call (running sums se O(1) possible)",
+   "Low traffic pe minimumCalls shayad kabhi poora na ho -- breaker kabhi open hi na ho"
+  ],
+  "common_mistakes": [
+   "Har call ka timestamp array mein rakhna (memory unbounded)",
+   "Read time pe stale buckets skip na karna -- sirf write time reset karna",
+   "Close pe window reset bhool jaana (B10 jaisa bug)"
+  ],
+  "follow_up_questions": [
+   "minimumCalls time-based window ke saath kaise behave karega low traffic pe?",
+   "Running sums ke saath O(1) totals kaise banaoge?",
+   "Clock jump (NTP adjust) pe kya hoga? `performance.now()` behtar hai?"
+  ],
+  "concepts": [
+   "time-based-window",
+   "sliding-window",
+   "circuit-breaker",
+   "lazy-expiry",
+   "coding-exercise"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Count-based: simple, O(1), traffic-independent memory, lekin low traffic pe stale. Time-based: 'abhi' ka rate, lekin minimumCalls low traffic pe kabhi poora nahi ho sakta aur bucket granularity tune karni padti hai. Hybrid: time window + minimumCalls dono.",
+   "failure_scenarios": "`Date.now()` wall clock hai; NTP backward jump pe epoch peeche jaata hai aur buckets galat expire/reuse ho sakte hain. Monotonic clock (`performance.now()`) safer. Breaker ka current `now` default bhi `Date.now` hai -- wahi risk openMs pe bhi hai.",
+   "alternatives": "Exponentially weighted moving average (EWMA) failure rate -- ek number, smooth decay, buckets nahi. Ya per-call timestamps ka deque (exact, lekin memory traffic ke proportional).",
+   "scale_10x_100x": "10x-100x traffic pe har bucket bada number hold karta hai, memory same (buckets fixed) -- time window high traffic pe count window se behtar scale karta hai jahan 20 calls ka window milliseconds ka hota hai.",
+   "production_improvements": "Window type ko option banao (`window: { type: \"count\" | \"time\" }`), slow-call rate saath mein (README NOT implemented), aur mutation checks naye window pe bhi (old failures expire, reset on close)."
+  }
+ },
+ {
+  "id": "RES-049",
+  "project_slug": "p18-resilience",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "You already have a retry budget. Why do you still need a circuit breaker, and what does each one stop that the other cannot?",
+  "answer_hinglish": "Dono alag cheez limit karte hain. Budget RETRIES limit karta hai, breaker CALLS.\n\nBudget ke saath outage mein bhi har incoming request dependency tak ek attempt bhejti hai. Simulation mein 1000 calls = 1003 attempts -- retries khatam, lekin 1000 attempts phir bhi gaye. Har attempt timeout tak wait karta hai (hanging dependency pe poore 2 s), caller ka latency kharab, sockets aur bulkhead slots bhare. Dependency ko recover karne ka time nahi milta kyunki traffic 1x pe chal raha hai.\n\nBreaker open hone ke baad calls dependency tak JAATE HI NAHI. `http.test.ts` mein 20 calls open breaker ke saath server tak 0 baar pahunche -- 'the struggling server gets a rest'. Caller ko turant `BrokenCircuitError` with `retryAfterMs`, aur adapter usko 503 + Retry-After mein badal deta hai. Fail fast = low latency failure.\n\nBreaker kya nahi kar sakta? Woh retries ko throttle nahi karta. Breaker closed hai (failure rate threshold se neeche, jaise 40%) toh har failed call ke 3 attempts jaayenge -- partial outage mein retries load ko 1.4x+ tak le jaate hain. Budget yahan adapt karta hai. Aur minimumCalls se pehle breaker koi decision nahi leta.\n\nComposition mein ek important detail: breaker retry ke ANDAR hai, toh breaker har attempt dekhta hai (har failed attempt record hota hai: 10th failed attempt, 4th call ke dauraan, ise open karta hai; bahar hota toh sirf 4 outcomes, closed). Aur open breaker ka error `isRetryableHttp` ke liye non-retryable hai, toh retry turant rukta hai aur budget nahi chhoota.\n\nSummary: budget = 'outage mein amplification band karo'; breaker = 'outage mein dependency ko bilkul chhod do aur jaldi fail karo'.",
+  "why_needed": "Interviewer check karta hai ki tum har pattern ka exact role samajhte ho ya bas 'sab laga do' bolte ho. Overlap aur gaps dono batana senior answer hai.",
+  "real_world_analogy": "Budget = 'ek baar hi call karo, baar baar nahi'. Breaker = 'abhi woh number band hai, call hi mat karo, 30 second baad try karna'.",
+  "how_it_works": "Budget state: tokens, retry decisions pe. Breaker state: failure window + state machine, har call ke admission pe. Retry -> breaker order mein breaker ka BrokenCircuitError retry ke shouldRetry tak aata hai.",
+  "in_this_project": "`src/budget.ts`, `src/breaker.ts`, `src/wrap.ts` comment. Tests: `test/budget.test.ts` (3000 vs 1003), `test/http.test.ts` 'circuit breaker: 503s open it, then requests stop reaching the server' (5 hits, phir 20 calls 0 hits, probe ke baad 6), `test/wrap.test.ts` 'breaker INSIDE retry sees every attempt' aur 'an open breaker inside retry (with isRetryableHttp) stops the retry at once' (0 retries).",
+  "implementation_files": [
+   "projects/18-resilience/src/breaker.ts::CircuitBreaker",
+   "projects/18-resilience/src/budget.ts::RetryBudget",
+   "projects/18-resilience/test/wrap.test.ts",
+   "projects/18-resilience/test/http.test.ts"
+  ],
+  "code_example": "// real, test/http.test.ts (trimmed)\nconst breaker = new CircuitBreaker({ windowSize: 5, minimumCalls: 5, openMs: 150, isFailure: isRetryableHttp });\nfor (let i = 0; i < 5; i++) await call();\nexpect(breaker.state).toBe(\"open\");\nfor (let i = 0; i < 20; i++) expect(await call()).toBeInstanceOf(BrokenCircuitError);\nexpect(s.hits()).toBe(5); // 20 calls, 0 requests: the struggling server gets a rest",
+  "code_language": "typescript",
+  "advantages": [
+   "Breaker: zero load + fast failure during outage",
+   "Budget: partial outage aur breaker-closed phase mein amplification control",
+   "Dono ek doosre ke signal ko distort nahi karte (non-retryable rejection)"
+  ],
+  "disadvantages": [
+   "Do mechanisms = do sets of tuning parameters",
+   "Breaker false opens ka risk laata hai jo budget mein nahi",
+   "Dono per-process"
+  ],
+  "common_mistakes": [
+   "Breaker ko retry ke bahar rakhna",
+   "Sochna budget hai toh breaker nahi chahiye (ya ulta)",
+   "Open breaker ke error ko retryable maanna (K9 mutation)"
+  ],
+  "follow_up_questions": [
+   "Partial outage (30% failures) mein kaun kya karega?",
+   "Kya breaker ka retryAfterMs retry ke Retry-After logic mein use hona chahiye?",
+   "Fallback (cached value) yahan kahan fit hoga? (implement nahi hai)"
+  ],
+  "concepts": [
+   "circuit-breaker",
+   "retry-budget",
+   "defense-in-depth",
+   "fail-fast"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Breaker: binary aur aggressive (sab band), budget: gradual (sirf retries band). Dono saath = outage mein zero load (breaker) aur grey failure mein bounded amplification (budget). Cost: zyada config aur interactions samajhne ki zaroorat.",
+   "failure_scenarios": "Breaker threshold 50% aur dependency 45% fail kar rahi: breaker closed, har failure retry -- yahan sirf budget bachata hai. Ulta: dependency 100% down lekin traffic minimumCalls se kam -- breaker kabhi open nahi, budget hi limit karta hai.",
+   "alternatives": "Adaptive concurrency limit (latency-based), load shedding server side (dependency ke apne `loadShedding` jaisa), fallbacks -- adaptive concurrency aur fallback implement nahi hain.",
+   "scale_10x_100x": "10x traffic pe breaker jaldi open hota hai (window fast bharta hai), budget jaldi drain -- dono better kaam karte hain. Lekin 100x replicas pe har replica alag seekhta hai.",
+   "production_improvements": "Ek dashboard pe dono: breaker state per dependency aur budget available; alerts give-up reason 'budget' aur 'breaker-rejected' rate pe."
+  }
+ },
+ {
+  "id": "RES-050",
+  "project_slug": "p18-resilience",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "The README lists adaptive concurrency and a slow-call rate as not implemented. If production showed the fixed bulkhead limit was wrong half the time, how would you evolve this design?",
+  "answer_hinglish": "Pehle honest baseline: is project mein `Bulkhead` ka `maxConcurrent` fixed hai, aur breaker sirf errors ginta hai, slowness nahi (README: 'it has no \"slow call\" rate: put a TimeoutPolicy inside it so slow calls become failures'). Adaptive concurrency PLAN mein 'Not in scope' hai.\n\nFixed limit kyun galat hota hai? Dependency ki capacity badalti hai -- deploys, uske apne load, GC, region. Limit 20: dependency fast hai toh 20 bahut kam (throughput waste, bekaar rejections); dependency slow hai toh 20 bahut zyada (har call 2 s timeout tak latka, queue bhari). Little's law: concurrency = throughput x latency, toh latency double hui toh same throughput ke liye double concurrency chahiye -- ya limit wahi rakho aur throughput gira do.\n\nEvolution, smallest step first:\n1. Measure: har call ka latency aur `running`/`queued` metrics (events already hain; latency histogram add karo).\n2. Slow-call rate breaker mein: outcome 'slow' agar duration > threshold, window mein alag counter, `slowRateThreshold` pe open. Breaker ke `record()` mein duration pass karna padega.\n3. Adaptive limit: AIMD (additive increase, multiplicative decrease) -- har successful fast call pe limit +1/limit, timeout ya latency spike pe limit x 0.5. Ya gradient approach (Netflix concurrency-limits jaisa): min latency vs current latency ka ratio. `Bulkhead` mein `maxConcurrent` readonly hai -- usko mutable banana padega, aur limit ghatne par running calls ko kill nahi karte, bas naye admit nahi karte.\n\nDirect hand-off design bachega: release ke waqt check 'active < currentLimit' tabhi hand-off, warna `active--`.\n\nRisk: adaptive algorithms oscillate karte hain aur debug karna mushkil -- isliye pehle data, phir algorithm.",
+  "why_needed": "Senior interview mein 'jo nahi banaya woh kaise banaoge' pucha jaata hai. Achha answer current limitation se shuru hota hai, measurement pe based hota hai, aur incremental hota hai.",
+  "real_world_analogy": "Highway pe fixed speed limit vs smart signals jo traffic ke hisaab se lane kholte band karte hain. Smart signals behtar hain lekin galat sensor data pe chaos.",
+  "how_it_works": "AIMD: TCP congestion control ka idea. Success pe slowly badhao, congestion signal (timeout, latency) pe tezi se ghatao. Bulkhead mein limit ek variable ban jaata hai jo har completion pe update hota hai.",
+  "in_this_project": "Aaj ke hooks: `src/bulkhead.ts` mein `running`/`queued` getters aur `bulkhead-rejected` event; `src/breaker.ts` mein outcome model ('success'/'failure'/'ignored') jisme 'slow' add ho sakta hai; `src/timeout.ts` slow calls ko failure banata hai. README 'NOT implemented': 'Hedged requests, adaptive concurrency, fallbacks, caching' aur count-based-only window.",
+  "implementation_files": [
+   "projects/18-resilience/src/bulkhead.ts::Bulkhead",
+   "projects/18-resilience/src/breaker.ts::record",
+   "projects/18-resilience/src/events.ts::ResilienceEvent",
+   "projects/18-resilience/README.md"
+  ],
+  "code_example": "// illustrative sketch -- NOT in the repo: an AIMD limit the Bulkhead could consult\nclass AimdLimit {\n  limit: number;\n  constructor(private readonly min: number, private readonly max: number, initial: number) { this.limit = initial; }\n  onSuccess(latencyMs: number, targetMs: number): void {\n    if (latencyMs <= targetMs) this.limit = Math.min(this.max, this.limit + 1 / this.limit); // additive increase\n  }\n  onDrop(): void { // a timeout or a latency spike\n    this.limit = Math.max(this.min, Math.floor(this.limit * 0.5)); // multiplicative decrease\n  }\n}\n// Bulkhead.execute: admit while this.active < Math.floor(limit.limit)\n// Bulkhead.release: hand off only if this.active <= Math.floor(limit.limit), else this.active--",
+  "code_language": "typescript",
+  "advantages": [
+   "Limit dependency ki real capacity follow karta hai",
+   "Slow-call rate slowness ko breaker signal banata hai bina caller timeout tune kiye",
+   "Existing hand-off aur events design reuse"
+  ],
+  "disadvantages": [
+   "Oscillation aur tuning complexity",
+   "Testing mushkil: deterministic tests ke liye latency inject karni padegi",
+   "Per-process adaptive limits ek doosre se independent -- fleet level behaviour emergent"
+  ],
+  "common_mistakes": [
+   "Bina metrics ke adaptive algorithm laga dena",
+   "Limit ghatne par running calls ko cancel karna",
+   "Latency target ko p50 pe set karna -- normal variance pe hi limit gir jaayegi"
+  ],
+  "follow_up_questions": [
+   "AIMD vs gradient based limits -- kab kya?",
+   "Slow-call threshold aur TimeoutPolicy ms ka relation?",
+   "Adaptive limit ko kaise test karoge deterministically?"
+  ],
+  "concepts": [
+   "adaptive-concurrency",
+   "aimd",
+   "littles-law",
+   "slow-call-rate",
+   "not-implemented"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fixed limit: predictable, easy to reason, lekin capacity changes ko ignore karta hai. Adaptive: efficient, lekin non-deterministic aur oscillation-prone. Middle ground: fixed limit + good metrics + slow-call breaker, adaptive tabhi jab data dikhaye.",
+   "failure_scenarios": "Adaptive limit ek latency spike pe crash karke 1-2 pe aa jaaye aur dheere (additive) wapas aaye -- dependency theek ho chuki lekin hum minutes tak throttled. Ya GC pauses ko congestion samajh ke galat ghataye.",
+   "alternatives": "Server-side load shedding (dependency khud 503 de), queue-based async processing (worker pool), hedged requests (tail latency ke liye; implement nahi). Ya simply dependency ke SLA ke hisaab se fixed limit + autoscaling.",
+   "scale_10x_100x": "10x-100x traffic pe fixed limit ka galat hona zyada costly hai (zyada rejections ya zyada pile-up). Adaptive per-process limits 100 replicas pe sab ek saath badhein toh dependency pe thundering herd -- jitter aur conservative increase zaroori.",
+   "production_improvements": "Pehle latency histogram aur `running` gauge per dependency; phir slow-call rate breaker mein with mutation checks; adaptive limit feature flag ke peeche, ek dependency pe canary."
+  }
+ },
+ {
+  "id": "RES-051",
+  "project_slug": "p18-resilience",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "The README says to create one set of policies per dependency, once, and share it across calls. What breaks if you create them per request or share one set across dependencies?",
+  "answer_hinglish": "Do alag galtiyan, dono state ki wajah se.\n\nPer request banana: breaker, bulkhead aur budget STATEFUL hain. Breaker ki window pichle calls yaad rakhti hai, bulkhead ka `active` sab concurrent calls ginta hai, budget ke tokens saare calls share karte hain. Har request pe `new CircuitBreaker()` = har breaker ka window khaali, pehla call hi uska ek-matra call -- `minimumCalls` (default 10) kabhi poora nahi hoga, breaker kabhi open nahi hoga. `new Bulkhead({ maxConcurrent: 20 })` har request pe = har request ka apna bulkhead jisme ek hi call -- limit kabhi lagti nahi. `new RetryBudget()` har request pe = har baar full bucket -- retry storm wapas (har call 3 attempts, simulation ka 3000). Code chalega, tests green, lekin protection zero. Sirf `TimeoutPolicy` aur `RetryPolicy` (bina budget) stateless hain, unko per call banana kaam karega lekin bekaar allocation hai.\n\nSaari dependencies ke liye ek set: SMS provider down hua, uske failures breaker open karte hain -- aur ab payment gateway ke calls bhi `BrokenCircuitError` paate hain jabki woh healthy hai. Bulkhead ke 20 slots hanging SMS calls kha jaate hain, payment ko jagah nahi -- bulkhead ka poora isolation point khatam. Budget bhi SMS failures se drain hoke payment ke retries rok dega.\n\nIsliye README: 'One set of policies PER DEPENDENCY, created once (module level / a singleton service), shared by every call.' NestJS mein yeh ek singleton provider ho sakta hai; Express mein module-level const, jaise README ka `sms` wrap.",
+  "why_needed": "Sabse common resilience bug yahi hai: library sahi, wiring galat. Code review mein `new CircuitBreaker` ko request handler ke andar dekhna red flag hai.",
+  "real_world_analogy": "Har ghar ka apna MCB (circuit breaker) hota hai, building ka ek common nahi -- warna ek flat ka short circuit poori building ki light kaat deta. Aur har baar switch on karte waqt naya MCB lagana bhi bekaar hai -- woh kuch yaad hi nahi rakhega.",
+  "how_it_works": "Policy objects mein state: `CircuitBreaker` (ring, current, generation), `Bulkhead` (active, queue), `RetryBudget` (tokens). `wrap()` khud stateless hai -- sirf references hold karta hai -- toh ek baar banao aur reuse karo.",
+  "in_this_project": "README 'Use it' section ka example: module level `const sms = wrap(...)` aur `sendSms` usko har call pe use karta hai. `src/budget.ts` comment: 'One budget per dependency, shared by every call to it.' `src/bulkhead.ts` comment: 'Limits how many calls to ONE dependency run at once'.",
+  "implementation_files": [
+   "projects/18-resilience/README.md",
+   "projects/18-resilience/src/wrap.ts::wrap",
+   "projects/18-resilience/src/budget.ts::RetryBudget",
+   "projects/18-resilience/src/bulkhead.ts::Bulkhead"
+  ],
+  "code_example": "// real, README usage (trimmed): created once, at module level, one set per dependency\nconst sms = wrap(\n  new RetryPolicy({ name: \"sms-retry\", maxAttempts: 3, budget: new RetryBudget(), shouldRetry: isRetryableHttp }),\n  new CircuitBreaker({ name: \"sms-breaker\", isFailure: isRetryableHttp }),\n  new Bulkhead({ name: \"sms-pool\", maxConcurrent: 20, maxQueue: 50 }),\n  new TimeoutPolicy({ name: \"sms-timeout\", ms: 2000 }),\n);\nexport function sendSms(body: unknown, signal?: AbortSignal) {\n  return sms.execute(async (s) => { /* fetch with s */ }, signal);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Har dependency ka failure isolated",
+   "State sahi accumulate hota hai, policies actually kaam karti hain",
+   "Names (`sms-breaker`) se events/metrics per dependency"
+  ],
+  "disadvantages": [
+   "Har nayi dependency ke liye config set banana padta hai",
+   "Per-process singletons -- replicas mein alag (README NOT implemented)"
+  ],
+  "common_mistakes": [
+   "Request handler ke andar `new CircuitBreaker()`",
+   "Ek global breaker sab dependencies ke liye",
+   "Ek dependency ke alag endpoints (fast read, slow report) ko ek hi bulkhead dena bina sooche"
+  ],
+  "follow_up_questions": [
+   "Ek dependency ke do endpoints ka behaviour bahut alag ho toh ek set ya do?",
+   "NestJS mein yeh policies kahan rakhoge?",
+   "Tests mein shared singleton state se isolation kaise rakhoge?"
+  ],
+  "concepts": [
+   "stateful-policies",
+   "isolation",
+   "singletons",
+   "per-dependency"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RES-052",
+  "project_slug": "p18-resilience",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Design how you would share circuit-breaker and retry-budget state across many API replicas, given this library keeps it per process. Would you actually do it?",
+  "answer_hinglish": "Pehle clear: yeh project mein implement nahi hai. README: 'Anything shared between processes: a budget, a breaker and a bulkhead live in one process's memory.' PLAN: 'Distributed state (a breaker shared between processes through Redis)' not in scope. Toh yeh design discussion hai.\n\nMera recommendation: by default per-process rakho, aur shared state sirf ADVISORY banao, critical path pe nahi.\n\nKyun? Breaker har call pe check hota hai. Agar uska state Redis mein hai toh har call pe ek network hop (local check ~200-250 ns ka hai bench mein, Redis round trip typically sub-millisecond se millisecond tak -- generic ballpark). Aur bura: Redis slow ya down toh protection layer hi failure ban jaati hai. Resilience library ka naya single point of failure nahi hona chahiye.\n\nAdvisory design:\n1. Har replica apna local breaker chalata rahe (aaj jaisa).\n2. Jab local breaker open ho, woh Redis mein `breaker:sms = open until T` publish kare (TTL = openMs) -- fire and forget, errors ignore (jaise `emit` throwing handlers ignore karta hai).\n3. Baaki replicas background mein (pub/sub ya har kuch second poll) yeh hint padhein aur apne breaker ko 'forced open until T' karein. Local decision hamesha valid; remote sirf jaldi open karata hai.\n4. Half-open: probes coordinate karne ke liye Redis `SET NX` lock 'probe:sms' with TTL -- sirf ek replica probe bheje. Lock na mile toh local fallback.\n\nBudget: sharing ka faayda kam hai -- har replica ka budget already apne traffic ke ratio pe adapt karta hai; outage mein extra cost sirf initial ~3 attempts per replica hai. Main share nahi karunga.\n\nBulkhead: global concurrency limit chahiye (dependency ka hard limit 50) toh Redis semaphore possible hai, lekin usually behtar hai per-replica limit = global / replicas, ya dependency ke saamne proxy.",
+  "why_needed": "Distributed state ka sawaal har senior backend interview mein aata hai. Achha answer 'Redis laga do' nahi, balki cost, failure modes aur 'kya zaroorat bhi hai' discuss karta hai.",
+  "real_world_analogy": "Har shop ka apna fire alarm (local breaker) + building ka WhatsApp group (advisory). Group pe message aaya 'third floor pe aag' toh tum bhi alert ho jaao, lekin group down ho toh bhi tumhara alarm kaam karta hai.",
+  "how_it_works": "Local state machine authoritative; remote signal sirf 'force open' hint with expiry. Coordination primitives: TTL keys (expiry automatic), SET NX lock (probe election), pub/sub (fast propagation). Har remote op timeout ke saath aur failure pe ignore.",
+  "in_this_project": "Aaj ke hooks jo design use karega: `onEvent` ka `breaker-state` event (publish trigger ke liye perfect -- open hone pe event aata hai), `BrokenCircuitError.retryAfterMs`, `CircuitBreaker` ka `now` aur `state`. Lekin 'force open' ke liye koi public API nahi hai -- `transition` private hai, toh library change chahiye. README NOT implemented aur PLAN Not in scope dono isko list karte hain.",
+  "implementation_files": [
+   "projects/18-resilience/README.md",
+   "projects/18-resilience/PLAN.md",
+   "projects/18-resilience/src/breaker.ts::transition",
+   "projects/18-resilience/src/events.ts::emit",
+   "projects/18-resilience/bench/reference-results/2026-11-23-win32-run2.json"
+  ],
+  "code_example": "// illustrative sketch -- NOT in the repo: publish local opens as an advisory hint\nconst breaker = new CircuitBreaker({\n  name: \"sms-breaker\",\n  isFailure: isRetryableHttp,\n  onEvent: (e) => {\n    if (e.type === \"breaker-state\" && e.to === \"open\") {\n      // fire and forget; a Redis failure must never affect the call (emit() already swallows throws,\n      // but an async rejection needs its own catch)\n      void redis.set(\"breaker:sms\", \"open\", { PX: 30_000 }).catch(() => {});\n    }\n  },\n});\n// other replicas: poll or subscribe, and if the key exists, reject locally before calling the dependency",
+  "code_language": "typescript",
+  "advantages": [
+   "Local fast path safe rehta hai, Redis outage protection nahi todta",
+   "Fleet jaldi seekhti hai ki dependency down hai",
+   "Probe coordination recovering dependency pe load kam karta hai"
+  ],
+  "disadvantages": [
+   "Naya infra dependency aur code complexity",
+   "Advisory = eventual; kuch calls phir bhi jaayenge",
+   "Library mein 'force open' API add karni padegi"
+  ],
+  "common_mistakes": [
+   "Har call pe Redis se breaker state padhna",
+   "Remote state ko authoritative banana -- network partition pe galat decisions",
+   "Budget bhi share karna jab zaroorat nahi"
+  ],
+  "follow_up_questions": [
+   "Network partition mein ek replica dependency tak pahunch sakta hai, baaki nahi -- shared breaker kya karega?",
+   "Probe lock holder crash ho jaaye toh?",
+   "Service mesh (Envoy) se yeh kaam karwaoge toh library ka kya role bachega?"
+  ],
+  "concepts": [
+   "distributed-state",
+   "advisory-signals",
+   "circuit-breaker",
+   "redis",
+   "not-implemented"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Authoritative shared state: consistent, lekin latency + naya SPOF. Advisory: fast aur resilient, lekin eventual. Pure per-process: simplest, fleet seekhne mein slow. Recommendation advisory, kyunki failure mode graceful hai (Redis gaya = aaj jaisa behaviour).",
+   "failure_scenarios": "Redis split-brain ya stale key: ek healthy dependency ko 30 s ke liye sab replicas pe band kar de. TTL isko bound karta hai. Probe lock holder crash: TTL expire hone tak koi probe nahi -- TTL ko openMs ke order pe rakho. Network partition: ek replica ka 'open' baaki ke liye galat ho sakta hai.",
+   "alternatives": "Service mesh outlier detection (Envoy) -- infra level per-host ejection, library ki zaroorat kam; client-side load balancer health checks; dependency ke saamne central proxy with global limits. Ya kuch nahi -- per-process enough hai zyaadatar cases mein.",
+   "scale_10x_100x": "10 replicas: per-process discovery cost (har replica ~minimumCalls failures) chhota. 100-1000 replicas: woh cost aur probes multiply hote hain, advisory sharing ki value badhti hai; Redis pub/sub fan-out bhi manageable. Global bulkhead semaphore 1000 replicas pe hot key ban sakta hai.",
+   "production_improvements": "Pehle metrics se measure karo kitni failed calls 'discovery' mein jaati hain per replica; agar significant ho tab advisory layer, feature flag ke peeche. Library mein minimal API add karo (`forceOpen(untilMs)`), mutation checks ke saath."
+  }
+ }
+]

@@ -261,6 +261,28 @@ describe("CircuitBreaker: odds and ends", () => {
     expect(breaker.state).toBe("open");
   });
 
+  it("an isFailure that throws counts as a failure; in half-open it does not leave the breaker stuck", async () => {
+    let t = 0;
+    const breaker = new CircuitBreaker({
+      windowSize: 1,
+      minimumCalls: 1,
+      openMs: 100,
+      now: () => t,
+      isFailure: () => {
+        throw new Error("classifier bug");
+      },
+    });
+    const e = await breaker.execute(boom).catch((x: unknown) => x);
+    expect(e).toMatchObject({ message: "down" }); // the operation's error, not the classifier's
+    expect(breaker.state).toBe("open");
+    t += 100;
+    await breaker.execute(boom).catch(() => {}); // the probe; its classification throws
+    expect(breaker.state).toBe("open"); // decided (as a failure), not stuck in half-open
+    t += 100;
+    expect(await breaker.execute(ok)).toBe("ok");
+    expect(breaker.state).toBe("closed");
+  });
+
   it("a synchronously throwing operation is recorded like any failure", async () => {
     const breaker = new CircuitBreaker({ windowSize: 1, minimumCalls: 1 });
     await breaker

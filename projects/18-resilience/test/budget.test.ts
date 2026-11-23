@@ -28,7 +28,7 @@ describe("RetryBudget", () => {
     expect(b.available).toBe(0);
   });
 
-  it("no drift: 10 000 x (+0.1) from 0 is exactly back at the cap, and 1000 x 0.001 is exactly 1", () => {
+  it("no drift: 50 x 0.1 from 0 is exactly 5, and 1000 x 0.001 is exactly 1", () => {
     const b = new RetryBudget({ maxTokens: 10, tokenRatio: 0.1 });
     for (let i = 0; i < 10; i++) b.onFailure();
     for (let i = 0; i < 50; i++) b.onSuccess();

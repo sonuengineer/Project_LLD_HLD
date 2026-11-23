@@ -36,6 +36,15 @@ beforeEach(async () => {
       next(e);
     }
   });
+  // Long timeout for the disconnect test: only the CLIENT may end this call (see nestjs.test.ts for why).
+  app.get("/proxy-long", async (req, res, next) => {
+    try {
+      lastSignal = requestSignal(req, res);
+      res.json(await new TimeoutPolicy({ ms: 15_000 }).execute((s) => getJson(up.url, s), lastSignal));
+    } catch (e) {
+      next(e);
+    }
+  });
   app.get("/boom", () => {
     throw new Error("not a resilience error");
   });
@@ -127,7 +136,7 @@ describe("Express adapter (real Express 4 app, real upstream server)", () => {
   it("the client disconnects -> the upstream request is cancelled (the upstream sees the close)", async () => {
     up.setHandler(hang);
     const client = new AbortController();
-    const p = fetch(`${base}/proxy`, { signal: client.signal }).catch((e: unknown) => e);
+    const p = fetch(`${base}/proxy-long`, { signal: client.signal }).catch((e: unknown) => e);
     await eventually(() => up.hits() === 1);
     client.abort();
     await p;

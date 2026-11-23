@@ -66,6 +66,24 @@ describe("wrap", () => {
     expect(opSignal!.reason).toBeInstanceOf(TimeoutError);
   });
 
+  it("50 concurrent calls without a caller signal: no MaxListenersExceededWarning (no listeners on the shared signal)", async () => {
+    const warnings: Error[] = [];
+    const onWarning = (w: Error) => warnings.push(w);
+    process.on("warning", onWarning);
+    try {
+      const bulkhead = new Bulkhead({ maxConcurrent: 5, maxQueue: 100 });
+      const policy = wrap(new RetryPolicy({ maxAttempts: 1 }), bulkhead, new TimeoutPolicy({ ms: 50 }));
+      const results = await Promise.all(
+        Array.from({ length: 50 }, () => policy.execute(() => new Promise(() => {})).catch((e: unknown) => e)),
+      );
+      expect(results.every((e) => e instanceof TimeoutError)).toBe(true);
+      await new Promise((r) => setTimeout(r, 20)); // warnings are emitted asynchronously
+      expect(warnings.filter((w) => w.name === "MaxListenersExceededWarning")).toEqual([]);
+    } finally {
+      process.off("warning", onWarning);
+    }
+  });
+
   it("needs at least one policy", () => {
     expect(() => wrap()).toThrow(RangeError);
   });
@@ -102,6 +120,29 @@ describe("why the recommended order is retry -> breaker -> bulkhead -> timeout",
     const outer = new CircuitBreaker({ windowSize: 10, minimumCalls: 10 });
     for (let i = 0; i < 4; i++) await wrap(outer, new RetryPolicy(noWait)).execute(fail).catch(() => {});
     expect(outer.state).toBe("closed"); // only 4 outcomes recorded
+  });
+
+  it("a half-open probe that hangs blocks the breaker forever; a timeout INSIDE the breaker turns it into a failure", async () => {
+    vi.useFakeTimers();
+    const hangs = () => new Promise<string>(() => {});
+    const trip = async (b: CircuitBreaker) => b.execute(async () => Promise.reject(new Error("down"))).catch(() => {});
+
+    const bare = new CircuitBreaker({ windowSize: 1, minimumCalls: 1, openMs: 1000 });
+    await trip(bare);
+    await vi.advanceTimersByTimeAsync(1000);
+    void bare.execute(hangs); // the probe never answers
+    await vi.advanceTimersByTimeAsync(60_000);
+    expect(await bare.execute(async () => "x").catch((e: unknown) => e)).toBeInstanceOf(BrokenCircuitError);
+    expect(bare.state).toBe("half-open"); // stuck: the probe slot is never freed
+
+    const guarded = new CircuitBreaker({ windowSize: 1, minimumCalls: 1, openMs: 1000 });
+    const policy = wrap(guarded, new TimeoutPolicy({ ms: 200 }));
+    await trip(guarded);
+    await vi.advanceTimersByTimeAsync(1000);
+    const probe = policy.execute(hangs).catch((e: unknown) => e);
+    await vi.advanceTimersByTimeAsync(200);
+    expect(await probe).toBeInstanceOf(TimeoutError);
+    expect(guarded.state).toBe("open"); // the timed-out probe counted as a failure: open again, will retry later
   });
 
   it("an open breaker inside retry (with isRetryableHttp) stops the retry at once", async () => {

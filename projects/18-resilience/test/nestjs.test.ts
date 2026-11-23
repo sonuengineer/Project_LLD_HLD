@@ -26,6 +26,14 @@ class ProxyController {
     return wrap(breaker, new TimeoutPolicy({ ms: 200 })).execute((s) => getJson(up.url, s), signal);
   }
 
+  // Same, with a long timeout: in the disconnect test only the CLIENT may end the call (with 200 ms, the timeout won
+  // the race on a busy machine and closed the upstream request first).
+  @Get("proxy-long")
+  async proxyLong(@RequestSignal() signal: AbortSignal): Promise<unknown> {
+    lastSignal = signal;
+    return new TimeoutPolicy({ ms: 15_000 }).execute((s) => getJson(up.url, s), signal);
+  }
+
   @Get("full")
   async busy(): Promise<unknown> {
     return full.execute(async () => "never");
@@ -103,7 +111,7 @@ describe("NestJS adapter (real Nest 10 app on platform-express, real upstream se
   it("the client disconnects -> the signal aborts with ClientClosedError and the upstream sees the close", async () => {
     up.setHandler(hang);
     const client = new AbortController();
-    const p = fetch(`${base}/proxy`, { signal: client.signal }).catch(() => {});
+    const p = fetch(`${base}/proxy-long`, { signal: client.signal }).catch(() => {});
     await eventually(() => up.hits() === 1);
     client.abort();
     await p;

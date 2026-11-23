@@ -446,6 +446,38 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 17, slug: "p18-resilience", dir: "projects/18-resilience", name: "Resilience Library (resilience-kit)",
+    tagline: "Timeouts, retries, a retry budget, a circuit breaker and a bulkhead for any async call -- with Express and NestJS adapters, built to use in my own projects.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "Express + NestJS adapters", "Vitest"],
+    features: [
+      "Timeout that really cancels: it aborts the operation's AbortSignal, so fetch closes the connection (a test watches the server see the close)",
+      "Retry with exponential backoff and full jitter, Retry-After honoured (and refused when absurd), an overall deadline, the last error rethrown unchanged",
+      "Retry budget (gRPC's scheme): 1000 calls to a dead service made 3000 attempts without it and 1003 with it (deterministic simulation)",
+      "Circuit breaker with a sliding window, half-open probes and generations so a late result from before a state change cannot move the state",
+      "Bulkhead with a FIFO queue and direct slot hand-off, tested against a newcomer scheduled exactly in the gap",
+      "wrap(retry, breaker, bulkhead, timeout): every claim about the order is a test that also shows what the wrong order does",
+      "Express and NestJS adapters tested with real apps: client disconnect cancels the outbound call, 503 + Retry-After / 504 mapping, load shedding; found and fixed an upstream 401 leaking to our own clients",
+      "86 deliberate code breaks in the final round, all caught; 5 real bugs found by reviewing the code while writing the interview bank, each fixed with a test",
+    ],
+    tests: "179 passing, including real Express 4 and NestJS 10 apps in front of a real upstream HTTP server",
+    run: "cd projects/18-resilience && npm ci && npm test && npm run bench",
+    docs: ["README", "PLAN"],
+    benches: [
+      {
+        title: "Per-call overhead on a no-op call: ours vs cockatiel 3.2.1", unit: "ns per call", log: true,
+        note: "Windows 11 PC, AMD Ryzen 5 4500, Node 20.20.1; one call at a time, 100 000 calls per round after 20 000 warm-up, median of 5 rounds (run 1; run 2, also saved, differed by up to 18%, on the bulkhead). Measures the wrapper, not network behaviour; the bare call took 146 ns.",
+        source: "projects/18-resilience/bench/reference-results/2026-11-23-win32-run1.json", series: ["ours", "cockatiel"],
+        rows: [
+          { label: "timeout", ours: 7745.4, cockatiel: 30412.8 },
+          { label: "retry", ours: 360.7, cockatiel: 382.4 },
+          { label: "breaker", ours: 228.8, cockatiel: 349.6 },
+          { label: "bulkhead", ours: 229, cockatiel: 248.9 },
+          { label: "all four", ours: 11355.6, cockatiel: 35250.5 },
+        ],
+      },
+    ],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
