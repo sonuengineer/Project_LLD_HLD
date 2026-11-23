@@ -1,4 +1,4 @@
-# A20 (build your own) -- cache-kit: plan
+# A21 (build your own) -- cache-kit: plan
 
 Status (2026-11-23): stage 1 DONE (LRU with max entries and max weight, TTL with lazy expiry and an optional unref'd
 sweep, single-flight `getOrLoad` with per-caller abort and load versions against stale writes, stats and events;
