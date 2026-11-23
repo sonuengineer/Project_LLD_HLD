@@ -14,8 +14,10 @@ import { isNotFound, loadForRequest, requestSignal, type CachedResponseOptions, 
 
 // An interceptor INSTANCE per decorated route (no dependency injection): on a miss the handler runs (next.handle());
 // on a hit, or while another request's load for the same key is running, the handler does NOT run at all.
-// Sets X-Cache: hit | miss | bypass. A "not found" value (default null / undefined) -> Nest's 404.
-// A handler error is not cached and reaches Nest's exception layer.
+// Sets X-Cache: hit | stale | miss | bypass. A "not found" value (default null / undefined) -> Nest's 404.
+// A handler error is not cached and reaches Nest's exception layer. Unlike the Express helper, a client that has gone
+// is not special-cased: its aborted wait also goes to Nest's exception layer (which writes to a closed connection,
+// a no-op), and the handler gets no abort signal (Nest handlers take none).
 export class CachedRouteInterceptor<V> implements NestInterceptor {
   constructor(
     private readonly cache: Loadable<V>,

@@ -23,7 +23,7 @@ export interface CachedResponseOptions<V> {
   notFound?: (value: V) => boolean;
 }
 
-export type CacheStatus = "hit" | "miss" | "bypass";
+export type CacheStatus = "hit" | "stale" | "miss" | "bypass";
 
 // An AbortSignal aborted when the client disconnects before the response is finished. Passed to getOrLoad: the
 // caller stops waiting, and if EVERY request waiting for the same load has gone, the load itself is aborted.
@@ -37,8 +37,13 @@ export function requestSignal(res: ServerResponse): AbortSignal {
 }
 
 // Runs one cached request: the producer only on a miss (and only once for concurrent misses of the same key).
-// "hit" = this request did not run the producer: served from the cache, from L2, or from a load another request
-// started. "miss" = it ran the producer. "bypass" = no key, not cached.
+// "hit"    = this request did not run the producer: served from the cache, from L2, or from a load another request
+//            started.
+// "stale"  = served a STALE value at once (stale-while-revalidate) while this request started the background refresh.
+//            (The first version reported this as "miss", because the refresh calls the loader synchronously; found
+//            by a reviewer while writing the interview bank.)
+// "miss"   = this request waited for the producer it ran.
+// "bypass" = no key, not cached.
 export async function loadForRequest<V>(
   cache: Loadable<V>,
   options: CachedResponseOptions<V>,
@@ -49,15 +54,18 @@ export async function loadForRequest<V>(
   const key = await options.key(req);
   if (key === undefined) return { value: await produce(signal), status: "bypass" };
   let ran = false;
+  let refreshed = false;
   const value = await cache.getOrLoad(
     key,
-    (loadSignal) => {
-      ran = true;
+    (loadSignal, context) => {
+      // context is optional in the Loadable shape; LruCache and TwoLevelCache always pass it.
+      if (context?.refresh) refreshed = true;
+      else ran = true;
       return produce(loadSignal);
     },
     { signal, ttlMs: options.ttlMs, staleMs: options.staleMs },
   );
-  return { value, status: ran ? "miss" : "hit" };
+  return { value, status: ran ? "miss" : refreshed ? "stale" : "hit" };
 }
 
 export const isNotFound = (v: unknown): boolean => v === null || v === undefined;

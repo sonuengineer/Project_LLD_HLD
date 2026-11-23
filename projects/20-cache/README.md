@@ -14,8 +14,8 @@ and negative caching; 99 deliberate breaks over stages 1 and 2, every one that c
 equivalent ones as stage 1 explained (see "Mutation checks"). The real-Redis test found a cross-replica race, fixed
 with SET NX + tombstones (see `TwoLevelCache`). Per-operation cost measured on one PC for stage 1 only (see
 "Overhead"). **Stage 3 done**: Express and NestJS helpers (cache a route's JSON or a service method) tested with
-real apps -- 175 tests in total; 17 stage-3 breaks, all caught (3 only after unit tests for the "client already
-gone" paths were added). Not published to npm.
+real apps -- 178 tests in total; 20 stage-3 breaks, all caught (3 only after unit tests for the "client already
+gone" paths were added; 3 more guard fixes from the interview-bank review). Not published to npm.
 
 ## In an Express or NestJS app (stage 3)
 
@@ -43,20 +43,30 @@ class ProductService {                                              // or cache 
 }
 ```
 
-- `X-Cache: hit | miss | bypass` on every response. "hit" = this request did not run the producer (from the
-  cache, from Redis, or from a load another request started); "bypass" = the key function returned `undefined`.
+- `X-Cache: hit | stale | miss | bypass` on every response. "hit" = this request did not run the producer (from
+  the cache, from Redis, or from a load another request started); "stale" = a stale value was served at once while
+  this request's background refresh ran the producer (stale-while-revalidate); "miss" = it waited for the producer
+  it ran; "bypass" = the key function returned `undefined`. The first version had no "stale": a stale serve was
+  labelled "miss", because the refresh calls the loader synchronously -- found by a reviewer while writing the
+  interview bank, fixed with a test (mutation C7). With `TwoLevelCache`, a stale serve whose refresh is answered by
+  Redis (no producer run) shows "hit".
 - **The key is required and must contain everything the producer reads** -- with coalescing, ONLY THE FIRST
   request's producer runs, and every request with the same key gets its result. Per-user data needs the user in
   the key (tested: alice, bob, alice -> miss, miss, hit with alice's own data). `@Cached` runs the method with the
-  first caller's `this` and arguments, so the key must capture instance differences too (a test shows the wrong
-  key on purpose: tenant b gets tenant a's config).
+  first caller's `this` and arguments, so the key must capture instance differences too: the key function is called
+  with the instance as `this` -- `key: function (this: Tenant) { return \`config:${this.name}\`; }` (tested; an
+  arrow function cannot see `this`, and a test shows that wrong key on purpose: tenant b gets tenant a's config).
+  The first version called the key without `this`, so instance state could not be in the key at all (found by a
+  reviewer; fixed, mutation D5). `@Cached` always returns a promise: a synchronous throw becomes a rejection (D6).
 - 20 concurrent requests for one key run the producer once (tested). A null / undefined result is answered 404 and
   is cached like any value (negative caching applies if the cache has it); `notFound` changes the rule.
 - A producer error is not cached (cache-kit never caches errors): Express `next(err)` / Nest's exception layer,
   and the next request runs the producer again.
 - The request's disconnect signal is passed to `getOrLoad`: a client that goes stops waiting; when EVERY client
-  waiting for a load has gone, the load's own signal is aborted (pass it to your DB driver / fetch). Nothing is
-  written to, and `next(err)` is not called for, a client that has gone.
+  waiting for a load has gone, the load's own signal is aborted (pass it to your DB driver / fetch). Express: nothing
+  is written to, and `next(err)` is not called for, a client that has gone. NestJS: not special-cased -- the aborted
+  wait goes to Nest's exception layer (a write to a closed connection, a no-op), and a Nest handler gets no abort
+  signal.
 - `@Cached` is framework-free (a legacy TypeScript method decorator, the kind NestJS uses; needs
   `experimentalDecorators`). A method gets no AbortSignal, so a caller cannot abandon the shared call.
 - Two Express instances sharing a `TwoLevelCache` over one real Redis: A loads, B answers from Redis without
@@ -153,7 +163,8 @@ are O(n).
 - A value heavier than `maxWeight` on its own is NOT stored: `set` returns false, a `reject` event, `stats().rejected`
   +1, nothing else evicted -- and the key's older value is removed (the caller just replaced it; keeping it would be
   a stale read). A value of exactly `maxWeight` is stored and pushes everything else out.
-- `delete(key)` returns true only if a live entry was removed. `clear()` empties everything. Neither is an eviction.
+- `delete(key)` returns true only if a FRESH entry was removed (what `has()` would say: false for an expired or a
+  stale entry, which it still removes). `clear()` empties everything. Neither is an eviction.
 - `size` counts entries held, INCLUDING expired ones not removed yet (see TTL). `totalWeight`, `keys()` (least
   recent first, read-only) for metrics and debugging.
 
@@ -184,8 +195,8 @@ same value or the same error.
 **Stats** (`stats()` returns a copy): `hits`, `misses` (from `get` and `getOrLoad` only), `loads` (loader calls),
 `coalesced` (misses that joined a running load), `loadErrors` (not counting aborted loads; a `weigh` failure on the
 loaded value counts here and rejects the waiters), `rejected`, `evictions: { size, weight, expired }`. Stage 2:
-`staleHits`, `negativeHits` (part of `hits`), `refreshes` (part of `loads`), `refreshErrors` (part of
-`loadErrors`). Hits and misses are counters, not events: an event on every read would cost every call.
+`staleHits` (neither a hit nor a miss), `negativeHits` (part of `hits`), `refreshes` (part of `loads`),
+`refreshErrors` (part of `loadErrors`). Hits and misses are counters, not events: an event on every read would cost every call.
 
 ### Stage 2: stale-while-revalidate
 
@@ -286,7 +297,7 @@ Keys are strings. L1 is your `LruCache` (its TTL, grace, negative caching and li
 
 ## What the tests show
 
-`npm test` -- 175 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files; stage 3 added 24):
+`npm test` -- 175 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files; stage 3 added 27):
 
 | File | Proves |
 |---|---|
@@ -300,9 +311,9 @@ Keys are strings. L1 is your `LruCache` (its TTL, grace, negative caching and li
 | `two-level.test.ts` | stage 2, `TwoLevelCache` against an in-memory fake Redis (exact control of time, failures and message delivery): L1 -> L2 -> loader with prefixed keys and the TTL; **replica B served from L2 without its loader**, its L1 copy expiring with the Redis copy; min(PTTL, call TTL); PTTL 0 = miss; an L1 hit touches no Redis; 50 concurrent misses -> 1 Redis read + 1 load; negatives through L2; a refresh reads L2 first; nobody waiting -> no load; **delete / set on A invalidate B**, A ignores its own message; Redis TTL from the L1 default; an invalidation or local delete during a load stops the Redis write; **both race orders (set, delete) with held messages: NX / tombstone refuse the late write**; tombstone lifetime; set overwrites a tombstone; **a disconnected subscriber misses messages, the reconnect clears L1**; malformed messages; channel names; close() waits for writes (incl. a slow one) and unsubscribes; codec (JSON round trip and its losses, custom codec, decode failure = miss + overwrite, encode failure incl. non-string results); **outage**: Redis down, Redis hanging (timeout, real 30 ms timer), subscribe failing, Redis back; TTL rounding; a throwing handler; invalid options (35) |
 | `adapters.test.ts` | stage 2, the ioredis adapters against stand-ins: messages for the channel only; the first `ready` ignored, after a reconnect onResubscribed only once the new SUBSCRIBE is confirmed; unsubscribe and a failed subscribe remove the listeners; MULTI errors and an aborted MULTI are errors; SET argument mapping for PX / NX (5) |
 | `redis-l2.test.ts` | stage 2, **a real Redis** (skipped with a printed notice if unreachable): the adapter's GET + PTTL MULTI and SET PX / NX replies; a load on A served from Redis on B (PTTL checked); delete on A reaches B's L1 over pub/sub, Redis holds a tombstone; set on A -> B reads the new value; **the race, 20 rounds, Redis always keeps A's value**; B's subscriber connection killed with CLIENT KILL -> reconnect, L1 cleared, invalidations arrive again; nothing listening on the port and a connection killed mid-run -> L1 + loader, set / delete false, no crash; all keys of the run deleted afterwards (8) |
-| `express-helper.test.ts` | stage 3, a real Express 4 app: miss then hit (producer once), ttlMs passed on (miss, hit, miss on an injected clock), keys separate, **per-user key: users never see each other's data**, no key = bypass, **20 concurrent requests -> 1 producer call**, null -> 404 and cached, an error not cached and handled by the app, **all clients gone -> the load's signal aborted; one left -> the load goes on**; **two Express instances on one real Redis: B answers from Redis without running its producer** (9) |
+| `express-helper.test.ts` | stage 3, a real Express 4 app: miss then hit (producer once), ttlMs passed on (miss, hit, miss on an injected clock), **a stale read answered at once with X-Cache: stale, the refresh then a hit**, keys separate, **per-user key: users never see each other's data**, no key = bypass, **20 concurrent requests -> 1 producer call**, null -> 404 and cached, an error not cached and handled by the app, **all clients gone -> the load's signal aborted; one left -> the load goes on**; **two Express instances on one real Redis: B answers from Redis without running its producer** (10) |
 | `nestjs-helper.test.ts` | stage 3, a real NestJS 10 app: `@CachedRoute` miss then hit (handler not run on a hit), 10 concurrent requests -> 1 handler run, null -> 404, an error not cached (500, then the handler runs again); `@Cached` on a service method used by a controller (5) |
-| `cached.test.ts` | stage 3, `@Cached` without a framework: key by arguments and `this` kept, 10 concurrent calls -> 1, undefined key = uncached, errors not cached, the first caller's `this` (wrong key on purpose), ttlMs passed on, only methods (6) |
+| `cached.test.ts` | stage 3, `@Cached` without a framework: key by arguments and `this` kept, 10 concurrent calls -> 1, undefined key = uncached, errors not cached, the first caller's `this` (wrong key on purpose), the key function gets `this` (the right per-tenant key), a sync throw is a rejection, ttlMs passed on, only methods (8) |
 | `adapters-unit.test.ts` | stage 3, with a fake response: requestSignal aborts on an early close but not after a finished response; nothing written to a response destroyed during the load; no `next(err)` for a client that has gone (4) |
 
 ## Mutation checks (stage 1, 2026-11-23)
@@ -464,27 +475,30 @@ X17, X19, X20, X22, X24, X25.
 
 ## Mutation checks, stage 3 (2026-11-23)
 
-One break at a time in the framework helpers, full suite (175 tests, real Redis on), reverted; runner outside the repo, started from `H:\`, killing the whole process tree on a timeout. 17 breaks, **all caught**. The first run left 3 survivors -- C4, E1, E2: the "client already gone" paths, invisible over a real socket because writing to a closed connection is silently dropped -- and `test/adapters-unit.test.ts` (a fake response object) was added for them. The 99 stage 1 + 2 breaks were not re-run: stage 3 changed none of the core files (`cache.ts`, `two-level.ts`, `events.ts`).
+One break at a time in the framework helpers, full suite (178 tests, real Redis on), reverted; runner outside the repo, started from `H:\`, killing the whole process tree on a timeout. 20 breaks, **all caught**. The first run left 3 survivors -- C4, E1, E2: the "client already gone" paths, invisible over a real socket because writing to a closed connection is silently dropped -- and `test/adapters-unit.test.ts` (a fake response object) was added for them. C7, D5 and D6 guard the three fixes from the interview-bank review (the "stale" label, the key function's `this`, a sync throw as a rejection). The 99 stage 1 + 2 breaks were not re-run: stage 3 changed none of the core files (`cache.ts`, `two-level.ts`, `events.ts`).
 
 | # | Break | Failed |
 |---|---|---|
-| C1 | every request reported as a hit (ran flag never set) | 8 |
+| C1 | every request reported as a hit (ran flag never set) | 9 |
 | C2 | no key does not bypass (caches under undefined) | 1 |
 | C3 | the request's signal not passed to getOrLoad | 1 |
 | C4 | requestSignal aborts even after a finished response | 1 |
 | C5 | ttlMs / staleMs not passed by the HTTP helpers | 1 |
 | C6 | default not-found rule broken (null is a 200) | 2 |
 | E1 | express: sends to a client that has gone | 1 |
-| E2 | express: next(err) even when the client has gone | 2 |
-| E3 | express: no X-Cache header | 7 |
+| E2 | express: next(err) even when the client has gone | 1 |
+| E3 | express: no X-Cache header | 8 |
 | E4 | express: not-found answered 200 with the value | 1 |
 | E5 | express: errors swallowed (request hangs) | 1 |
 | N1 | nest: no X-Cache header | 2 |
 | N2 | nest: not-found returned as a value | 1 |
 | D1 | @Cached: undefined key still cached | 1 |
-| D2 | @Cached: `this` lost in the cached call | 2 |
+| D2 | @Cached: `this` lost in the cached call | 3 |
 | D3 | @Cached: ttlMs not passed | 1 |
 | D4 | @Cached: decorates non-methods silently | 1 |
+| C7 | a stale serve labelled miss (refresh flag ignored) | 1 |
+| D5 | @Cached: key function called without `this` | 1 |
+| D6 | @Cached: a sync throw escapes as a throw | 1 |
 
 ## Overhead
 
@@ -507,8 +521,9 @@ other work (the Map floor alone moved from 37 to 79 between the runs), so read t
 | `set` new key (evicts the LRU) | 548.8 | 664.6 |
 | `getOrLoad` hit (awaited) | 924.6 | 1091.7 |
 
-**Found by the benchmark: eviction was not O(1).** The first version found the victim with
-`this.map.entries().next()`. The first run measured **10 401.9 ns per evicting set** (raw:
+**Found by the benchmark: eviction was not O(1).** The first version found the victim with a fresh
+`this.map.keys().next()` per eviction (this README said `entries()` until a reviewer compared it with the code
+comment, PLAN and the guard test, which spies on `Map.prototype.keys`). The first run measured **10 401.9 ns per evicting set** (raw:
 `2026-11-23-win32-before-iterator-fix.json`), about 150x a `Map.get`. Likely cause (from how V8's ordered hash
 tables are known to work; V8's source was not read here, only the fix's effect was measured): V8 leaves a hole in a
 Map's table for each deleted entry until it rehashes, and a NEW iterator starts at slot 0, so every eviction walked
@@ -538,9 +553,17 @@ concurrency, memory per entry, Linux.
   (b) a replica whose subscriber is silently cut off (not yet detected) serves its L1 copy until the L1 TTL;
   (c) between A's `set` and the message reaching B, B still serves its old L1 copy (milliseconds on a healthy
   network); (d) if `set` / `delete` resolve `false`, other replicas and Redis may hold the old value until their
-  TTLs. This is a cache, not a consistency protocol: use short TTLs for data that changes.
+  TTLs; (e) a value Redis holds but cannot decode is overwritten with a plain SET, not NX -- a `set` on another
+  replica in that gap can be overwritten (rare: needs a corrupt value AND a concurrent set); (f) a tombstone is an
+  ordinary Redis key: if Redis evicts it under memory pressure or restarts without persistence (the repo's infra
+  Redis runs with `--appendonly no --save ""`), a late NX write is accepted again; (g) the ioredis subscriber
+  adapter ignores a failed re-SUBSCRIBE after a reconnect: if ioredis's own resubscribe works, messages flow again
+  but L1 was not cleared (bounded by the L1 TTL). This is a cache, not a consistency protocol: use short TTLs for
+  data that changes.
+- `TwoLevelCache.set` writes Redis even when the value is too heavy for L1 (L1 refuses it and drops the older
+  value) and can still resolve `true` (= the Redis write worked).
 - `TwoLevelCache` has no `clear()` across replicas (clearing a prefix in Redis needs SCAN; not built).
-- Overhead not re-measured for stage 2: the numbers below are stage 1's. The hit path gained one boolean check
+- Overhead not re-measured for stage 2: the numbers in "Overhead" above are stage 1's. The hit path gained one boolean check
   (negative hits) and the fresh/stale comparison; not benchmarked. Redis round trips were not benchmarked either.
 - `weigh` is called on every `set` and every loaded value; an expensive `weigh` (JSON.stringify of a large object) is
   paid on the write path.

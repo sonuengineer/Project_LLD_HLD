@@ -10,7 +10,7 @@ type Next = (error?: unknown) => void;
 //     (req, signal) => db.products.find(req.params.id, { signal })));
 //
 // Caches the DATA, not the HTTP bytes: the producer returns a value, the helper sends it as JSON with
-// X-Cache: hit | miss | bypass. A value that means "not found" (default null / undefined) is answered with 404 --
+// X-Cache: hit | stale | miss | bypass. A value that means "not found" (default null / undefined) is answered with 404 --
 // and, being a value, it is cached like any other (cache-kit's negative caching applies if the cache has it).
 // A producer error is NOT cached (cache-kit never caches errors) and goes to next(err).
 // If the client disconnects, this request stops waiting; the shared load is aborted only when every request

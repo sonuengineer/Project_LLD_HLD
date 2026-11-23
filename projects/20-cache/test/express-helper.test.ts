@@ -59,6 +59,25 @@ describe("cachedJson (real Express 4 app)", () => {
     expect(await get()).toEqual(["miss", 2]);
   });
 
+  it("stale-while-revalidate: a stale read is answered at once with X-Cache: stale, the refresh lands as a hit", async () => {
+    let t = 0;
+    let version = 0;
+    const cache = new LruCache<string, { v: number }>({ maxEntries: 10, ttlMs: 1000, staleMs: 5000, now: () => t });
+    const app = express();
+    app.get("/s", cachedJson(cache, { key: () => "s" }, () => ({ v: ++version })));
+    const base = await listen(app);
+    const get = async () => {
+      const r = await fetch(`${base}/s`);
+      return [r.headers.get("x-cache"), (await r.json()).v];
+    };
+    expect(await get()).toEqual(["miss", 1]);
+    t = 1500; // stale: the old value at once, one background refresh
+    expect(await get()).toEqual(["stale", 1]);
+    await until(() => version === 2, "the refresh");
+    await new Promise((r) => setTimeout(r, 20));
+    expect(await get()).toEqual(["hit", 2]);
+  });
+
   it("different keys are different entries", async () => {
     let calls = 0;
     const cache = new LruCache<string, number>({ maxEntries: 100 });

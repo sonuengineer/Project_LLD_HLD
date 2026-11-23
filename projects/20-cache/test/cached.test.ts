@@ -65,6 +65,45 @@ describe("@Cached method decorator (no framework)", () => {
     expect(await new Tenant("b").config()).toBe("config of a"); // b got a's value: put the tenant in the key
   });
 
+  it("the key function gets the instance as `this` (the right way to key per tenant)", async () => {
+    const cache = new LruCache<string, string>({ maxEntries: 10 });
+    class Tenant {
+      constructor(readonly name: string) {}
+      @Cached(cache, {
+        key: function (this: Tenant) {
+          return `config:${this.name}`;
+        },
+      })
+      async config(): Promise<string> {
+        return `config of ${this.name}`;
+      }
+    }
+    expect([await new Tenant("a").config(), await new Tenant("b").config()]).toEqual(["config of a", "config of b"]);
+  });
+
+  it("a synchronous throw (uncached path or key function) is a rejected promise, not a throw", async () => {
+    const cache = new LruCache<string, string>({ maxEntries: 10 });
+    class Svc {
+      @Cached(cache, { key: () => undefined })
+      syncFails(): Promise<string> {
+        throw new Error("sync boom");
+      }
+      @Cached(cache, {
+        key: () => {
+          throw new Error("key boom");
+        },
+      })
+      async badKey(): Promise<string> {
+        return "x";
+      }
+    }
+    const s = new Svc();
+    let result: Promise<string> | undefined;
+    expect(() => (result = s.syncFails())).not.toThrow();
+    await expect(result).rejects.toThrow("sync boom");
+    await expect(s.badKey()).rejects.toThrow("key boom");
+  });
+
   it("passes ttlMs on: after it the method runs again", async () => {
     let t = 0;
     const cache = new LruCache<string, number>({ maxEntries: 10, now: () => t }); // no default TTL

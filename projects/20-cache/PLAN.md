@@ -5,8 +5,8 @@ sweep, single-flight `getOrLoad` with per-caller abort and load versions against
 tested against a naive reference model with seeded random steps; deliberate breaks, see README "Mutation checks").
 Stage 2 DONE (stale-while-revalidate, negative caching, load context, `TwoLevelCache` with a Redis L2 and pub/sub
 invalidation; the model test extended to both; real-Redis tests; mutation checks re-run over stages 1 and 2).
-Stage 3 DONE in code (Express `cachedJson`, NestJS `@CachedRoute`, framework-free `@Cached`; real apps; 175 tests;
-17 stage-3 mutation checks, all caught); interview bank and portfolio page follow.
+Stage 3 DONE in code (Express `cachedJson`, NestJS `@CachedRoute`, framework-free `@Cached`; real apps; 178 tests;
+20 stage-3 mutation checks, all caught); interview bank and portfolio page follow.
 
 Stage 3 decisions (one recommendation each):
 - **Cache handler DATA, not HTTP bytes.** Intercepting and replaying `res.write` breaks on streaming, headers and
