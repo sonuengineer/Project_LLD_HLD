@@ -1,7 +1,8 @@
 # A19 (build your own) -- resilience-kit: plan
 
 Status (2026-11-23): stage 1 DONE (timeout, retry with backoff and jitter, retry budget, HTTP helpers; 86 tests incl.
-a real loopback HTTP server; 32 mutation checks all caught). Stages 2 and 3 not started.
+a real loopback HTTP server; 32 mutation checks all caught). Stage 2 DONE (circuit breaker with generations, bulkhead
+with direct hand-off; 130 tests; 27 new mutation checks, 1 survivor closed with a test). Stage 3 not started.
 
 ## Why this project
 
@@ -35,6 +36,20 @@ what each policy does and where it fails; stage 3 compares against one of them.
   health.
 - **Retry-After is honoured when longer than the backoff; a request to wait longer than `maxRetryAfterMs`
   (default 60 s) gives up** instead of parking the request.
+- **Stage 2: count-based sliding window for the breaker** (last N calls, ring buffer), with a minimum number of
+  calls before any decision. Simpler than time buckets and the usual default (resilience4j's is count-based);
+  the cost is that at low traffic the window can hold old outcomes -- `minimumCalls` and a sensible `windowSize`
+  limit that. Time-based windows are not built.
+- **Stage 2: open -> half-open is checked lazily on the next call, no timer.** Nothing runs in the background, and an
+  idle breaker costs nothing.
+- **Stage 2: generations instead of trusting every late result.** A state change bumps a counter; a call records its
+  outcome only in the generation it started in. Without it, a slow failure from before the breaker opened pushes the
+  open timer back, or a slow success from the closed state closes a half-open breaker without a real probe.
+- **Stage 2: errors that are not failures count as successes** (the dependency answered). Recommended over ignoring
+  them: a service answering 404 to everything is healthy, and ignoring those calls would let a few 5xx decide alone.
+- **Stage 2: the bulkhead hands a slot directly to the next waiter.** Releasing the slot and letting the waiter take
+  it when it wakes up lets a newcomer barge in between; the hand-off keeps the queue fair (tested with a newcomer
+  scheduled exactly in that gap).
 - **Test hooks instead of global fake time where possible:** `sleep`, `random` and `now` can be injected, so retry
   tests record waits instead of waiting. Fake timers are used where the real timer behaviour is the point.
 
@@ -43,7 +58,7 @@ what each policy does and where it fails; stage 3 compares against one of them.
 | Stage | What | Status |
 |---|---|---|
 | 1 | TimeoutPolicy, RetryPolicy (exponential backoff, full/equal/no jitter, shouldRetry, Retry-After, deadline, events), RetryBudget, HTTP helpers (parseRetryAfter, HttpError, isRetryableHttp) | DONE 2026-11-23 |
-| 2 | Circuit breaker (closed -> open -> half-open, failure rate over a sliding window, minimum calls, probe calls in half-open, BrokenCircuitError), bulkhead (max concurrent + bounded queue, reject when full) | not started |
+| 2 | Circuit breaker (closed -> open -> half-open, failure rate over a count-based sliding window, minimum calls, probe calls in half-open, generations against stale results, BrokenCircuitError), bulkhead (max concurrent + bounded FIFO queue, direct hand-off, reject when full, cancellable waiting) | DONE 2026-11-23 |
 | 3 | Composition (`wrap(retry, breaker, timeout)` and why the order matters), one event stream for logs/metrics, Express middleware and NestJS interceptor adapters (tested with each framework), comparison with an established library, interview bank, portfolio page | not started |
 
 ## Not in scope

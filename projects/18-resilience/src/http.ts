@@ -1,3 +1,5 @@
+import { BrokenCircuitError, BulkheadRejectedError } from "./errors.js";
+
 // Helpers for the most common use: calling an HTTP API with fetch.
 
 // HTTP Retry-After is either delay-seconds ("120") or an HTTP-date ("Wed, 21 Oct 2026 07:28:00 GMT").
@@ -26,8 +28,10 @@ export class HttpError extends Error {
 }
 
 // Worth retrying: no answer at all (network error, timeout), 408, 429 and 5xx except 501. NOT 4xx in general: the
-// same request will fail the same way.
+// same request will fail the same way. NOT a circuit-breaker or bulkhead rejection either: failing fast is their
+// whole point, and an immediate retry would only hit the same open breaker / full bulkhead.
 export function isRetryableHttp(error: unknown): boolean {
+  if (error instanceof BrokenCircuitError || error instanceof BulkheadRejectedError) return false;
   if (!(error instanceof HttpError)) return true;
   const s = error.status;
   return s === 408 || s === 429 || (s >= 500 && s !== 501);

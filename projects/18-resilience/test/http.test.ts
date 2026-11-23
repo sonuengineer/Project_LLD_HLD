@@ -2,7 +2,9 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import type { AddressInfo } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { RetryBudget } from "../src/budget.js";
-import { TimeoutError } from "../src/errors.js";
+import { BrokenCircuitError, BulkheadRejectedError, TimeoutError } from "../src/errors.js";
+import { CircuitBreaker } from "../src/breaker.js";
+import { Bulkhead } from "../src/bulkhead.js";
 import { HttpError, isRetryableHttp, parseRetryAfter } from "../src/http.js";
 import { RetryPolicy } from "../src/retry.js";
 import { TimeoutPolicy } from "../src/timeout.js";
@@ -45,6 +47,11 @@ describe("isRetryableHttp", () => {
   it("network errors and timeouts are retryable", () => {
     expect(isRetryableHttp(new TypeError("fetch failed"))).toBe(true);
     expect(isRetryableHttp(new TimeoutError(100))).toBe(true);
+  });
+
+  it("an open breaker or a full bulkhead is NOT retried (fail fast)", () => {
+    expect(isRetryableHttp(new BrokenCircuitError("open", 500))).toBe(false);
+    expect(isRetryableHttp(new BulkheadRejectedError(2, 0))).toBe(false);
   });
 });
 
@@ -158,6 +165,44 @@ describe("over real HTTP (loopback server + fetch)", () => {
     await expect(p).rejects.toThrow("client went away");
     for (let i = 0; i < 50 && s.closed() === 0; i++) await new Promise((r) => setTimeout(r, 10));
     expect([s.hits(), s.closed()]).toEqual([1, 1]);
+  });
+
+  it("circuit breaker: 503s open it, then requests stop reaching the server; after openMs one probe closes it", async () => {
+    let healthy = false;
+    const s = await serve([(req, res) => (healthy ? json({ up: true })(req, res) : status(503)(req, res))]);
+    const breaker = new CircuitBreaker({ windowSize: 5, minimumCalls: 5, openMs: 150, isFailure: isRetryableHttp });
+    const call = () => breaker.execute((sig) => getJson(s.url, sig)).catch((e: unknown) => e);
+    for (let i = 0; i < 5; i++) await call();
+    expect(breaker.state).toBe("open");
+    expect(s.hits()).toBe(5);
+    for (let i = 0; i < 20; i++) expect(await call()).toBeInstanceOf(BrokenCircuitError);
+    expect(s.hits()).toBe(5); // 20 calls, 0 requests: the struggling server gets a rest
+    healthy = true;
+    await new Promise((r) => setTimeout(r, 170));
+    expect(await call()).toEqual({ up: true }); // the probe
+    expect(breaker.state).toBe("closed");
+    expect(s.hits()).toBe(6);
+  });
+
+  it("404s do not open a breaker that uses isRetryableHttp as isFailure", async () => {
+    const s = await serve([status(404)]);
+    const breaker = new CircuitBreaker({ windowSize: 5, minimumCalls: 5, isFailure: isRetryableHttp });
+    for (let i = 0; i < 10; i++) await breaker.execute((sig) => getJson(s.url, sig)).catch(() => {});
+    expect(breaker.state).toBe("closed");
+    expect(s.hits()).toBe(10);
+  });
+
+  it("bulkhead: a server that hangs can hold at most 2 sockets; the rest are refused at once", async () => {
+    const s = await serve([hang]);
+    const bulkhead = new Bulkhead({ maxConcurrent: 2 });
+    const timeout = new TimeoutPolicy({ ms: 300 });
+    const calls = Array.from({ length: 6 }, () =>
+      bulkhead.execute((sig) => timeout.execute((t) => getJson(s.url, t), sig)).catch((e: unknown) => e),
+    );
+    const results = await Promise.all(calls);
+    expect(results.filter((e) => e instanceof BulkheadRejectedError)).toHaveLength(4);
+    expect(results.filter((e) => e instanceof TimeoutError)).toHaveLength(2);
+    expect(s.hits()).toBe(2);
   });
 
   it("server down (connection refused) with a shared budget: retries stop after a few calls", async () => {
