@@ -86,3 +86,15 @@ export function setHeaders(res: ServerResponse, d: Decision): void {
 }
 
 export const TOO_MANY_REQUESTS_BODY = { error: "rate_limited", message: "Too many requests. Try again later." } as const;
+
+// ---- When the store fails (Redis down, timeout, circuit open, no fallback) ----
+//   "error" (default) -> the framework's error handling (Express next(err), Nest exception layer)
+//   "allow"           -> FAIL OPEN: the request goes through unlimited. For limits that protect capacity, where
+//                        refusing everyone is worse than briefly not limiting (a general API limit).
+//   "deny"            -> FAIL CLOSED: 503 + Retry-After. For limits that protect SECURITY (login, OTP, password
+//                        reset): an attacker must not get unlimited guesses because Redis is down. 503, not 429:
+//                        the server has the problem, not the client.
+// A RateLimitError (bad key / cost -- a bug) is never covered by this: it always goes to error handling.
+export type OnStoreError = "error" | "allow" | "deny";
+export const STORE_UNAVAILABLE_RETRY_AFTER_S = 5;
+export const STORE_UNAVAILABLE_BODY = { error: "rate_limit_unavailable", message: "Please try again shortly." } as const;

@@ -5,10 +5,11 @@ window counter** (about N per window), either in memory (one process) or **atomi
 number of app instances share one limit. You pass your own Redis client; the package has no runtime dependency.
 The Lua scripts are project 1's (`projects/01-rate-limiter`), reused unchanged.
 
-Status (2026-11-23): **stages 1 and 2 done** -- 77 tests pass (Windows, Node 20), 10 of them against a real
-Redis 7 (the repo's `infra/docker-compose.yml` Redis), including two Express instances sharing one limit through
-Redis; Express middleware and a NestJS decorator tested with real apps; mutation checks below. Stage 3 (Redis-down
-behaviour, a load test, interview bank) is planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-23): **stages 1-3 done** -- 90 tests pass (Windows, Node 20), 10 of them against a real Redis 7
+(the repo's `infra/docker-compose.yml` Redis), including two Express instances sharing one limit through Redis;
+Express middleware and a NestJS decorator tested with real apps; Redis-down behaviour (failover, fail open / closed)
+tested with a real client on a dead port; a load test across 3 instances (correctness held; throughput NOT validly
+measurable on this busy PC); 51 mutation checks: 49 caught, 2 equivalent.
 
 ## In an Express or NestJS app (stage 2)
 
@@ -85,6 +86,61 @@ if (!d.allowed) {
 node-redis instead of ioredis: `new RedisStore({ evalsha: (sha, keys, args) => client.evalSha(sha, { keys,
 arguments: args }), scriptLoad: (s) => client.scriptLoad(s) })` (not tested here; ioredis is).
 
+## When Redis is down (stage 3)
+
+Two decisions: what to do INSTEAD of Redis, and what to do if there is nothing.
+
+```ts
+import { CircuitBreaker, TimeoutPolicy, wrap } from "resilience-kit"; // projects/18-resilience (optional)
+
+const store = new FailoverStore(new RedisStore(ioredisClient(redis)), {
+  guard: wrap(new CircuitBreaker({ openMs: 10_000 }), new TimeoutPolicy({ ms: 50 })), // anything with execute()
+  fallback: new MemoryStore(),             // while Redis is down: each instance limits on its own
+  onError: (e) => logger.warn({ err: e }, "rate-limit store failed"),
+});
+
+app.use("/api", rateLimit(apiLimit, { onStoreError: "allow" }));   // capacity limit: fail OPEN
+app.post("/login", rateLimit(loginLimit, { onStoreError: "deny" }), login); // security limit: fail CLOSED
+```
+
+- **`guard`**: any object with resilience-kit's `execute(op, signal)` shape (structural -- this package does not
+  import resilience-kit). The timeout is what keeps a HANGING Redis (partition, overload) from hanging every request:
+  a test with a never-answering store gets the fallback's answer after the 100 ms timeout. The circuit breaker
+  skips Redis at once while it is known to be down: a test with a dead store and a breaker of 3 calls made 10 checks
+  and called the dead store only 3 times. The Redis call itself cannot be cancelled (clients take no AbortSignal) --
+  the timeout stops WAITING for it.
+- **`fallback`** (usually a `MemoryStore`): decisions are marked `degraded: true`. Weaker -- N instances allow up
+  to N x the limit -- but still a limit; tested with a real ioredis client pointed at a closed port: capacity 2 ->
+  200, 200, 429. Its own failure is reported, not hidden.
+- **No fallback, or it fails too** -> `StoreUnavailableError`, and the adapters' **`onStoreError`** decides:
+  - `"error"` (default): the framework's error handling (Express `next(err)`, Nest's exception layer -> 500).
+  - `"allow"` (fail OPEN): the request goes through, unlimited, without `RateLimit-*` headers. For limits that
+    protect capacity, where refusing everyone is worse than briefly not limiting.
+  - `"deny"` (fail CLOSED): **503** with `Retry-After: 5` and `{"error":"rate_limit_unavailable"}`. For limits that
+    protect SECURITY (login, OTP, password reset): an attacker must not get unlimited guesses because Redis is down.
+    503, not 429: the server has the problem, not the client.
+- A `RateLimitError` (bad key / cost -- a bug) is NEVER failed open: it reaches the error handler even with
+  `"allow"` (tested for Express and Nest).
+
+## Load test (stage 3) -- correctness held, throughput not measurable on this PC
+
+`bench/load.mjs`: 3 Express instances as separate Node processes, all limiting against one Redis; the client
+spreads requests round-robin over them with 32 concurrent connections. Raw results:
+`bench/reference-results/2026-11-23-win32-load-run1.json` and `-run2.json` (Windows 11, Ryzen 5 4500, Node
+20.20.1, Redis 7 in Docker on the same PC).
+
+**Correctness under load (run 1):** one shared key, sliding window limit 500, all 3 instances -> **exactly 500
+allowed**, 503 denied, nothing else. The same with MemoryStore (each instance counting alone): 1116 allowed, 0
+denied -- the "N instances, up to N x the limit" warning, measured. Run 2 sent only 410 requests to the shared key
+in its 3 seconds (the PC was slower), so it never reached the limit and proves nothing about the cap. The
+deterministic test (two Express instances, one Redis, 30 concurrent requests -> exactly 10 of 10) covers the same
+property on every `npm test`.
+
+**Throughput: NOT a valid measurement.** The PC's CPU was at 90% (run 1) and 100% (run 2) from other programs, and
+the numbers show it: in both runs "no limiter" came out SLOWER than "with a limiter" (run 1: 348 vs 490 req/s;
+run 2: 161 vs 256 req/s), which cannot be a real effect. They are kept in the JSON files, but no conclusion is drawn
+from them; a clean measurement needs an idle machine or a separate load-generator host.
+
 ## The two algorithms
 
 **Token bucket** `tokenBucket({ capacity, refillPerSec })` -- `src/lua/token_bucket.lua`
@@ -143,7 +199,7 @@ Two precision details make this hold:
 
 ## What the tests show
 
-`npm test` -- 77 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
+`npm test` -- 90 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
 infra/docker-compose.yml up -d redis`) or `REDIS_URL`; without it they are SKIPPED with a printed notice, never
 silently passed. All numbers below are from runs WITH Redis.
 
@@ -154,13 +210,14 @@ silently passed. All numbers below are from runs WITH Redis.
 | `redis.test.ts` | real Redis: parity over 3 seeds x 200 steps for each algorithm, atomicity (3 clients, 300 requests, capacity 50 -> exactly 50; sliding window 200 -> exactly 40), Redis TIME by default and a key expiry set, NOSCRIPT after `SCRIPT FLUSH`, other errors not retried, the empty time argument without a clock, an unexpected reply rejected (9) |
 | `ip.test.ts` | clientIp: forged X-Forwarded-For ignored by default, 1 and 2 trusted proxies, repeated headers, fewer entries than proxies, invalid counts; ipKey: IPv4, mapped IPv6 (both cases), /64 grouping incl. leading zeros, `::`, `::1`, zone ids, one /64 = one client, non-IPs; the headers (rounding, Retry-After at least 1) (24) |
 | `express.test.ts` | real Express 4 app: limit then 429 with headers and the route not run, forged X-Forwarded-For gives no fresh limit, one trusted proxy, per-user key and `undefined` = not limited, two stacked limiters, cost, `headers: false`, a store error and a throwing key fn reach the error handler; **two Express instances sharing one Redis: 30 concurrent requests over both -> exactly 10 allowed** (10) |
-| `nestjs.test.ts` | real NestJS 10 app: headers then 429 with Retry-After and the handler not run, an undecorated route untouched, stacked per-IP + per-user decorators with anonymous skip, a decorator on a controller shared by its routes (4) |
+| `nestjs.test.ts` | real NestJS 10 app: headers then 429 with Retry-After and the handler not run, an undecorated route untouched, stacked per-IP + per-user decorators with anonymous skip, a decorator on a controller shared by its routes; store down: allow -> 200, deny -> 503 + Retry-After, default -> 500, a bug -> 500 even with allow (5) |
+| `failover.test.ts` | FailoverStore: primary used and not degraded, fallback marked degraded, no fallback -> StoreUnavailableError with the cause, a failing fallback reported, a throwing onError contained; with resilience-kit as the guard: a hanging primary times out (100 ms) to the fallback, an open breaker stops calling the dead primary (3 calls for 10 checks); a real ioredis client on a closed port behind Express: allow -> 200 without headers, deny -> 503 + Retry-After, default -> error handler, with a memory fallback still limited (200, 200, 429), a bug never failed open (12) |
 
 ### Mutation checks (2026-11-23)
 
 One deliberate bug at a time, full suite with Redis, reverted (runner kept outside the repo, started from `H:\`).
 
-Run on the stage 2 code against all 77 tests: 39 breaks (24 stage-1 + 15 adapter); **37 caught, 2 equivalent** (cannot be caught by design). From the first stage-1 run: M3 (the memory store ignored its expiry) survived and showed the expiry was redundant -- removed; L3 survived and got a sharper test.
+Final run on the stage 3 code against all 90 tests: 51 breaks (24 stage 1, 15 stage 2, 12 stage 3); **49 caught, 2 equivalent** (cannot be caught by design). From the first stage-1 run: M3 (the memory store ignored its expiry) survived and showed the expiry was redundant -- removed; L3 survived and got a sharper test. Stage 3: all 12 caught at the first run (one Nest test -- a bug is never failed open -- was added before the run, after listing what was not covered).
 
 | # | Break | Failed |
 |---|---|---|
@@ -169,7 +226,7 @@ Run on the stage 2 code against all 77 tests: 39 breaks (24 stage-1 + 15 adapter
 | L3 | a clock going backwards changes tokens | 1 |
 | L4 | needs MORE than cost tokens | 12 |
 | L5 | retry rounded down | 1 |
-| L6 | a new bucket starts empty | 18 |
+| L6 | a new bucket starts empty | 20 |
 | S1 | previous window not weighted | 2 |
 | S2 | limit exclusive | 4 |
 | S3 | denied requests are counted | 2 |
@@ -179,7 +236,7 @@ Run on the stage 2 code against all 77 tests: 39 breaks (24 stage-1 + 15 adapter
 | M1 | memory store never evicts | 2 |
 | M2 | memory store does not refresh recency | 1 |
 | Q1 | prefix not applied | 5 |
-| Q2 | cost above the limit not rejected | 1 |
+| Q2 | cost above the limit not rejected | 3 |
 | Q3 | key length limit off by one | 1 |
 | R1 | NOSCRIPT not handled | 2 |
 | R2 | every error retried as if NOSCRIPT | 1 |
@@ -197,19 +254,32 @@ Run on the stage 2 code against all 77 tests: 39 breaks (24 stage-1 + 15 adapter
 | H7 | RateLimit-Reset rounded down | 1 |
 | E1 | express: 429 without headers when headers:false | 1 |
 | E2 | express: undefined key not skipped | 1 |
-| E3 | express: cost option ignored | 1 |
-| E4 | express: store errors swallowed (request hangs) | 2 |
-| E5 | express: 403 instead of 429 | 8 |
+| E3 | express: cost option ignored | 2 |
+| E4 | express: store errors swallowed (request hangs) | 4 |
+| E5 | express: 403 instead of 429 | 9 |
 | N1 | nest: undefined key not skipped | 1 |
 | N2 | nest: no headers on the 429 | 1 |
 | N3 | nest: 403 instead of 429 | 3 |
+| F1 | fallback decisions not marked degraded | 3 |
+| F2 | guard ignored (a hanging Redis hangs the request; an open breaker still calls it) | 2 |
+| F3 | no fallback: raw error instead of StoreUnavailableError | 1 |
+| F4 | a throwing onError is not contained | 1 |
+| F5 | a failing fallback's raw error leaks | 1 |
+| O1 | express: a bug (RateLimitError) is failed open | 1 |
+| O2 | express: fail-closed answers 429 instead of 503 | 1 |
+| O3 | express: fail-closed without Retry-After | 1 |
+| O4 | express: allow and deny swapped | 2 |
+| O5 | nest: fail-closed answers 429 instead of 503 | 1 |
+| O6 | nest: allow ignored | 1 |
+| O7 | nest: a bug (RateLimitError) is failed open | 1 |
 
 Equivalent: **S6** -- both candidates for the retry are already >= 1 ms (`elapsed < window`, `needed > 0`), so `max(retry, 1)` never changes the value (kept to mirror the Lua). **H5** -- a zone id (`%eth0`) only ever sits in the LAST group of an address and the /64 key keeps the first four, so stripping it never changes a key (kept for clarity). U1-U3 break the Lua script itself; the tests against the real Redis catch them.
 
-## NOT implemented (after stage 2)
+## NOT implemented (after stage 3)
 
-- Behaviour when Redis is down (stage 3): today the error reaches the framework's error handling; whether to fail
-  open or closed is the app's decision for now.
+- A valid throughput / latency measurement (see "Load test"): needs an idle machine or a separate load generator.
+- While degraded, the fallback's counts are per instance and are NOT merged back into Redis when it returns.
+- Cancelling an in-flight Redis call (the client APIs take no AbortSignal): a timeout only stops waiting.
 - NestJS on Fastify, an Express 5 test, other frameworks (Koa, Hono): not done.
 - The combined `RateLimit` / `RateLimit-Policy` fields of newer drafts of the header spec: not sent.
 - Not measured: throughput / latency per check (project 1 measured its Lua scripts from Python; not repeated here).
@@ -240,7 +310,9 @@ npm run build   # dist/ (copies the Lua scripts next to the JS)
 | `src/redis-store.ts` | `RedisStore`, `RedisScriptClient`, `ioredisClient` |
 | `src/limiter.ts` | `RateLimiter`, `Store` |
 | `src/types.ts` | `Decision`, `Algorithm`, `RateLimitError` |
-| `src/adapters/http.ts` | `clientIp`, `ipKey`, `keyByIp`, `rateLimitHeaders` (shared by both adapters) |
+| `src/failover-store.ts` | `FailoverStore`, `Guard` (stage 3) |
+| `src/adapters/http.ts` | `clientIp`, `ipKey`, `keyByIp`, `rateLimitHeaders`, `OnStoreError` (shared by both adapters) |
+| `bench/load.mjs` | load test: 3 instances on one Redis; results in `bench/reference-results/` |
 | `src/adapters/express.ts` | `rateLimit` middleware (`ratelimit-kit/express`) |
 | `src/adapters/nestjs.ts` | `@RateLimit`, `RateLimitGuard` (`ratelimit-kit/nestjs`) |
 | `scripts/copy-lua.mjs` | copies the Lua scripts into `dist/` on build |

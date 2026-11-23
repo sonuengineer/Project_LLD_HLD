@@ -5,6 +5,9 @@ export interface Decision {
   readonly remaining: number; // whole units left after this request (0 when denied and empty)
   readonly retryAfterMs: number; // 0 when allowed; otherwise how long until this cost would be allowed
   readonly resetMs: number; // until fully refilled (token bucket) / until the current window ends (sliding window)
+  // true when the decision came from a FailoverStore's fallback (the primary store -- Redis -- failed): it is then
+  // per instance, not shared. Absent otherwise.
+  readonly degraded?: true;
 }
 
 // A rate-limiting algorithm in two forms that MUST agree (tested by test/parity.test.ts):
@@ -20,6 +23,13 @@ export interface Algorithm<S> {
   stateTtlMs(): number; // how long state is worth keeping after the last request
 }
 
+// A programming / input error (bad key, bad cost, bad options). Never a reason to fail open: always reported.
 export class RateLimitError extends Error {
   override name = "RateLimitError";
+}
+
+// The store could not answer (Redis down, timed out, circuit open) and there was no fallback. The adapters decide
+// what that means for the request (onStoreError).
+export class StoreUnavailableError extends Error {
+  override name = "StoreUnavailableError";
 }

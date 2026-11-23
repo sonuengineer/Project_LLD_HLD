@@ -2,7 +2,16 @@
 // and 5 without importing Express at runtime (tested with 4.21.2).
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { RateLimiter } from "../limiter.js";
-import { keyByIp, setHeaders, TOO_MANY_REQUESTS_BODY, type KeyFn } from "./http.js";
+import { RateLimitError, type Decision } from "../types.js";
+import {
+  keyByIp,
+  setHeaders,
+  STORE_UNAVAILABLE_BODY,
+  STORE_UNAVAILABLE_RETRY_AFTER_S,
+  TOO_MANY_REQUESTS_BODY,
+  type KeyFn,
+  type OnStoreError,
+} from "./http.js";
 
 type Next = (error?: unknown) => void;
 
@@ -12,22 +21,33 @@ export interface RateLimitMiddlewareOptions {
   key?: KeyFn;
   cost?: (req: IncomingMessage) => number; // default 1
   headers?: boolean; // send RateLimit-* headers on every response, default true
+  onStoreError?: OnStoreError; // see adapters/http.ts; default "error"
 }
 
-// app.use("/api", rateLimit(apiLimiter, { key: keyByIp({ trustedProxies: 1 }) }));
-// app.post("/login", rateLimit(loginLimiter, { key: (req) => "email:" + req.body?.email?.toLowerCase() }), login);
+// app.use("/api", rateLimit(apiLimiter, { key: keyByIp({ trustedProxies: 1 }), onStoreError: "allow" }));
+// app.post("/login", rateLimit(loginLimiter, { key: ..., onStoreError: "deny" }), login);
 //
 // Denied: 429 with Retry-After and a generic JSON body; the route does not run.
-// A store error (Redis down) goes to next(err) -- the app's error handler decides (fail-open / fail-closed per limit
-// is stage 3).
 export function rateLimit(limiter: RateLimiter, options: RateLimitMiddlewareOptions = {}) {
   const keyFn = options.key ?? keyByIp();
   const sendHeaders = options.headers ?? true;
+  const onStoreError = options.onStoreError ?? "error";
   return function rateLimitMiddleware(req: IncomingMessage, res: ServerResponse, next: Next): void {
     void (async () => {
       const key = await keyFn(req);
       if (key === undefined) return next();
-      const decision = await limiter.consume(key, options.cost?.(req) ?? 1);
+      let decision: Decision;
+      try {
+        decision = await limiter.consume(key, options.cost?.(req) ?? 1);
+      } catch (error) {
+        if (error instanceof RateLimitError || onStoreError === "error") throw error;
+        if (onStoreError === "allow") return next();
+        res.statusCode = 503;
+        res.setHeader("retry-after", String(STORE_UNAVAILABLE_RETRY_AFTER_S));
+        res.setHeader("content-type", "application/json; charset=utf-8");
+        res.end(JSON.stringify(STORE_UNAVAILABLE_BODY));
+        return;
+      }
       if (sendHeaders || !decision.allowed) setHeaders(res, decision);
       if (decision.allowed) return next();
       res.statusCode = 429;
@@ -37,4 +57,4 @@ export function rateLimit(limiter: RateLimiter, options: RateLimitMiddlewareOpti
   };
 }
 
-export { clientIp, ipKey, keyByIp, rateLimitHeaders, type KeyFn } from "./http.js";
+export { clientIp, ipKey, keyByIp, rateLimitHeaders, type KeyFn, type OnStoreError } from "./http.js";

@@ -3,7 +3,9 @@
 Status (2026-11-23): stage 1 DONE (token bucket + sliding window counter, in memory and atomically in Redis via Lua,
 bring-your-own Redis client; parity between the TypeScript and the Lua versions tested against a real Redis).
 Stage 2 DONE (Express middleware, NestJS decorator, safe client-IP extraction, headers; real apps; two Express
-instances sharing one Redis limit). Stage 3 not started.
+instances sharing one Redis limit). Stage 3 DONE in code (FailoverStore with a guard + memory fallback, fail open /
+closed per limit, load test across 3 instances; 90 tests; 51 mutation checks, 49 caught, 2 equivalent); its
+interview bank and portfolio page follow.
 
 ## Why this project
 
@@ -38,6 +40,16 @@ workers): the inbound half of the toolkit, next to `projects/18-resilience` for 
   The left-most entry is client-controlled; trusting it makes every limit bypassable. IPv6 keyed per /64.
 - **Stage 2: the NestJS decorator attaches a guard instance** (`UseGuards(new RateLimitGuard(limiter))`), so it
   needs no DI and no decorator metadata; stacking several decorators stacks guards.
+- **Stage 3: failover is a Store wrapper, not adapter logic.** `FailoverStore(primary, { guard, fallback })` keeps
+  "what instead of Redis" in one place for every framework; the adapters only decide what a request gets when there
+  is nothing (`onStoreError`).
+- **Stage 3: the guard is structural** (`execute(op, signal)`), so resilience-kit's breaker and timeout plug in with
+  no dependency between the packages.
+- **Stage 3: fail open vs fail closed is chosen PER LIMIT** (capacity limits open, security limits closed), and a
+  bug (RateLimitError) is never failed open. Fail closed answers 503, not 429.
+- **Stage 3: the load test's throughput numbers are not published as results**: the PC was at 90-100% CPU from
+  other programs and "no limiter" came out slower than "limiter". Only the correctness result (exactly the limit
+  across 3 instances) is claimed.
 - **Stage 2: adapters are separate entry points** written against Node's http types (Express not imported at
   runtime); same layout as resilience-kit.
 
@@ -47,7 +59,7 @@ workers): the inbound half of the toolkit, next to `projects/18-resilience` for 
 |---|---|---|
 | 1 | Algorithms (TypeScript + Lua), MemoryStore, RedisStore (EVALSHA, NOSCRIPT, Redis TIME), RateLimiter (prefix, validation), parity + atomicity tests against a real Redis | DONE 2026-11-23 |
 | 2 | Express middleware and NestJS `@RateLimit()` decorator; key strategies (IP behind a proxy, IPv6 /64, user id, skip); `RateLimit-*` and `Retry-After` headers; tested with real apps and two Express instances on one Redis | DONE 2026-11-23 |
-| 3 | Redis down: fail-open vs fail-closed per limit, protected by resilience-kit's circuit breaker and timeout; a load test across several app instances on one Redis; interview bank; portfolio page | not started |
+| 3 | Redis down: FailoverStore (guard = resilience-kit breaker + timeout, memory fallback, degraded decisions), fail open / closed per limit; a load test across 3 app instances on one Redis; interview bank; portfolio page | code DONE 2026-11-23; bank + portfolio in progress |
 
 ## Not in scope
 

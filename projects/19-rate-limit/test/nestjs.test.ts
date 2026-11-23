@@ -47,7 +47,38 @@ class LimitedController {
   }
 }
 
-@Module({ controllers: [DemoController, LimitedController] })
+const brokenStore = { consume: async () => Promise.reject(new Error("ECONNREFUSED")) };
+const brokenLimiter = () => new RateLimiter({ algorithm: tokenBucket({ capacity: 1, refillPerSec: 1 }), store: brokenStore });
+
+@Controller("down")
+class StoreDownController {
+  @Get("open")
+  @RateLimit(brokenLimiter(), { onStoreError: "allow" })
+  open(): string {
+    return "allowed while the store is down";
+  }
+
+  @Get("closed")
+  @RateLimit(brokenLimiter(), { onStoreError: "deny" })
+  closed(): string {
+    return "never";
+  }
+
+  @Get("default")
+  @RateLimit(brokenLimiter())
+  dflt(): string {
+    return "never";
+  }
+
+  // A bug (cost above the limit) must never be failed open, even with allow.
+  @Get("bug")
+  @RateLimit(brokenLimiter(), { onStoreError: "allow", cost: () => 99 })
+  bug(): string {
+    return "never";
+  }
+}
+
+@Module({ controllers: [DemoController, LimitedController, StoreDownController] })
 class AppModule {}
 
 let app: INestApplication;
@@ -85,6 +116,16 @@ describe("NestJS @RateLimit (real Nest 10 app, platform-express)", () => {
   it("stacked decorators: per-user limit for a user, skipped for anonymous requests", async () => {
     const as = (user?: string) => fetch(`${base}/me`, { headers: user ? { "x-user": user } : {} }).then((r) => r.status);
     expect([await as("alice"), await as("alice"), await as("bob"), await as(), await as()]).toEqual([200, 429, 200, 200, 200]);
+  });
+
+  it("store down: allow -> 200, deny -> 503 + Retry-After, default -> Nest's 500", async () => {
+    const open = await fetch(`${base}/down/open`);
+    const closed = await fetch(`${base}/down/closed`);
+    const dflt = await fetch(`${base}/down/default`);
+    expect([open.status, await open.text()]).toEqual([200, "allowed while the store is down"]);
+    expect([closed.status, closed.headers.get("retry-after"), (await closed.json()).error]).toEqual([503, "5", "rate_limit_unavailable"]);
+    expect(dflt.status).toBe(500);
+    expect((await fetch(`${base}/down/bug`)).status).toBe(500);
   });
 
   it("on a controller: one limit shared by all its routes", async () => {
