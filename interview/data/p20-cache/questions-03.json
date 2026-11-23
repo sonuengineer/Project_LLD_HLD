@@ -1,0 +1,1320 @@
+[
+  {
+    "id": "CKT-053",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Beginner",
+    "question": "How does the cache-kit overhead benchmark measure the cost of one cache operation, and what does it deliberately NOT measure?",
+    "answer_hinglish": "Seedha jawab: `bench/overhead.mjs` har operation ko ek tight loop mein 1 000 000 baar chalata hai, us round ka time `performance.now()` se naapta hai, aur ns per operation nikalta hai (`ms * 1e6 / N`). Aise 7 rounds hote hain aur report hota hai unka MEDIAN (sorted array ka index 3). Har case se pehle 200 000 warm-up operations chalte hain taaki V8 ka JIT code ko optimise kar le aur pehla round compile time na naape.\n\nHar case ka apna cache hai, sab mein 10 000 entries (`filledCache()`): hit ke liye, miss ke liye, existing key set ke liye, evicting set ke liye (hamesha nayi key `next++`, toh har set ek LRU eviction karta hai), aur ek `ttlMs: 3_600_000` wala. Floor ke liye ek plain `Map.get` -- yeh batata hai ki \"kuch bhi nahi karna\" kitna sasta hai is machine par. Results ek `sink` variable mein jodte hain taaki engine kaam ko dead code samajhkar hata na de. `getOrLoad` hit async hai, isliye `measureAsync` mein har call sequentially await hota hai.\n\nOutput: `bench/reference-results/<date>-<platform>.json` -- har round, Node version, platform, CPU. Reference machine: Windows 11 (10.0.26200), AMD Ryzen 5 4500, Node 20.20.1.\n\nKya NAHI naapta: caching ka fayda (README khud kehta hai ek DB query around a millisecond hoti hai, yahan ke kisi bhi number se hazaron guna), concurrency, memory per entry, Linux, Redis round trips, aur stage 2 ka overhead (numbers stage 1 ke hain). Yeh sirf cache ki apni bookkeeping hai.",
+    "why_needed": "Interview mein \"tumhara cache fast hai?\" ka honest jawab tabhi de sakte ho jab pata ho ki number kaise aaya aur kis cheez ka hai. Benchmark method samjhe bina number bolna risky hai.",
+    "real_world_analogy": "Jaise petrol pump ka meter check karna: pehle engine garam (warm-up), phir 7 baar same distance chalao, beech wali reading lo -- ek baar traffic mein phans gaye toh woh reading average ko kharab nahi karegi.",
+    "how_it_works": "Microbenchmark = ek chhota operation bahut baar loop mein, total time / count. Warm-up JIT tiering ke liye; median outliers (GC pause, OS scheduling) ke against robust hai; floor (`Map.get`) se pata chalta hai ki machine ka baseline kitna hai, taaki cache ka number relative dekh sakein. Sink dead-code elimination rokta hai.",
+    "in_this_project": "`npm run bench` = `npm run build && node bench/overhead.mjs` -- yeh `dist/index.js` import karta hai, yaani compiled code naapa jaata hai, source nahi. Constants: `N = 1_000_000`, `ROUNDS = 7`, `WARMUP = 200_000`, `KEYS = 10_000`. Teen raw files hain: `2026-11-23-win32-before-iterator-fix.json`, `-run1.json`, `-run2.json` (script `<date>-<platform>.json` likhta hai, author ne haath se rename kiya).",
+    "implementation_files": [
+      "projects/20-cache/bench/overhead.mjs::measure",
+      "projects/20-cache/bench/overhead.mjs::measureAsync",
+      "projects/20-cache/bench/overhead.mjs::filledCache",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run1.json",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, bench/overhead.mjs (trimmed)\nconst N = 1_000_000; // operations per round\nconst ROUNDS = 7;\nconst WARMUP = 200_000;\nfunction measure(fn) {\n  for (let i = 0; i < WARMUP; i++) fn(i);\n  const rounds = [];\n  for (let r = 0; r < ROUNDS; r++) {\n    const t0 = performance.now();\n    for (let i = 0; i < N; i++) fn(i);\n    const ms = performance.now() - t0;\n    rounds.push({ ms: +ms.toFixed(2), nsPerOp: +((ms * 1e6) / N).toFixed(1) });\n  }\n  const sorted = [...rounds].sort((a, b) => a.nsPerOp - b.nsPerOp);\n  return { median: sorted[Math.floor(ROUNDS / 2)].nsPerOp, rounds };\n}",
+    "code_language": "javascript",
+    "advantages": [
+      "Har round raw JSON mein save -- README ke numbers koi bhi verify kar sakta hai",
+      "Map.get floor se machine ka noise dikhta hai",
+      "Compiled dist code naapa jaata hai, wahi jo ship hota hai"
+    ],
+    "disadvantages": [
+      "Single thread, koi concurrency nahi",
+      "Ek hi Windows machine, jo busy thi",
+      "Memory aur stage 2 ka cost nahi naapa"
+    ],
+    "common_mistakes": [
+      "Median ki jagah mean report karna (ek GC pause poora number bigaad deta hai)",
+      "Warm-up skip karna aur interpreter/JIT compile time naap lena",
+      "Microbenchmark number ko end-to-end latency samajh lena"
+    ],
+    "follow_up_questions": [
+      "Median of 7 kyun, mean ya min kyun nahi?",
+      "Sink variable na ho toh kya ho sakta hai?",
+      "Isko Linux par compare karne ke liye kya badloge?"
+    ],
+    "concepts": [
+      "microbenchmark",
+      "warm-up / JIT",
+      "median",
+      "baseline floor",
+      "dead-code elimination"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-054",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Advanced",
+    "question": "The first benchmark showed an evicting set costing about 10 microseconds. What caused it, how was it fixed, and how sure are you about the cause?",
+    "answer_hinglish": "Pehle run mein `set new key (evicts LRU)` ka median 10401.9 ns aaya (rounds 9769.3 se 11636.7 tak) -- usi run ke `Map.get` floor 69.3 ns se lagbhag 150 guna. LRU eviction O(1) honi chahiye thi, toh yeh bug tha, noise nahi.\n\nPurana code har eviction par victim ek NAYE iterator se nikalta tha (`this.map.keys().next()` -- code comment aur PLAN mein yahi likha hai). Likely cause, aur main isko reasoning hi kahunga kyunki V8 ka source nahi padha gaya, sirf fix ka effect naapa gaya: V8 Map ki hash table mein har deleted entry ek \"hole\" chhod deti hai jab tak rehash na ho, aur naya iterator slot 0 se shuru hota hai. Toh har eviction pichli saari evictions ke holes ke upar se chalti thi -- O(1) nahi, holes ke count jitna kaam.\n\nFix: ek long-lived iterator, `private oldest: Iterator<K> = this.map.keys()`, sirf eviction ke liye. Language spec guarantee deta hai ki Map iterator deleted entries skip karta hai aur baad mein append hui entries bhi visit karta hai. Har live key iterator ki position par ya uske baad hai (keys ya toh nikalti hain ya hit/set par end mein re-append hoti hain), isliye `next()` hamesha least recently used key deta hai, aur har hole total mein ek hi baar cross hota hai -- amortized O(1).\n\nResult: 548.8 ns (run 1) aur 664.6 ns (run 2). Order same raha -- randomized model test pass karta hai. Aur regression rokne ke liye ek test `Map.prototype.keys` ke calls ginta hai (mutation L8).",
+    "why_needed": "Interviewers \"LRU O(1) hai\" sunte hi poochte hain ki tumne verify kiya? Yeh ek real case hai jahan theory O(1) thi par runtime ka internal behaviour usko tod raha tha.",
+    "real_world_analogy": "Ek register jismein kaate hue naam line se mitaye nahi jaate, bas strike hote hain. Har baar pehla zinda naam dhundhne ke liye page 1 se padhna shuru karo toh kaate hue naam baar baar padhoge. Bookmark rakh lo jahan tak padh chuke -- har kata naam ek hi baar dikhega.",
+    "how_it_works": "JS Map insertion order rakhta hai. V8 ka implementation ordered hash table hai (yeh general knowledge hai, project ne verify nahi kiya): entries ek array mein insertion order mein, delete par slot khaali-marked. Iterator ek index hai us array mein. Naya iterator index 0 se; purana iterator aage badh chuka hai, toh holes dobara nahi dekhta.",
+    "in_this_project": "`src/cache.ts` mein `evictOldest(reason)`: `let next = this.oldest.next()`; agar `done` ho toh naya iterator (equivalent mutant L7, practically unreachable). `clear()` bhi `this.oldest = this.map.keys()` reset karta hai (L6, spec ke hisaab se zaroori nahi). Evidence files: `bench/reference-results/2026-11-23-win32-before-iterator-fix.json` (10401.9) aur `-run1.json` / `-run2.json`.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::evictOldest",
+      "projects/20-cache/src/cache.ts::oldest",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-before-iterator-fix.json",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run1.json",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run2.json"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed)\nprivate oldest: Iterator<K> = this.map.keys(); // ONE long-lived iterator\n\nprivate evictOldest(reason: EvictionReason): void {\n  let next = this.oldest.next();\n  if (next.done) {\n    this.oldest = this.map.keys();\n    next = this.oldest.next();\n    if (next.done) return;\n  }\n  const key = next.value;\n  const entry = this.map.get(key)!;\n  this.evict(key, this.now() >= entry.deadAt ? \"expired\" : reason);\n}\n// the slow version was, per eviction:  const key = this.map.keys().next().value;",
+    "code_language": "typescript",
+    "advantages": [
+      "Code wahi simple Map, koi linked list nahi",
+      "Eviction measured roughly 19x sasti (10401.9 -> 548.8 ns, same machine)",
+      "Spec-backed: kisi V8-specific hack par depend nahi"
+    ],
+    "disadvantages": [
+      "Subtle code -- comment aur test ke bina koi bhi 'simplify' karke wapas tod dega",
+      "Cause ka V8 explanation verify nahi hua, sirf effect",
+      "Iterator state ek aur cheez hai jo clear() mein yaad rakhni padti hai"
+    ],
+    "common_mistakes": [
+      "O(1) maan lena kyunki textbook kehta hai, bina measure kiye",
+      "Cause ko fact ki tarah bolna jab sirf fix ka effect naapa gaya",
+      "Timing assertion wala test likhna jo busy machine par flaky ho"
+    ],
+    "follow_up_questions": [
+      "Holes rehash par kab saaf hote hain, aur uska cost kahan dikhta hai?",
+      "Doubly linked list wala textbook LRU yahan kyun nahi liya?",
+      "Is fix ko bina timing ke test kaise karoge?"
+    ],
+    "concepts": [
+      "LRU eviction",
+      "Map iteration order",
+      "hash table tombstones",
+      "amortized O(1)",
+      "benchmark-driven fix"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Trade-off: Map + ek long-lived iterator bahut kam code hai, par uski correctness ek invariant par tiki hai (\"har live key iterator ke aage hai\"). Linked list mein yeh explicit hota; yahan comment aur test mein. PLAN ne jaan-boojhkar Map choose kiya kyunki linked list \"only adds code to get wrong\".",
+      "failure_scenarios": "Agar koi refactor karke `map.keys().next()` wapas le aaye -- koi functional test fail nahi hota (L8 pehle 0 tests se pakda gaya). Isliye keys-count test add hua. Agar koi `entries().next()` use kare toh woh spy (sirf `keys` par) usse nahi pakdega -- yeh test ki ek limit hai.",
+      "alternatives": "Textbook doubly linked list + hash map (har node object, prev/next pointers); ek fixed-size array ring with index map; ya ek existing library jaise `lru-cache` (PLAN mein naam hai) use karna.",
+      "scale_10x_100x": "Purane code mein cost holes ke count ke saath badhta tha, yaani zyada churn (zyada evictions) aur bada table = aur bura. Fix ke baad cost entries ke count se independent hona chahiye (amortized). 100x entries par yeh dubara naapna chahiye -- abhi sirf 10 000 entries par naapa gaya.",
+      "production_improvements": "Linux par aur quiet machine par re-run; `node --cpu-prof` se profile lekar cause confirm karna (hole walking dikhna chahiye); bench ko CI mein trend ke liye chalana, assertion ke liye nahi."
+    }
+  },
+  {
+    "id": "CKT-055",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Intermediate",
+    "question": "Why does a get hit cost around 400 ns while a get miss costs about 50 ns and a plain Map.get 37 to 79 ns?",
+    "answer_hinglish": "Numbers pehle (Windows, Ryzen 5 4500, Node 20.20.1): run 1 mein `Map.get` 36.9, `get` miss 48.6, `get` hit 413.7 ns; run 2 mein 78.9, 60.2, 403.9. Miss floor ke paas hai, hit lagbhag 400.\n\nMiss sasta kyun: miss path mein `get` -> `fresh()` -> `live()` -> `this.map.get(key)` undefined deta hai, wahin return, phir `misses++`. Yeh basically ek Map.get plus ek counter hai. Bench mein miss keys `KEYS + (i % KEYS)` hain jo cache mein kabhi nahi hoti.\n\nHit mehnga kyun -- yeh code padhkar meri reasoning hai, README saaf kehta hai \"which of those dominates was not measured\": (1) `live()` mein `this.now()` (default `performance.now()`) se `deadAt` compare, (2) `fresh()` mein phir se `this.now()` se `expiresAt` compare -- yaani ek hit mein do clock reads, (3) `hit()` mein counters, aur (4) `touch()` = `map.delete` + `map.set` taaki key LRU order ke end mein chali jaaye. Map.get ke upar ek delete aur ek set lagbhag teen Map operations hain, plus clock.\n\nEk interesting detail: `ttlMs` ke bina bhi clock padha jaata hai, kyunki `expiresAt = Infinity` hone par bhi comparison chalta hai. Isliye \"get hit, ttlMs set\" ka number (325.4 / 417.5) normal hit se consistently zyada nahi hai -- run 1 mein toh kam tha. Woh fark noise hai.\n\nAgar main isko investigate karta: ek variant jismein `now` ek constant function ho, ek jismein touch na ho, aur `--cpu-prof`. Yeh project mein nahi kiya gaya.",
+    "why_needed": "Hit path cache ka sabse common path hai. Interviewer dekhna chahta hai ki tum code se cost explain kar sakte ho aur jo naapa nahi uska claim nahi karte.",
+    "real_world_analogy": "Library se kitab lena (hit): register mein entry check, date stamp dekhna, kitab ko shelf ke aage rakhna. 'Nahi hai' bolna (miss): bas register dekha aur mana kar diya.",
+    "how_it_works": "LRU ka recency update hi hit ka extra kaam hai: Map mein 'move to end' ka koi native operation nahi, isliye delete + re-insert. Lazy expiry ka matlab har read par clock compare. `performance.now()` monotonic clock hai, ek function call jo Map.get se sasta nahi maana ja sakta.",
+    "in_this_project": "`src/cache.ts`: `get()`, `fresh()`, `live()`, `hit()`, `touch()`. Default clock `options.now ?? (() => performance.now())`. Bench cases: `[\"get hit\", (i) => { sink += hitCache.get(i % KEYS); }]` aur `[\"get miss\", (i) => { sink += missCache.get(KEYS + (i % KEYS)) === undefined ? 1 : 0; }]`.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::touch",
+      "projects/20-cache/src/cache.ts::fresh",
+      "projects/20-cache/src/cache.ts::live",
+      "projects/20-cache/bench/overhead.mjs",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed): the hit path\nget(key: K): V | undefined {\n  const entry = this.fresh(key);          // live(): map.get + now() vs deadAt; then now() vs expiresAt\n  if (entry === undefined) { this.counters.misses++; return undefined; }\n  this.hit(key, entry);                   // counters + touch()\n  return entry.value;\n}\nprivate touch(key: K, entry: Entry<V>): void {\n  this.map.delete(key);                   // move to the most-recent end\n  this.map.set(key, entry);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Miss path almost free -- cold keys par cache overhead nahi badhata",
+      "Recency update O(1) hai, bas constant factor bada",
+      "Clock injectable hai, tests real time par depend nahi"
+    ],
+    "disadvantages": [
+      "Har hit par do clock reads, chahe TTL ho ya na ho",
+      "delete + set Map ke andar hash table churn (holes) banata hai",
+      "Kaunsa part dominate karta hai, naapa nahi gaya"
+    ],
+    "common_mistakes": [
+      "Bina profile kiye bolna ki performance.now hi slow hai",
+      "'get hit, ttlMs set' aur 'get hit' ke fark ko real samajhna",
+      "Miss ko cheap dekhkar sochna ki loader wala miss bhi cheap hai (asli cost loader hai)"
+    ],
+    "follow_up_questions": [
+      "Do now() calls ko ek mein kaise karoge, aur woh worth it hai?",
+      "Sampled LRU (har hit par reorder na karna) kya trade-off deta hai?",
+      "Hit ko profile kaise karoge?"
+    ],
+    "concepts": [
+      "LRU recency update",
+      "lazy expiry",
+      "monotonic clock",
+      "cost breakdown",
+      "honest measurement"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-056",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Intermediate",
+    "question": "The README says to read the overhead numbers as orders of magnitude. What in the raw JSON shows the machine was noisy, and how would you benchmark more reliably?",
+    "answer_hinglish": "Jawab: teeno raw JSON files khud dikhate hain ki machine busy thi, isliye README ke numbers \"orders of magnitude\" hain, precise nahi.\n\nEvidence: (1) `Map.get` floor -- jo cache code chhoota bhi nahi -- run 1 mein 36.9 aur run 2 mein 78.9 ns, yaani double. (2) Ek hi run ke andar rounds bikhre hue: run 2 ke floor rounds 36.2 se 187.7 tak; before-fix file mein floor ka ek round 334.5 tha jab baaki 57.9-113.3. (3) Before-fix file mein `getOrLoad` hit ke rounds 949.9 se 3167.6 tak. (4) Fix sirf eviction ko chhoota tha, phir bhi before-fix file mein `get hit` 562.1 aur `set existing key` 548.2 the, jabki baad ke runs mein 413.7/403.9 aur 279.8/346.4 -- yeh fark code ka nahi, machine ka hai. (5) Run 1 mein \"get hit, ttlMs set\" (325.4) normal hit (413.7) se kam aaya, run 2 mein ulta.\n\nMedian of 7 isliye liya gaya: ek-do bure rounds median ko nahi hilate, mean ko hilate. Par jab poori machine dheere chal rahi ho, median bhi shift hota hai -- floor ka double hona yahi hai.\n\nBetter kaise: quiet machine (ya dedicated CI runner), CPU frequency/power plan fix, cases ko interleave karke same process mein multiple baar, spread report karna (min / median / max), aur hamesha floor saath mein -- ratio compare karo, absolute nahi. Aur performance ko tests mein timing se assert mat karo -- author ne bhi yahi seekha, timing assertions is machine par flaky thi, isliye L8 ka guard call-count se hai.",
+    "why_needed": "Interviewer ko 'mera X 400 ns hai' se zyada impress karta hai 'yeh number itna reliable hai aur yeh hai kyun'. Noise pehchanna senior signal hai.",
+    "real_world_analogy": "Traffic wale din car ka mileage naapna: car wahi hai, par reading kharab. Saath mein ek reference car (floor) chalao -- agar woh bhi slow hai toh sadak ki galti hai, engine ki nahi.",
+    "how_it_works": "Microbenchmark noise ke source: OS scheduling, doosre processes, CPU boost/thermal, GC pauses, JIT deopts. Median single outliers absorb karta hai; floor systematic slowdown pakadta hai; repeated independent runs batate hain ki result reproducible hai ya nahi.",
+    "in_this_project": "Teeno files `bench/reference-results/` mein hain aur har round store karti hain, isliye yeh analysis koi bhi dobara kar sakta hai. README table mein run 1 aur run 2 dono columns hain, aur caveat likha hai: \"the Map floor alone moved from 37 to 79 between the runs\".",
+    "implementation_files": [
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-before-iterator-fix.json",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run1.json",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run2.json",
+      "projects/20-cache/bench/overhead.mjs"
+    ],
+    "code_example": "// illustrative (NOT in the repo): print spread next to the median from a reference JSON\nimport { readFileSync } from \"node:fs\";\nconst r = JSON.parse(readFileSync(process.argv[2], \"utf8\"));\nfor (const c of r.results) {\n  const ns = c.rounds.map((x) => x.nsPerOp).sort((a, b) => a - b);\n  console.log(c.name.padEnd(28), \"min\", ns[0], \"median\", c.medianNsPerOp, \"max\", ns[ns.length - 1]);\n}",
+    "code_language": "javascript",
+    "advantages": [
+      "Raw rounds saved -- noise ka analysis possible",
+      "Floor saath mein hone se systematic slowdown dikhta hai",
+      "Author ne numbers ko overclaim nahi kiya"
+    ],
+    "disadvantages": [
+      "Sirf do runs, ek machine",
+      "Spread README table mein nahi, sirf JSON mein",
+      "Quiet-machine run kabhi nahi hua"
+    ],
+    "common_mistakes": [
+      "Ek run ke number ko final maan lena",
+      "Do cases ke 20 percent fark ko real improvement bolna jab floor khud 2x hil raha ho",
+      "Unit test mein 'expect(time).toBeLessThan(...)' likhna"
+    ],
+    "follow_up_questions": [
+      "Do implementations compare karne ke liye kitne runs chahiye?",
+      "Ratio to floor report karna kab galat ho sakta hai?",
+      "CI mein benchmark kaise rakhoge bina flaky hue?"
+    ],
+    "concepts": [
+      "benchmark noise",
+      "median vs mean",
+      "baseline",
+      "reproducibility",
+      "flaky timing tests"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-057",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Senior/System Design",
+    "question": "How would you size this cache's memory in production? What does maxWeight actually bound, and what was never measured?",
+    "answer_hinglish": "Pehle honest part: memory per entry is project mein MEASURE nahi hui -- README ke \"Not measured\" mein likha hai. Toh main koi bytes-per-entry number nahi bolunga.\n\nDo limits hain. `maxEntries` required hai (integer >= 1) -- bina bound ka cache \"a memory leak with extra steps\" hai. `maxWeight` optional doosra limit hai aur `weigh(value, key)` ke saath aata hai, jo integer >= 0 return kare warna `set` RangeError deta hai aur cache unchanged rehta hai. README ka example: `weigh: (u) => Buffer.byteLength(JSON.stringify(u))` aur `maxWeight: 50 * 1024 * 1024` -- \"about 50 MB of JSON\".\n\nImportant baat: maxWeight wahi bound karta hai jo `weigh` gin raha hai -- JSON bytes. Yeh V8 heap size NAHI hai. Ek JS object heap mein apne JSON se alag size leta hai, plus har entry ka apna `Entry` object (`value, weight, expiresAt, deadAt, negative`), Map ka slot aur key string. \"A size estimate that walks objects\" NOT implemented hai. Aur `weigh` har set aur har loaded value par chalta hai -- JSON.stringify bade object par write path ka cost hai.\n\nSizing kaise karunga: working set se shuru (kitni distinct keys hot hain), hit ratio `stats()` se dekhna, staging mein N entries fill karke `process.memoryUsage().heapUsed` before/after naapna (yeh project mein nahi kiya), phir `maxEntries` usse set aur `maxWeight` ko safety net rakhna taaki kuch bade values sab kuch na kha jaayein. Aur yaad rakhna: L1 har replica par alag hai, toh total RAM = replicas x L1.",
+    "why_needed": "Cache ka sabse common production failure OOM hai. Interviewer dekhna chahta hai ki tum entries-count aur bytes ka fark samajhte ho aur bina measure kiye number nahi dete.",
+    "real_world_analogy": "Godown mein boxes ginna (maxEntries) vs unka wazan tolna (maxWeight). Par tum label par likha wazan tol rahe ho (JSON bytes), box ki packing aur pallet ka wazan alag hai (heap overhead).",
+    "how_it_works": "Count-based LRU tab theek hai jab values similar size ki hon. Values bahut alag size ki hon (ek user 1 KB, ek report 5 MB) toh weight-based limit chahiye. Weight ek running total hai: store par +weight, remove par -weight; total > maxWeight hone par LRU end se evict. Ek value jo akeli maxWeight se bhari ho, store hi nahi hoti (`reject` event, `rejected` +1) aur key ki purani value bhi hat jaati hai.",
+    "in_this_project": "`src/cache.ts` mein `weighOf()` `Number.isSafeInteger(w) && w >= 0` check karta hai -- fractions refuse kyunki float total drift karta hai (`0.1 + 0.2 - 0.1 - 0.2` 0 nahi). `store()` mein pehle size loop, phir weight loop `while (this.weightTotal > this.maxWeight && this.map.size > 1)`. `lru.test.ts` exactly-at-maxWeight, too-heavy value, aur invalid weigh results (-1, NaN, Infinity, 1.5, 0.1, string, undefined, null) test karta hai.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::weighOf",
+      "projects/20-cache/src/cache.ts::store",
+      "projects/20-cache/src/cache.ts::LruCacheOptions",
+      "projects/20-cache/test/lru.test.ts",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, README.md usage (illustrative app code: db, User are yours)\nconst users = new LruCache<string, User | null>({\n  maxEntries: 10_000,\n  maxWeight: 50 * 1024 * 1024, // ~50 MB of JSON\n  weigh: (u) => Buffer.byteLength(JSON.stringify(u)),\n  ttlMs: 60_000,\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Do independent bounds: count aur bytes",
+      "Galat weight loudly fail hota hai, total corrupt nahi hota",
+      "Ek giant value poore cache ko flush nahi kar sakti (reject)"
+    ],
+    "disadvantages": [
+      "Bytes = JSON size, heap size nahi",
+      "weigh ka cost har write par",
+      "Per-entry overhead kabhi naapa nahi gaya"
+    ],
+    "common_mistakes": [
+      "maxWeight ko process memory limit samajhna",
+      "Mehnga weigh (bada JSON.stringify) bina soche har set par chalana",
+      "Replicas ka multiplier bhool jaana"
+    ],
+    "follow_up_questions": [
+      "Heap overhead kaise naapoge?",
+      "Hit ratio dekhkar maxEntries kaise tune karoge?",
+      "Kab L1 chhota rakhkar Redis L2 par zyada bharosa karoge?"
+    ],
+    "concepts": [
+      "capacity planning",
+      "weight-based eviction",
+      "heap vs serialized size",
+      "working set",
+      "OOM"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Count limit simple aur sasta hai par variable-size values ke saath unpredictable memory; weight limit predictable hai par weigh ka CPU cost aur approximation (JSON bytes) laata hai. Is design ne dono ko optional combination banaya.",
+      "failure_scenarios": "Weigh function galat (bahut kam ginta) toh cache limit se zyada memory le sakta hai -- process OOM. Weigh throw kare toh set RangeError deta hai; loaded value par woh load error ban jaata hai (`loadErrors`) aur waiters reject hote hain. Ek W5-type bookkeeping bug (weight subtract na ho) ne mutation run mein loop hang kiya tha -- ab `size > 1` guard hai.",
+      "alternatives": "V8 heap snapshot se estimate; object-walking sizeof (not implemented); values ko serialized Buffer ke roop mein store karna (tab weight = exact bytes, par har hit par decode); ya L1 chhota rakhkar Redis L2 par shift.",
+      "scale_10x_100x": "10x keys: maxEntries badhao par per-replica RAM check karo; 100x: in-process mein sab nahi samayega -- L1 sirf hot set ke liye, baaki TwoLevelCache ka Redis L2 ya dedicated cache tier. Replicas 10x hone par L1 memory bhi 10x.",
+      "production_improvements": "Staging mein memory per entry naapna aur README mein likhna; `totalWeight` aur `size` ko metrics endpoint par export karna (README example `res.json(users.stats())`); heap usage par alert; weigh ko sasta banana (pehle se known size field use karna)."
+    }
+  },
+  {
+    "id": "CKT-058",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Senior/System Design",
+    "question": "An awaited getOrLoad hit costs about one microsecond. Does the cache's own overhead matter for a backend service, and when would it start to?",
+    "answer_hinglish": "Measured: `getOrLoad hit (awaited)` 924.6 ns (run 1) aur 1091.7 ns (run 2), jabki sync `get` hit 413.7 / 403.9 ns. Fark ka hissa async function aur har call par ek `await` ka hai -- yeh reasoning hai, split naapa nahi gaya. Bench ne har call ko sequentially await kiya.\n\nKya yeh matter karta hai? Normal API ke liye nahi. README ka point: yeh cache ki bookkeeping hai, caching ki value nahi -- ek DB query around a millisecond hoti hai, yaani ek miss bachana hazaron hits ke barabar hai. Ek back-of-envelope (measured number se arithmetic, hypothetical load): agar ek request 3 lookups kare aur process 10 000 req/s le, toh 30 000 x ~1 us = ~30 ms CPU per second, ek core ka ~3 percent. HTTP parsing aur JSON serialize usse kaafi zyada lete hain (yeh general experience hai, yahan naapa nahi).\n\nKab matter karega: (1) tight loops -- ek batch job jo 1 lakh items par per-item `getOrLoad` await kare, wahan microsecond jud jaata hai; (2) bahut chhote values jinka source khud sasta hai (in-memory computation) -- tab cache lagana hi galat ho sakta hai; (3) jab hit ratio low ho -- tab overhead + loader dono. Aur jo NAHI naapa: stage 2 ka hit path (ek extra boolean check aur fresh/stale comparison), Redis round trips, stage 3 HTTP helpers, concurrency. Toh \"cache-kit fast hai\" bolne se pehle main kahunga: \"stage 1 ki bookkeeping microsecond range mein hai, baaki unmeasured\".",
+    "why_needed": "Senior interview mein yeh pucha jaata hai taaki pata chale ki tum micro-optimisation aur real bottleneck mein fark karte ho.",
+    "real_world_analogy": "Toll booth ka 2 second ka stop vs poori 3 ghante ki journey: booth fast karna tabhi matter karta hai jab tum shehar ke andar har gali mein toll de rahe ho.",
+    "how_it_works": "Ek async function hamesha ek Promise return karta hai, aur `await` continuation ko microtask queue mein daalta hai -- chahe value turant available ho. Isliye sync hit se async hit hamesha mehnga hoga. Latency budget mein cache lookup ka share = lookups per request x cost per lookup.",
+    "in_this_project": "`bench/overhead.mjs` mein `const loader = async () => 0;` aur `await loadCache.getOrLoad(i % KEYS, loader)` -- cache full hai, toh loader kabhi nahi chalta, pure hit path. README \"Known\": \"Overhead not re-measured for stage 2 ... Redis round trips were not benchmarked either.\"",
+    "implementation_files": [
+      "projects/20-cache/bench/overhead.mjs::measureAsync",
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/bench/reference-results/2026-11-23-win32-run2.json",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, bench/overhead.mjs (trimmed)\nconst loadCache = filledCache();\nconst loader = async () => 0;           // never called: every key is present\nconst r = await measureAsync(async (i) => { sink += await loadCache.getOrLoad(i % KEYS, loader); });",
+    "code_language": "javascript",
+    "advantages": [
+      "Overhead microsecond range mein -- DB call ke saamne negligible",
+      "Sync get path available jab async nahi chahiye",
+      "Raw rounds se claim verify ho sakta hai"
+    ],
+    "disadvantages": [
+      "Stage 2 / Redis / HTTP helpers ka cost unmeasured",
+      "Async hit har call par ek microtask",
+      "Concurrency mein behaviour naapa nahi"
+    ],
+    "common_mistakes": [
+      "Microsecond optimise karna jab DB query millisecond le rahi ho",
+      "Sasti computation ko bhi cache karna (cache khud mehnga pad jaata hai)",
+      "Unmeasured stage 2 ke liye stage 1 ka number quote karna"
+    ],
+    "follow_up_questions": [
+      "Batch job mein yeh overhead kaise kam karoge?",
+      "Redis L2 hit ka cost kaise naapoge?",
+      "Hit ratio aur overhead ka break-even kaise nikaaloge?"
+    ],
+    "concepts": [
+      "latency budget",
+      "async overhead",
+      "microtask",
+      "hit ratio",
+      "premature optimisation"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Async API (`getOrLoad`) single flight aur abort deta hai par har call ek Promise; sync `get` sasta hai par loader/coalescing nahi. Design ne dono rakhe; caller choose karta hai.",
+      "failure_scenarios": "Hit ratio gir jaaye (TTL bahut chhota, keys bahut random) toh har request overhead + loader dono deti hai; cache faayda nahi, nuksaan. Loader kabhi settle na ho toh flight atak sakti hai (README Known: loader mein timeout daalo).",
+      "alternatives": "Hot path par request-scoped memo (ek request ke andar same lookup dobara na karna); batch APIs (multi-get) jo ek await mein kai keys dein -- yeh project mein nahi hai.",
+      "scale_10x_100x": "10x traffic par cache overhead linearly badhta hai par DB load hit ratio ki wajah se bahut kam badhta hai -- yahi cache ka point. 100x par single-process CPU ki limit pehle aayegi; tab horizontal scaling aur L2 -- aur tab Redis round trip ka cost (unmeasured) asli number banega.",
+      "production_improvements": "Stage 2 aur L2 hit path benchmark karna; production mein cache lookup ko tracing span mein rakhna taaki real share dikhe; `stats()` se hit ratio dashboard."
+    }
+  },
+  {
+    "id": "CKT-059",
+    "project_slug": "p20-cache",
+    "category": "Performance & Scalability",
+    "difficulty": "Intermediate",
+    "question": "How do the HTTP helpers protect the database from a stampede when many requests hit a cold key, and what exactly did the tests prove?",
+    "answer_hinglish": "Jawab: helpers khud koi naya mechanism nahi laate -- woh `cache.getOrLoad` use karte hain, jiska single flight per key hai. Pehli request producer start karti hai; uske chalte jo bhi same key ke saath aati hai, woh usi flight ko join karti hai (`coalesced`) aur same result paati hai.\n\nTests ne kya prove kiya: Express mein 20 concurrent requests ek key par -> producer EK baar chala, sabko `{ v: 42 }` mila, aur exactly 1 response par `X-Cache: miss` (baaki 19 \"hit\", kyunki unhone producer nahi chalaya). NestJS mein 10 concurrent requests -> handler ek baar. `@Cached` par 10 concurrent calls -> method ek baar. Core level par: 100 concurrent `getOrLoad` -> 1 loader call, 99 coalesced; stale-while-revalidate mein 50 concurrent stale reads -> 1 refresh; negative caching ke saath missing id ke 1000 sequential + 100 concurrent lookups -> 1 loader call.\n\nLimit samajhna zaroori hai: single flight ek PROCESS ke andar hai. Do replicas cold key par ek saath miss karein toh dono apna loader chala sakte hain. TwoLevelCache ke saath har replica par Redis read bhi L1 load ke andar hai (50 concurrent misses = 1 Redis read + at most 1 load per replica), aur dono replicas ke background writes `SET NX` hain -- doosra refuse hota hai (`l2WritesSkipped`). Cross-replica stampede ke liye distributed lock is project mein implement nahi hai.\n\nAur ek baat: koi throughput/latency number in helpers ke liye naapa nahi gaya -- tests correctness prove karte hain, speed nahi.",
+    "why_needed": "Cache stampede (thundering herd) classic production incident hai: cache expire hua, 1000 requests ek saath DB par. Interviewer jaanna chahta hai ki tumhara cache isse bachata hai aur kahan tak.",
+    "real_world_analogy": "Ek dukaan par 20 log ek hi cheez maangne aaye jo stock mein nahi: dukandaar 20 baar godown nahi jaata, ek baar jaata hai aur sabko wahi de deta hai.",
+    "how_it_works": "`getOrLoad` miss par `flights` Map dekhta hai: flight hai toh `coalesced++` aur `wait()`, nahi toh `startLoad()`. Sab waiters ek hi Promise par wait karte hain. Error bhi sabko same milta hai aur cache nahi hota.",
+    "in_this_project": "`test/express-helper.test.ts` ka test \"20 concurrent requests for one key: ONE producer call (no stampede)\": producer ek manual `release` par ruka rehta hai, test `calls === 1` ka wait karta hai, 100 ms deta hai taaki baaki 19 join karein, phir release. `test/nestjs-helper.test.ts` \"10 concurrent requests run the handler once\".",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::loadForRequest",
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/test/express-helper.test.ts",
+      "projects/20-cache/test/nestjs-helper.test.ts",
+      "projects/20-cache/test/cached.test.ts"
+    ],
+    "code_example": "// real, test/express-helper.test.ts (trimmed)\nconst all = Array.from({ length: 20 }, () => fetch(`${base}/slow`));\nawait until(() => calls === 1, \"the first load\");\nawait new Promise((r) => setTimeout(r, 100)); // the other 19 arrive and join it\nrelease();\nconst responses = await Promise.all(all);\nexpect(calls).toBe(1);\nexpect(responses.filter((r) => r.headers.get(\"x-cache\") === \"miss\")).toHaveLength(1);",
+    "code_language": "typescript",
+    "advantages": [
+      "Har route ko free stampede protection",
+      "Errors bhi shared, cache nahi -- DB dobara try hoga",
+      "Real Express/Nest apps par tested"
+    ],
+    "disadvantages": [
+      "Sirf per-process; replicas ke beech nahi",
+      "Ek slow load par sab waiters atak jaate hain (loader mein timeout chahiye)",
+      "Throughput naapa nahi gaya"
+    ],
+    "common_mistakes": [
+      "Sochna ki single flight replicas ke across bhi hai",
+      "Loader mein timeout na daalna -- ek hung query sab ko rok de",
+      "Coalesced requests ka X-Cache 'miss' expect karna (woh 'hit' hain)"
+    ],
+    "follow_up_questions": [
+      "Replicas ke across stampede kaise rokoge?",
+      "Ek hung loader se kaise bachoge?",
+      "Stale-while-revalidate stampede ko kaise aur kam karta hai?"
+    ],
+    "concepts": [
+      "cache stampede",
+      "single flight",
+      "request coalescing",
+      "thundering herd",
+      "per-process scope"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-060",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Beginner",
+    "question": "What do X-Cache hit, stale, miss and bypass mean in the HTTP helpers, and how does the code decide which one to send?",
+    "answer_hinglish": "Asal mein chaar values hain: `hit | stale | miss | bypass`. Definition README se: \"hit\" = is request ne producer NAHI chalaya (cache se, Redis se, ya kisi doosri request ke shuru kiye load se mila); \"stale\" = stale value turant mili aur IS request ke background refresh ne producer chalaya (stale-while-revalidate); \"miss\" = is request ne producer chalaya aur uska wait kiya; \"bypass\" = key function ne `undefined` diya, cache use hi nahi hua.\n\nCode `loadForRequest` (`src/adapters/http.ts`) mein hai aur bahut simple hai. Pehle `await options.key(req)`. Agar `undefined` hai toh seedha `produce(signal)` aur status \"bypass\". Warna do local flags `ran` aur `refreshed`, aur `cache.getOrLoad(key, loader, ...)` ko ek wrapper loader diya jaata hai: `context.refresh` true ho toh `refreshed = true`, warna `ran = true`, phir `produce(loadSignal)`. Wrapper sirf tabhi chalega jab IS call ne load start kiya. Result: `ran ? \"miss\" : refreshed ? \"stale\" : \"hit\"`. Coalesced request kisi aur ki flight join karti hai -- uska wrapper kabhi nahi chalta, toh \"hit\". TwoLevelCache mein Redis hit par user loader nahi chalta, toh woh bhi \"hit\" -- stale serve ka refresh bhi agar Redis se answer ho jaaye (producer nahi chala) toh \"hit\".\n\nFound-and-fixed: pehli version mein sirf hit / miss / bypass the aur ek hi `ran` flag. Stale entry par `getOrLoad` purani value turant deta hai par background refresh isi call ke loader ko synchronously invoke karta hai, toh `ran` true ho jaata aur response \"miss\" kehta, jabki client ko cached (stale) data mila. Interview bank likhte waqt ek reviewer ne yeh pakda; fix mein loader context ka `refresh` flag dekha jaata hai, ek Express test (miss, phir stale par `[\"stale\", 1]`, phir refresh ke baad `[\"hit\", 2]`) aur mutation C7 (refresh flag ignore -> stale serve 'miss') jo 1 test se caught hai.\n\nKaam ka kya hai: hit ratio logs se nikalna, aur debugging -- agar galat data \"hit\" ke saath aaya toh key function suspect hai.",
+    "why_needed": "X-Cache header production debugging ka pehla tool hai: response dekhte hi pata chal jaata hai ki DB tak gaya ya nahi.",
+    "real_world_analogy": "Canteen counter par token: 'fresh bana' (miss), 'tray mein ready tha' (hit), 'special order, line ke bahar' (bypass).",
+    "how_it_works": "Status decide karne ke liye cache se poochne ki zaroorat nahi -- bas dekho ki tumhara loader chala ya nahi, aur chala toh normal load tha ya background refresh (loader context ka `refresh`). Closure mein do booleans, loader ke andar set. Yeh cache implementation (LruCache ya TwoLevelCache) se independent hai, kyunki sirf `Loadable` interface use hota hai.",
+    "in_this_project": "`CacheStatus = \"hit\" | \"stale\" | \"miss\" | \"bypass\"`. Express `res.setHeader(\"x-cache\", status)`; Nest `if (!res.headersSent) res.setHeader(\"x-cache\", status)`. Test `test/express-helper.test.ts` 'stale-while-revalidate: a stale read is answered at once with X-Cache: stale, the refresh lands as a hit'. Mutation C1 (ran flag kabhi set nahi -> sab hit) 9 tests se pakda gaya; E3 (Express mein header nahi) 8 se; N1 (Nest) 2 se; C7 (stale serve 'miss' label) 1 se.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::loadForRequest",
+      "projects/20-cache/src/adapters/http.ts::CacheStatus",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/src/adapters/nestjs.ts::CachedRouteInterceptor"
+    ],
+    "code_example": "// real, src/adapters/http.ts (trimmed)\nconst key = await options.key(req);\nif (key === undefined) return { value: await produce(signal), status: \"bypass\" };\nlet ran = false;\nlet refreshed = false;\nconst value = await cache.getOrLoad(\n  key,\n  (loadSignal, context) => {\n    if (context?.refresh) refreshed = true; // a background refresh this request started\n    else ran = true;\n    return produce(loadSignal);\n  },\n  { signal, ttlMs: options.ttlMs, staleMs: options.staleMs },\n);\nreturn { value, status: ran ? \"miss\" : refreshed ? \"stale\" : \"hit\" };",
+    "code_language": "typescript",
+    "advantages": [
+      "Cache internals jaane bina sahi status",
+      "LruCache aur TwoLevelCache dono par kaam karta hai",
+      "Coalesced requests sahi tarah 'hit'"
+    ],
+    "disadvantages": [
+      "Pehli version stale serve ko 'miss' dikhati thi (review mein pakda, ab 'stale')",
+      "Hit ka source (L1 / Redis / joined load) alag nahi dikhta",
+      "Header sirf debugging, standard HTTP caching nahi"
+    ],
+    "common_mistakes": [
+      "X-Cache ko browser/CDN caching header samajhna",
+      "Coalesced request ko 'miss' expect karna",
+      "Bypass ko error samajhna -- woh deliberate hai"
+    ],
+    "follow_up_questions": [
+      "L1 hit aur Redis hit ko alag dikhana ho toh kya badloge?",
+      "Ek stale serve ka refresh Redis se answer ho toh status kya hoga, aur kyun?",
+      "Hit ratio metric kahan se nikaaloge?"
+    ],
+    "concepts": [
+      "X-Cache",
+      "closure flag",
+      "cache status",
+      "observability"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-061",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Advanced",
+    "question": "Trace what happens when a client disconnects while its cachedJson request is waiting for a load that other requests share.",
+    "answer_hinglish": "Short: sirf us client ka wait khatam hota hai; shared load tab hi abort hota hai jab us load ka HAR waiter chala jaaye.\n\nStep by step. (1) Handler start mein `requestSignal(res)` banata hai: `res.once(\"close\", ...)` aur agar `!res.writableFinished` toh `controller.abort(new Error(\"client closed the connection\"))`. Response ka close isliye, kyunki Node 16 se request apna close body padhte hi emit kar deta hai. (2) Yeh signal `getOrLoad` ke `{ signal }` mein jaata hai. (3) `wait()` signal par abort listener lagata hai. Client gaya -> `leave()`: `waiters--`; agar abhi bhi koi waiter hai ya flight settle ho chuki, kuch nahi. Last waiter gaya toh flight detach (`flights.delete`), `controller.abort(reason)` aur `load-abort` event. (4) Producer ko `loadSignal` mila tha (`produce(req, s)`) -- usse DB driver / fetch ko do, tab query sach mein cancel hogi. (5) Abandoned load baad mein jawab de bhi de toh kuch write nahi karta (version check), aur next caller fresh load karta hai. (6) cachedJson ke `.catch` mein `if (signal.aborted) return` -- gaye hue client ke liye `next(err)` nahi; `.then` mein `res.writableEnded || res.destroyed` par kuch nahi likhta.\n\nTest (real Express): do clients same key par, dono abort -> `seen[0].aborted` true. Phir do clients doosri key par, ek abort -> `seen[1].aborted` false rehta hai aur doosre ko \"done\" milta hai.\n\nEk design rule: jo caller signal nahi deta woh kabhi leave nahi karta, toh load zinda rakhta hai. `@Cached` ko signal nahi milta isliye usmein abandon possible hi nahi.",
+    "why_needed": "Bina iske, ek user tab band kare toh ya toh DB query bekaar chalti rahe, ya ek impatient user sabka shared load cancel kar de. Dono production mein bure hain.",
+    "real_world_analogy": "Group cab booking: ek dost cancel kare toh cab nahi rukti; sab cancel karein tabhi driver ko cancel message jaata hai. Jo bina app ke (bina signal) baitha hai, woh kabhi cancel nahi karta.",
+    "how_it_works": "Reference counting on a shared operation: `waiters` count; refresh flight cache ko permanent waiter ginti hai (`waiters: refresh ? 1 : 0`). AbortSignal do level par: caller ka signal (sirf wait) aur flight ka controller (actual work).",
+    "in_this_project": "`src/adapters/http.ts::requestSignal`, `src/cache.ts` mein `wait()` aur `leave()`, `src/adapters/express.ts` mein catch aur writableEnded/destroyed check. Mutation C3 (signal getOrLoad tak nahi gaya) 1 test se pakda gaya; A1 (ek waiter ka abort sabka load abort kare) stage 1 mein 3 tests se.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::requestSignal",
+      "projects/20-cache/src/cache.ts::leave",
+      "projects/20-cache/src/cache.ts::wait",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/test/express-helper.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed)\nprivate leave(key: K, flight: Flight<V>, reason: unknown): void {\n  flight.waiters--;\n  if (flight.waiters > 0 || flight.settled) return;\n  if (this.flights.get(key) === flight) this.flights.delete(key);\n  flight.controller.abort(reason);\n  emit(this.options.onEvent, { type: \"load-abort\", key });\n}\n// real, src/adapters/http.ts\nexport function requestSignal(res: ServerResponse): AbortSignal {\n  const controller = new AbortController();\n  res.once(\"close\", () => {\n    if (!res.writableFinished) controller.abort(new Error(\"client closed the connection\"));\n  });\n  return controller.signal;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Stage 1 ka abort rule reuse -- naya cancellation logic nahi",
+      "Kisi ek client ka cancel doosron ko nahi todta",
+      "Bekaar DB kaam ruk sakta hai jab koi nahi chahta"
+    ],
+    "disadvantages": [
+      "Producer ko signal aage pass karna padta hai, warna query chalti rahegi",
+      "NestJS route helper apne handler ko signal nahi deta",
+      "Bina-signal caller load ko hamesha zinda rakhta hai"
+    ],
+    "common_mistakes": [
+      "Request ke 'close' par sunna (Node 16+ mein body padhte hi fire)",
+      "Pehle abort par shared load cancel karna",
+      "Gaye hue client ke liye next(err) bulana -- error logs mein noise"
+    ],
+    "follow_up_questions": [
+      "Producer signal ignore kare toh kya hota hai?",
+      "Refresh ko joiner abort kyun nahi kar sakta?",
+      "Nest mein handler tak signal kaise pahunchaoge?"
+    ],
+    "concepts": [
+      "AbortSignal",
+      "reference counting",
+      "client disconnect",
+      "cancellation propagation",
+      "load versions"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Abort only-when-all-leave vs first-abort-cancels vs never-cancel: PLAN ne pehla chuna -- ek impatient client sabko fail na kare, aur jo kaam koi nahi chahta woh ruke. Cost: thoda state (waiters, settled).",
+      "failure_scenarios": "Producer signal ignore kare -> load chalta rahega par write nahi karega (detached). Loader kabhi settle na ho aur caller bina signal ho -> flight forever (README Known; loader mein timeout daalo). Real socket par \"client gone\" path dikhte hi nahi the -- isliye fake response tests.",
+      "alternatives": "Per-request timeout (projects/18-resilience ka TimeoutPolicy README mein suggest hai); request-scoped AbortSignal jo framework de (Express 5 / Fastify ke apne hooks) -- yahan Node http types par khud banaya.",
+      "scale_10x_100x": "Zyada traffic par zyada disconnects; jitne zyada waiters per key, utna kam chance ki load abort ho -- yeh sahi hai. 100x par loads detached hokar bhi DB par chalte rahein (signal ignore) toh DB load badhega -- signal propagation zaroori.",
+      "production_improvements": "Producer mein signal ko DB driver tak le jaana enforce karna (lint/review); `load-abort` events ko metric banana; Nest helper mein `loadSignal` handler tak pahunchane ka tareeka (abhi nahi hai)."
+    }
+  },
+  {
+    "id": "CKT-062",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "How does @CachedRoute plug into NestJS, and why does the route handler not run at all on a cache hit?",
+    "answer_hinglish": "`@CachedRoute(cache, options)` bas `applyDecorators(UseInterceptors(new CachedRouteInterceptor(cache, options)))` hai -- har decorated route ke liye ek interceptor INSTANCE, bina dependency injection ke.\n\nNest interceptor ko `intercept(context, next)` milta hai; `next.handle()` call karna hi actual route handler chalata hai. Trick yeh hai ki `next.handle()` sirf producer ke andar hai: `() => lastValueFrom(next.handle())`. Producer `loadForRequest` ke through `getOrLoad` ka loader banta hai, jo sirf miss par chalta hai. Hit par (ya jab doosri request ka load chal raha ho) loader nahi chalta, toh `next.handle()` kabhi call nahi hota -- handler nahi chalta. Test yahi check karta hai: do requests, `runs.route` 1.\n\nBaaki: `context.switchToHttp()` se req aur res (platform-express, isliye Node ke IncomingMessage / ServerResponse). Result aane par `if (!res.headersSent) res.setHeader(\"x-cache\", status)`. Value `notFound` (default null/undefined) ho toh `throw new NotFoundException()` -- Nest ka 404. Handler throw kare toh error `from(...)` Observable se Nest ke exception layer mein -- test mein pehle 500, phir handler dobara chalta hai aur \"recovered\" + X-Cache miss.\n\nTeen limitations: producer ko diya gaya load signal handler tak nahi jaata (produce signal ignore karta hai; Nest handlers signal lete hi nahi); jo client chala gaya uska Express jaisa special case nahi -- uska aborted wait bhi Nest ke exception layer mein jaata hai, jo closed connection par likhta hai (no-op); aur Fastify platform test nahi hua (README NOT implemented).",
+    "why_needed": "Nest mein caching ka sahi hook samajhna -- guard, interceptor, pipe mein se kaunsa handler ko skip kar sakta hai aur response modify kar sakta hai.",
+    "real_world_analogy": "Receptionist (interceptor) file pehle shelf mein dekhti hai; mili toh wahin se de deti hai, officer (handler) ko bulaati hi nahi. Nahi mili toh officer ko bulaati hai aur copy shelf mein rakh deti hai.",
+    "how_it_works": "Nest interceptors RxJS Observables par bane hain: `next.handle()` ek Observable deta hai jo subscribe hone par handler chalata hai. `lastValueFrom` usse Promise banata hai, `from(promise)` wapas Observable. Interceptor apna Observable return kare toh Nest usi ki value response mein serialize karta hai.",
+    "in_this_project": "`src/adapters/nestjs.ts`: `CachedRouteInterceptor implements NestInterceptor`, `CachedRoute()`, aur `export { Cached } from \"../cached.js\"`. `@nestjs/common` aur `rxjs` optional peer dependencies -- sirf `cache-kit/nestjs` entry point unhe import karta hai. Test `test/nestjs-helper.test.ts` real Nest 10 app (`NestFactory.create`, `logger: false`).",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/nestjs.ts::CachedRouteInterceptor",
+      "projects/20-cache/src/adapters/nestjs.ts::CachedRoute",
+      "projects/20-cache/test/nestjs-helper.test.ts"
+    ],
+    "code_example": "// real, src/adapters/nestjs.ts (trimmed)\nintercept(context: ExecutionContext, next: CallHandler): Observable<V> {\n  const http = context.switchToHttp();\n  const req = http.getRequest<IncomingMessage>();\n  const res = http.getResponse<ServerResponse>();\n  return from((async () => {\n    const { value, status } = await loadForRequest(this.cache, this.options, req, requestSignal(res), () =>\n      lastValueFrom(next.handle() as Observable<V>),   // the handler runs ONLY here, i.e. on a miss\n    );\n    if (!res.headersSent) res.setHeader(\"x-cache\", status);\n    if ((this.options.notFound ?? isNotFound)(value)) throw new NotFoundException();\n    return value;\n  })());\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Hit par handler aur uski saari dependencies skip",
+      "Nest ka 404 aur exception layer as-is use",
+      "DI setup ki zaroorat nahi"
+    ],
+    "disadvantages": [
+      "Handler ko abort signal nahi milta",
+      "Sirf platform-express tested",
+      "Cache instance module level par banana padta hai (DI nahi)"
+    ],
+    "common_mistakes": [
+      "next.handle() ko loader ke bahar call kar dena -- handler har baar chalega",
+      "Hit par headersSent check bhoolna",
+      "null ko 200 ke saath bhejna (N2 mutation)"
+    ],
+    "follow_up_questions": [
+      "Interceptor instance vs class (DI) mein kya fark hai?",
+      "Fastify par kya tootega?",
+      "Handler tak signal kaise pahunchaoge?"
+    ],
+    "concepts": [
+      "NestJS interceptor",
+      "RxJS lastValueFrom",
+      "skip handler on hit",
+      "NotFoundException"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-063",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Advanced",
+    "question": "How does the @Cached method decorator work, and why can a wrong key hand one tenant another tenant's data?",
+    "answer_hinglish": "`@Cached(cache, { key, ttlMs, staleMs })` ek legacy TypeScript method decorator hai (wahi kind jo NestJS use karta hai, `experimentalDecorators` chahiye). Decorator ko `(target, property, descriptor)` milta hai. Woh `descriptor.value` (original method) check karta hai -- function nahi toh `TypeError(\"@Cached can only decorate a method\")` (mutation D4). Phir `descriptor.value` ko ek wrapper se replace karta hai.\n\nWrapper: `const key = options.key.apply(this, args)` -- key function ko instance `this` ke roop mein milta hai. `undefined` -> `Promise.resolve(original.apply(this, args))`, uncached. Warna `cache.getOrLoad(key, () => original.apply(this, args), { ttlMs, staleMs })`. Poora body `try / catch` mein hai: sync throw (key function ka, ya uncached sync method ka) `Promise.reject` ban jaata hai, toh `@Cached` hamesha promise lautata hai. Woh arrow function closure mein `this` aur `args` capture karta hai -- jis caller ne load START kiya uske. Concurrent same-key callers usi flight ko join karte hain, unka apna `this` kabhi use nahi hota.\n\nIsliye tenant bug: test mein `Tenant` class ka `config()` method key `() => \"config\"` ke saath (galat, jaan-boojhkar). `new Tenant(\"a\").config()` -> \"config of a\"; `new Tenant(\"b\").config()` -> bhi \"config of a\". Key ne instance ka fark capture nahi kiya, cache ne a ka result b ko de diya.\n\nSahi tareeka (doosra test): key ko normal `function` banao, arrow nahi -- `key: function (this: Tenant) { return \"config:\" + this.name; }` -- tab a ko \"config of a\" aur b ko \"config of b\". Arrow function apna `this` nahi leta, isliye woh instance nahi dekh sakta. Cache decoration time par class level par fix hai, toh saare instances ek cache share karte hain -- isliye instance ka fark key mein hona hi chahiye.\n\nFound-and-fixed: pehli version `options.key(...args)` bulati thi, `this` ke bina -- instance state key mein aa hi nahi sakta tha, aur workaround tenant ko method argument banana tha. Interview bank likhte waqt reviewer ne pakda; ab `key.apply(this, args)`, test aur mutation D5 (key bina `this`) 1 test se caught. Saath hi pehli version mein uncached path ka sync throw sync throw hi rehta tha; ab rejection (D6). Aur method ko AbortSignal nahi milta, toh caller shared call chhod nahi sakta.",
+    "why_needed": "Decorator-based caching (Spring @Cacheable, Nest) bahut common hai, aur uska classic bug yahi hai: key mein koi input chhoot gaya aur data leak.",
+    "real_world_analogy": "Ek shared notice board: pehla aadmi apne department ka circular lagaata hai 'circular', sab log 'circular' maangte hain aur wahi paate hain -- department naam label mein nahi tha.",
+    "how_it_works": "Legacy decorators class definition time par chalte hain aur prototype ke property descriptor ko modify karte hain. Replace kiya gaya function `function (this, ...args)` hona chahiye (arrow nahi) taaki call-time `this` mile. Single flight ka matlab hai result per key, per caller nahi.",
+    "in_this_project": "`src/cached.ts::Cached`, `CachedOptions<A>` (`extends SetOptions`, `key: (this: any, ...args: A) => string | undefined`). `test/cached.test.ts` (8 tests): args se key aur `this` kept (`Greeter`), 10 concurrent -> 1, undefined key uncached aur error not cached, wrong-key tenant test, key function ko `this` milta hai (sahi per-tenant key), sync throw = rejection, ttlMs passed (`t = 999` hit, `t = 1001` miss), non-method TypeError. Mutations D1-D6 sab caught (D5, D6 review fixes guard karte hain).",
+    "implementation_files": [
+      "projects/20-cache/src/cached.ts::Cached",
+      "projects/20-cache/src/cached.ts::CachedOptions",
+      "projects/20-cache/test/cached.test.ts",
+      "projects/20-cache/test/nestjs-helper.test.ts"
+    ],
+    "code_example": "// real, src/cached.ts (trimmed)\ndescriptor.value = function (this: unknown, ...args: A): Promise<V> {\n  try {\n    const key = options.key.apply(this, args); // the key function sees the instance\n    if (key === undefined) return Promise.resolve(original.apply(this, args));\n    return cache.getOrLoad(key, () => original.apply(this, args), { ttlMs: options.ttlMs, staleMs: options.staleMs });\n  } catch (error) {\n    return Promise.reject(error); // a sync throw as a rejection\n  }\n};\n\n// real, test/cached.test.ts: the wrong key on purpose\n@Cached(cache, { key: () => \"config\" })   // ignores the tenant\nasync config(): Promise<string> { return `config of ${this.name}`; }\n// new Tenant(\"b\").config() -> \"config of a\"\n\n// real, test/cached.test.ts: the right key\n@Cached(cache, { key: function (this: Tenant) { return `config:${this.name}`; } })\nasync config(): Promise<string> { return `config of ${this.name}`; }\n// a -> \"config of a\", b -> \"config of b\"",
+    "code_language": "typescript",
+    "advantages": [
+      "Framework-free: Nest service aur plain class dono",
+      "Single flight + TTL bina method code chhoe",
+      "Errors cache nahi hote"
+    ],
+    "disadvantages": [
+      "Key ko this sirf normal function mein milta hai, arrow mein nahi -- easy to miss",
+      "Ek cache saare instances ke liye",
+      "AbortSignal nahi -- caller abandon nahi kar sakta"
+    ],
+    "common_mistakes": [
+      "Key mein ek argument bhool jaana",
+      "Instance state (tenant, user) par depend method ki key arrow function se likhna -- arrow this nahi dekhta, key mein tenant aata hi nahi",
+      "Arrow function se descriptor.value replace karna (this kho jaata hai, mutation D2)"
+    ],
+    "follow_up_questions": [
+      "Key function ko this kaise milta hai, aur arrow function kyun kaam nahi karta?",
+      "TC39 standard decorators mein yeh kaise likhoge?",
+      "Bypass path par sync throw kaise behave karta hai, aur pehli version mein kya galat tha?"
+    ],
+    "concepts": [
+      "method decorator",
+      "property descriptor",
+      "closure capture",
+      "cache key design",
+      "multi-tenancy"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Pehli version simple API thi (key sirf args se); review ke baad key ko `this` bhi milta hai (`key.apply(this, args)`), toh instance state ko argument banana nahi padta -- bas key ko normal function likhna padta hai. Class-level cache vs per-instance: class level simple hai par instances share karte hain.",
+      "failure_scenarios": "Galat key = data leak across tenants/users, aur yeh \"kaam karta hua\" dikhta hai -- sirf ek wrong-key test hi pakadta hai. Pehli version mein bypass path ka sync throw wrapper se bhi sync throw hota tha (rejected Promise nahi); ab try / catch se rejection (mutation D6).",
+      "alternatives": "Key ko `this` alag parameter ki tarah dena (`(self, ...args)`) -- arrow functions bhi kaam karte, par API alag; per-instance cache (constructor mein); Nest ka DI-based cache module (yeh repo use nahi karta); ya explicit `cache.getOrLoad` method body mein -- sabse saaf, decorator magic ke bina.",
+      "scale_10x_100x": "Zyada tenants par key cardinality badhti hai -- maxEntries/maxWeight tune karna. 100x par per-tenant prefix aur TwoLevelCache L2 shared, tab galat key ka leak replicas tak phail jaata hai -- review aur tests aur zaroori.",
+      "production_improvements": "Key function ke liye lint rule ya review checklist (\"har argument key mein?\"); per-tenant/per-user cases ke liye mandatory test jaise wrong-key test; arrow key function ko instance-state wale methods par flag karne wala lint rule."
+    }
+  },
+  {
+    "id": "CKT-064",
+    "project_slug": "p20-cache",
+    "category": "Core Concepts",
+    "difficulty": "Beginner",
+    "question": "Why do the Express and NestJS helpers cache the data a handler produces instead of the HTTP response bytes?",
+    "answer_hinglish": "PLAN ka stage 3 decision: \"Cache handler DATA, not HTTP bytes.\" Reason: response bytes cache karne ka matlab hai `res.write` / `res.end` ko intercept karke record karna aur baad mein replay karna -- aur yeh fragile hai: streaming responses, headers, status codes, sab ko sahi capture aur replay karna padta.\n\nData cache karne mein producer bas ek value return karta hai -- `(req, signal) => db.products.find(id, { signal })`. Helper woh value cache karta hai aur har response par khud `JSON.stringify` karke bhejta hai, `X-Cache` header ke saath. Isse teen fayde: (1) cache-kit ki saari machinery (single flight, TTL, stale-while-revalidate, negative caching, TwoLevelCache ka Redis codec) as-is apply hoti hai, kyunki yeh wahi value hai jo koi bhi `getOrLoad` cache karta; (2) test karna simple -- value compare karo; (3) same cache ek route aur ek service method share kar sakte hain.\n\nKya chhoota (README NOT implemented): `Cache-Control` / `ETag` / `Vary` / conditional requests nahi; non-JSON ya streamed responses cache nahi hote. Aur har hit par serialize phir se hota hai (iska cost naapa nahi gaya). PLAN kehta hai HTTP caching semantics reverse proxy ya CDN behtar karta hai -- woh layer alag hai.",
+    "why_needed": "Interviewer poochta hai 'response caching kaise karoge' -- do layers ka fark (application data cache vs HTTP cache) samajhna basic hai.",
+    "real_world_analogy": "Restaurant mein bani hui dish (data) store karna vs plate ki photo (bytes) store karna. Dish ko kisi bhi plate mein serve kar sakte ho; photo sirf wahi ek plate dikhati hai.",
+    "how_it_works": "Application-level cache value ke level par kaam karta hai aur transport se independent hai. HTTP cache (browser, CDN, reverse proxy) headers se chalta hai aur poore representation (bytes + headers) ko store karta hai. Dono saath reh sakte hain.",
+    "in_this_project": "`src/adapters/express.ts` mein `res.end(JSON.stringify(missing ? NOT_FOUND_BODY : value))` -- har response par stringify. `src/adapters/nestjs.ts` value return karta hai aur Nest serialize karta hai. Express helper `node:http` types par likha hai, Express import nahi karta.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/src/adapters/nestjs.ts::CachedRouteInterceptor",
+      "projects/20-cache/PLAN.md",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Saari cache features automatically apply",
+      "Simple tests (values compare)",
+      "Route aur service method same cache share kar sakte hain"
+    ],
+    "disadvantages": [
+      "Har hit par JSON.stringify",
+      "Koi standard HTTP caching headers nahi",
+      "Sirf JSON, streaming nahi"
+    ],
+    "common_mistakes": [
+      "res.write monkey-patch karke bytes cache karna",
+      "Application cache aur CDN cache ko ek hi cheez samajhna",
+      "Sochna ki X-Cache browser ko cache karne ko bolta hai"
+    ],
+    "follow_up_questions": [
+      "ETag kaise add karoge?",
+      "Serialized string cache karna kab better hoga?",
+      "CDN aur yeh cache dono hon toh invalidation kaise?"
+    ],
+    "concepts": [
+      "data vs response caching",
+      "HTTP caching",
+      "serialization",
+      "separation of concerns"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-065",
+    "project_slug": "p20-cache",
+    "category": "Core Concepts",
+    "difficulty": "Beginner",
+    "question": "Why is the cache key function required in the helpers, and what must it contain?",
+    "answer_hinglish": "Jawab: kyunki koi safe default nahi hai. PLAN: \"a URL-only key would hand one user's data to another.\" `/cart` URL sabke liye same hai, par cart har user ka alag.\n\nRule README mein bold hai: key mein woh SAB hona chahiye jo producer padhta hai. Wajah coalescing hai -- same key wali requests mein sirf PEHLI request ka producer chalta hai, baaki sab uska result paati hain. Toh agar producer `req.user` padhta hai aur key mein user nahi hai, toh doosre user ko pehle wale ka data milega -- aur yeh concurrent requests mein bhi hoga, sirf cache hit par nahi.\n\nExamples `src/adapters/http.ts` ke comment se: per resource `product:${id}` (sabke liye same answer), per user `cart:${userId(req)}` (\"NEVER omit the user\"), per query string `search:${normalised query}`. Key `undefined` return kare toh request cache nahi hoti -- producer chalta hai aur `X-Cache: bypass`. Test: header `x-user` alice, bob, alice, aur koi nahi -> miss alice, miss bob, hit alice (alice ka hi data), bypass anonymous.\n\nTwoLevelCache ke saath ek aur layer: Redis key `prefix + key` hoti hai, toh do apps ek Redis par prefix se alag rehte hain.",
+    "why_needed": "Cache data leak (ek user ko doosre ka data) sabse gambhir caching bug hai -- security incident. Interviewer yeh check karta hai.",
+    "real_world_analogy": "Dhobi ko kapde dete waqt sirf 'shirt' likha tag -- sab ki shirt mix. Tag par naam + flat number (key mein user) hona chahiye.",
+    "how_it_works": "Cache ek function `key -> value` memoize karta hai. Correct hone ke liye key producer ke saare inputs ka function honi chahiye. Jo input key mein nahi, woh cache ke liye invisible hai.",
+    "in_this_project": "`CachedResponseOptions.key: CacheKeyFn` -- comment: \"required on purpose: there is no safe default\". `CacheKeyFn = (req) => string | undefined | Promise<string | undefined>` (async allowed, e.g. session lookup). Test \"per-user data: the user is IN the key\" in `test/express-helper.test.ts`. Mutation C2 (undefined key ko bypass na karna) 1 test se pakda gaya.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::CacheKeyFn",
+      "projects/20-cache/src/adapters/http.ts::CachedResponseOptions",
+      "projects/20-cache/test/express-helper.test.ts",
+      "projects/20-cache/PLAN.md"
+    ],
+    "code_example": "// real, test/express-helper.test.ts (trimmed)\napp.get(\"/cart\", cachedJson(cache,\n  { key: (req) => (user(req) ? `cart:${user(req)}` : undefined) },\n  (req) => ({ cartOf: user(req) ?? \"anonymous\" })));\n// alice, bob, alice, nobody ->\n// [\"miss\",\"alice\"], [\"miss\",\"bob\"], [\"hit\",\"alice\"], [\"bypass\",\"anonymous\"]",
+    "code_language": "typescript",
+    "advantages": [
+      "Data leak ka sabse bada source band",
+      "Bypass se anonymous / uncacheable requests simple",
+      "Async key function allowed"
+    ],
+    "disadvantages": [
+      "Har route par key sochna padta hai",
+      "Developer key mein input bhool sakta hai -- framework rok nahi sakta",
+      "Query string normalise karna developer ki zimmedari"
+    ],
+    "common_mistakes": [
+      "URL ko key bana dena",
+      "User ko key mein daalna par spoofable header se (auth se lo)",
+      "Query params ka order normalise na karna (do keys ek hi data ke liye)"
+    ],
+    "follow_up_questions": [
+      "Coalescing ke bina bhi yeh bug hota?",
+      "Query string normalise kaise karoge?",
+      "Key mein permissions bhi chahiye kya?"
+    ],
+    "concepts": [
+      "cache key",
+      "data isolation",
+      "coalescing",
+      "bypass"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-066",
+    "project_slug": "p20-cache",
+    "category": "Core Concepts",
+    "difficulty": "Intermediate",
+    "question": "What is the randomized model test in cache-kit, and what does it check after every single step?",
+    "answer_hinglish": "Yeh model-based (property-style) testing hai: ek naive \"reference model\" likho jo obviously sahi ho, phir real implementation aur model dono par same random operations chalao aur har step ke baad compare karo.\n\nModel: `class Model` ek array hai recency order mein (index 0 = least recently used), sab O(n) -- `findIndex`, `splice`, `reduce`. README ke rules se likha gaya, Map implementation se nahi. Stage 2 mein stale grace (fresh until expiresAt, stale until deadAt) aur negative caching (loaded 0 = \"not found\") add hue.\n\nRun: 8 seeds (1, 2, 3, 42, 1337, 2024, 9001, 123456) x 3000 steps. Seeded PRNG (mulberry32) taaki failure seed se reproduce ho. Har seed random `maxEntries` (1-6), `maxWeight` (10-39), TTL, staleMs, negativeTtlMs. Steps: get, set (kabhi maxWeight se bhaari value, per-entry TTL/staleMs), getOrLoad (stale reads + refresh, negative values), delete, peek, has, purge, clear, aur manual clock advance.\n\nHar step ke baad CHAAR cheezein identical honi chahiye: return value, `cache.keys()` ka order vs model list, `totalWeight` vs model weight, aur poora `stats()` object. Failure message mein seed, step aur last 8 operations. Aakhri test check karta hai ki random steps ne sach mein har rule chhua: hits, misses, rejects, teeno eviction reasons, stale hits, negative hits -- har ek 50 se zyada (recorded: 104 stale hits, 192 negative hits). Iski wajah se iterator fix ke baad bhi order unchanged prove hua.",
+    "why_needed": "Hand-written tests woh cases cover karte hain jo tumne soche. Model test woh combinations dhundhta hai jo tumne nahi soche -- jaise evict + expire + replace ek saath.",
+    "real_world_analogy": "Naya calculator test karna: ek purana bharosemand calculator (model) saath rakho, dono mein hazaron random sums daalo, har baar answer same hona chahiye.",
+    "how_it_works": "Differential testing: same input, do implementations, outputs compare. Model simple hone ki wajah se reviewable hai. Seeded randomness = reproducible. Coverage assertion confirm karta hai ki generator weak nahi hai.",
+    "in_this_project": "`test/model.test.ts`: `rng(seed)`, `Model`, seeds loop, `expect(got, ctx).toEqual(want)`, `expect(cache.keys(), ctx).toEqual(model.list.map((e) => e.key))`, `expect(cache.totalWeight, ctx).toBe(model.weight())`, `expect(cache.stats(), ctx).toEqual(model.stats)`. `weigh: (v) => v`. getOrLoad ke baad `await flush()` taaki background refresh khatam ho.",
+    "implementation_files": [
+      "projects/20-cache/test/model.test.ts::Model",
+      "projects/20-cache/test/model.test.ts::rng",
+      "projects/20-cache/test/support.ts::flush",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, test/model.test.ts (trimmed): after EVERY step\nconst ctx = `seed ${seed} step ${step}; last ops: ${log.slice(-8).join(\" | \")}`;\nexpect(got, ctx).toEqual(want);\nexpect(cache.keys(), ctx).toEqual(model.list.map((e) => e.key));\nexpect(cache.totalWeight, ctx).toBe(model.weight());\nexpect(cache.stats(), ctx).toEqual(model.stats);",
+    "code_language": "typescript",
+    "advantages": [
+      "Unsoche combinations pakadta hai",
+      "Failure seed + last ops se reproduce",
+      "Refactors (jaise iterator fix) ko safe banata hai"
+    ],
+    "disadvantages": [
+      "Model galat ho toh dono galat match kar sakte hain",
+      "Concurrency / real timers model nahi karta",
+      "Chhote parameters (maxEntries 1-6) -- bade scale ke bugs miss ho sakte hain"
+    ],
+    "common_mistakes": [
+      "Model ko implementation se copy karna (same bug dono mein)",
+      "Coverage check na karna -- generator kabhi rare path tak pahunchta hi nahi",
+      "Seed fix na karna -- failure reproduce nahi hoga"
+    ],
+    "follow_up_questions": [
+      "Model aur cache dono galat hon toh kaun pakdega?",
+      "fast-check jaisi library se kya milta?",
+      "Shrinking kya hai aur yahan kyun nahi?"
+    ],
+    "concepts": [
+      "model-based testing",
+      "differential testing",
+      "seeded PRNG",
+      "invariants",
+      "coverage of generators"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-067",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "Putting the slow eviction code back failed no test at all. How do you catch a pure performance regression in a unit test without timing anything?",
+    "answer_hinglish": "Symptom: mutation L8 (\"the eviction iterator recreated on every eviction\") ne pehle 0 tests fail kiye. Logical hai -- order same hai, results same hain, sirf slow hai. Functional tests performance nahi dekhte.\n\nPehla idea timing assertion hota, par author ne note kiya ki timing assertions is machine par flaky thi (busy machine, floor 37 se 79). Toh structural guard: test `vi.spyOn(Map.prototype, \"keys\")` lagata hai, phir 1000 evictions karta hai (`maxEntries: 100`, 100 se 1100 tak set, har set se pehle `c.get(i - 50)` taaki beech mein bhi holes banen), aur expect karta hai `keys.mock.calls.length` <= 1. Slow code har eviction par `keys()` bulata -> 1000 calls. Saath mein `c.size` 100 aur `evictions.size` 1000 -- yaani evictions sach mein hui. `finally` mein `mockRestore()`.\n\nKyun <= 1, 0 nahi: long-lived iterator constructor mein (spy se pehle) bana; par `done` fallback branch naya `keys()` bana sakti hai -- woh allowed. Iske baad L8 1 test se caught (stage 2 re-run mein bhi 1).\n\nLimitation jo main interview mein bolunga: spy sirf `keys` par hai. Original slow code `this.map.keys().next()` tha (har eviction par naya iterator) -- README pehle `entries()` likhta tha, jab tak ek reviewer ne use code comment, PLAN aur isi guard test (jo `keys` spy karta hai) se compare karke theek nahi karwaya. Toh test asli regression ko pakadta hai; par agar koi `entries().next()` ya `[...map][0]` likhe, yeh test nahi pakdega. Fix: `entries` aur `Symbol.iterator` par bhi spy, ya ek \"operations count\" test jo eviction ke cost ko N se independent dikhaye.",
+    "why_needed": "Performance regressions chupke se aate hain kyunki output same rehta hai. Bina flaky timing ke unhe CI mein pakadna ek practical senior skill hai.",
+    "real_world_analogy": "Petrol kitna laga woh stopwatch se naapna mushkil (traffic), par meter kitni baar ruka (call count) gin lena reliable hai.",
+    "how_it_works": "Complexity ko proxy se test karna: expensive operation ke calls gino (allocations, iterator creations, DB queries). N badhao aur dekho ki count constant rehta hai ya N ke saath badhta hai. Yeh deterministic hai, machine se independent.",
+    "in_this_project": "`test/lru.test.ts` ka pehla describe: \"eviction cost (guards the fix in README 'Overhead' without timing anything)\". Mutation table mein L8: \"0 at first; 1 after a test was added (67)\". README: \"so L8 is caught without any timing assertion (those were flaky on this machine)\".",
+    "implementation_files": [
+      "projects/20-cache/test/lru.test.ts",
+      "projects/20-cache/src/cache.ts::evictOldest",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, test/lru.test.ts (trimmed)\nconst c = new LruCache<number, number>({ maxEntries: 100 });\nfor (let i = 0; i < 100; i++) c.set(i, i);\nconst keys = vi.spyOn(Map.prototype, \"keys\");\ntry {\n  for (let i = 100; i < 1100; i++) {\n    c.get(i - 50); // touches leave holes in the middle too\n    c.set(i, i);   // evicts\n  }\n  expect(keys.mock.calls.length).toBeLessThanOrEqual(1);\n} finally {\n  keys.mockRestore();\n}\nexpect(c.stats().evictions.size).toBe(1000);",
+    "code_language": "typescript",
+    "advantages": [
+      "Deterministic -- busy machine par flaky nahi",
+      "Fast (1000 operations)",
+      "Regression ka exact cause batata hai"
+    ],
+    "disadvantages": [
+      "Implementation detail se bandha (keys hi spy)",
+      "entries()/spread wala regression nahi pakdega",
+      "Global prototype spy -- test mein doosra Map.keys bhi gina jaayega"
+    ],
+    "common_mistakes": [
+      "Unit test mein wall-clock threshold lagana",
+      "Spy restore na karna (doosre tests toot jaate hain)",
+      "Sirf ek API spy karke maan lena ki saare regressions covered hain"
+    ],
+    "follow_up_questions": [
+      "Isko entries() regression ke liye kaise mazboot karoge?",
+      "CI mein benchmark trend kaise rakhoge?",
+      "Allocation count test kab useful hai?"
+    ],
+    "concepts": [
+      "performance regression",
+      "mutation testing",
+      "spy / call counting",
+      "structural tests",
+      "flaky tests"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Structural test deterministic hai par implementation se coupled -- valid refactor (jaise alag data structure) par toot sakta hai. Timing test implementation-agnostic hai par flaky. Yahan structural chuna, kyunki flaky test ignore hone lagte hain.",
+      "failure_scenarios": "False negative: regression `entries()` ya spread se aaye toh pass ho jaayega. False positive: koi valid change jo ek baar se zyada `keys()` legitimately bulaaye (jaise clear() ke baad) -- abhi test mein clear nahi hai, toh nahi hota.",
+      "alternatives": "Ratio test: N=1000 aur N=10000 evictions ka time ratio (still timing, kam flaky); allocation counting; dedicated perf CI with trend alerts; complexity test via operation counter injected into the cache.",
+      "scale_10x_100x": "10x bade cache par purana bug aur bura (zyada holes) -- structural test size se independent hai, wahi kaam karega. Bade codebase mein aise guards har known hot path ke liye rakhna padega.",
+      "production_improvements": "Spy ko `entries` aur `Symbol.iterator` tak badhana; bench ko CI mein chalakar JSON artifacts compare karna (alert, fail nahi); README mein perf invariants ki list."
+    }
+  },
+  {
+    "id": "CKT-068",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Intermediate",
+    "question": "A user reports seeing another user's cart from an endpoint wrapped in cachedJson. How do you investigate and fix it?",
+    "answer_hinglish": "Symptom: user B ko user A ka cart. Mera pehla shak: key function mein user nahi hai.\n\nInvestigate: (1) Response ka `X-Cache` header dekho -- galat data ke saath \"hit\" (ya \"stale\") aaya toh cache ne diya, DB ne nahi. (2) Route ka `key: (req) => ...` padho -- kya woh producer ke saare inputs (user id, tenant, query params) shamil karta hai? Agar sirf `cart` ya URL hai, mil gaya. (3) Yaad rakho ki yeh sirf repeat requests ka issue nahi: coalescing mein same key ki concurrent requests sab PEHLI request ka result paati hain, toh \"miss\" wale burst mein bhi leak ho sakta hai. (4) Repro test: alice, bob, alice -- expect miss/alice, miss/bob, hit/alice (repo mein yahi test hai).\n\nFix: key mein authenticated user id -- authenticated identity se, kisi client-controlled header se nahi (test `x-user` header simple demo ke liye use karta hai). Jahan user nahi (anonymous) wahan `undefined` -> bypass.\n\nCleanup zaroori: galat entries TTL tak rahengi. LruCache par `clear()`. TwoLevelCache par cross-replica clear NOT implemented (README: Redis mein prefix clear ke liye SCAN chahiye) -- practical rasta: naya `prefix` deploy karo (purani keys apne TTL par expire), ya affected keys ko `delete()` karo jo tombstone + pub/sub se sab replicas tak jaata hai. Aur incident ke baad: har cached route ke liye per-user test mandatory.",
+    "why_needed": "Yeh real-world privacy incident hai (kai companies mein CDN/cache misconfig se hua hai). Interviewer structured debugging aur cleanup dono dekhna chahta hai.",
+    "real_world_analogy": "Post office mein sirf building number par letters sort kiye, flat number nahi -- pehle flat waale ki chitthi sabko. Fix: flat number add karo, aur jo galat chitthiyan baant chuke unhe wapas lo.",
+    "how_it_works": "Cache correctness ka invariant: same key => same answer for everyone who can send that key. Key producer inputs ka complete function honi chahiye. Galat entries ka blast radius = TTL x jitne users ne woh key hit ki.",
+    "in_this_project": "`src/adapters/http.ts` comment: \"per user: (req) => `cart:${userId(req)}` (NEVER omit the user for user-specific data)\". `test/express-helper.test.ts` per-user test. `TwoLevelCache.delete()` tombstone + publish; `prefix` constructor option.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::CacheKeyFn",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/test/express-helper.test.ts",
+      "projects/20-cache/src/two-level.ts::TwoLevelCache"
+    ],
+    "code_example": "// illustrative fix (app code; req.user set by your auth middleware)\napp.get(\"/cart\", cachedJson(cartCache,\n  { key: (req) => { const u = (req as any).user?.id; return u ? `cart:${u}` : undefined; }, ttlMs: 30_000 },\n  (req, signal) => carts.findByUser((req as any).user.id, { signal })));",
+    "code_language": "typescript",
+    "advantages": [
+      "X-Cache header se turant pata ki cache involved hai",
+      "Bypass path anonymous ko safe rakhta hai",
+      "Repo mein ready repro test pattern"
+    ],
+    "disadvantages": [
+      "Framework galat key ko rok nahi sakta",
+      "TwoLevelCache par cross-replica clear nahi",
+      "Poisoned entries TTL tak rehti hain"
+    ],
+    "common_mistakes": [
+      "Sirf code fix karna aur purani entries bhool jaana",
+      "Client header se user lena (spoofable)",
+      "Sochna ki sirf cache hits leak karte hain, coalesced misses nahi"
+    ],
+    "follow_up_questions": [
+      "Poisoned entries ko replicas mein kaise saaf karoge?",
+      "Is class ke bugs ko CI mein kaise rokoge?",
+      "Role/permission bhi key mein chahiye kab?"
+    ],
+    "concepts": [
+      "cache poisoning",
+      "data leak",
+      "cache key",
+      "incident cleanup",
+      "X-Cache"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-069",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "Mutations C4, E1 and E2 survived the real-app tests. Why were they invisible, and how were they finally caught?",
+    "answer_hinglish": "Teen mutations: C4 -- `requestSignal` finished response ke baad bhi abort kare; E1 -- Express helper gaye hue client ko bhi response bheje; E2 -- client gaya ho tab bhi `next(err)` bulaye. Stage 3 ke pehle mutation run mein yeh teeno survive hue.\n\nKyun invisible: real socket par, closed connection par likhna Node chupchaap drop kar deta hai -- koi error nahi, client (fetch) toh abort ho chuka hai. Toh black-box HTTP test ke paas dekhne ko kuch nahi: E1 ka extra `res.end` kahin nahi pahunchta, E2 ka `next(err)` error handler ko ek closed response par chalata hai jo bhi drop. C4 mein normal close (response finish ke baad) par abort -- real app test mein us signal ko baad mein koi nahi dekhta.\n\nFix: `test/adapters-unit.test.ts` -- ek fake response (`EventEmitter` + `writableFinished`, `writableEnded`, `destroyed`, `statusCode`, aur `setHeader` / `end` as `vi.fn()`). Ab side effects observable hain. Tests: (1) close before finish -> `s.aborted` true; (2) `writableFinished = true` phir close -> abort NAHI (C4); (3) load ke dauraan `res.destroyed = true`, phir value aaye -> `res.end` call nahi, `next` nahi (E1); (4) close phir producer reject -> `next` nahi, `end` nahi (E2). Final: C4, E1 aur E2 har ek 1 test se caught -- stage 3 ke 20 mein se 20 (baad mein bank review ke teen fixes ke guards C7, D5, D6 jude).\n\nLesson: \"client already gone\" jaisi paths ke liye boundary ko fake karo -- integration test woh nahi dekh sakta jo network nigal leta hai.",
+    "why_needed": "Mutation survivors batate hain ki tests kahan andhe hain. Yeh case dikhata hai ki integration tests har cheez prove nahi karte -- kabhi unit-level fakes zaroori hain.",
+    "real_world_analogy": "Ghar khaali hone ke baad bhi courier letter box mein chitthi daal raha hai -- door se dekhne wala (integration test) kuch nahi dekhta. Letter box mein camera lagao (fake response) toh dikh jaata hai.",
+    "how_it_works": "Observability of side effects: test sirf wahi assert kar sakta hai jo use dikhe. Fake/spy objects ek boundary (yahan ServerResponse) ko replace karke calls record karte hain. Mutation testing batata hai ki kaunse code paths ka koi observable effect test mein nahi hai.",
+    "in_this_project": "`src/adapters/express.ts`: `.then` mein `if (res.writableEnded || res.destroyed) return;`, `.catch` mein `if (signal.aborted) return;`. `src/adapters/http.ts::requestSignal` mein `if (!res.writableFinished)`. README stage 3 mutation section: \"The first run left 3 survivors -- C4, E1, E2 ... and test/adapters-unit.test.ts (a fake response object) was added for them.\"",
+    "implementation_files": [
+      "projects/20-cache/test/adapters-unit.test.ts::fakeRes",
+      "projects/20-cache/src/adapters/http.ts::requestSignal",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, test/adapters-unit.test.ts (trimmed)\nfunction fakeRes() {\n  const res = Object.assign(new EventEmitter(), {\n    writableFinished: false, writableEnded: false, destroyed: false, statusCode: 200,\n    setHeader: vi.fn(), end: vi.fn(),\n  });\n  return res as unknown as ServerResponse & typeof res;\n}\nit(\"does not call next(err) for a client that has gone\", async () => {\n  // ... handler(req, res, next); await tick();\n  res.emit(\"close\");            // client gone before the answer\n  fail(new Error(\"db down\"));\n  await tick(); await tick();\n  expect(next).not.toHaveBeenCalled();\n  expect(res.end).not.toHaveBeenCalled();\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Invisible paths ab tested",
+      "Fast aur deterministic (no sockets)",
+      "Mutation testing ne gap khud dikhaya"
+    ],
+    "disadvantages": [
+      "Fake response real ServerResponse se drift kar sakta hai",
+      "Sirf Express helper ke paths; Nest helper mein client-gone special case hai hi nahi (aborted wait exception layer mein, no-op write)",
+      "Mutation list haath se banti hai -- jo socha nahi woh test nahi"
+    ],
+    "common_mistakes": [
+      "Maan lena ki real-app test sab cover karta hai",
+      "Fake mein woh properties bhool jaana jo code padhta hai (writableFinished)",
+      "Survivor ko 'equivalent' bolkar chhod dena bina soche"
+    ],
+    "follow_up_questions": [
+      "Equivalent mutant aur test gap mein fark kaise karoge?",
+      "Nest helper ke liye aisa test kaise likhoge?",
+      "Gaye hue client ke liye next(err) bulane ka real nuksaan kya hai?"
+    ],
+    "concepts": [
+      "mutation testing",
+      "test doubles",
+      "observability of side effects",
+      "client disconnect",
+      "integration vs unit"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Real-app tests realistic hain par andhe; fakes sab dikhate hain par reality se drift kar sakte hain. Project ne dono rakhe: real Express/Nest apps behaviour ke liye, fake response sirf invisible paths ke liye.",
+      "failure_scenarios": "Bina in guards ke: gaye client ke liye `next(err)` error logs/alerts mein noise banata hai aur error handler ek closed response par kaam karta hai; finished response par signal abort hona kisi bhi code ko jo signal dekhe galat \"cancelled\" bataega.",
+      "alternatives": "Real socket ko `socket.destroy()` karke server-side spies; Node ke `http` module ko mock karna; ya instrumentation (counters) jo test padhe.",
+      "scale_10x_100x": "Zyada traffic par disconnects common hain (mobile clients); har disconnect par galat `next(err)` ka matlab hazaron fake error logs -- alerting toot sakti hai. Isliye yeh path correctness ke saath operability bhi hai.",
+      "production_improvements": "NestJS interceptor mein bhi client-gone special case (abhi aborted wait Nest ke exception layer mein jaata hai) aur uska unit test; mutation runner ko CI mein periodic chalana; fake response ko ek shared test helper banana."
+    }
+  },
+  {
+    "id": "CKT-070",
+    "project_slug": "p20-cache",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "Walk through the cachedJson handler line by line. What does each check protect against?",
+    "answer_hinglish": "`cachedJson(cache, options, produce)` ek Express-style handler `(req, res, next)` return karta hai. Pehle bahar hi `const notFound = options.notFound ?? isNotFound` -- default null/undefined.\n\nHandler ke andar: (1) `const signal = requestSignal(res)` -- client disconnect par abort hone wala signal. (2) `loadForRequest(cache, options, req, signal, (s) => produce(req, s))` -- producer ko LOAD ka signal `s` milta hai, request ka nahi; woh tab abort hota hai jab us load ke saare waiters chale jaayein. (3) `.then(({ value, status }) => ...)`: `if (res.writableEnded || res.destroyed) return;` -- client ya koi aur pehle hi response khatam kar chuka, kuch mat likho (mutation E1). Phir `missing = notFound(value)`, `res.statusCode = missing ? 404 : 200`, headers `x-cache` aur `content-type: application/json; charset=utf-8`, aur `res.end(JSON.stringify(missing ? NOT_FOUND_BODY : value))`. (4) `.catch`: `if (signal.aborted) return;` -- gaye client ke liye error handler mat bulao (E2); warna `next(error)` -- Express ka error middleware handle kare (E5: errors swallow karne se request hang hoti).\n\nNotice karo: handler `async` nahi hai aur Promise return nahi karta -- Express 4 rejected promises handle nahi karta, isliye saari errors explicit `.catch` -> `next`. Aur Express import nahi hai, sirf `node:http` types; README kehta hai 4 aur 5 dono ke liye likha hai par sirf 4.21.2 tested.",
+    "why_needed": "Interview mein code-level walkthrough se pata chalta hai ki tum har line ka reason jaante ho, sirf copy nahi kiya.",
+    "real_world_analogy": "Delivery boy: pehle dekhta hai customer abhi bhi ghar par hai (writableEnded/destroyed), phir packet aur bill (headers) deta hai. Agar raste mein kuch toota aur customer ja chuka -- complaint (next(err)) file nahi karta.",
+    "how_it_works": "Express 4 middleware signature `(req, res, next)`; errors ko `next(err)` se error middleware tak bhejna. `res.writableEnded` = `end()` call ho chuka; `res.destroyed` = socket destroy. Promise chain mein `.then` ke baad `.catch` dono loader errors aur `.then` ke andar ki errors pakadta hai.",
+    "in_this_project": "`src/adapters/express.ts::cachedJson` (handler ka naam `cachedJsonHandler`). Generic `Req extends IncomingMessage` taaki Express ka `req.params` producer mein use ho. Mutations E1-E5 sab caught (1, 1, 8, 1, 1 tests).",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/src/adapters/express.ts::cachedJsonHandler",
+      "projects/20-cache/src/adapters/http.ts::NOT_FOUND_BODY",
+      "projects/20-cache/src/adapters/http.ts::isNotFound"
+    ],
+    "code_example": "// real, src/adapters/express.ts (trimmed)\nreturn function cachedJsonHandler(req: Req, res: ServerResponse, next: Next): void {\n  const signal = requestSignal(res);\n  loadForRequest(cache, options, req, signal, (s) => produce(req, s))\n    .then(({ value, status }) => {\n      if (res.writableEnded || res.destroyed) return;\n      const missing = notFound(value);\n      res.statusCode = missing ? 404 : 200;\n      res.setHeader(\"x-cache\", status);\n      res.setHeader(\"content-type\", \"application/json; charset=utf-8\");\n      res.end(JSON.stringify(missing ? NOT_FOUND_BODY : value));\n    })\n    .catch((error: unknown) => {\n      if (signal.aborted) return; // the client is gone: nobody to answer\n      next(error);\n    });\n};",
+    "code_language": "typescript",
+    "advantages": [
+      "Express runtime dependency nahi",
+      "Har failure path explicit",
+      "Load signal producer tak"
+    ],
+    "disadvantages": [
+      "JSON.stringify har response par (hit bhi)",
+      "Sirf JSON",
+      "Express 5 test nahi hua"
+    ],
+    "common_mistakes": [
+      "Handler ko async banakar rejection Express 4 par chhod dena",
+      "Producer ko request ka signal dena load ka nahi (ek client sabka query cancel kar dega)",
+      "Headers set karne se pehle writableEnded check na karna"
+    ],
+    "follow_up_questions": [
+      "Producer ko request signal diya jaata toh kya tootta?",
+      "JSON.stringify khud throw kare (BigInt) toh kya hoga?",
+      "Express 5 mein kya alag hoga?"
+    ],
+    "concepts": [
+      "Express middleware",
+      "error propagation",
+      "response lifecycle",
+      "AbortSignal"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-071",
+    "project_slug": "p20-cache",
+    "category": "Code-Level",
+    "difficulty": "Beginner",
+    "question": "What does cachedJson answer when the producer returns null or throws, and which of the two is cached?",
+    "answer_hinglish": "Null (ya undefined) -> 404 with body `{ \"error\": \"not_found\" }`, aur yeh CACHED hota hai. Throw -> error `next(err)` se Express error handler tak, aur yeh cache NAHI hota.\n\nNull kyun cache: helper ke liye null ek value hai jo producer ne lautayi -- cache-kit ise baaki values ki tarah store karta hai. Test: do requests `/p/x`, dono 404, doosri `X-Cache: hit`, producer calls 1. Agar cache mein `negativeTtlMs` set hai toh negative caching lagti hai -- \"not found\" `min(normal TTL, negativeTtlMs)` ke liye, bina stale grace. Kaunsi value \"not found\" hai woh `notFound` option badal sakta hai (default `isNotFound`: null ya undefined).\n\nError kyun nahi: cache-kit errors kabhi cache nahi karta. Error zyadatar transient hota hai (timeout, restart); cache karne se 50 ms ka blip poori error TTL ke liye us key ka outage ban jaata. Test: pehli request par producer `throw new Error(\"db down\")` -> app ka error middleware 503 deta hai; doosri request par producer phir chalta hai -> 200 \"ok\" aur X-Cache miss.\n\nNestJS mein: null -> `NotFoundException` (Nest ka 404); handler error -> Nest exception layer (test mein 500), phir agli request par handler dobara.",
+    "why_needed": "404 aur error ka fark caching mein bahut important hai -- galat choice se ya toh DB par flood ya outage lambi.",
+    "real_world_analogy": "Dukaan: 'yeh item hum rakhte hi nahi' (404) ek board par likh do, sab ko wahi jawab. 'Abhi godown ki chaabi nahi mil rahi' (error) board par mat likho -- 5 minute baad shayad mil jaaye.",
+    "how_it_works": "Negative caching = 'not found' result ko short TTL ke liye cache karna, taaki missing ids ke flood se DB bache. Error caching = failure cache karna -- yahan deliberately NOT implemented. Loader jo jaanta hai ki error ka matlab not found hai (HTTP 404), woh null return kare.",
+    "in_this_project": "`src/adapters/http.ts`: `isNotFound = (v) => v === null || v === undefined`, `NOT_FOUND_BODY = { error: \"not_found\" } as const`. `test/express-helper.test.ts` ke do tests: \"not found (null) -> 404, and it is cached like any value\" aur \"a producer error is NOT cached\". Mutations C6 (null 200 ban jaaye) 2 tests, E4 1, N2 1.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::isNotFound",
+      "projects/20-cache/src/adapters/http.ts::NOT_FOUND_BODY",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/test/express-helper.test.ts"
+    ],
+    "code_example": "// real, test/express-helper.test.ts (trimmed)\napp.get(\"/p/:id\", cachedJson(cache, { key: (req) => `p:${req.params.id}` }, () => (calls++, null)));\n// -> [404, { error: \"not_found\" }, 404, \"hit\", 1]\n\napp.get(\"/x\", cachedJson(cache, { key: () => \"x\" }, () => {\n  if (++calls === 1) throw new Error(\"db down\");\n  return \"ok\";\n}));\n// first: 503 from the app's error handler; second: 200 \"ok\", X-Cache miss",
+    "code_language": "typescript",
+    "advantages": [
+      "Missing ids ka flood DB tak nahi jaata",
+      "Transient errors outage nahi bante",
+      "notFound customisable"
+    ],
+    "disadvantages": [
+      "Null normal TTL tak cache (negativeTtlMs ke bina) -- naya record der se dikhega",
+      "Hamesha fail hone wali key har miss par loader tak jaati hai",
+      "404 body fixed hai"
+    ],
+    "common_mistakes": [
+      "Errors ko 'performance ke liye' cache karna",
+      "negativeTtlMs set na karna aur phir naya record minutes tak 404 dikhna",
+      "Loader mein 404 ko throw karna (tab cache nahi hoga)"
+    ],
+    "follow_up_questions": [
+      "Negative TTL kitna rakhoge?",
+      "Error caching kab sahi hota?",
+      "Nest mein custom 404 body kaise doge?"
+    ],
+    "concepts": [
+      "negative caching",
+      "error caching",
+      "404",
+      "transient failures"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-072",
+    "project_slug": "p20-cache",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "Look at evictOldest and the store loop. Why are there branches that mutation testing says no test can ever catch, and why keep them?",
+    "answer_hinglish": "Teen equivalent mutants hain jo har run mein survive karte hain -- L6, L7, W8 -- aur README unhe documentation ke roop mein rakhta hai.\n\nL7: `evictOldest` mein `if (next.done)` branch naya iterator banati hai. Unreachable hai kyunki eviction tabhi chalti hai jab map mein keys hon, aur har live key iterator ki position par ya uske aage hai -- toh `next()` kabhi done nahi deta jab keys hon. Phir bhi rakha kyunki finished iterator hamesha finished rehta hai, chahe baad mein keys aayein -- agar kabhi invariant toote toh eviction chupchaap band na ho. Sasta safety.\n\nL6: `clear()` mein `this.oldest = this.map.keys()`. Language spec ke hisaab se purana iterator `clear()` ke baad bhi valid rehta hai, toh reset zaroori nahi; model test ke random `clear` steps confirm karte hain. Rakha kyunki \"obviously right\" code padhne wale ke liye easier hai.\n\nW8: weight loop `while (this.weightTotal > this.maxWeight && this.map.size > 1)`. Sahi bookkeeping mein naya entry akela maxWeight se halka hai (bhaari toh pehle hi reject), toh loop uske pehle ruk jaata hai -- `size > 1` no-op. Par mutation W5 (remove par weight subtract na karna) ne pehle run mein yeh loop empty map par forever spin karwaya: test run hang, 300 s timeout ne sirf shell maara, 12 orphan node processes. Guard ke saath bookkeeping bug galat evictions deta hai jo tests dekh lete hain, hang nahi.\n\nLesson: equivalent mutant ka matlab \"dead code\" nahi -- kabhi woh defence-in-depth hai. Bas use explain karke document karo.",
+    "why_needed": "Mutation testing ke results padhna aur 'survivor = bad test' ke simple rule se aage sochna senior-level samajh hai.",
+    "real_world_analogy": "Building mein fire exit jo kabhi use nahi hua -- 'unused' hai, par hatana bewakoofi. Inspector (mutation test) usse 'koi fark nahi padta' bolega; tum likh ke rakhte ho kyun hai.",
+    "how_it_works": "Equivalent mutant: code change jo program ka observable behaviour nahi badalta, isliye koi test fail nahi kar sakta. Defensive guards aksar equivalent hote hain jab tak koi aur bug na ho. Infinite-loop guard failure ko 'hang' se 'wrong answer' mein badalta hai -- debuggable.",
+    "in_this_project": "`src/cache.ts`: `evictOldest()` done-branch, `clear()` iterator reset, `store()` mein `size > 1`. README tables: survivors L6, L7, W8 with reasons; W5 hang story; runner ab whole process tree kill karta hai.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::evictOldest",
+      "projects/20-cache/src/cache.ts::store",
+      "projects/20-cache/src/cache.ts::clear",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed)\nwhile (this.map.size > this.maxEntries) this.evictOldest(\"size\");\n// `size > 1` is a guard, not a rule: if the total ever drifted from the entries (a bug), the loop\n// would otherwise spin forever on an empty map (found by mutation W5, which hung the test run).\nif (this.maxWeight !== undefined) {\n  while (this.weightTotal > this.maxWeight && this.map.size > 1) this.evictOldest(\"weight\");\n}\n\nclear(): void {\n  this.map.clear();\n  this.oldest = this.map.keys(); // the spec keeps an old iterator valid across clear(); a fresh one is simpler to trust\n  this.flights.clear();\n  this.weightTotal = 0;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Bugs hang ki jagah visible wrong behaviour dete hain",
+      "Survivors documented, chhupaye nahi",
+      "Code ka intent comments mein"
+    ],
+    "disadvantages": [
+      "Untestable branches coverage/mutation score kam dikhate hain",
+      "Guard asli bug ko 'mask' bhi kar sakta hai (galat evictions)",
+      "Reviewer ko extra samajhna padta hai"
+    ],
+    "common_mistakes": [
+      "Equivalent mutant ko hatane ke liye guard delete kar dena",
+      "Har survivor ko test gap maan lena",
+      "Infinite loop wale code mein termination guard na rakhna"
+    ],
+    "follow_up_questions": [
+      "Equivalent mutant ko kaise prove karoge?",
+      "Guard ki jagah assertion (throw) kyun nahi?",
+      "W5 hang ne runner design kaise badla?"
+    ],
+    "concepts": [
+      "equivalent mutants",
+      "defensive programming",
+      "loop termination",
+      "iterator invariants"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Guard silently continue karta hai (galat eviction) vs throw karna (loud). Author ne continue chuna taaki production mein cache chalta rahe aur tests galat evictions pakad lein; throw zyada loud hota par request fail karta.",
+      "failure_scenarios": "Agar weight total drift ho (weigh ka non-deterministic result, ya bookkeeping bug), guard ke saath cache ek entry tak sikud sakta hai -- hit ratio girega, process hang nahi. Iterator invariant toote toh L7 branch eviction ko zinda rakhti hai.",
+      "alternatives": "Invariant assertion dev mode mein (`if (map.size === 0 && weightTotal > 0) throw`); periodic self-check jo totalWeight ko entries se recompute kare; property test jo model se compare kare (already hai).",
+      "scale_10x_100x": "Bade caches mein drift ka asar der se dikhega; metrics (`totalWeight` vs `size`) par alert useful. Mutation testing ka cost bhi scale hota hai -- 99 breaks x full suite.",
+      "production_improvements": "`totalWeight` ka periodic consistency check debug flag ke peeche; survivors ki list CI mein track karna taaki naya survivor turant dikhe."
+    }
+  },
+  {
+    "id": "CKT-073",
+    "project_slug": "p20-cache",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Coding exercise: add optional Cache-Control and ETag support to cachedJson, with a test. (Not in the repo.)",
+    "answer_hinglish": "Pehle saaf: yeh repo mein NAHI hai -- README ke NOT implemented mein likha hai \"no Cache-Control / ETag / Vary / conditional requests\". Yeh ek exercise hai; neeche ka code illustrative hai aur koi measurement nahi.\n\nApproach: helper data cache karta hai, toh hum response banate waqt body string ka hash ETag banayenge. Do naye options: `cacheControl?: string` (jaise `\"private, max-age=30\"`) aur `etag?: boolean`. Flow: body = `JSON.stringify(value)`; ETag = `\"` + sha1(body) base64url ka chhota hissa + `\"` (strong ETag). Agar request ka `if-none-match` header ETag se match kare -> `304`, bina body. Warna 200 body ke saath. 404 par ETag nahi lagayenge, aur Cache-Control bhi sirf 200 par.\n\nDhyan rakhne ki baatein: (1) per-user data par `Cache-Control: public` kabhi nahi -- shared caches (CDN) ek user ka response doosre ko de denge; per-user routes par `private` ya kuch nahi. Agar response kisi header par depend kare toh `Vary` chahiye -- yeh exercise usse cover nahi karti. (2) Har response par hash ka CPU cost -- behtar hai ETag ko value ke saath cache karna, par woh `Loadable` ke value type ko badalta hai; pehle simple version. (3) X-Cache header 304 par bhi bhejo, debugging ke liye. Test: real Express app, pehli request se ETag lo, doosri `if-none-match` ke saath -> 304 aur producer phir bhi ek hi baar.",
+    "why_needed": "HTTP conditional requests bandwidth bachate hain aur interview mein 'browser caching vs server caching' ka classic sawaal hai.",
+    "real_world_analogy": "Kitab ka edition number: reader kehta hai 'mere paas edition 3 hai' (If-None-Match); agar wahi latest hai toh librarian bolta hai 'wahi rakho' (304), poori kitab nahi deta.",
+    "how_it_works": "ETag ek representation ka identifier; client `If-None-Match` bhejta hai; match par server 304 Not Modified, body nahi. Cache-Control batata hai browser/CDN kitni der tak bina pooche reuse kar sakte hain. `private` = sirf end-user ka browser, shared cache nahi.",
+    "in_this_project": "Base: `src/adapters/express.ts::cachedJson` aur `CachedResponseOptions` (`src/adapters/http.ts`). Test style `test/express-helper.test.ts` jaisa: `express()`, `listen(0)`, `fetch`. Abhi repo mein yeh options NAHI hain.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/src/adapters/http.ts::CachedResponseOptions",
+      "projects/20-cache/test/express-helper.test.ts",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// ILLUSTRATIVE -- NOT in the repo. A variant of cachedJson with Cache-Control and ETag.\nimport { createHash } from \"node:crypto\";\nimport type { IncomingMessage, ServerResponse } from \"node:http\";\nimport { isNotFound, loadForRequest, NOT_FOUND_BODY, requestSignal, type CachedResponseOptions, type Loadable } from \"./http.js\";\n\nexport interface HttpCacheOptions<V> extends CachedResponseOptions<V> {\n  cacheControl?: string; // e.g. \"private, max-age=30\" -- never \"public\" for per-user data\n  etag?: boolean;\n}\n\nexport function cachedJsonHttp<V, Req extends IncomingMessage = IncomingMessage>(\n  cache: Loadable<V>, options: HttpCacheOptions<V>, produce: (req: Req, signal: AbortSignal) => Promise<V> | V,\n) {\n  const notFound = options.notFound ?? isNotFound;\n  return function (req: Req, res: ServerResponse, next: (e?: unknown) => void): void {\n    const signal = requestSignal(res);\n    loadForRequest(cache, options, req, signal, (s) => produce(req, s))\n      .then(({ value, status }) => {\n        if (res.writableEnded || res.destroyed) return;\n        res.setHeader(\"x-cache\", status);\n        if (notFound(value)) {\n          res.statusCode = 404;\n          res.setHeader(\"content-type\", \"application/json; charset=utf-8\");\n          res.end(JSON.stringify(NOT_FOUND_BODY));\n          return;\n        }\n        const body = JSON.stringify(value);\n        if (options.cacheControl) res.setHeader(\"cache-control\", options.cacheControl);\n        if (options.etag) {\n          const tag = `\"${createHash(\"sha1\").update(body).digest(\"base64url\").slice(0, 27)}\"`;\n          res.setHeader(\"etag\", tag);\n          if (req.headers[\"if-none-match\"] === tag) {\n            res.statusCode = 304;\n            res.end();\n            return;\n          }\n        }\n        res.statusCode = 200;\n        res.setHeader(\"content-type\", \"application/json; charset=utf-8\");\n        res.end(body);\n      })\n      .catch((error: unknown) => {\n        if (signal.aborted) return;\n        next(error);\n      });\n  };\n}\n\n// ILLUSTRATIVE test (vitest + real Express, same style as test/express-helper.test.ts)\nit(\"ETag: a matching If-None-Match gets 304 and the producer still ran once\", async () => {\n  let calls = 0;\n  const cache = new LruCache<string, { n: number }>({ maxEntries: 10 });\n  const app = express();\n  app.get(\"/e\", cachedJsonHttp(cache, { key: () => \"e\", etag: true, cacheControl: \"private, max-age=30\" }, () => ({ n: ++calls })));\n  const base = await listen(app);\n  const a = await fetch(`${base}/e`);\n  const tag = a.headers.get(\"etag\")!;\n  expect([a.status, a.headers.get(\"cache-control\"), await a.json()]).toEqual([200, \"private, max-age=30\", { n: 1 }]);\n  const b = await fetch(`${base}/e`, { headers: { \"if-none-match\": tag } });\n  expect([b.status, b.headers.get(\"x-cache\"), calls]).toEqual([304, \"hit\", 1]);\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Unchanged data par bandwidth bachti hai",
+      "Existing helper ka structure reuse",
+      "Browser/CDN ke saath kaam karta hai"
+    ],
+    "disadvantages": [
+      "Har response par hash ka CPU (naapa nahi)",
+      "Vary aur weak ETags cover nahi",
+      "Galat Cache-Control se shared cache leak"
+    ],
+    "common_mistakes": [
+      "Per-user route par public Cache-Control",
+      "If-None-Match ki list (comma-separated, W/ prefix) ko handle na karna",
+      "304 ke saath body bhejna"
+    ],
+    "follow_up_questions": [
+      "ETag ko har response par compute karne ke bajaye cache kaise karoge?",
+      "Vary kab chahiye?",
+      "Weak vs strong ETag ka fark?"
+    ],
+    "concepts": [
+      "ETag",
+      "Cache-Control",
+      "conditional requests",
+      "304 Not Modified",
+      "HTTP caching"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-074",
+    "project_slug": "p20-cache",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Coding exercise: write a Koa version of cachedJson that reuses the shared HTTP core, with a test. (Not in the repo.)",
+    "answer_hinglish": "Yeh repo mein NAHI hai, aur Koa repo ki dependency bhi nahi hai -- exercise hai. Point yeh dikhana hai ki stage 3 ka design reuse ke liye bana hai: `src/adapters/http.ts` mein framework-free core hai (`Loadable`, `requestSignal`, `loadForRequest`, `isNotFound`, `NOT_FOUND_BODY`), aur Express/Nest helpers us par patli layer hain.\n\nKoa mein kya alag: middleware `async (ctx, next) => {}`; Node ke objects `ctx.req` aur `ctx.res` par milte hain, toh `requestSignal(ctx.res)` aur `loadForRequest(..., ctx.req, ...)` seedhe kaam karte hain. Response `ctx.status`, `ctx.set()`, `ctx.body` se. Errors: Koa async middleware ki rejection apne aap error handling mein le jaata hai, toh Express ki tarah `next(err)` nahi chahiye -- bas throw hone do. Client-gone case: agar `signal.aborted` toh kuch set mat karo aur return.\n\nDo gotchas: (1) `ctx.body = \"some string\"` Koa text/plain bhejega, aur `ctx.body = null` 204 -- isliye hum khud `ctx.type = \"application/json\"` aur `JSON.stringify` karte hain, taaki string value bhi JSON jaaye (Express helper bhi yahi karta hai). (2) Not-found par 404 + `NOT_FOUND_BODY`. Test: miss phir hit, aur 20 concurrent -> 1 producer call, Express tests jaisa.",
+    "why_needed": "Interviewer dekhna chahta hai ki tum ek abstraction ko naye framework tak extend kar sakte ho bina core ko chhede -- aur framework ke chhote fark (body semantics, error flow) jaante ho.",
+    "real_world_analogy": "Ek hi engine (http.ts core) alag-alag car body (Express, Nest, Koa) mein -- sirf mounting brackets badlte hain.",
+    "how_it_works": "Adapter pattern: framework-specific edge, framework-free core. Koa ka onion model: `await next()` downstream ko chalata hai; yahan hum terminal handler hain toh `next` call nahi karte. Koa error middleware try/catch se upstream errors pakadta hai.",
+    "in_this_project": "Reuse hoga: `src/adapters/http.ts::loadForRequest`, `requestSignal`, `isNotFound`, `NOT_FOUND_BODY`, `CachedResponseOptions`. Pattern: `src/adapters/express.ts::cachedJson`. NestJS on Fastify aur Express 5 test bhi README mein not done hain -- Koa toh bilkul nahi.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::loadForRequest",
+      "projects/20-cache/src/adapters/http.ts::requestSignal",
+      "projects/20-cache/src/adapters/express.ts::cachedJson",
+      "projects/20-cache/test/express-helper.test.ts"
+    ],
+    "code_example": "// ILLUSTRATIVE -- NOT in the repo (Koa is not a dependency here).\nimport type { Context } from \"koa\";\nimport { isNotFound, loadForRequest, NOT_FOUND_BODY, requestSignal, type CachedResponseOptions, type Loadable } from \"./http.js\";\n\nexport function cachedJsonKoa<V>(\n  cache: Loadable<V>, options: CachedResponseOptions<V>, produce: (ctx: Context, signal: AbortSignal) => Promise<V> | V,\n) {\n  const notFound = options.notFound ?? isNotFound;\n  return async function cachedJsonKoaMiddleware(ctx: Context): Promise<void> {\n    const signal = requestSignal(ctx.res);\n    let result: Awaited<ReturnType<typeof loadForRequest<V>>>;\n    try {\n      result = await loadForRequest(cache, options, ctx.req, signal, (s) => produce(ctx, s));\n    } catch (error) {\n      if (signal.aborted) return; // client gone: nothing to answer\n      throw error;                // Koa's error handling takes it (not cached)\n    }\n    const missing = notFound(result.value);\n    ctx.set(\"x-cache\", result.status);\n    ctx.status = missing ? 404 : 200;\n    ctx.type = \"application/json\";\n    ctx.body = JSON.stringify(missing ? NOT_FOUND_BODY : result.value); // a string value stays JSON\n  };\n}\n\n// ILLUSTRATIVE test\nit(\"koa: miss then hit, producer once\", async () => {\n  let calls = 0;\n  const app = new Koa();\n  app.use(cachedJsonKoa(new LruCache<string, { n: number }>({ maxEntries: 10 }), { key: () => \"k\" }, () => ({ n: ++calls })));\n  const server = app.listen(0, \"127.0.0.1\");\n  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;\n  const a = await fetch(base);\n  const b = await fetch(base);\n  expect([a.headers.get(\"x-cache\"), await a.json(), b.headers.get(\"x-cache\"), await b.json(), calls])\n    .toEqual([\"miss\", { n: 1 }, \"hit\", { n: 1 }, 1]);\n  server.close();\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Core logic zero duplication",
+      "Same X-Cache / 404 / error semantics",
+      "Koa ki native async error flow"
+    ],
+    "disadvantages": [
+      "Naya framework = naya test matrix",
+      "Koa ka apna body handling bypass kiya (string body)",
+      "Koa router params ke liye key mein ctx chahiye -- CacheKeyFn sirf req leta hai"
+    ],
+    "common_mistakes": [
+      "ctx.body = value (string value text/plain ban jaayega, null 204)",
+      "Client gone par bhi throw karna (error logs mein noise)",
+      "next() call karke downstream bhi chala dena"
+    ],
+    "follow_up_questions": [
+      "CacheKeyFn ko ctx kaise doge bina core badle?",
+      "Fastify adapter mein kya alag hoga?",
+      "Koa test mein disconnect case kaise likhoge?"
+    ],
+    "concepts": [
+      "adapter pattern",
+      "Koa middleware",
+      "framework-free core",
+      "error propagation"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-075",
+    "project_slug": "p20-cache",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Advanced",
+    "question": "Why is @CachedRoute a plain interceptor instance without dependency injection, and @Cached a legacy decorator, instead of a DI-based Nest cache module?",
+    "answer_hinglish": "PLAN ka decision: \"@Cached is a framework-free legacy method decorator (works in NestJS and plain classes); the Nest route helper is an interceptor INSTANCE (no DI), like ratelimit-kit's guard.\"\n\nInterceptor instance kyun: `UseInterceptors(new CachedRouteInterceptor(cache, options))` -- cache aur options decorator ko seedhe diye jaate hain. Na module registration, na provider token, na `@Inject`. Har route apna cache aur key le sakta hai. Cache ek module-level singleton hota hai (README: \"One cache per KIND of data, created once\"). Cost: interceptor DI container ke bahar hai, toh Nest ke providers (jaise ConfigService se TTL) inject nahi ho sakte, aur test mein cache swap karna module-level variable se hota hai, DI override se nahi.\n\nLegacy decorator kyun: NestJS khud `experimentalDecorators` wale legacy decorators use karta hai; same kind likhne se `@Cached` Nest services mein bhi chalta hai aur plain classes / workers / scripts mein bhi, aur `cached.ts` Nest import nahi karta. TC39 standard decorators ka signature alag hai -- yeh NOT implemented.\n\nNest ka apna cache module bhi hota hai (`@nestjs/cache-manager` -- general knowledge, is repo mein use nahi). Jahan tak mujhe pata hai, uska interceptor default mein request URL se key banata hai -- jo per-user data ke liye wahi risk hai jiske against yahan key required hai. Yahan ke helpers single flight, abort, stale-while-revalidate aur TwoLevelCache ke saath tied hain -- woh features yahan ke core se aate hain.",
+    "why_needed": "Framework integration mein DI vs plain objects ka trade-off har team face karti hai. Interviewer justification sunna chahta hai, sirf 'maine aise kiya' nahi.",
+    "real_world_analogy": "Ghar mein apna water purifier (instance, seedha lagao) vs building ka central supply (DI module): apna lagana fast aur flexible, central supply ka config aur maintenance ek jagah.",
+    "how_it_works": "Nest interceptors do tarah se: class (`UseInterceptors(MyInterceptor)`) -- Nest DI se banata hai; ya instance (`new MyInterceptor(...)`) -- Nest use as-is chalata hai, DI nahi. Legacy decorator = `(target, key, descriptor)`; standard decorator = `(value, context)`.",
+    "in_this_project": "`src/adapters/nestjs.ts::CachedRoute` -> `applyDecorators(UseInterceptors(new CachedRouteInterceptor(cache, options)))`. `src/cached.ts` header comment: \"Framework-free (a plain TypeScript legacy method decorator, the kind NestJS uses -- needs experimentalDecorators)\". Test `test/nestjs-helper.test.ts` module-level `routeCache` aur `serviceCache`; `ProductService` bina DI ke `new` hota hai.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/nestjs.ts::CachedRoute",
+      "projects/20-cache/src/cached.ts::Cached",
+      "projects/20-cache/PLAN.md",
+      "projects/20-cache/test/nestjs-helper.test.ts"
+    ],
+    "code_example": "// real, src/adapters/nestjs.ts\nexport function CachedRoute<V>(cache: Loadable<V>, options: CachedResponseOptions<V>) {\n  return applyDecorators(UseInterceptors(new CachedRouteInterceptor(cache, options)));\n}\n// real usage, test/nestjs-helper.test.ts\nconst routeCache = new LruCache<string, unknown>({ maxEntries: 100, ttlMs: 60_000 });\n@Get(\"route/:id\")\n@CachedRoute(routeCache, { key: (req) => `route:${params(req).id}` })\nroute(@Param(\"id\") id: string) { /* runs only on a miss */ }",
+    "code_language": "typescript",
+    "advantages": [
+      "Zero setup, explicit dependencies",
+      "Same @Cached Nest aur non-Nest code mein",
+      "Har route apna cache/key"
+    ],
+    "disadvantages": [
+      "Nest providers inject nahi ho sakte",
+      "Test mein cache swap DI se nahi",
+      "Legacy decorators -- future TC39 migration"
+    ],
+    "common_mistakes": [
+      "Interceptor class pass karna aur constructor args expect karna (DI unhe nahi dega)",
+      "Cache ko request scope mein banana (har request naya cache)",
+      "Standard decorators ke saath experimentalDecorators mix karna"
+    ],
+    "follow_up_questions": [
+      "ConfigService se TTL chahiye toh kya karoge?",
+      "Interceptor ko DI-friendly kaise banaoge bina features khoye?",
+      "TC39 decorators par migrate karne mein kya badlega?"
+    ],
+    "concepts": [
+      "dependency injection",
+      "NestJS interceptors",
+      "legacy decorators",
+      "framework coupling"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Simplicity aur portability (instance, legacy decorator, no framework import in core) vs Nest-native ergonomics (DI, config, testing overrides). Is project ne portability chuni kyunki same library workers aur scripts mein bhi chalni hai.",
+      "failure_scenarios": "Cache ko galti se request-scoped bana diya (handler ke andar `new LruCache`) toh caching kabhi nahi hogi. Do modules alag-alag cache instances banaayein same data ke liye -- double memory, inconsistent invalidation.",
+      "alternatives": "DI provider jo cache expose kare aur ek interceptor class jo `@Inject(CACHE)` le plus route metadata (`SetMetadata`) se key options; Nest ka built-in cache module; ya service layer mein explicit `getOrLoad` (sabse kam magic).",
+      "scale_10x_100x": "Bahut routes par per-route caches ka sprawl -- har ek ka apna maxEntries; total memory ka hisaab mushkil. 10x routes par ek central registry (DI) ka fayda badhta hai.",
+      "production_improvements": "Ek optional DI wrapper module jo isi interceptor ko provider se cache de; caches ka registry jisse metrics ek endpoint par aayein; standard decorators ka variant."
+    }
+  },
+  {
+    "id": "CKT-076",
+    "project_slug": "p20-cache",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Senior/System Design",
+    "question": "Mutation testing took real effort in this project. What did it find that line coverage would not have, and is it worth the cost?",
+    "answer_hinglish": "Method pehle: ek deliberate bug `src/` mein, akela apply, poora suite chalao (`npx vitest run --reporter=json`, uppercase `H:` drive se, kyunki lowercase path par projects/18 mein vitest ne modules do baar load kiye), file byte-exact restore (checked). Har pattern pehle check hota hai ki exactly ek baar match kare. Runner repo ke bahar. Number = kitne tests fail hue. Stage 1: 42 breaks; stage 2: total 99 (42 re-based + 57 naye); stage 3: 20 framework-helper breaks -- kul 119 distinct breaks.\n\nKya mila jo coverage nahi deta (coverage sirf batata hai line chali; mutation batata hai ki line galat hone par koi test fail hota hai): (1) W5 ne test run HANG kiya -- weight loop forever; isse `size > 1` guard aur integer-only weights (W7) aaye, aur runner ab poora process tree kill karta hai. (2) L8 -- slow eviction wapas lana 0 tests fail -- naya call-count test. (3) Stage 2 ke 4 first-run survivors real test gaps the: X15 (test ne Redis timeout se pehle hi check kar liya), X16 (bad codec `undefined` deta tha jo doosra guard bhi pakadta), X24 (fake Redis synchronous, koi pending write nahi), X25 (PTTL exactly 0 kabhi produce nahi hua). (4) Stage 3: C4, E1, E2 -- real socket par invisible, fake response tests aaye; aur C7, D5, D6 un teen bugs ko guard karte hain jo interview bank ke review mein mile (stale serve 'miss' label, `@Cached` key ko `this` na milna, sync throw). Aur 3 equivalent mutants (L6, L7, W8) explain karke documented.\n\nWorth it? Library code ke liye -- jahan concurrency, versions aur edge boundaries hain -- haan. Cost: har break ek full suite run, aur list haath se likhi hai (koi Stryker jaisa tool nahi), toh sirf woh bugs test hote hain jo author ne soche. README \"caught by exactly one test\" bhi list karta hai -- woh tests delete karna in bugs ko chhupa dega, yeh fragility ka map hai. Har app feature par main itna nahi karunga; core infra libraries par haan.",
+    "why_needed": "Test quality ka sawal senior interviews mein aata hai: '100 percent coverage hai' kaafi nahi. Mutation testing test suite ko test karta hai.",
+    "real_world_analogy": "Fire drill: building mein jaan-boojhkar ek alarm band karo aur dekho kaun notice karta hai. Agar koi nahi karta, toh tumhara monitoring andha hai -- chahe har room mein sensor (coverage) ho.",
+    "how_it_works": "Mutant = code mein ek chhota deliberate change. Killed = koi test fail hua. Survived = ya toh test gap, ya equivalent mutant (behaviour same). Mutation score = killed / non-equivalent. Hand-picked mutants targeted hain; tools (Stryker) automatic par noisy.",
+    "in_this_project": "README ke teen 'Mutation checks' sections (stage 1, 2, 3) har break ka naam aur failed count dete hain. Stage 3 ne core files (`cache.ts`, `two-level.ts`, `events.ts`) nahi badle, isliye 99 stage 1+2 breaks re-run nahi hue.",
+    "implementation_files": [
+      "projects/20-cache/README.md",
+      "projects/20-cache/PLAN.md",
+      "projects/20-cache/test/lru.test.ts",
+      "projects/20-cache/test/adapters-unit.test.ts",
+      "projects/20-cache/src/cache.ts::store"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Test gaps concrete milte hain",
+      "Defensive design improvements (hang guard)",
+      "Har survivor explained -- trust badhta hai"
+    ],
+    "disadvantages": [
+      "Mehnga: har break = full suite",
+      "Hand-written list -- unsoche bugs miss",
+      "Process discipline chahiye (restore, timeouts, orphan processes)"
+    ],
+    "common_mistakes": [
+      "Coverage percentage ko test quality samajhna",
+      "Survivor ko bina analysis 'equivalent' bolna",
+      "Runner mein timeout ke saath child processes kill na karna"
+    ],
+    "follow_up_questions": [
+      "Stryker jaisa tool vs hand-picked mutants?",
+      "Mutation testing CI mein kaise fit karoge?",
+      "Equivalent mutants ko kaise identify karoge efficiently?"
+    ],
+    "concepts": [
+      "mutation testing",
+      "test adequacy",
+      "equivalent mutants",
+      "coverage limits",
+      "test gaps"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Hand-picked mutants: high signal, low noise, par author ki imagination tak limited. Automatic tools: broad par hazaron mutants, slow, aur bahut saare trivial/equivalent. Yahan targeted list chuni kyunki rules (TTL boundary, versions, NX) clear the.",
+      "failure_scenarios": "Runner bug ne file restore na ki toh repo mein bug reh jaata -- isliye byte-exact check. W5 jaise hang ne orphan processes chhode jo baaki checks slow karte rahe. Ek test jo \"exactly one\" bugs pakadta hai, delete ho toh silent regression.",
+      "alternatives": "Stryker (JS/TS ke liye mutation tool -- general knowledge, yahan use nahi); property-based testing (yahan model test already); fault injection in integration tests.",
+      "scale_10x_100x": "10x code par full-suite-per-mutant ka cost bahut badhta hai -- incremental mutation (sirf changed files), test selection, parallel runners. 100x par sirf critical modules.",
+      "production_improvements": "Runner ko repo mein (ya shared tooling mein) rakhna taaki reproducible ho; CI mein weekly run; \"caught by exactly one test\" list ko coverage report ke saath track karna."
+    }
+  },
+  {
+    "id": "CKT-077",
+    "project_slug": "p20-cache",
+    "category": "Architecture & System Design",
+    "difficulty": "Senior/System Design",
+    "question": "Two Express instances share a TwoLevelCache over one Redis. Walk through a request on each instance and what X-Cache says.",
+    "answer_hinglish": "Test setup (`test/express-helper.test.ts`, real Redis, warna skip notice): har instance ka apna `TwoLevelCache` -- apna L1 (`LruCache`, maxEntries 100, ttlMs 60 000), `ioredisL2Client` ek connection par, `ioredisSubscriber` doosre connection par, dono ka same unique `prefix`. Dono par `cachedJson(cache, { key: () => \"shared\" }, producer)`.\n\nInstance A request: `loadForRequest` -> `TwoLevelCache.getOrLoad` -> L1 miss -> L1 ka loader `loadThrough` -> `readL2` (GET + PTTL ek MULTI mein) -> Redis miss -> user loader (yahan `ran = true`) -> producer `{ from: \"a\" }`. Value L1 mein store aur `writeBehind`: `SET prefix+key value PX 60000 NX` background mein, await nahi -- response turant: `X-Cache: miss`. Isliye test Redis mein `EXISTS` poll karta hai jab tak key na aaye.\n\nInstance B request: L1 miss -> `loadThrough` -> Redis HIT -> `context.ttlMs = min(PTTL, call TTL)` taaki B ki copy Redis copy se zyada na jiye -> value return; user loader kabhi nahi chala, `ran` false -> `X-Cache: hit`, body `{ from: \"a\" }`. `calls` = `{ a: 1, b: 0 }`.\n\nSystem view: L1 per replica (fast, inconsistent window), Redis shared (ek DB load sab replicas ke liye). Invalidation: app update ke baad `cache.delete(key)` -- tombstone + publish, doosre replicas ka L1 drop. Redis down -> har call `l2TimeoutMs` (250 ms default) se bounded, read miss ban jaata hai, response phir bhi aata hai (X-Cache miss). Remaining windows README \"Known\" mein: silently cut subscriber L1 TTL tak purana serve karega, isliye L1 TTL chhota rakho.",
+    "why_needed": "Multi-replica caching ka asli sawaal yahi hai: ek replica ka load doosre ke kaam aaye, aur update sab tak pahunche.",
+    "real_world_analogy": "Do branch offices ek shared central record room (Redis) use karte hain, aur har office ki desk par photocopies (L1). Ek office ne file nikalwayi toh central room mein copy rakh di; doosra office central se le leta hai, archive (DB) tak nahi jaata.",
+    "how_it_works": "Two-level cache: L1 in-process (nanoseconds-microseconds), L2 network cache (round trip), source of truth (DB). Read-through: L1 -> L2 -> DB. Write-behind to L2 after load. Pub/sub invalidation for L1 copies. SET NX + tombstones stale writes ko rokte hain.",
+    "in_this_project": "`src/two-level.ts`: `getOrLoad` L1 load ke andar `loadThrough`; `readL2`; `writeBehind` (`pending` set, `flush()`); `set`/`delete` publish. `test/express-helper.test.ts` describe \"two Express instances sharing a TwoLevelCache over one Redis\"; cleanup mein `keys(prefix*)` delete aur connections quit.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::TwoLevelCache",
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/src/two-level.ts::writeBehind",
+      "projects/20-cache/test/express-helper.test.ts",
+      "projects/20-cache/src/adapters/http.ts::loadForRequest"
+    ],
+    "code_example": "// real, src/two-level.ts (trimmed)\nprivate async loadThrough(key: string, loader: Loader<V>, signal: AbortSignal, context: LoadContext): Promise<V> {\n  const read = await this.readL2(key);\n  if (typeof read === \"object\") {\n    this.counters.l2Hits++;\n    context.ttlMs = Math.min(read.ttlMs, context.ttlMs ?? Infinity); // L1 copy must not outlive Redis's\n    return read.value;                                               // user loader NOT called -> X-Cache: hit\n  }\n  signal.throwIfAborted();\n  const value = await loader(signal, context);                       // ran = true -> X-Cache: miss\n  if (context.isCurrent()) this.writeBehind(key, value, this.l1.loadedTtl(value, context.ttlMs), read !== \"corrupt\");\n  return value;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek DB load sab replicas ke kaam",
+      "Redis outage par bhi reads chalte hain",
+      "Late stale writes NX/tombstone se refuse"
+    ],
+    "disadvantages": [
+      "Write-behind: response ke turant baad doosra replica Redis miss dekh sakta hai",
+      "Pub/sub fire-and-forget -- missed messages",
+      "Redis round trip cost naapa nahi"
+    ],
+    "common_mistakes": [
+      "Redis write ko await karke har miss slow karna",
+      "Subscriber ke liye same connection use karna (subscriber mode)",
+      "L1 TTL lamba rakhna jab replicas data share karein"
+    ],
+    "follow_up_questions": [
+      "Write-behind ki jagah write-through kab chahiye?",
+      "Dono replicas ek saath cold miss karein toh kya hota hai?",
+      "Cross-replica clear kaise banaoge?"
+    ],
+    "concepts": [
+      "two-level cache",
+      "read-through",
+      "write-behind",
+      "pub/sub invalidation",
+      "replicas"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Write-behind response latency bachata hai par ek chhota window chhodta hai jahan doosra replica Redis miss dekhe aur khud load kare. L1 copy ka TTL Redis PTTL se cap -- consistency ke liye, thodi zyada Redis reads ke cost par. Redis TTL sirf fresh part; stale grace per replica.",
+      "failure_scenarios": "Redis down: L1 + loader, `set`/`delete` false resolve. Subscriber silently cut: purana L1 TTL tak. Load `tombstoneMs` se zyada slow: purani value wapas likh sakta hai -- tombstoneMs loader timeout se upar rakho. Race test: 20 rounds, recorded runs mein NX refusal 6, 14, 17, 11 rounds mein hit hua, Redis ne hamesha A ki value rakhi.",
+      "alternatives": "Redis Streams (durable invalidation log), RESP3 client tracking (server-pushed invalidation) -- dono NOT implemented; Redis Cluster/Sentinel specifics bhi nahi; ya L1 hatakar sirf Redis (simple consistency, har read par network).",
+      "scale_10x_100x": "10x replicas: har update ka publish sab tak -- pub/sub fan-out badhta hai; Redis ek shared bottleneck aur SPOF; L1 hit ratio replicas ke beech bant jaata hai. 100x: Redis Cluster, key hashing, aur shayad invalidation ke liye durable stream.",
+      "production_improvements": "Redis round trip aur L2 hit latency benchmark; `stats()` (l2Hits, l2Errors, l2WritesSkipped, resubscribes) ko metrics mein; cross-replica clear (SCAN ya versioned prefix); Cluster support."
+    }
+  },
+  {
+    "id": "CKT-078",
+    "project_slug": "p20-cache",
+    "category": "Architecture & System Design",
+    "difficulty": "Advanced",
+    "question": "How are the stage-3 helpers layered so that the core library stays framework-free?",
+    "answer_hinglish": "Layers, neeche se upar. (1) Core: `src/cache.ts` (`LruCache`), `src/two-level.ts` (`TwoLevelCache`), `src/events.ts` -- koi framework nahi, koi runtime dependency nahi. Stage 3 ne inme se kuch nahi badla, isliye stage 1+2 ke 99 mutation breaks dobara nahi chalaye gaye. (2) `src/cached.ts` -- `@Cached`, framework-free legacy method decorator, sirf `Loadable` aur `SetOptions` types import karta hai. (3) `src/adapters/http.ts` -- shared HTTP core: `Loadable<V>` (structural interface: `getOrLoad(key, loader, options)` -- `LruCache<string, V>` aur `TwoLevelCache<V>` dono fit), `CacheKeyFn`, `CachedResponseOptions`, `requestSignal`, `loadForRequest`, `isNotFound`, `NOT_FOUND_BODY`. Sirf `node:http` types. (4) Framework edges: `src/adapters/express.ts` (`cachedJson`, Express runtime import nahi -- 4 aur 5 dono ke liye likha, 4.21.2 tested) aur `src/adapters/nestjs.ts` (`@nestjs/common` + `rxjs` import karta hai).\n\nPackaging: `package.json` exports teen entry points -- `\".\"` -> `dist/index.js`, `\"./express\"`, `\"./nestjs\"`. `src/index.ts` core aur `Cached` export karta hai, aur HTTP types sirf `type` exports -- comment: \"Framework helpers are separate entry points\". `@nestjs/common` aur rxjs optional peer dependencies hain, toh jo sirf core ya Express use kare usse Nest install nahi karna padta.\n\nFayda: naya framework (Koa, Fastify) = ek patli file, core untouched. Structural interface ka matlab koi base class ya registration nahi.",
+    "why_needed": "Library design interviews mein 'core ko framework se kaise alag rakhoge' common hai -- dependency direction aur packaging dono.",
+    "real_world_analogy": "Mobile charger: ek hi adapter (core) aur alag-alag plugs (Express, Nest) -- naye desh ke liye sirf plug badlo.",
+    "how_it_works": "Hexagonal / ports-and-adapters: core business logic ek interface (port) expose karta hai, adapters bahar ki duniya se jodte hain. Dependency hamesha andar ki taraf. Node package `exports` map alag entry points deta hai taaki optional deps sirf us entry point ke users ko chahiye hon.",
+    "in_this_project": "`src/adapters/http.ts::Loadable` (comment: \"LruCache<string, V> and TwoLevelCache<V> both fit (structural)\"); `src/index.ts` last lines; `package.json` `exports`. README Files table har file ka role batata hai.",
+    "implementation_files": [
+      "projects/20-cache/src/adapters/http.ts::Loadable",
+      "projects/20-cache/src/index.ts",
+      "projects/20-cache/package.json",
+      "projects/20-cache/src/adapters/express.ts",
+      "projects/20-cache/src/adapters/nestjs.ts"
+    ],
+    "code_example": "// real, src/adapters/http.ts\nexport interface Loadable<V> {\n  getOrLoad(key: string, loader: Loader<V>, options?: LoadOptions): Promise<V>;\n}\n// real, package.json (trimmed)\n\"exports\": {\n  \".\": \"./dist/index.js\",\n  \"./express\": \"./dist/adapters/express.js\",\n  \"./nestjs\": \"./dist/adapters/nestjs.js\"\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Core par framework ka koi asar nahi",
+      "Optional peer deps -- sirf jo chahiye woh install",
+      "Structural typing se L1 aur L2 dono plug"
+    ],
+    "disadvantages": [
+      "Teen entry points -- docs aur versioning zyada",
+      "Express helper Express types nahi deta, `req as express.Request` cast karna padta hai",
+      "Har adapter ke tests alag"
+    ],
+    "common_mistakes": [
+      "Core mein framework import kar dena",
+      "Nest ko hard dependency banana",
+      "Adapter mein business logic duplicate karna (http.ts ki jagah)"
+    ],
+    "follow_up_questions": [
+      "Fastify adapter ke liye kya chahiye?",
+      "Structural vs nominal interface ka trade-off?",
+      "Express 5 support kaise verify karoge?"
+    ],
+    "concepts": [
+      "ports and adapters",
+      "package exports",
+      "optional peer dependencies",
+      "structural typing",
+      "layering"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Separate entry points clean dependencies dete hain par API surface aur docs badhate hain. Node http types par Express helper likhna Express-version-agnostic hai, par developer ko `req` cast karna padta hai (tests mein `(req as express.Request).params`).",
+      "failure_scenarios": "Agar koi core file adapter ke liye badle (jaise LoadContext mein HTTP field), framework-free promise toot jaata. Optional peer dep missing ho aur koi `cache-kit/nestjs` import kare -- runtime import error.",
+      "alternatives": "Ek monolithic package jo sab import kare (simple, heavy); alag npm packages per framework (cleanest, zyada release overhead); plugin registration system (overkill yahan).",
+      "scale_10x_100x": "Zyada frameworks par yeh layering scale karti hai -- har naya adapter ek file. 10x users par semver aur entry-point-wise changelogs zaroori; abhi package npm par published hi nahi hai.",
+      "production_improvements": "Express helper ke liye generic Req type ka better inference; Fastify aur Express 5 tests; package npm par publish karne se pehle exports ka type check (`types` conditions) -- abhi README kehta hai not published."
+    }
+  }
+]

@@ -1,0 +1,1295 @@
+[
+  {
+    "id": "CKT-027",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Beginner",
+    "question": "What is a cache stampede, and how does getOrLoad make 100 concurrent misses for one key cost a single loader call?",
+    "answer_hinglish": "Cache stampede tab hota hai jab ek popular key cold ya expire ho jaaye aur usi waqt bahut saari requests aa jaayen. Naive code har request mein `get` -> miss -> DB query karta hai, toh 100 requests = ek hi row ke liye 100 identical queries. DB ko bilkul usi waqt maar padti hai jab cache kaam nahi kar raha.\n\ncache-kit ka jawab hai single flight. `LruCache` mein entries ke `map` ke alawa ek doosra Map hai: `flights` -- har key ke liye abhi chal raha load. `getOrLoad` miss par pehle `this.flights.get(key)` dekhta hai. Koi flight nahi -> `startLoad` naya `Flight` banata hai aur loader chalane se PEHLE `flights.set(key, flight)` kar deta hai. Baaki 99 callers ko running flight mil jaati hai, `coalesced++` hota hai, aur woh usi promise ka wait karte hain. Loader ek baar, sabko same value.\n\nEk process ke andar yahan koi race kyun nahi? Kyunki JavaScript single-threaded hai aur `flights.get` se `flights.set` tak beech mein koi `await` nahi hai -- async function pehle `await` tak synchronously chalta hai. Toh doosra caller beech mein ghus hi nahi sakta.\n\nProof: `test/load.test.ts` ka test '100 concurrent getOrLoad for one key -> the loader runs ONCE': loader ek deferred promise return karta hai, 100 calls, `loader` 1 baar, aur stats `misses: 100, loads: 1, coalesced: 99`. Dhyan rahe, yeh per process hai -- teen replicas teen baar load karenge (wahan `TwoLevelCache` Redis read ko bhi single flight ke andar rakhta hai).",
+    "why_needed": "Bina single flight ke cache cold start, deploy ya ek hot key expire hone par DB par burst bhejta hai -- cache hone ke bawajood DB overload ho sakta hai.",
+    "real_world_analogy": "Office mein 100 log ek hi file maang rahe hain. Har koi alag se record room nahi jaata; pehla banda jaata hai, baaki uske laut aane ka intezaar karte hain aur photocopy le lete hain.",
+    "how_it_works": "Per key ek in-flight promise rakho. Miss par: promise hai -> usi ka wait; nahi hai -> naya load shuru karo aur promise register karo, ek hi synchronous step mein. Load khatam hone par flight hata do aur value cache mein store karo.",
+    "in_this_project": "`src/cache.ts` mein `getOrLoad`: `this.counters.misses++; let flight = this.flights.get(key); if (flight !== undefined) this.counters.coalesced++; else flight = this.startLoad(...)` aur phir `this.wait(key, flight, signal)`. `startLoad` loader ko call karne se pehle `this.flights.set(key, flight)` karta hai. README ka example: '100 concurrent requests for a cold id -> ONE query'. Mutation F1 ('single-flight dedupe removed') stage 2 par 12 tests ne pakda.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/load.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed): the miss path of getOrLoad\nthis.counters.misses++;\nlet flight = this.flights.get(key);\nif (flight !== undefined) this.counters.coalesced++;\nelse flight = this.startLoad(key, loader, options, false); // flights.set happens inside, before the loader runs\nreturn this.wait(key, flight, signal);",
+    "code_language": "typescript",
+    "advantages": [
+      "Cold key par DB ko sirf ek query",
+      "Lock ya mutex ki zaroorat nahi -- event loop khud serialize karta hai",
+      "`coalesced` stat se dikh jaata hai kitne callers ne load share kiya"
+    ],
+    "disadvantages": [
+      "Sirf ek process ke andar: N replicas = ab bhi N loads",
+      "Saare callers ek hi loader ki speed par atke hain; loader hang ho toh sab atke"
+    ],
+    "common_mistakes": [
+      "Pehle `await` karke phir flight register karna -- beech mein doosra caller naya load shuru kar dega",
+      "Single flight ko cross-replica guarantee samajhna",
+      "Coalescing ko caching samajhna: flight khatam hote hi hat jaata hai, value `map` mein jaati hai"
+    ],
+    "follow_up_questions": [
+      "Agar loader fail ho toh 100 waiters ko kya milega?",
+      "Ek caller abort kare toh shared load ka kya hoga?",
+      "Replicas ke beech stampede kaise rokoge?"
+    ],
+    "concepts": [
+      "cache-stampede",
+      "single-flight",
+      "request-coalescing",
+      "event-loop"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-028",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Intermediate",
+    "question": "In single-flight loading, why is a loader error shared with every waiter but never cached? What does the next caller see?",
+    "answer_hinglish": "Error sab waiters ko milta hai kyunki sab ek hi `flight.promise` ka wait kar rahe hain -- woh reject hua toh sab reject. Par error cache nahi hota: `startLoad` ka `catch` flight ko `flights` se hata deta hai (agar woh abhi bhi current version hai), aur `map` mein kuch nahi likhta. Toh agla `getOrLoad` naya load shuru karta hai.\n\nKyun nahi cache karte? README ka argument: loader error aksar transient hota hai -- ek timeout, ek DB restart. Agar use TTL ke liye cache kar diya toh 50 ms ka blip us key ka poore error-TTL ka outage ban jaata hai. Jo loader jaanta hai ki error ka matlab 'not found' hai (HTTP 404), woh `null` return kare -- woh negative caching mein short TTL ke saath cache hota hai. Errors kabhi nahi.\n\nKuch details jo interview mein kaam aati hain: (1) sync throw bhi rejection hai, kyunki loader `await loader(...)` ke andar async IIFE mein chalta hai. (2) `flight.promise.catch(() => {})` lagaya hai taaki jab koi waiter na bacha ho (sab abort kar gaye, ya background refresh), tab unhandled rejection na aaye. (3) Aborted load error count nahi hota: `if (!flight.controller.signal.aborted)` ke andar hi `loadErrors++` aur `load-error` event.\n\nTest 'an error is shared by every waiter, is NOT cached, and the next call loads again': 10 waiters, sabko same `boom` error, loader 1 baar, `has(\"k\")` false, agla call 5 load karta hai, stats `loads: 2, loadErrors: 1`. Kimat (README Known): jo key hamesha fail hoti hai, uska har miss loader tak jaata hai -- concurrent callers ke liye ab bhi ek load at a time.",
+    "why_needed": "Errors cache karna ek chhoti problem ko lambi bana deta hai; errors na share karna stampede ko failure ke waqt wapas le aata hai. Dono ka balance chahiye.",
+    "real_world_analogy": "Restaurant mein kitchen se ek dish jal gayi. Us table ke saare log ko bata do 'yeh nahi bani'. Par menu par 'yeh dish kabhi nahi milegi' ka board mat lagao -- agla order phir se try hoga.",
+    "how_it_works": "Shared promise reject hota hai -> har waiter ke `then` ka reject handler chalta hai. Catch block mein identity check ke saath flight detach hota hai, taaki naye caller ko fresh load mile, aur ek purana fail hua load naye load ko na hata de.",
+    "in_this_project": "`src/cache.ts` `startLoad` ka catch: `if (this.flights.get(key) === flight) this.flights.delete(key); // not cached: the next call loads again`. Phir `loadErrors++`, refresh ho toh `refreshErrors++`, aur `throw error`. Stage-1 mutation F2 ('error cached: a failed load stays attached') stage 2 par 4 tests ne pakda. `test/negative.test.ts` ka 'errors are still NOT cached' negative caching on hone par bhi yahi prove karta hai.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/load.test.ts",
+      "projects/20-cache/test/negative.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed): startLoad's catch\n} catch (error) {\n  if (this.flights.get(key) === flight) this.flights.delete(key); // not cached: the next call loads again\n  if (!flight.controller.signal.aborted) {\n    this.counters.loadErrors++;\n    if (refresh) this.counters.refreshErrors++;\n    emit(this.options.onEvent, { type: refresh ? \"refresh-error\" : \"load-error\", key, error });\n  }\n  throw error;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Transient error ek hi request batch tak simit rehta hai",
+      "Recovery automatic: backend theek hote hi agla call kaam karta hai",
+      "Concurrent callers ke liye ab bhi ek hi load (failing DB par burst nahi)"
+    ],
+    "disadvantages": [
+      "Hamesha fail hone wali key par har miss loader tak jaata hai",
+      "Error ke liye koi backoff nahi"
+    ],
+    "common_mistakes": [
+      "Catch mein bina identity check ke `flights.delete(key)` -- ek purana fail hua load naye load ko detach kar dega",
+      "`flight.promise` par catch na lagana -> unhandled rejection jab koi wait nahi kar raha",
+      "Aborted load ko bhi load error ginna"
+    ],
+    "follow_up_questions": [
+      "Error caching opt-in kab sahi hota?",
+      "404 ko error ki jagah null kyun return karna chahiye?",
+      "Ek key jo hamesha fail hoti hai, usko kaise protect karoge?"
+    ],
+    "concepts": [
+      "error-handling",
+      "single-flight",
+      "negative-caching",
+      "unhandled-rejection"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-029",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "How do you let one caller abandon a shared load without cancelling it for everyone else, and when should the underlying load itself be aborted?",
+    "answer_hinglish": "Rule simple hai: caller ka abort sirf USKA wait khatam karta hai; asli load tabhi abort hota hai jab EVERY waiting caller chala gaya ho. Ek impatient client sabko fail na kare, aur aisa kaam bhi na chale jo ab kisi ko nahi chahiye.\n\nImplementation `Flight.waiters` counter par hai. `wait()` har caller par `waiters++` karta hai. Jis caller ke paas signal hai, use ek apna `Promise` milta hai: signal par `abort` listener (`once: true`), aur `flight.promise.then(...)` jo settle hone par listener hata deta hai. Abort hua toh `leave()` chalta hai: `waiters--`; agar `waiters > 0` ya flight `settled` hai toh kuch nahi. Last caller gaya toh: flight detach (agar abhi bhi current hai), `flight.controller.abort(reason)` -- yeh wahi signal hai jo loader ko mila tha, DB driver ya fetch ko pass karo -- aur `load-abort` event.\n\nTeen edge cases jo design ka hissa hain: (1) signal ke bina caller kabhi leave nahi karta, toh woh load zinda rakhta hai. (2) pehle se aborted caller `signal?.throwIfAborted()` par turant reject hota hai -- na load start, na join, na miss count. (3) background refresh `waiters: 1` se start hota hai (cache khud ek permanent waiter), toh join karke abort karne wala caller refresh abort nahi kar sakta.\n\nDetach kyun? Taaki agla caller ek cancelled load join na kare (mutation A3), aur abandoned loader agar baad mein value de bhi de toh version check use likhne na de. Test 'ALL waiters abort': loader ka signal last reason (`reasonB`) ke saath abort, `load-abort` event, phir naya caller fresh load karta hai aur late answer kuch nahi likhta. Mutation A1 ('one waiter aborting aborts the shared load') stage 2 par 4 tests ne pakda.",
+    "why_needed": "HTTP world mein client disconnect common hai. Bina is rule ke ya toh ek disconnect sabki request fail karta hai, ya koi nahi sun raha phir bhi DB query chalti rehti hai.",
+    "real_world_analogy": "Taxi share: ek passenger beech mein utar jaaye toh taxi chalti rehti hai. Jab aakhri passenger bhi utar jaaye, tabhi driver meter band karke wapas jaata hai.",
+    "how_it_works": "Reference counting on waiters + ek AbortController per load. Har caller ka apna promise shared promise ko wrap karta hai; caller ka abort sirf apna wrapper reject karta hai aur count ghatata hai. Count zero hone par controller abort aur flight detach.",
+    "in_this_project": "`src/cache.ts`: `wait()` aur `leave()`; `Flight` interface ka comment 'callers without a signal never leave'. Stage 3 mein yahi rule HTTP par reuse hua: `src/adapters/http.ts` ka `requestSignal(res)` response `close` par (agar `writableFinished` false) abort karta hai, aur `test/express-helper.test.ts` dikhata hai 'all clients gone -> the load's signal aborted; one left -> the load goes on'.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::wait",
+      "projects/20-cache/src/cache.ts::leave",
+      "projects/20-cache/src/adapters/http.ts::requestSignal",
+      "projects/20-cache/test/load.test.ts",
+      "projects/20-cache/test/swr.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts\nprivate leave(key: K, flight: Flight<V>, reason: unknown): void {\n  flight.waiters--;\n  if (flight.waiters > 0 || flight.settled) return;\n  if (this.flights.get(key) === flight) this.flights.delete(key);\n  flight.controller.abort(reason);\n  emit(this.options.onEvent, { type: \"load-abort\", key });\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek client ka disconnect doosron ko affect nahi karta",
+      "Bekaar kaam (koi nahi sun raha) cancel ho jaata hai",
+      "Abandoned load kuch nahi likhta -- version check se"
+    ],
+    "disadvantages": [
+      "Loader ko signal respect karna padta hai, warna abort sirf flag hai",
+      "Signal ke bina ek caller load ko hamesha zinda rakh sakta hai",
+      "`@Cached` method ko signal nahi milta, toh wahan caller leave nahi kar sakta (README)"
+    ],
+    "common_mistakes": [
+      "Pehle caller ke abort par hi controller abort karna",
+      "Abort ke baad flight ko `flights` mein chhod dena -- naya caller cancelled load join karega",
+      "Settle ke baad listener na hatana"
+    ],
+    "follow_up_questions": [
+      "Refresh ko permanent waiter kyun diya?",
+      "Loader signal ignore kare toh kya hota hai?",
+      "`@Cached` decorator mein abort kyun nahi hai?"
+    ],
+    "concepts": [
+      "abort-signal",
+      "reference-counting",
+      "cancellation",
+      "single-flight"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Waiter counting thoda state add karta hai par 'first abort cancels all' (unfair) aur 'never abort' (wasted DB work) dono se behtar hai. Kimat: correctness ab is par depend karti hai ki har join par ++ aur har leave par -- exactly ek baar ho.",
+      "failure_scenarios": "Loader signal ignore kare aur kabhi settle na ho: signal wale callers chale jaate hain, par flight detach hone ke baad bhi loader resources pakde rehta hai. Signal-less caller ho toh flight hamesha attached rehti hai (README Known: loader ke andar timeout lagao).",
+      "alternatives": "Har caller ka alag load (no coalescing); pehle caller ke signal ko hi load ka signal banana; ek fixed timeout per load bina caller signals ke. Project 18 ka TimeoutPolicy loader ke andar combine kiya ja sakta hai.",
+      "scale_10x_100x": "10x callers per key par bhi load ek hi; har caller ka cost ek listener aur ek wrapper promise. Bahut lambe loads par hazaaron listeners ek signal par -- isliye settle par listener hatana zaroori hai.",
+      "production_improvements": "`load-abort` events ko metric banao (kitne loads sab clients ke jaane par cancel hue), loader ke andar timeout lagao, aur DB driver ko signal sach mein pass karo."
+    }
+  },
+  {
+    "id": "CKT-030",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "A request deletes a key right after a DB update while a slow load of the old row is still running. How does cache-kit stop that load from writing the stale row back?",
+    "answer_hinglish": "Flight object ki identity hi key ka version hai. `delete(key)`, `set(key, ...)` aur `clear()` running flight ko `flights` se detach kar dete hain. Load khatam hone par woh sirf tab store karta hai jab `this.flights.get(key) === flight` -- yaani woh abhi bhi attached version hai. Delete ke baad check false, toh purani row cache mein wapas nahi aati.\n\nTimeline socho: T1 par request A miss karti hai, DB se row padhna shuru (slow). T2 par request B row update karti hai aur `cache.delete(id)` karti hai. T3 par A ka load purani row ke saath khatam hota hai. Bina version check ke A purani row cache mein likh dega aur TTL bhar sab stale padhenge -- delete ne kuch nahi kiya. Version check ke saath A ke waiters ko purani row milti hai (unhone wahi maanga tha, update se pehle), par cache mein nahi likhi jaati.\n\nDo aur fayde: (1) delete ke baad naya caller purana load JOIN nahi karta -- woh fresh load start karta hai (test: `fresh` loader 1 baar, value 2). (2) set ke dauraan load ho toh newer set wins. Aur catch block bhi identity check karta hai, toh purana load fail ho to naye load ko detach nahi karta (test 'an old load failing after delete() does not remove the new load in flight').\n\nYeh wahi idea hai jo projects/18-resilience ke `breaker.ts` mein generations ka hai. Counter ki jagah object identity use karne ka fayda: alag version map nahi, cleanup nahi -- flight khatam, version khatam. Mutation F3 ('load version check removed') stage 2 par 9 tests ne pakda; F4/F5/F6 ne delete/set/clear ka detach alag se check kiya. Yeh sirf process ke andar hai; replicas ke beech yahi problem `TwoLevelCache` mein SET NX aur tombstones se solve hui.",
+    "why_needed": "Cache invalidation ka sabse common bug: 'delete kiya phir bhi purana data wapas aa gaya'. Yeh slow load aur write ke beech ka race hai.",
+    "real_world_analogy": "Purane notice board par naya notice lagane se pehle purana hataya, par ek peon jo pehle purana notice photocopy karne gaya tha, laut ke purana wapas chipka deta hai. Version check peon ko bolta hai: 'tumhara kaam ab valid nahi, sirf jisne maanga use de do'.",
+    "how_it_works": "Compare-and-set ka in-process version: write se pehle check karo ki tumhara token (flight object) abhi bhi current hai. Detach karne wale operations token badal dete hain. `LoadContext.isCurrent()` isi check ko loader ko expose karta hai.",
+    "in_this_project": "`src/cache.ts`: `set` mein `this.flights.delete(key); // a load already running is older than this value`, `delete` mein `this.flights.delete(key)`, `clear` mein `this.flights.clear()`. `startLoad` ke success path par `if (this.flights.get(key) === flight)` aur `context.isCurrent: () => this.flights.get(key) === flight`. Tests: `test/load.test.ts` describe 'no stale writes (load versions)' -- delete / clear / set during a load.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::Flight",
+      "projects/20-cache/src/cache.ts::isCurrent",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/load.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed): the write is guarded by the flight's identity\nconst value = await loader(flight.controller.signal, context);\nif (this.flights.get(key) === flight) {\n  // Still the current version of this key: nothing deleted, replaced or cleared it meanwhile.\n  const negative = this.negativeOf(value);\n  const weight = this.weighOf(value, key);\n  this.flights.delete(key);\n  this.store(key, value, weight, this.loadedTtl(value, context.ttlMs), negative ? 0 : stale, negative);\n}\nreturn value;",
+    "code_language": "typescript",
+    "advantages": [
+      "Delete-after-update sach mein kaam karta hai",
+      "Alag version counter ya map ki zaroorat nahi",
+      "Same mechanism refresh par bhi lagta hai"
+    ],
+    "disadvantages": [
+      "Waiting callers ko phir bhi purani value milti hai (by design)",
+      "Sirf ek process ke andar; replicas ke liye alag mechanism chahiye"
+    ],
+    "common_mistakes": [
+      "Sochna ki `delete` ke baad cache automatically safe hai",
+      "Load ke result ko bina check ke `set` kar dena",
+      "Catch block mein bhi identity check bhool jaana"
+    ],
+    "follow_up_questions": [
+      "Waiting callers ko purani value kyun milti hai, error kyun nahi?",
+      "Number generation counter vs object identity -- kya fark hai?",
+      "Do replicas ke beech yahi race kaise solve kiya?"
+    ],
+    "concepts": [
+      "versioning",
+      "stale-write",
+      "race-condition",
+      "cache-invalidation"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Object identity version free hai aur flight ke saath khatam hota hai; per-key counter ko alag storage aur cleanup chahiye hota. Trade-off: purani value waiters tak jaati hai, cache tak nahi.",
+      "failure_scenarios": "Process crash: koi issue nahi (in-memory). Loader jo kabhi settle nahi hota aur signal-less caller ho: flight attached rehti hai, par delete use detach kar deta hai, toh delete hamesha jeet jaata hai.",
+      "alternatives": "Per-key numeric generation (breaker.ts jaisa), write ke waqt DB se version re-read karna, ya lock leke load karna (throughput khatam).",
+      "scale_10x_100x": "Load count badhne se cost nahi badhti: har write par ek Map lookup. 100x replicas par in-process check kaafi nahi -- Redis mein NX/tombstone chahiye (TwoLevelCache).",
+      "production_improvements": "Delete-after-update ko hamesha DB write ke BAAD karo (README example yahi karta hai), aur loader ke andar timeout rakho taaki detached loads resources na pakde rahein."
+    }
+  },
+  {
+    "id": "CKT-031",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Intermediate",
+    "question": "With stale-while-revalidate, what happens when 50 requests read the same stale key at once, and what if a request that joins the refresh aborts?",
+    "answer_hinglish": "50 stale reads -> sirf 1 background refresh, aur sabko purani value turant milti hai. `getOrLoad` ka stale branch: `staleHits++`, key ko most recent banao, `if (!this.flights.has(key)) this.startLoad(key, loader, options, true)`, aur `return entry.value`. Pehla stale read refresh shuru karta hai; baaki 49 ko flight mil jaati hai toh woh naya load start nahi karte -- aur woh wait bhi nahi karte, isliye `coalesced` 0 rehta hai.\n\nTest '50 concurrent stale reads start ONE refresh and all get the old value': `all` 50 baar 1, `loader` 1 baar, phir refresh resolve hone par `peek` 2, stats `staleHits: 50, refreshes: 1, loads: 1, coalesced: 0`.\n\nAb tricky case: grace khatam ho gaya par refresh abhi chal raha hai. Entry ab dead hai, toh naya caller plain miss hai -- par `flights` mein refresh hai, toh woh refresh JOIN karta hai (`coalesced: 1`, loader phir bhi 1). Yahi wajah hai ki refresh ek 'ordinary flight' hai: same map, same version check, aur 'one refresh at a time' stage-1 single flight se free mein mil gaya.\n\nAgar woh joiner abort kare? Normal load mein last waiter ke jaane par load abort hota. Par refresh `waiters: 1` se start hota hai -- cache khud ek waiter hai jo kabhi nahi jaata. Toh joiner ka `leave()` count 2 se 1 karta hai aur return; refresh chalta rehta hai (test 'a caller that joins the refresh and aborts does NOT abort the refresh'). Mutation R8 isi ko todta hai, 1 test ne pakda; R6 ('every stale read starts its own refresh') bhi 1 test ne.",
+    "why_needed": "Hot key ke expire hone par latency spike aur DB burst dono se bachne ke liye SWR use hota hai -- par agar har stale read apna refresh chalaye toh stampede wapas aa jaata.",
+    "real_world_analogy": "Newspaper stand: aaj ka paper aane tak kal ka paper de do (stale), aur ek hi banda press se naya laane jaaye. Jo customer naya paper ka wait karte hue chala jaaye, uske jaane se naya paper laana band nahi hota -- dukaan ko khud chahiye.",
+    "how_it_works": "Stale read flights map check karta hai, refresh sirf tab start karta hai jab koi load chal na raha ho, aur value bina await ke return karta hai. Refresh flight permanent waiter ke saath create hoti hai taaki waiter count kabhi zero na ho.",
+    "in_this_project": "`src/cache.ts` `getOrLoad` stale branch aur `startLoad` mein `waiters: refresh ? 1 : 0`. `flight.promise.catch(() => {})` refresh ke liye zaroori hai kyunki stale readers uska wait nahi karte. Tests `test/swr.test.ts` describe 'stale-while-revalidate: single refresh'.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/swr.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed): getOrLoad on a stale entry\nthis.counters.staleHits++;\nthis.touch(key, entry);\nif (!this.flights.has(key)) this.startLoad(key, loader, options, true);\nreturn entry.value; // at once, nobody waits for the refresh\n\n// startLoad: a refresh starts with the cache itself as a waiter that never leaves\nconst flight: Flight<V> = { controller: new AbortController(), promise: undefined as never, waiters: refresh ? 1 : 0, settled: false };",
+    "code_language": "typescript",
+    "advantages": [
+      "Stale reads ki latency hit jaisi -- koi wait nahi",
+      "Ek key par ek hi refresh, chahe kitne readers ho",
+      "Refresh ko ek impatient joiner cancel nahi kar sakta"
+    ],
+    "disadvantages": [
+      "Refresh kabhi abort nahi hota, toh hung refresh ko sirf loader ka apna timeout rok sakta hai",
+      "Stale value grace bhar serve hoti hai -- data utna purana ho sakta hai"
+    ],
+    "common_mistakes": [
+      "Stale read ko refresh ka await karwana (mutation R5, 26 tests ne pakda)",
+      "Har stale read par naya refresh",
+      "Refresh ko normal waiter count 0 se start karna"
+    ],
+    "follow_up_questions": [
+      "Failed refresh ke baad kya hota hai?",
+      "`get` stale value kyun nahi deta?",
+      "Refresh `set` ya `delete` ko overwrite kar sakta hai kya?"
+    ],
+    "concepts": [
+      "stale-while-revalidate",
+      "single-flight",
+      "background-refresh",
+      "abort-signal"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-032",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Senior/System Design",
+    "question": "Two replicas share a Redis L2. Replica B loads an old row while replica A writes the new value. How can B's late write poison Redis for every replica, and how do SET NX and tombstones fix it?",
+    "answer_hinglish": "Race yeh hai: B miss karta hai, DB se PURANI row padhta hai. Tab tak A row update karke `set` karta hai -- Redis mein naya value. Phir B ka load khatam hota hai aur B apna write-behind bhejta hai. B ka SET B ke apne connection par jaata hai, A ka A ke; do connections ke beech ordering ki koi guarantee nahi. Agar B ka write A ke baad pahunche, Redis purani value rakhta hai aur har replica use poore TTL tak serve karta hai. Ek replica ka stale L1 local problem hai; Redis mein stale value cluster-wide problem hai.\n\nFix ke do parts: (1) load ke baad ke writes `SET ... NX` hain -- sirf tab likho jab key absent ho. Explicit `set` overwrite karta hai (woh newer value hai). Toh A ki value maujood hai -> B ka NX refuse -> `l2WritesSkipped++`. (2) `delete` `DEL` nahi karta, balki `TOMBSTONE` value `tombstoneMs` (default 10 s) ke liye likhta hai. DEL ke baad key absent hoti aur B ka late NX write succeed kar jaata; tombstone ke saath woh bhi refuse. Readers tombstone ko miss maante hain.\n\nTeesri defense pehle se thi: agar A ka invalidation message B ke load khatam hone se pehle pahunch jaaye, B ka L1 load detach karta hai (`isCurrent()` false) aur B na L1 likhta na Redis.\n\nProof: real-Redis race test 20 rounds chalata hai aur print karta hai kaunsa path liya; README ke chaar recorded runs mein NX refusal 20 mein se 6, 14, 17 aur 11 rounds mein hit hua, baaki mein message pehle pahuncha, aur Redis ne har baar A ki value rakhi. PLAN ne alternatives reject kiye: Lua compare-and-set with version keys (zyada moving parts, har key ka version) aur 'delayed double delete' (ek sleep, window phir bhi).",
+    "why_needed": "Shared L2 ka poora fayda (ek replica load kare, sab use karein) tabhi hai jab woh galat value ko sabke liye amplify na kare.",
+    "real_world_analogy": "Do clerk ek hi register mein entry karte hain. Purani info wala clerk late pahunch kar nayi entry ke upar likh deta hai. Rule: 'load se aayi entry sirf khaali line mein likho', aur deleted entry ki jagah 'cancelled' stamp lagao taaki khaali na dikhe.",
+    "how_it_works": "SET NX ek atomic conditional write hai Redis server par -- ordering kuch bhi ho, newer explicit write ko later load write overwrite nahi kar sakta. Tombstone delete ko 'absent' nahi balki 'occupied by a marker' banata hai, sirf ek limited time ke liye.",
+    "in_this_project": "`src/two-level.ts`: `loadThrough` mein `this.writeBehind(key, value, ..., read !== \"corrupt\")` (onlyIfAbsent), `set` mein `this.redis.set(this.prefix + key, text, ttl, false)`, `delete` mein `this.redis.set(this.prefix + key, TOMBSTONE, this.tombstoneMs, false)`. `TOMBSTONE = \"\\u0000cache-kit:deleted\"` -- NUL character pehle, jo JSON codec kabhi produce nahi karta. Tests: `test/redis-l2.test.ts` 'RACE ... 20 rounds', `test/two-level.test.ts` dono race orders held messages ke saath. Mutation X4 ('loads write without NX') 6 tests ne pakda.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::writeBehind",
+      "projects/20-cache/src/two-level.ts::TOMBSTONE",
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/test/redis-l2.test.ts",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, src/two-level.ts (trimmed)\nasync delete(key: string): Promise<boolean> {\n  this.l1.delete(key);\n  const removed = (await this.call(\"delete\", key, () => this.redis.set(this.prefix + key, TOMBSTONE, this.tombstoneMs, false))) !== FAILED;\n  const told = await this.invalidateOthers(key);\n  return removed && told;\n}\n// after a load (in loadThrough): NX unless the value Redis held could not be decoded\nif (context.isCurrent()) this.writeBehind(key, value, this.l1.loadedTtl(value, context.ttlMs), read !== \"corrupt\");",
+    "code_language": "typescript",
+    "advantages": [
+      "Redis server-side atomic check, koi extra round trip ya Lua nahi",
+      "Dono orders (message pehle ya write pehle) safe",
+      "`l2WritesSkipped` se production mein dikhta hai race kitni baar hua"
+    ],
+    "disadvantages": [
+      "Tombstone ke dauraan Redis kuch nahi rakhta: har replica ek baar DB se apne L1 mein load karta hai",
+      "tombstoneMs se slow load phir bhi purani value likh sakta hai",
+      "Corrupt value overwrite NX ke bina hota hai (deliberate)"
+    ],
+    "common_mistakes": [
+      "DEL use karna aur sochna NX kaafi hai",
+      "Explicit set ko bhi NX banana -- update hi refuse ho jaayega",
+      "Sochna ki pub/sub message hamesha write se pehle pahunchega"
+    ],
+    "follow_up_questions": [
+      "tombstoneMs kaise choose karoge?",
+      "Lua CAS with version keys kab behtar hota?",
+      "Corrupt value ko NX ke bina kyun overwrite karte hain?"
+    ],
+    "concepts": [
+      "race-condition",
+      "set-nx",
+      "tombstone",
+      "distributed-cache",
+      "write-behind"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "NX + tombstone simple hai (ek flag, ek marker value) par time-bounded hai: guarantee tombstoneMs tak. Lua CAS with per-key versions strict hota par har key ka version store aur har write ek script. PLAN ne simplicity choose ki aur window README mein likhi.",
+      "failure_scenarios": "Load tombstoneMs se slow (README Known a): tombstone expire, key absent, NX succeed, purani value Redis mein. Corrupt value padhne ke baad ka write NX ke bina hai, toh us beech A ka set ho toh B use overwrite kar sakta hai -- yeh code se dikhta hai, README ki windows list mein alag se nahi likha. Redis write fail: `set` false return karta hai.",
+      "alternatives": "Lua compare-and-set with version keys; delayed double delete (sleep ke baad dobara delete); write-through sirf DB update path se (loads Redis kabhi na likhein); CDC stream se invalidation.",
+      "scale_10x_100x": "Zyada replicas = zyada concurrent loads per key = NX refusals zyada, par correctness same. Zyada deletes = zyada tombstone keys (har ek tombstoneMs tak), memory chhoti. Redis Cluster par single-key commands theek, par cluster yahan test nahi hua.",
+      "production_improvements": "`l2WritesSkipped` aur `invalidationsReceived` ko metrics banao, tombstoneMs ko loader timeout se upar rakho, aur loader mein timeout lagao taaki 'slow load' ki upper bound ho."
+    }
+  },
+  {
+    "id": "CKT-033",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "Pub/sub invalidation is fire-and-forget. What does cache-kit do about missed messages, and why would clearing L1 on ioredis's 'ready' event be too early?",
+    "answer_hinglish": "Redis pub/sub message queue nahi karta: jab subscriber disconnected hai, us beech publish hua message hamesha ke liye gaya. Toh replica B ka L1 purani value rakh sakta hai bina jaane. cache-kit ka mitigation: har RE-subscribe par B apna poora L1 clear karta hai (`resubscribed` event, `resubscribes` stat). Kuch bhi miss hua ho, L1 khaali hai; woh Redis se refill hota hai (sasta), DB se nahi. `clear()` running loads bhi detach karta hai, toh reconnect se pehle padhi value koi load nahi likhega.\n\nTiming yahan sab kuch hai. ioredis reconnect par khud re-subscribe karta hai, par `ready` event apna re-SUBSCRIBE bhejne se PEHLE emit karta hai (README: ioredis 5.4.1 ka `event_handler.js` padh ke). Agar `ready` par clear karo: L1 khaali, B Redis se value padhta hai, aur abhi SUBSCRIBE active nahi -- us gap mein A ka `set` publish ho toh B miss karta hai aur ab B ke paas clear ke BAAD padhi purani value hai. Clear bekaar.\n\nIsliye `ioredisSubscriber` adapter har `ready` (pehle subscribe ke baad) par khud `sub.subscribe(channel)` bhejta hai -- Redis mein do baar subscribe harmless hai -- aur `onResubscribed` sirf tab call karta hai jab Redis ne woh SUBSCRIBE CONFIRM kar diya. Confirm ke baad koi message miss nahi hota, toh us moment par clear gap close karta hai.\n\nJo koi client nahi dekh sakta -- half-open connection jo abhi dead detect nahi hua -- woh sirf L1 TTL se bounded hai: README kehta hai replicas data share karein toh TTL seconds mein rakho, hours mein nahi. Tests: fake Redis par disconnected subscriber `set` miss karta hai aur reconnect L1 clear karta hai; real Redis par CLIENT KILL ke baad reconnect, L1 clear, invalidations phir aate hain. Mutation X17 ('onResubscribed at ready') 1 test ne pakda, X10 2 ne.",
+    "why_needed": "Bina iske ek network blip ke baad replica chupchap purana data TTL bhar serve karta -- aur koi metric nahi batata.",
+    "real_world_analogy": "Radio par announcements aate hain, recording nahi hoti. Signal gaya aur wapas aaya toh aap maan lo kuch miss hua aur apne notes phaad do -- par tabhi jab confirm ho ki radio phir se sun raha hai, tuning shuru hote hi nahi.",
+    "how_it_works": "At-most-once delivery ke upar 'assume loss on reconnect' strategy: reconnect ko ek full invalidation maano. Correct hone ke liye reset listening confirm hone ke baad hona chahiye, warna reset aur listening ke beech ki window bachi rehti hai.",
+    "in_this_project": "`src/two-level.ts` `ioredisSubscriber`: `const ready = () => { if (!subscribed) return; sub.subscribe(channel).then(onResubscribed, () => {}); }`. `TwoLevelCache.onResubscribed` -> `this.l1.clear()`. `test/adapters.test.ts` ka test: reconnect par doosra `subscribe ch` jaata hai, `resub` tab tak call nahi jab tak `f.answer()` (confirm) na ho. `test/redis-l2.test.ts`: subscriber connection naam se dhoondh kar `CLIENT KILL`.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::ioredisSubscriber",
+      "projects/20-cache/src/two-level.ts::onResubscribed",
+      "projects/20-cache/test/adapters.test.ts",
+      "projects/20-cache/test/redis-l2.test.ts",
+      "projects/20-cache/test/two-level.test.ts"
+    ],
+    "code_example": "// real, src/two-level.ts (trimmed)\nconst ready = () => {\n  if (!subscribed) return; // the first connect, not a reconnect\n  sub.subscribe(channel).then(onResubscribed, () => {}); // only once Redis confirmed it\n};\nsub.on(\"message\", message);\nsub.on(\"ready\", ready);\n\nprivate onResubscribed(): void {\n  this.l1.clear(); // also detaches running loads\n  this.counters.resubscribes++;\n  this.emit({ type: \"resubscribed\" });\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Missed messages ka asar ek reconnect tak simit",
+      "L1 Redis se refill hota hai, DB par burst nahi",
+      "Pub/sub simple hai, consumer bookkeeping nahi"
+    ],
+    "disadvantages": [
+      "Har reconnect par poora L1 jaata hai -- kuch Redis round trips ka burst",
+      "Half-open connection detect nahi hota; sirf TTL bound karta hai",
+      "Agar adapter ka explicit SUBSCRIBE fail ho toh L1 clear nahi hota, agle reconnect tak (code: failure par `() => {}`)"
+    ],
+    "common_mistakes": [
+      "`ready` ko 'listening again' samajhna",
+      "Reconnect par sirf kuch keys clear karna -- kaunsi miss hui pata hi nahi",
+      "Bahut lamba L1 TTL rakhna jab replicas data share karte hain"
+    ],
+    "follow_up_questions": [
+      "Subscriber ke liye alag connection kyun chahiye?",
+      "Redis Streams is problem ko kaise solve karte?",
+      "Half-open connection ko jaldi kaise detect karoge?"
+    ],
+    "concepts": [
+      "pub-sub",
+      "cache-invalidation",
+      "at-most-once",
+      "reconnect",
+      "ioredis"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Clear-on-resubscribe sasta aur simple hai par blunt: ek blip = poora L1 cold. Streams replay se sirf miss hui keys invalidate kar sakte the, par har replica ka consumer state chahiye.",
+      "failure_scenarios": "Subscriber silently cut off: reconnect kabhi trigger nahi, L1 TTL tak stale. Explicit re-SUBSCRIBE fail: ioredis ka apna re-subscribe kaam kar sakta hai par L1 clear nahi hua. Bina subscriber ke (`subscriber` optional hai): koi invalidation nahi, sirf TTL.",
+      "alternatives": "Redis Streams (durable log, replay on reconnect), RESP3 client tracking (server push), har read par Redis version check (L1 ka fayda kam), bahut short L1 TTL bina pub/sub.",
+      "scale_10x_100x": "Replicas 10x: har publish 10x deliveries -- pub/sub ke liye chhota. Reconnect storms (Redis failover) par sab replicas saath mein L1 clear karke Redis ko hit karte hain; Redis ki capacity dekhni padegi. Measured nahi hai.",
+      "production_improvements": "`resubscribes` aur `l2-error` op `subscribe` par alert, TCP keepalive / health PING subscriber connection par taaki half-open jaldi pakda jaaye, aur L1 TTL seconds mein."
+    }
+  },
+  {
+    "id": "CKT-034",
+    "project_slug": "p20-cache",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Intermediate",
+    "question": "Why does TwoLevelCache run the Redis read inside the L1 load instead of before it, and why does an L2 hit's L1 copy get min(Redis PTTL, call TTL)?",
+    "answer_hinglish": "Kyunki tab L1 ki saari concurrency machinery Redis read par free mein lag jaati hai. `TwoLevelCache.getOrLoad` bas `this.l1.getOrLoad(key, (signal, context) => this.loadThrough(...), options)` hai. Matlab Redis read L1 ke loader ke ANDAR hai: L1 miss -> single flight -> ek hi `loadThrough` -> ek Redis read -> zaroorat ho toh ek loader call. Test: 50 concurrent misses ek replica par = 1 Redis read + 1 loader call. Agar Redis read pehle hota, 50 misses = 50 Redis GETs.\n\nBonus: stale-while-revalidate aur negative caching bhi bina badlaav lagte hain. Refresh bhi ek flight hai, toh woh bhi pehle Redis padhta hai -- agar doosre replica ne already refresh kar diya, koi loader call nahi (test 'a refresh reads L2 first').\n\nPTTL wala rule: L1 copy Redis copy se zyada nahi jeeni chahiye. Suppose A ne 60 s TTL ke saath likha aur B 50 s baad padhta hai. Agar B apna 60 s TTL de, toh B 110 s tak purani value rakhega jabki Redis 60 s par chhod chuka. Isliye `context.ttlMs = Math.min(read.ttlMs, context.ttlMs ?? Infinity)` -- B 10 s rakhta hai. Aur call ne chhota TTL maanga ho toh woh jeetta hai.\n\nTTL value ke saath atomic padhna zaroori hai: `getWithTtl` ioredis par `MULTI GET + PTTL` hai, taaki TTL usi value ka ho. PTTL -1 = no expiry -> Infinity; 0 ya -2 -> miss. Test: clock 700 aage, Redis mein 300 bache, B ka L1 299 par hai, 300 par gone.",
+    "why_needed": "Ek L2 jo har L1 miss par alag Redis call kare, wahi stampede Redis par le aata hai; aur jo L1 copy Redis se lambi jiye, woh replicas ko alag alag value dikhati hai.",
+    "real_world_analogy": "Godown (Redis) se maal lene ek hi banda jaata hai, sab nahi. Aur jo dabba godown mein kal expire ho raha hai, use dukaan mein 'agle mahine tak' ka label nahi milta.",
+    "how_it_works": "Composition: L2 lookup ko L1 ka loader bana do. L1 ke guarantees (dedupe, versions, abort, SWR) loader par apply hote hain, toh L2 lookup ko inherit milte hain. Load context ka `ttlMs` loader ko value ka TTL change karne deta hai.",
+    "in_this_project": "`src/two-level.ts` `getOrLoad` aur `loadThrough`: hit par `this.counters.l2Hits++; context.ttlMs = Math.min(read.ttlMs, context.ttlMs ?? Infinity); return read.value;` -- hit par Redis ko wapas nahi likha jaata. `ioredisL2Client.getWithTtl`: `client.multi().get(key).pttl(key).exec()`. Mutation X2 ('an L2 hit's L1 copy does not get Redis's remaining TTL') 1 test ne pakda, X25 (PTTL 0 as hit) baad mein add hue test ne.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/src/two-level.ts::ioredisL2Client",
+      "projects/20-cache/test/two-level.test.ts"
+    ],
+    "code_example": "// real, src/two-level.ts\ngetOrLoad(key: string, loader: Loader<V>, options: LoadOptions = {}): Promise<V> {\n  return this.l1.getOrLoad(key, (signal, context) => this.loadThrough(key, loader, signal, context), options);\n}\n// in loadThrough, on a Redis hit:\nthis.counters.l2Hits++;\ncontext.ttlMs = Math.min(read.ttlMs, context.ttlMs ?? Infinity);\nreturn read.value;",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek replica par N concurrent misses = 1 Redis read",
+      "SWR aur negative caching L2 par bina naye code ke",
+      "Replicas ki L1 copies Redis ke saath expire hoti hain"
+    ],
+    "disadvantages": [
+      "Har replica par alag se ek Redis read (cross-replica dedupe nahi)",
+      "MULTI ek round trip hai par do commands"
+    ],
+    "common_mistakes": [
+      "Redis read ko L1 ke bahar rakhna",
+      "L2 hit ko full call TTL dena",
+      "GET aur PTTL alag round trips mein -- TTL kisi aur value ka ho sakta hai"
+    ],
+    "follow_up_questions": [
+      "PTTL 0 ko miss kyun maana?",
+      "L2 hit ke baad Redis ko dobara kyun nahi likhte?",
+      "Refresh pehle Redis kyun padhta hai?"
+    ],
+    "concepts": [
+      "two-level-cache",
+      "single-flight",
+      "ttl",
+      "redis-pttl",
+      "composition"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-035",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Beginner",
+    "question": "What does a Flight object hold in cache-kit, and what is each field for?",
+    "answer_hinglish": "`Flight` ek running load hai ek key ke liye. Iske chaar fields hain, aur paanchvi cheez uski identity hai.\n\n(1) `controller: AbortController` -- iska `signal` loader ko pehle argument ke roop mein milta hai. Jab har waiting caller chala jaaye, `leave()` isko abort karta hai, taaki loader DB query ya fetch rok sake.\n\n(2) `promise: Promise<V>` -- shared result. Har caller isi ka wait karta hai (signal wale ek wrapper promise ke through). Isi par `.catch(() => {})` laga hai taaki jab koi wait na kar raha ho toh unhandled rejection na aaye.\n\n(3) `waiters: number` -- kitne callers wait kar rahe hain. `wait()` ++ karta hai, abort par `leave()` -- karta hai. Normal load 0 se start, background refresh 1 se (cache khud ek waiter jo kabhi nahi jaata). Signal ke bina caller kabhi leave nahi karta.\n\n(4) `settled: boolean` -- `finally` mein true. Settle ke baad koi abort kuch nahi badalta: `leave()` mein `if (flight.waiters > 0 || flight.settled) return`.\n\nAur sabse important: object khud key ka VERSION hai. Flights ek alag `Map<K, Flight<V>>` (`flights`) mein rehti hain, entries waale `map` se alag. `delete`, `set`, `clear` flight ko detach karte hain, aur load sirf tab store karta hai jab `this.flights.get(key) === flight`. Matlab ek chhota object teen kaam karta hai: dedupe (join karo), cancellation (waiters + controller), aur stale-write protection (identity).",
+    "why_needed": "Single flight, abort aur versioning sab isi ek data structure par tike hain -- isko samjhe bina baaki code samajh nahi aata.",
+    "real_world_analogy": "Ek courier booking slip: tracking number (identity), cancel button (controller), kitne logon ko delivery ka intezaar hai (waiters), aur 'delivered' stamp (settled).",
+    "how_it_works": "Per-key in-flight record jo shared promise, cancellation handle, reference count aur completion flag rakhta hai. Map mein uski presence = 'load chal raha hai aur current hai'.",
+    "in_this_project": "`src/cache.ts` mein `interface Flight<V>` aur uske upar ka comment: 'The object itself is the key's load VERSION'. `LruCache` mein `private readonly flights = new Map<K, Flight<V>>()`. `startLoad` flight banata hai: `{ controller: new AbortController(), promise: undefined as never, waiters: refresh ? 1 : 0, settled: false }`, phir `flights.set`, phir promise assign.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::Flight",
+      "projects/20-cache/src/cache.ts::startLoad"
+    ],
+    "code_example": "// real, src/cache.ts\ninterface Flight<V> {\n  readonly controller: AbortController;\n  promise: Promise<V>;\n  waiters: number; // callers waiting on it; callers without a signal never leave\n  settled: boolean;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek chhota object, teen guarantees",
+      "Version ke liye alag counter ya cleanup nahi",
+      "Entries aur in-flight loads alag maps mein -- dono ka lifecycle alag"
+    ],
+    "disadvantages": [
+      "`promise: undefined as never` -- ek chhota moment jab type jhooth bolta hai (flight set hone aur promise assign hone ke beech; synchronous, toh koi observe nahi karta)"
+    ],
+    "common_mistakes": [
+      "Flight ko entries ke map mein hi rakhna -- stale value aur running load mix ho jaate",
+      "Settled flag ke bina late abort par count galat hona",
+      "Version ke liye flight ki jagah value compare karna"
+    ],
+    "follow_up_questions": [
+      "Refresh flight waiters 1 se kyun start hoti hai?",
+      "Promise par khaali catch kyun lagaya?",
+      "`isCurrent()` is object ko kaise use karta hai?"
+    ],
+    "concepts": [
+      "single-flight",
+      "data-structure",
+      "abort-controller",
+      "versioning"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-036",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "Walk through wait(): how does each caller get its own promise while sharing one load, and why is the abort listener removed when the load settles?",
+    "answer_hinglish": "`wait()` do raaste leta hai. Pehle `flight.waiters++`. Agar caller ke paas signal nahi hai, toh seedha `flight.promise` return -- woh caller kabhi leave nahi kar sakta, toh wrapper ki zaroorat nahi. Agar signal hai, toh ek naya `Promise` banta hai jo do cheezon ki race hai: caller ka abort, aur shared load ka result.\n\nAbort side: `signal.addEventListener(\"abort\", onAbort, { once: true })`. `onAbort` pehle `this.leave(key, flight, signal.reason)` (count ghatao, last ho toh load abort) aur phir `reject(signal.reason)` -- caller ko turant uska apna reason milta hai, load ka wait nahi.\n\nLoad side: `flight.promise.then(value => { removeEventListener; resolve(value) }, error => { removeEventListener; reject(error) })`.\n\nListener kyun hatana? Do wajah. (1) Leak: ek long-lived signal -- jaise app-wide shutdown signal jo har call mein pass hota hai -- par har call ek listener chhod jaata, aur woh closures flight aur cache ko pakde rehte. (2) Correctness: load settle hone ke baad abort hua toh purana listener `leave()` chalata. `settled` flag ise harmless banata hai, par listener hatana isko hone hi nahi deta. Test 'the abort listener is removed from the caller's signal once the load settles' `vi.spyOn` se `addEventListener` aur `removeEventListener` dono check karta hai, same function ke saath; mutation A5 isi test ne pakda.\n\nEk subtle baat: abort ke baad caller ka promise reject ho chuka hai; baad mein `flight.promise.then` ka `resolve` call hona no-op hai, kyunki promise sirf ek baar settle hota hai. Isliye code ko 'already rejected' check nahi chahiye. Mutation A6 ('an aborting caller keeps waiting') stage 2 par 6 tests ne pakda.",
+    "why_needed": "Per-caller cancellation shared work ke saath -- yeh pattern har dedupe layer (HTTP coalescing, DataLoader jaisa) mein aata hai.",
+    "real_world_analogy": "Ek group ticket par sab saath jaa rahe hain, par har insaan ka apna 'main jaa raha hoon' button hai. Button dabane wala chala jaata hai; trip chalti rehti hai. Trip khatam hone par sabke button nikal lo, warna koi baad mein galti se dabayega.",
+    "how_it_works": "Promise wrapper pattern: inner shared promise + outer per-caller promise. Outer do sources mein se jo pehle aaye usse settle hota hai. Cleanup dono raaston par.",
+    "in_this_project": "`src/cache.ts` `wait()`; `test/load.test.ts` describe 'getOrLoad: abort' -- 'one waiter aborts ... continues for the others', 'the abort listener is removed', 'aborting after the load settled changes nothing for other waiters'.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::wait",
+      "projects/20-cache/src/cache.ts::leave",
+      "projects/20-cache/test/load.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts\nprivate wait(key: K, flight: Flight<V>, signal: AbortSignal | undefined): Promise<V> {\n  flight.waiters++;\n  if (signal === undefined) return flight.promise;\n  return new Promise<V>((resolve, reject) => {\n    const onAbort = () => {\n      this.leave(key, flight, signal.reason);\n      reject(signal.reason);\n    };\n    signal.addEventListener(\"abort\", onAbort, { once: true });\n    flight.promise.then(\n      (value) => { signal.removeEventListener(\"abort\", onAbort); resolve(value); },\n      (error: unknown) => { signal.removeEventListener(\"abort\", onAbort); reject(error); },\n    );\n  });\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Har caller apne reason ke saath turant reject",
+      "Shared load untouched jab tak koi aur wait kar raha",
+      "Listener leak nahi"
+    ],
+    "disadvantages": [
+      "Har signal wale caller par ek extra promise aur closure",
+      "Signal-less caller ko leave karne ka koi tareeka nahi"
+    ],
+    "common_mistakes": [
+      "`once: true` ke bharose listener na hatana (abort kabhi na ho toh listener rehta hai)",
+      "Abort par shared promise ko reject karne ki koshish",
+      "Pehle se aborted signal par listener lagana (yahan `throwIfAborted` pehle hi rok deta hai)"
+    ],
+    "follow_up_questions": [
+      "`AbortSignal.any` se yeh simple hota kya?",
+      "Signal-less callers ko time limit kaise doge?",
+      "Agar loader abort ignore kare toh?"
+    ],
+    "concepts": [
+      "promises",
+      "abort-signal",
+      "memory-leak",
+      "event-listeners"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-037",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Advanced",
+    "question": "Trace TwoLevelCache.loadThrough: what are the possible outcomes of the Redis read, and how does each decide whether the write-behind uses NX?",
+    "answer_hinglish": "`readL2` teen tarah ka result deta hai: ek hit `{ value, ttlMs }`, string `\"corrupt\"`, ya `undefined`.\n\n`undefined` teen cases mein: (a) Redis call fail ya `l2TimeoutMs` mein jawab nahi -> `fail(\"get\")`, `l2Errors++`; (b) key absent (`text === null`), ya value `TOMBSTONE` hai; (c) PTTL na -1 hai na > 0 -- yaani -2 (gone) ya 0 (isi millisecond mein expire). (b) aur (c) `l2Misses++`. `\"corrupt\"` tab jab `codec.decode` throw kare -- kharab value, ya kisi doosre app version ka codec.\n\nAb `loadThrough`: hit par `l2Hits++`, TTL ko PTTL se cap karo, return -- Redis ko kuch nahi likhna. Baaki cases mein pehle `signal.throwIfAborted()`: agar Redis read ke dauraan saare callers chale gaye, loader start hi mat karo. Phir `loader(signal, context)`. Phir sirf `if (context.isCurrent())` -- yaani load ke dauraan koi delete / set / invalidation nahi hua -- `writeBehind(key, value, this.l1.loadedTtl(value, context.ttlMs), read !== \"corrupt\")`.\n\nLast argument `onlyIfAbsent` hai. Absent / tombstone / failed read -> NX: agar Redis mein kuch hai (newer set, tombstone, kisi aur replica ka load), toh hamara write refuse. Failed read ke baad NX safe side hai -- read fail hua par value ho sakti hai. Corrupt -> plain SET: kharab value ko overwrite karna hi hai, warna woh har replica ko hamesha miss deti (mutation X5 'loads always NX' 1 test ne pakda).\n\n`writeBehind` await nahi hota -- callers ko value mil chuki hai. `encode` fail ho toh write skip. Reply `null` (NX refused) -> `l2WritesSkipped++`; `FAILED` -> kuch nahi (error pehle hi count hua); warna `l2Writes++`. Promise `pending` set mein hai taaki `flush()` / `close()` wait kar sakein.",
+    "why_needed": "L2 ke saare correctness rules -- outage, race, corrupt data, abort -- isi 20 line ke function mein milte hain. Interview mein yahi trace maanga jaata hai.",
+    "real_world_analogy": "Godown clerk ke paas teen jawab: 'maal mil gaya', 'dabba toota hua hai', 'kuch nahi mila ya godown band'. Toote dabbe ki jagah naya rakh do; khaali shelf par sirf tab rakho jab abhi bhi khaali ho.",
+    "how_it_works": "Read result ko tagged union bana do taaki har case ka write policy alag ho. Write-behind fire-and-forget hai par tracked, aur ek version check (`isCurrent`) aur ek server-side condition (NX) dono se guarded.",
+    "in_this_project": "`src/two-level.ts`: `readL2` ka comment 'A hit, \"corrupt\" (a value we cannot decode), or undefined (absent, a tombstone, or Redis failed)', condition `text === null || text === TOMBSTONE || (pttl !== -1 && !(pttl > 0))`. Mutations: X3 (write-behind without isCurrent) 2 tests, X6 (tombstone read as a value) 1, X15 (loader starts although every caller left during the Redis read) -- pehle 0, test fix ke baad 1.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/src/two-level.ts::readL2",
+      "projects/20-cache/src/two-level.ts::writeBehind",
+      "projects/20-cache/test/two-level.test.ts"
+    ],
+    "code_example": "// real, src/two-level.ts\nprivate async loadThrough(key: string, loader: Loader<V>, signal: AbortSignal, context: LoadContext): Promise<V> {\n  const read = await this.readL2(key);\n  if (typeof read === \"object\") {\n    this.counters.l2Hits++;\n    context.ttlMs = Math.min(read.ttlMs, context.ttlMs ?? Infinity);\n    return read.value;\n  }\n  signal.throwIfAborted(); // every caller left while Redis was asked: do not start the loader for nobody\n  const value = await loader(signal, context);\n  if (context.isCurrent()) this.writeBehind(key, value, this.l1.loadedTtl(value, context.ttlMs), read !== \"corrupt\");\n  return value;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Har failure mode ka explicit, tested behaviour",
+      "Write-behind callers ki latency mein nahi",
+      "Negative value Redis mein bhi apne short TTL ke saath (`loadedTtl`)"
+    ],
+    "disadvantages": [
+      "Corrupt path NX ke bina hai, toh wahan cross-replica race ki chhoti window hai",
+      "Write-behind fail hone par sirf event, retry nahi"
+    ],
+    "common_mistakes": [
+      "Failed read ke baad plain SET -- newer value overwrite ho sakti",
+      "Hit par Redis ko wapas likhna (TTL reset ho jaata)",
+      "Write-behind ko await karna -- Redis slow toh har miss slow"
+    ],
+    "follow_up_questions": [
+      "`flush()` kab call karna chahiye?",
+      "Codec badalne par rolling deploy mein kya hoga?",
+      "PTTL 0 ko hit maanne se kya toot-ta?"
+    ],
+    "concepts": [
+      "two-level-cache",
+      "write-behind",
+      "set-nx",
+      "error-handling",
+      "codec"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Tagged result se code thoda verbose hai par har case ka write policy explicit. Write-behind ka matlab: L1 aur Redis thodi der alag ho sakte hain, aur write ki failure caller ko nahi dikhti -- sirf events/stats mein.",
+      "failure_scenarios": "Redis hang: read `l2TimeoutMs` (250 ms default) ke baad miss, loader chalta hai; write bhi timeout. Codec mismatch rolling deploy mein: naya version purane values ko corrupt maan ke overwrite karega -- purana version naye values ko -- dono taraf churn.",
+      "alternatives": "Write-through (await karo, error caller ko do), sirf DB update path Redis likhe (loads kabhi nahi), Lua script jo read + conditional write ek step mein kare.",
+      "scale_10x_100x": "100x misses par bhi per replica per key ek read (single flight). Pending writes ka set bada ho sakta hai agar Redis slow hai -- har ek timeout se bounded.",
+      "production_improvements": "`l2WritesSkipped`, `l2Errors` by op metric, codec mein version prefix (rolling deploy ke liye), aur shutdown par `close()` taaki pending writes complete hon."
+    }
+  },
+  {
+    "id": "CKT-038",
+    "project_slug": "p20-cache",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "How does the ioredisSubscriber adapter tell the first 'ready' from a reconnect, and why does it send its own SUBSCRIBE instead of trusting ioredis's auto-resubscribe?",
+    "answer_hinglish": "Adapter ek local flag `subscribed` rakhta hai, `false` se start. Pehla `await sub.subscribe(channel)` succeed hone ke baad hi woh `true` hota hai. `ready` listener ki pehli line `if (!subscribed) return;` -- toh initial connect ka `ready` ignore hota hai (test: pehle subscribe ke dauraan emit hua `ready` kuch nahi karta, `calls` mein sirf ek `subscribe ch`). Uske baad har `ready` ek reconnect hai.\n\nReconnect par ioredis khud bhi re-subscribe karta hai, par `ready` us SUBSCRIBE ke bhejne se pehle aata hai, aur ioredis koi alag event nahi deta jo bole 'ab sun raha hoon'. Toh adapter khud `sub.subscribe(channel)` bhejta hai -- Redis mein same channel par do baar subscribe harmless hai -- aur us promise ke resolve hone par (`.then(onResubscribed, ...)`) cache ko batata hai. Promise resolve = Redis ne confirm kiya = ab koi message miss nahi. Tab L1 clear sahi moment par hota hai. Test: reconnect ke baad `flush()` tak `resub` call nahi hua; `f.answer()` (confirm) ke baad exactly 1 baar.\n\nBaaki details: `message` listener sirf apne channel ke messages aage bhejta hai. Pehla subscribe fail ho toh dono listeners hata ke error rethrow -- `TwoLevelCache.ready` `false` resolve karta hai aur `l2-error` op `subscribe` aata hai, cache bina invalidation ke chalta hai. Return value ek unsubscribe function hai jo listeners hata ke `UNSUBSCRIBE` bhejta hai. Reconnect wala SUBSCRIBE fail ho toh error swallow (`() => {}`): comment kehta hai agla reconnect phir try karega.\n\nAlag connection kyun? RESP2 mein (ioredis 5 ka default) SUBSCRIBE ke baad connection sirf (UN)SUBSCRIBE / PING / QUIT chala sakta hai, GET/SET nahi. Isliye README `ioredisSubscriber(redis.duplicate())`.",
+    "why_needed": "Library events ka matlab documentation se nahi, source se pata chalta hai. Galat event par reset karna woh gap chhod deta hai jo pura mechanism band karne ke liye tha.",
+    "real_world_analogy": "Phone call drop hui, network wapas aaya ('ready'), par doosri taraf wala abhi line par nahi aaya. Tum khud 'hello?' bolte ho aur jawab aane par hi maante ho ki baat chalu hai.",
+    "how_it_works": "Adapter pattern + explicit acknowledgement: lifecycle event ko trust karne ke bajaye ek idempotent command bhejo jiska reply confirmation hai.",
+    "in_this_project": "`src/two-level.ts` `ioredisSubscriber` aur `L2Subscriber` interface ka comment ('After every RE-connection, once the channel is subscribed again, call onResubscribed'). `test/adapters.test.ts` EventEmitter fake ke saath ordering prove karta hai; `test/redis-l2.test.ts` real `CLIENT KILL` ke saath. Mutation X18 ('the adapter treats the first ready as a reconnect') 2 tests ne pakda.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::ioredisSubscriber",
+      "projects/20-cache/src/two-level.ts::L2Subscriber",
+      "projects/20-cache/test/adapters.test.ts"
+    ],
+    "code_example": "// real, src/two-level.ts (trimmed)\nlet subscribed = false;\nconst message = (ch: string, text: string) => { if (ch === channel) onMessage(text); };\nconst ready = () => {\n  if (!subscribed) return;\n  sub.subscribe(channel).then(onResubscribed, () => {}); // a failure here: the next reconnect tries again\n};\nsub.on(\"message\", message);\nsub.on(\"ready\", ready);\ntry {\n  await sub.subscribe(channel);\n} catch (error) {\n  sub.off(\"message\", message);\n  sub.off(\"ready\", ready);\n  throw error;\n}\nsubscribed = true;",
+    "code_language": "typescript",
+    "advantages": [
+      "Confirmation-based, timing par guess nahi",
+      "Adapter chhota; doosre client ke liye paanch line",
+      "Failure par listeners leak nahi"
+    ],
+    "disadvantages": [
+      "Ek extra SUBSCRIBE har reconnect par",
+      "Reconnect SUBSCRIBE fail ho aur ioredis ka apna succeed ho, toh messages aate hain par L1 clear nahi hua -- TTL hi bound hai"
+    ],
+    "common_mistakes": [
+      "`ready` ko 'subscribed' samajhna",
+      "Subscriber aur commands ek hi connection par",
+      "Pehle connect ko bhi reconnect gin ke L1 clear karna"
+    ],
+    "follow_up_questions": [
+      "RESP3 mein yeh restriction hai kya?",
+      "node-redis ke liye adapter kaise likhoge?",
+      "Half-open connection ko adapter kaise detect karega?"
+    ],
+    "concepts": [
+      "adapter-pattern",
+      "ioredis",
+      "pub-sub",
+      "reconnect"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-039",
+    "project_slug": "p20-cache",
+    "category": "Failure Scenarios",
+    "difficulty": "Beginner",
+    "question": "What happens to reads and writes in TwoLevelCache when Redis goes down or stops answering?",
+    "answer_hinglish": "Seedha jawab: Redis kabhi read fail nahi karta -- cache L1 + loader par degrade ho jaata hai. Har Redis call `l2TimeoutMs` (default 250 ms) se bounded hai. Failed ya timed-out read = miss: loader chalta hai, value L1 mein cache hoti hai, aur agla read L1 hit hai. Writes chupchap fail hote hain: `l2-error` event, `l2Errors++`. `set` aur `delete` `false` resolve karte hain -- throw nahi. (Invalid options par woh Redis chhoone se pehle `RangeError` zaroor throw karte hain.)\n\nThrow kyun nahi? PLAN ka reasoning: jab tum `updateUser` mein pehle DB update karke phir `cache.delete` karte ho, DB write ho chuka hai. Cache ki problem ke liye user ko 500 dena galat hai. Boolean aur event caller ko log karne dete hain.\n\nTimeout `withTimeout` mein hai: `Promise.race([promise, timeout])`, timer `unref()` (process ko zinda nahi rakhta), aur `finally` mein `clearTimeout`. Original promise par `.catch(() => {})` taaki timeout jeetne ke baad uska late rejection unhandled na ho.\n\nEk practical tip README se: ioredis mein `enableOfflineQueue: false` set karo. Warna disconnected hone par commands queue hote hain aur har ek poora 250 ms timeout wait karta hai; offline queue band ho toh woh turant fail hote hain.\n\nTests: fake Redis 'down' -- loader 1 baar, L1 hit, `set`/`delete` false, `l2Errors` 6 (get, write-behind, set, publish, delete, publish). 'hang' -- real 30 ms timer, error message 'did not answer within 30 ms'. Real ioredis ke saath port 1 (kuch nahi sun raha) aur mid-run connection kill. Redis wapas aaye toh agla miss use phir se use karta hai.",
+    "why_needed": "Cache ek optimization hai; uski dependency ka outage poori service ka outage nahi banna chahiye.",
+    "real_world_analogy": "Dukaan ka godown band hai toh dukaandaar seedha factory se maal mangwata hai aur counter par rakh leta hai -- 'godown band hai, kuch nahi milega' nahi bolta.",
+    "how_it_works": "Har remote call ko timeout ke saath wrap karo aur failure ko miss mein convert karo (fail-open for reads). Writes best-effort, result boolean mein, observability events mein.",
+    "in_this_project": "`src/two-level.ts`: `call()` ('Runs one Redis call with the timeout; its reply, or FAILED (and an l2-error event). Never throws.'), `withTimeout()`, `readL2` ka catch. Mutation X12 ('a failed Redis read fails getOrLoad') 8 tests ne pakda, X11 (no timeout) 2, X21 (set/delete report success when Redis failed) 3.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::withTimeout",
+      "projects/20-cache/src/two-level.ts::readL2",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/test/redis-l2.test.ts"
+    ],
+    "code_example": "// real, src/two-level.ts\nprivate withTimeout<T>(promise: Promise<T>): Promise<T> {\n  promise.catch(() => {}); // if the timeout wins, a later rejection of the call must not be unhandled\n  let timer: NodeJS.Timeout | undefined;\n  const timeout = new Promise<never>((_, reject) => {\n    timer = setTimeout(() => reject(new Error(`Redis did not answer within ${this.timeoutMs} ms`)), this.timeoutMs);\n    timer.unref();\n  });\n  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Redis outage = sirf zyada DB load, errors nahi",
+      "Har call ki latency ki upper bound",
+      "Events se outage dikhta hai"
+    ],
+    "disadvantages": [
+      "Outage mein har replica ka L1 alag -- invalidation nahi, consistency kam",
+      "Har miss par ek timeout wait jab tak offline queue band na ho",
+      "DB par load badh jaata hai jab L2 gaya"
+    ],
+    "common_mistakes": [
+      "Redis error ko request error bana dena",
+      "Timeout na lagana -- hung Redis = hung requests",
+      "Offline queue on chhodna"
+    ],
+    "follow_up_questions": [
+      "250 ms default kaise choose hua?",
+      "Outage ke dauraan DB ko kaise protect karoge?",
+      "`set` false aaye toh caller ko kya karna chahiye?"
+    ],
+    "concepts": [
+      "graceful-degradation",
+      "timeouts",
+      "fail-open",
+      "redis-outage"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-040",
+    "project_slug": "p20-cache",
+    "category": "Failure Scenarios",
+    "difficulty": "Advanced",
+    "question": "What goes wrong if a load takes longer than tombstoneMs after a delete, and how should tombstoneMs be chosen?",
+    "answer_hinglish": "Tombstone ek time-limited guard hai. `delete` key ko `tombstoneMs` (default 10 000 ms) ke liye `TOMBSTONE` value se replace karta hai. Us dauraan koi load NX se key nahi likh sakta. Par agar ek load delete se PEHLE purani row padh chuka tha aur uska write Redis tak tombstone expire hone ke BAAD pahunche, toh key absent hai, NX succeed karta hai, aur purani value Redis mein wapas -- har replica ko TTL tak. Yeh README ki 'Known' list ka item (a) hai.\n\nPractically yeh kab hota hai? Delete karne wale replica par nahi: wahan L1 delete load ko detach karta hai, `isCurrent()` false, write hota hi nahi. Doosre replica B par bhi agar invalidation message load khatam hone se pehle aa jaaye toh B nahi likhta. Toh tombstone woh case pakadta hai jab message late ho, miss ho gaya ho, ya B ke paas subscriber hi na ho (`subscriber` optional hai) -- aur tab slow load + expire hua tombstone = stale Redis.\n\ntombstoneMs kaise choose karein: code comment kehta hai 'Must be longer than your slowest load (its timeout)'. Matlab pehle loader mein timeout lagao (README: projects/18-resilience ka TimeoutPolicy), phir tombstoneMs us timeout se upar. Bina loader timeout ke koi tombstoneMs safe nahi.\n\nLamba rakhne ki kimat kya hai? Comment: 'Longer only means that, for that long after a delete, Redis holds nothing for the key and each replica loads it once into its own L1.' Har replica ka NX write refuse hota hai (`l2WritesSkipped`), toh shared L2 ka fayda utni der ke liye nahi. Explicit `set` tombstone overwrite karta hai -- woh newer value hai, late load nahi (test 'an explicit set() overwrites a tombstone'). Test 'a tombstone lasts tombstoneMs': 300 ms tombstone ke dauraan write refused, uske baad load Redis likhta hai.",
+    "why_needed": "Distributed guards jo time par depend karte hain, unki ek window hoti hai. Senior engineer ko window ka size aur use control karne wala knob pata hona chahiye.",
+    "real_world_analogy": "Kisi ke ghar ke bahar 'shift ho gaye' ka board 10 din ke liye. Agar postman ek mahine purani chitthi le kar aaye, board hat chuka hai aur woh chitthi purane pate par daal deta hai.",
+    "how_it_works": "Time-bounded fencing: marker value TTL ke saath. Conditional write marker ke rehte refuse. Guarantee = marker ki lifetime; isse lamba koi operation fence se bahar hai.",
+    "in_this_project": "`src/two-level.ts`: `TwoLevelCacheOptions.tombstoneMs` ka comment aur constructor validation (`Number.isFinite(tombstone) && tombstone > 0`, warna RangeError -- test `tombstoneMs: 0` par throw check karta hai). `delete()` `this.tombstoneMs` ke saath SET karta hai. Real-Redis test tombstone ka PTTL `> 0` aur `<= 10_000` check karta hai.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::tombstoneMs",
+      "projects/20-cache/src/two-level.ts::TOMBSTONE",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/test/redis-l2.test.ts",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, src/two-level.ts (option comment, trimmed)\n// How long delete() keeps a tombstone in Redis, during which no load can write the key back (see delete). Must be\n// longer than your slowest load (its timeout); default 10 000.\ntombstoneMs?: number;\n\n// illustrative: pick it from the loader timeout\nconst LOADER_TIMEOUT_MS = 3_000;\nconst users = new TwoLevelCache<User | null>({ l1, redis, subscriber, prefix: \"myapp:users:\", tombstoneMs: 3 * LOADER_TIMEOUT_MS });",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek simple knob jo window control karta hai",
+      "DEL ke saath wala race closed",
+      "Explicit set tombstone ko turant replace karta hai"
+    ],
+    "disadvantages": [
+      "Guarantee loader timeout par depend -- jo cache-kit enforce nahi karta",
+      "Tombstone ke dauraan Redis copy nahi, har replica DB se load"
+    ],
+    "common_mistakes": [
+      "Loader mein timeout na lagana aur default 10 s ko safe maan lena",
+      "tombstoneMs ko L1 TTL se confuse karna",
+      "Subscriber ko optional maan kar hata dena -- tab tombstone hi akela guard hai"
+    ],
+    "follow_up_questions": [
+      "Bina time ke fencing kaise karte -- version numbers?",
+      "tombstoneMs bahut chhota ho toh kya dikhega?",
+      "Delete-heavy workload par tombstones ka kya asar?"
+    ],
+    "concepts": [
+      "tombstone",
+      "fencing",
+      "time-bounded-guarantee",
+      "cache-invalidation"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Time-based fence simple hai (ek extra SET with PX) par absolute nahi. Version-based fence (har key ka monotonic version, Lua mein compare) time par depend nahi karta par har write ek script aur extra key.",
+      "failure_scenarios": "Load > tombstoneMs aur message lost/late: stale Redis TTL tak. Clock skew yahan issue nahi -- TTL Redis server par chalta hai. Redis restart bina persistence ke: tombstone bhi gaya, tab Redis khaali hai (stale value bhi nahi).",
+      "alternatives": "Lua CAS with version keys (PLAN mein rejected: zyada moving parts), delayed double delete (sleep, still a window), DB se CDC based invalidation.",
+      "scale_10x_100x": "Zyada deletes par tombstone keys zyada, par har ek chhoti string aur TTL ke saath expire. Bahut slow loaders (reports, aggregates) ke liye tombstoneMs minutes mein jaana padega -- tab us key ka L2 utni der useless.",
+      "production_improvements": "Loader timeout ko config mein ek jagah rakho aur tombstoneMs usse derive karo; `l2WritesSkipped` spike aur slow-load metrics monitor karo."
+    }
+  },
+  {
+    "id": "CKT-041",
+    "project_slug": "p20-cache",
+    "category": "Failure Scenarios",
+    "difficulty": "Intermediate",
+    "question": "The database is down and a hot key goes stale. What does stale-while-revalidate do during the outage, and where is its weakness?",
+    "answer_hinglish": "SWR outage mein bahut kaam aata hai -- grace ke andar. Stale read purani value turant deta hai aur ek refresh shuru karta hai. Refresh fail hota hai: `refresh-error` event, `refreshErrors++` (aur `loadErrors++` bhi), aur stale entry jaisi thi waisi rehti hai. Agla stale read phir ek refresh try karta hai. Users ko errors nahi, purana data milta hai. Grace khatam hone par key plain miss hai: callers loader ka wait karte hain aur uska error paate hain.\n\nTest 'keeps serving the stale value until the grace ends, reports refresh-error, and the next stale read retries': grace mein do stale reads, dono 1 return, `failing` 2 baar; grace khatam (`clock.advance(1)`) par `rejects.toBe(boom)`; final stats `staleHits: 2, misses: 1, loadErrors: 3, refreshErrors: 2`. Mutation R11 ('a failed refresh drops the stale entry') isi test ne pakda.\n\nWeakness 1 -- no backoff (README Known): har failed refresh ke baad agla stale read turant naya refresh bhejta hai. Hot key par iska matlab: DB outage ke dauraan roughly ek refresh at a time, back to back, grace khatam hone tak. Single flight concurrent burst rokta hai, par continuous retry nahi. Backoff 'NOT implemented' list mein hai.\n\nWeakness 2 -- hung refresh: loader kabhi settle na ho aur signal ignore kare, toh refresh flight hamesha attached. Naya refresh start nahi hota (`flights.has(key)` true), aur grace ke baad har caller usi stuck refresh ko join karta hai -- aur refresh ka permanent waiter hai, toh abort bhi nahi hota. README ka fix: loader ke andar timeout (jaise projects/18 ka TimeoutPolicy). Timeout ke baad refresh fail hota hai, stale value bachi rehti hai, agla read retry karta hai.",
+    "why_needed": "SWR ka asli value outage mein hai, par bina backoff aur timeout ke woh failing backend par steady pressure aur stuck keys bhi la sakta hai.",
+    "real_world_analogy": "Bijli gayi toh dukaan generator par purane stock se chalti hai (stale). Har customer ke aate hi dukaandaar supplier ko phone karta hai -- line busy, phir phone, phir phone. Kuch der ruk ke phone karna (backoff) better hota.",
+    "how_it_works": "Refresh error stale entry ko touch nahi karta; sirf flight detach hoti hai. Retry next stale read par piggyback karta hai -- koi timer nahi, koi state nahi. Grace ki boundary par entry dead, normal miss semantics.",
+    "in_this_project": "`src/cache.ts` `getOrLoad` ka comment 'A failed refresh leaves the entry as it is, so the next stale read serves it again and tries again.' `startLoad` catch refresh ke liye `refresh-error` emit karta hai. `src/events.ts`: 'A background refresh failed (instead of \"load-error\"). The stale value is still served until its grace ends.' PLAN: backoff ko 'more state' bol ke reject kiya.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/src/events.ts",
+      "projects/20-cache/test/swr.test.ts",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, test/swr.test.ts (trimmed)\nexpect(await c.getOrLoad(\"k\", failing)).toBe(1); // stale, refresh 1 fails in the background\nawait flush();\nclock.advance(49);\nexpect(await c.getOrLoad(\"k\", failing)).toBe(1); // still stale, still served; a second refresh started\nawait flush();\nexpect(failing).toHaveBeenCalledTimes(2);\nclock.advance(1); // grace over: behaves like a miss\nawait expect(c.getOrLoad(\"k\", failing)).rejects.toBe(boom);",
+    "code_language": "typescript",
+    "advantages": [
+      "Outage ke dauraan users ko data milta rehta hai",
+      "Recovery automatic -- DB aate hi agla refresh succeed",
+      "Refresh errors alag counter mein, alert lagana aasaan"
+    ],
+    "disadvantages": [
+      "No backoff: failing DB par continuous retries",
+      "Hung loader key ko stuck kar sakta hai",
+      "Grace lambi ho toh users bahut purana data dekh sakte hain"
+    ],
+    "common_mistakes": [
+      "Failed refresh par stale entry delete karna",
+      "Loader mein timeout na lagana",
+      "`staleMs: Infinity` bina soche -- outage mein data hamesha ke liye purana"
+    ],
+    "follow_up_questions": [
+      "Backoff kaise implement karoge?",
+      "Grace ki length kaise decide karoge?",
+      "Refresh-ahead (stale hone se pehle refresh) kab useful hai?"
+    ],
+    "concepts": [
+      "stale-while-revalidate",
+      "outage",
+      "retry",
+      "backoff",
+      "timeouts"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-042",
+    "project_slug": "p20-cache",
+    "category": "Failure Scenarios",
+    "difficulty": "Senior/System Design",
+    "question": "List every window in which a replica can serve an outdated value from TwoLevelCache, and say what bounds each one.",
+    "answer_hinglish": "README khud saat windows (a)-(g) likhta hai (pehle chaar thi; review ke baad (e), (f), (g) jude), aur bolta hai 'This is a cache, not a consistency protocol: use short TTLs for data that changes.'\n\n(a) Load slower than tombstoneMs: delete ke baad tombstone expire, late NX write succeed, purani value Redis mein. Bound: tombstoneMs ko loader timeout se upar rakhna.\n\n(b) Subscriber silently cut off (half-open, abhi detect nahi): invalidations nahi aate, reconnect bhi trigger nahi hota, toh L1 clear nahi. Bound: sirf L1 TTL -- isliye 'seconds, not hours'.\n\n(c) A ke `set` aur message ke B tak pahunchne ke beech: B purani L1 copy serve karta hai. Bound: network latency, healthy network par milliseconds.\n\n(d) `set` / `delete` `false` resolve karein (Redis fail): A ka L1 updated, par doosre replicas aur Redis purani value TTL tak rakh sakte hain. Bound: unke TTLs; caller ko false aur `l2-error` milta hai.\n\n(e) Redis ki value decode na ho (corrupt): loader ka write NX ke bina plain SET jaata hai (`read !== \"corrupt\"`), toh agar beech mein A ne `set` kiya ho, B ka write use overwrite kar sakta hai. Bound: Redis TTL; rare -- corrupt value AUR concurrent set dono chahiye.\n\n(f) Tombstone ek normal Redis key hai: memory pressure mein evict ho jaaye, ya Redis bina persistence restart ho (repo ka infra Redis `--appendonly no --save \"\"`), toh late NX write phir accept. Bound: Redis TTL; tombstones ko evict na hone do (eviction policy).\n\n(g) ioredis subscriber adapter failed re-SUBSCRIBE ignore karta hai: agar ioredis ka apna resubscribe chal jaaye toh messages phir aate hain, par L1 clear nahi hua. Bound: L1 TTL.\n\nCode padh ke ek aur cheez: `subscriber` optional hai -- bina uske koi invalidation nahi, har replica ki L1 copy apne TTL tak (window b ka permanent version). Aur `TwoLevelCache.set` Redis likhta hai chahe L1 value ko too heavy maan ke refuse kare (L1 purani value hata deta hai) -- aur `true` resolve kar sakta hai. Aur design limitations: `TwoLevelCache` mein replicas ke across `clear()` nahi hai (prefix clear ke liye SCAN chahiye, not built), aur SWR grace mein L1 jaan-boojh kar TTL ke baad bhi stale value deta hai.\n\nInterview answer ka core: har window ka ek knob hai -- L1 TTL, tombstoneMs, loader timeout -- aur jo data stale bilkul nahi ho sakta (balance, inventory), use is cache se padhna hi nahi chahiye.",
+    "why_needed": "'Cache consistent hai?' ka honest jawab 'haan/nahi' nahi, balki windows aur unke bounds ki list hai. Yahi senior answer hai.",
+    "real_world_analogy": "Railway ke har station par timetable ki copy. Head office badlaav fax karta hai. Fax line kharab ho, fax raste mein ho, ya head office ka fax hi fail ho -- har case mein koi station purani timing dikhata hai, jab tak copy ki expiry date na aa jaaye.",
+    "how_it_works": "Eventual consistency with bounded staleness: har stale path ka ek upper bound (TTL, tombstone life, network delay). Strong consistency ke liye har read par source of truth se version check chahiye, jo cache ka point khatam karta hai.",
+    "in_this_project": "README 'Known and NOT changed' ka `TwoLevelCache` item (a)-(g) aur 'TwoLevelCache.set writes Redis even when the value is too heavy for L1', aur 'NOT implemented' mein 'A clear across replicas'. `src/two-level.ts`: `subscriber?: L2Subscriber` comment 'Without one there is no invalidation between replicas', `set()` ka comment 'other replicas may serve the OLD value from their L1 and from Redis until those TTLs end'. Tests: disconnected subscriber old value serve karta hai jab tak reconnect na ho.",
+    "implementation_files": [
+      "projects/20-cache/README.md",
+      "projects/20-cache/src/two-level.ts::TwoLevelCacheOptions",
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/test/two-level.test.ts"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Har window documented aur bounded",
+      "Knobs simple: TTL, tombstoneMs, loader timeout",
+      "Outage mein bhi reads kaam karte hain"
+    ],
+    "disadvantages": [
+      "Strong consistency nahi",
+      "Half-open subscriber ka koi detection nahi",
+      "Cross-replica clear nahi"
+    ],
+    "common_mistakes": [
+      "Pub/sub ko reliable delivery samajhna",
+      "Long L1 TTL ke saath shared mutable data cache karna",
+      "`set`/`delete` ka boolean ignore karna"
+    ],
+    "follow_up_questions": [
+      "Kis data ko is cache mein bilkul nahi rakhoge?",
+      "Window (b) ko kaise chhota karoge?",
+      "Cross-replica clear kaise banaoge?"
+    ],
+    "concepts": [
+      "consistency",
+      "bounded-staleness",
+      "distributed-cache",
+      "failure-modes"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Simple design (pub/sub + TTL + NX) ne har window bounded rakhi par zero nahi. Zero ke liye har read par DB/Redis version check ya lease-based protocol chahiye -- latency aur complexity dono.",
+      "failure_scenarios": "Network partition jisme replica Redis se kat jaaye: reads L1 + loader se, invalidations nahi, L1 TTL tak stale. Redis failover: subscribers reconnect -> sab L1 clear -> Redis par refill burst. Corrupt value + concurrent set: rare overwrite.",
+      "alternatives": "CLIENT TRACKING (RESP3, server-pushed invalidations), Redis Streams (replayable), lease-based caching (Facebook memcache leases style), ya L1 hatao aur sirf Redis padho.",
+      "scale_10x_100x": "Replicas 10x: window (c) ke beech zyada replicas, par har ek same ms delay. Write rate 10x: invalidation messages 10x aur L1 hit rate gir sakta hai. Measured nahi.",
+      "production_improvements": "Har data type ke liye allowed staleness likho aur L1 TTL usse set karo, `set`/`delete` false par alert/retry, subscriber connection par health check, aur critical paths ko cache bypass karne do."
+    }
+  },
+  {
+    "id": "CKT-043",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "The first version of the real-Redis test 'set on A: B reads the new value' failed. How was the cause found, and how was the race turned into tests that fail reliably?",
+    "answer_hinglish": "Symptom: A `set` karta hai, B ko invalidation milta hai, B Redis se padhta hai -- par Redis purani value deta hai. Fake Redis par aisa dikhna mushkil tha, kyunki fake mein sab commands ek hi in-memory object mein synchronously apply hote hain.\n\nCause dhoondhne ka tareeka: kaun Redis mein purani value likh sakta hai? Sirf B ka write-behind -- B ka load purani row padh ke ab likh raha tha. B ka SET B ke command connection par jaata hai, A ka A ke. Do TCP connections ke beech Redis par arrival order ki koi guarantee nahi. Toh B ka write A ke baad pahunch sakta tha aur overwrite. README: 'Redis then served the old value to every replica for a whole TTL'.\n\nFix (SET NX for loads, tombstone for delete) ke baad tests do level par bane. (1) Real Redis: 20 rounds; har round B ka loader running pakad ke rakho (B ka Redis read ho chuka), A `set` kare, phir B ka loader purani value de; assert Redis mein A ki value. Test print karta hai kitni baar NX ne refuse kiya vs message pehle aaya; README ke chaar runs: 6, 14, 17, 11 of 20, aur `l2Writes` hamesha 0. (2) Deterministic: `FakeRedis.holdMessages()` invalidation ko 'network par slow' rakhta hai, toh 'B ka write message se pehle' order har baar banta hai; `releaseMessages()` baad mein. Dono orders -- set aur delete -- ke liye alag tests.\n\nLesson: real infra par race 'kabhi kabhi' dikhta hai; deterministic fake mein exact interleaving force karo, aur real test ko loop mein chalao aur path print karo taaki pata ho dono branches sach mein chale. Production mein `l2WritesSkipped` batata hai yeh race kitni baar hua. Mutation X4 ('loads write without NX') 6 tests ne pakda.",
+    "why_needed": "Distributed bugs unit tests mein chhup jaate hain kyunki fakes perfect ordering dete hain. Real-dependency test + controllable fake dono chahiye.",
+    "real_world_analogy": "Do courier alag raaston se ek hi ghar par parcel le ja rahe hain. Kaun pehle pahunchega, guarantee nahi. Test karne ke liye ek courier ko jaan-boojh kar signal par rok do.",
+    "how_it_works": "Race ko reproduce karne ke liye interleaving control karo: deferred loader (load ko 'in flight' rakhna) aur held messages (delivery delay). Real system par repetition + path logging.",
+    "in_this_project": "`test/redis-l2.test.ts` ka 'RACE: ... Redis keeps A's value whichever arrives first' (20 rounds, `console.log` with `l2WritesSkipped`). `test/fake-redis.ts` `holdMessages` / `releaseMessages`. `test/two-level.test.ts` 'RACE: B's load finishes after A's set() but BEFORE A's message reaches B' aur delete wala version.",
+    "implementation_files": [
+      "projects/20-cache/test/redis-l2.test.ts",
+      "projects/20-cache/test/fake-redis.ts::holdMessages",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/src/two-level.ts::writeBehind"
+    ],
+    "code_example": "// real, test/two-level.test.ts (trimmed): the deterministic order\nconst p = b.c.getOrLoad(\"1\", () => d.promise); // B reads the OLD row\nawait flush();\nredis.holdMessages(); // A's invalidation is slow on the network\nexpect(await a.c.set(\"1\", { name: \"new\" })).toBe(true);\nd.resolve({ name: \"old\" }); // B still thinks its load is current and writes behind\nawait p;\nawait b.c.flush();\nexpect(redis.commands).toContain(\"set app:u:1 1000 NX\");\nexpect(redis.data.get(\"app:u:1\")!.value).toBe('{\"v\":{\"name\":\"new\"}}');\nexpect(b.c.stats()).toMatchObject({ l2WritesSkipped: 1, l2Writes: 0 });",
+    "code_language": "typescript",
+    "advantages": [
+      "Real bug real dependency ne pakda",
+      "Deterministic test regression ko hamesha pakadta hai",
+      "Path logging se pata chalta hai test dono branches cover karta hai"
+    ],
+    "disadvantages": [
+      "Real-Redis tests Redis na ho toh skip hote hain (notice ke saath)",
+      "Real test probabilistic hai -- ek round ek hi path leta hai"
+    ],
+    "common_mistakes": [
+      "Sirf fake par test karke cross-connection ordering assume karna",
+      "Race test ek hi baar chalana",
+      "Assert karna ki 'NX hit hua' -- kabhi message pehle aata hai, dono valid hain"
+    ],
+    "follow_up_questions": [
+      "Fake Redis mein yeh race kyun nahi dikhi?",
+      "Production mein yeh race kaise monitor karoge?",
+      "Aur kaun se races sirf real Redis par dikhenge?"
+    ],
+    "concepts": [
+      "race-condition",
+      "testing",
+      "fakes",
+      "determinism",
+      "debugging"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Real Redis tests slow aur environment-dependent hain par woh bugs pakadte hain jo fakes nahi pakad sakte. Fake deterministic hai par sirf woh orderings test karta hai jo tumne socha.",
+      "failure_scenarios": "Agar real test sirf ek round chalta, kai runs mein woh hamesha 'message first' path le sakta tha aur NX path kabhi test nahi hota. Redis unreachable: tests SKIPPED with notice, silently pass nahi.",
+      "alternatives": "Jepsen-style randomized fault injection, network proxy (toxiproxy) se delay inject karna, ya model checking (TLA+) for the protocol.",
+      "scale_10x_100x": "Zyada replicas wale test mein interleavings exponentially badhte hain; deterministic tests targeted orders cover karein, real tests random sampling.",
+      "production_improvements": "CI mein real Redis service ke saath race test ko mandatory banao (skip na ho), aur `l2WritesSkipped` ko dashboard par rakho."
+    }
+  },
+  {
+    "id": "CKT-044",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Beginner",
+    "question": "During mutation testing, one deliberate bug made the whole test run hang and left node processes spinning. What happened and what changed afterwards?",
+    "answer_hinglish": "Mutation W5 tha: 'removing an entry does not subtract its weight'. Iska asar: `weightTotal` entries se zyada ho gaya. `store()` ka weight-eviction loop `while (this.weightTotal > this.maxWeight) this.evictOldest(\"weight\")` tha. Map khaali ho gaya, par total ab bhi limit se upar -- `evictOldest` ko kuch nahi milta, total kabhi nahi ghatta, loop hamesha chalta. Sync infinite loop = event loop block = vitest kabhi khatam nahi hota.\n\nAur bura hua: runner ka 300 s timeout sirf shell ko maarta tha. Vitest ke worker node processes uske children the -- woh orphan ho kar spin karte rahe. 12 orphaned node processes CPU khaate rahe aur baaki har check ko slow kiya, jab tak haath se dhoondh ke kill nahi kiye.\n\nTeen changes aaye: (1) loop mein guard `&& this.map.size > 1`. Naya entry last hai aur akela `maxWeight` se halka hai, toh sahi bookkeeping mein loop usse pehle ruk jaata hai -- guard no-op hai. Par bookkeeping bug ho toh ab galat evictions hoti hain jo tests dekh lete hain, hung process nahi. Isi wajah se W8 (guard hatao) equivalent mutant hai -- koi test use nahi pakad sakta. (2) Weights integer hone chahiye: fractions add-subtract mein drift karte hain (`0.1 + 0.2 - 0.1 - 0.2` = `2.8e-17`, 0 nahi), total entries se match nahi karta. Naya break W7 isko check karta hai. (3) Runner ab timeout par poora process TREE kill karta hai.\n\nWindows par generic tareeka `taskkill /PID <pid> /T /F` hai (`/T` = tree) -- README specific command nahi batata, sirf 'kills the whole tree'.",
+    "why_needed": "Test infrastructure bhi production code jaisi fail hoti hai. Ek hung test aur orphan processes baaki saare results ko corrupt kar dete hain.",
+    "real_world_analogy": "Ghar ka main switch band kiya par inverter alag chal raha hai -- pankhe chalte rehte hain. Poora circuit band karna padta hai, sirf ek switch nahi.",
+    "how_it_works": "Infinite loop ki defense: loop condition mein ek invariant-independent progress check (size > 1). Process supervision: parent ke saath children bhi maaro, warna orphan.",
+    "in_this_project": "`src/cache.ts` `store()` ka comment: '`size > 1` is a guard, not a rule: if the total ever drifted from the entries (a bug), the loop would otherwise spin forever on an empty map (found by mutation W5, which hung the test run).' `weighOf` integer check (`!Number.isSafeInteger(w) || w < 0` -> RangeError). README section 'Found by a mutation: W5 hung the test run'.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::store",
+      "projects/20-cache/src/cache.ts::weighOf",
+      "projects/20-cache/README.md",
+      "projects/20-cache/test/lru.test.ts"
+    ],
+    "code_example": "// real, src/cache.ts (trimmed)\nwhile (this.map.size > this.maxEntries) this.evictOldest(\"size\");\n// `size > 1` is a guard, not a rule (found by mutation W5, which hung the test run).\nif (this.maxWeight !== undefined) {\n  while (this.weightTotal > this.maxWeight && this.map.size > 1) this.evictOldest(\"weight\");\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Bookkeeping bug ab visible failure deta hai, hang nahi",
+      "Integer weights drift khatam",
+      "Runner ab robust"
+    ],
+    "disadvantages": [
+      "Guard ek equivalent mutant (W8) chhod deta hai jo koi test nahi pakad sakta",
+      "Fractional weights (jaise MB mein) ab allowed nahi -- bytes mein do"
+    ],
+    "common_mistakes": [
+      "Timeout par sirf parent process maarna",
+      "Float accumulators par equality maanna",
+      "Loop condition ko sirf ek derived counter par depend karna"
+    ],
+    "follow_up_questions": [
+      "Equivalent mutant kya hota hai aur use kaise justify karte ho?",
+      "Linux par process group kaise kill karoge?",
+      "Aur kaun se loops is cache mein unbounded ho sakte the?"
+    ],
+    "concepts": [
+      "mutation-testing",
+      "infinite-loop",
+      "process-tree",
+      "floating-point"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-045",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "Four stage-2 mutations (X15, X16, X24, X25) survived the first run. Why did the passing tests prove nothing, and how was each gap closed?",
+    "answer_hinglish": "Chaaron real test gaps the, equivalent mutants nahi. Har ek ka pattern alag hai, aur interview mein yahi pattern batane laayak hain.\n\nX15 -- 'the loader starts although every caller left during the Redis read'. Test caller abort karke turant check karta tha ki loader nahi chala. Par Redis read hang tha aur abhi timeout bhi nahi hua tha -- loader chalne ka moment aaya hi nahi tha. Check bahut jaldi tha, condition kabhi possible hi nahi thi. Fix: test ab read ke timeout event (`l2-error` op `get`) ka wait karta hai, phir check.\n\nX16 -- 'a non-string encode result sent to Redis'. Test ka bad codec `undefined` return karta tha, jo ek doosra guard (`text === undefined`) bhi pakad leta. Mutation ne ek guard hataya, doosre ne kaam kar diya. Fix: codec ab number aur object bhi return karta hai.\n\nX24 -- '`close()` does not wait for pending writes'. Fake Redis synchronously likhta hai, toh kabhi pending write tha hi nahi. Fix: naya test jiska client SET ka jawab 20 ms baad deta hai.\n\nX25 -- 'a PTTL of 0 counted as a hit'. Fake key ko expiry par drop kar deta hai, toh PTTL exactly 0 kabhi nahi aaya. Fix: naya test jo 0 return karta hai -- aur woh dikhata hai ki hit with TTL 0 load ko RangeError se fail karta (checkTtl > 0 maangta hai).\n\nCommon lesson: green test ka matlab nahi ki woh behaviour test karta hai. Mutation testing poochta hai 'yeh code tod do, kya koi test laal hota hai?'. Har gap ke liye 'condition kabhi possible thi?', 'koi aur guard toh nahi bacha raha?', 'fake yeh state produce kar sakta hai?' -- yeh teen sawal. README: X15, X16, X24, X25 ab har ek exactly ek test se caught hain.",
+    "why_needed": "Coverage percent yeh nahi batata ki assertion meaningful hai. Mutation checks batate hain -- aur unke survivors aksar test design ki galtiyan dikhate hain.",
+    "real_world_analogy": "Smoke detector test karna hai toh button dabao mat, asli dhuan karo. Button test (fake) pass hona aur asli aag mein bajna alag baatein hain.",
+    "how_it_works": "Har mutation ek chhota deliberate bug hai, akela apply, poora suite chalao, file byte-exact restore. 0 failures = ya toh test gap ya equivalent mutant; har survivor ko explain ya fix karna.",
+    "in_this_project": "README 'Mutation checks, stage 2': runner repo ke bahar, uppercase drive letter se start, 300 s timeout par process tree kill, har pattern exactly ek baar match check. `test/two-level.test.ts` mein X15 aur X16 ke comments: '(The first version checked the loader right after the abort ... mutation X15...)' aur '(the first version only tried undefined, so mutation X16 survived)'.",
+    "implementation_files": [
+      "projects/20-cache/README.md",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/src/two-level.ts::encode",
+      "projects/20-cache/src/two-level.ts::flush"
+    ],
+    "code_example": "// real, test/two-level.test.ts (trimmed): X15's fix waits for the hung read to time out first\nconst p = a.c.getOrLoad(\"1\", loader, { signal: ac.signal });\nac.abort(new Error(\"client left\"));\nawait expect(p).rejects.toThrow(\"client left\");\nwhile (!a.events.some((e) => e.type === \"l2-error\" && e.op === \"get\")) await new Promise((r) => setTimeout(r, 5));\nawait flush();\nexpect(loader).not.toHaveBeenCalled();",
+    "code_language": "typescript",
+    "advantages": [
+      "Har gap ka root cause documented",
+      "Tests ab behaviour pakadte hain, sirf code path nahi",
+      "Survivors explain karna discipline banata hai"
+    ],
+    "disadvantages": [
+      "Mutation runs slow (99 breaks x full suite)",
+      "Kuch tests ab real timers par (30 ms, 20 ms) -- busy machine par slow"
+    ],
+    "common_mistakes": [
+      "Check karna us moment se pehle jab bug possible ho",
+      "Do guards mein se ek ko test karna jab dono same input pakadte hain",
+      "Sochna fake ke paas har edge state hai"
+    ],
+    "follow_up_questions": [
+      "Equivalent mutant aur test gap mein fark kaise karoge?",
+      "Mutation testing CI mein kaise chalaoge?",
+      "Fake ko real ke kitna paas hona chahiye?"
+    ],
+    "concepts": [
+      "mutation-testing",
+      "test-design",
+      "fakes",
+      "debugging"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Mutation testing mehenga hai par coverage se zyada honest. Har survivor ko investigate karna time leta hai; README ne equivalent ones (L6, L7, W8) ko reason ke saath document kiya.",
+      "failure_scenarios": "Bina is ke X24 jaisa bug production mein graceful shutdown par pending Redis writes kho deta; X25 ek rare PTTL 0 par load ko RangeError se fail karta.",
+      "alternatives": "Stryker jaisa automated mutation tool (yahan custom runner tha), property-based testing, fault-injecting fakes.",
+      "scale_10x_100x": "Breaks badhne se runtime linear badhta hai; parallel runs ke liye har run ko alag copy chahiye (runner repo ke bahar rakha gaya).",
+      "production_improvements": "Critical modules (`cache.ts`, `two-level.ts`) par mutation run ko release checklist mein rakho, aur naye fakes mein edge states (PTTL 0, slow replies) by design daalo."
+    }
+  },
+  {
+    "id": "CKT-046",
+    "project_slug": "p20-cache",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Intermediate",
+    "question": "After an update, one replica keeps returning the old value while the others return the new one. How would you investigate with cache-kit's stats and events?",
+    "answer_hinglish": "Pehle classify karo: problem Redis mein hai ya sirf us replica ke L1 mein? Redis mein key directly dekho (README: `TOMBSTONE` 'exported for anyone inspecting Redis by hand'). Agar Redis mein nayi value hai aur doosre replicas sahi hain, toh stuck replica ka L1 purana hai -- invalidation nahi pahuncha.\n\nChecklist, stats aur events se: (1) Writer side: `set` / `delete` ne `true` diya ya `false`? False = Redis write ya publish fail; `l2-error` event ka `op` batata hai (`set`, `delete`, `publish`). Writer ka `invalidationsSent` badha? (2) Stuck replica: `await cache.ready` -- `false` matlab subscribe fail hua (`l2-error` op `subscribe`) ya `subscriber` pass hi nahi kiya; tab koi invalidation nahi aata, sirf TTL. (3) Uska `invalidationsReceived` badh raha hai? Nahi badh raha aur `ready` true tha -- channel mismatch ho sakta hai: channel default `prefix + \"invalidate\"` hai, toh do replicas par alag prefix ya alag `channel` option = alag channels. (4) `l2-error` op `message` -- malformed messages ignore hote hain. (5) `resubscribes` -- kya disconnect hua? Reconnect hua hota toh L1 clear hota; badha nahi aur messages bhi nahi aa rahe toh half-open connection ka shak (README window b).\n\nFix: immediate -- us replica ka L1 clear (`cache.l1.clear()`) ya restart. Root cause ke hisaab se: subscriber configure karo (`ioredisSubscriber(redis.duplicate())`), prefix/channel sab replicas par same, aur L1 TTL chhota rakho taaki jo bhi window bache woh seconds ki ho. Yeh sab bina naye code ke ho sakta hai kyunki cache har decision ko counter ya event ke roop mein deta hai.",
+    "why_needed": "Distributed cache bugs 'sirf ek server par' dikhte hain. Bina per-replica stats ke yeh guesswork ban jaata hai.",
+    "real_world_analogy": "Ek branch office ko circular nahi mila. Check karo: head office ne bheja? Fax machine on thi? Number sahi tha? Branch ka fax kab se band tha?",
+    "how_it_works": "Pipeline ke har hop ka counter: publish (sent) -> channel -> subscribe (ready) -> receive (received) -> apply (invalidated event). Jahan count rukta hai, wahi fault.",
+    "in_this_project": "`src/two-level.ts`: `TwoLevelStats` (`invalidationsSent`, `invalidationsReceived`, `resubscribes`, `l2Errors`), `TwoLevelEvent` (`l2-error` with `op`, `invalidated`, `resubscribed`), `ready: Promise<boolean>`, channel default `${options.prefix}invalidate`. `onMessage` apne `id` wale messages ignore karta hai, isliye writer ka apna `invalidationsReceived` nahi badhta -- yeh expected hai.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::TwoLevelStats",
+      "projects/20-cache/src/two-level.ts::TwoLevelEvent",
+      "projects/20-cache/src/two-level.ts::onMessage",
+      "projects/20-cache/test/two-level.test.ts"
+    ],
+    "code_example": "// illustrative, NOT in the repo: log what the investigation needs\nconst users = new TwoLevelCache<User | null>({\n  l1, redis: ioredisL2Client(redis), subscriber: ioredisSubscriber(redis.duplicate()), prefix: \"myapp:users:\",\n  onEvent: (e) => {\n    if (e.type === \"l2-error\") logger.warn({ op: e.op, key: e.key, err: e.error }, \"cache l2 error\");\n    else if (e.type === \"resubscribed\") logger.info(\"cache subscriber reconnected, L1 cleared\");\n  },\n});\nif (!(await users.ready)) logger.error(\"cache invalidation is OFF on this replica\");\nsetInterval(() => metrics.gauge(\"cache_l2\", users.stats()), 10_000).unref();",
+    "code_language": "typescript",
+    "advantages": [
+      "Har hop ka counter, toh fault localize hota hai",
+      "Events throw karein bhi toh cache par asar nahi",
+      "`ready` boolean startup par hi problem bata deta hai"
+    ],
+    "disadvantages": [
+      "Half-open connection ka koi direct signal nahi",
+      "Stats per instance hain -- aggregate karne ke liye apna metrics pipeline chahiye"
+    ],
+    "common_mistakes": [
+      "`ready` ko await hi na karna",
+      "Replicas par alag prefix (aur isliye alag channel)",
+      "`set`/`delete` ka false ignore karna"
+    ],
+    "follow_up_questions": [
+      "Half-open subscriber ko kaise detect karoge?",
+      "Ek replica ka L1 remotely kaise clear karoge?",
+      "Kaunse alerts lagaoge?"
+    ],
+    "concepts": [
+      "debugging",
+      "observability",
+      "pub-sub",
+      "metrics"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-047",
+    "project_slug": "p20-cache",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Add an exponential backoff between failed stale-while-revalidate refreshes (NOT in the repo), with a test.",
+    "answer_hinglish": "Abhi (README Known) failed refresh ke baad agla stale read turant naya refresh bhejta hai -- DB outage mein hot key par back-to-back refreshes. Backoff 'NOT implemented' list mein hai. Main ise aise add karunga.\n\nDecision 1 -- state kahan? Alag `Map<K, ...>` nahi, `Entry` par hi do fields: `refreshFailures` aur `refreshNotBefore`. Fayda: entry replace, delete, evict ya clear ho toh backoff state apne aap chali jaati hai -- koi cleanup nahi, koi leak nahi. `store()` naya entry banata hai toh dono 0 -- matlab ek successful refresh ya explicit `set` backoff reset kar deta hai.\n\nDecision 2 -- kab gate karein? Sirf stale branch mein: `if (!this.flights.has(key) && this.now() >= entry.refreshNotBefore) startLoad(...)`. Grace ke baad plain miss gate nahi hota -- wahan caller wait kar raha hai aur error paana chahiye, waisa hi jaisa aaj.\n\nDecision 3 -- failure kab gino? `startLoad` ke catch mein, sirf jab refresh tha, abort nahi hua, aur flight abhi bhi current thi. Current check zaroori hai: agar beech mein `set` hua, naya entry hai aur purane refresh ki failure use penalize na kare.\n\nDelay: `min(base * 2^(failures-1), max)`. Options `refreshBackoffMs` (off by default, backward compatible) aur `maxRefreshBackoffMs`. Test manual clock se: 50, 100, phir cap 150; aur `set` ke baad reset. Production mein jitter bhi add karna chahiye taaki bahut saari keys ek saath retry na karein. Model test (`test/model.test.ts`) ko bhi naye rule ke saath extend karna hoga, warna woh pehli failing refresh par diverge karega -- us model mein loader kabhi fail nahi hota, toh shayad sirf naye option ko on karke failing loads add karne padenge.",
+    "why_needed": "Retry without backoff ek failing dependency par khud ka load-generator ban jaata hai.",
+    "real_world_analogy": "Busy number par baar baar call karne ke bajaye: 1 minute ruko, phir 2, phir 4 -- par 10 se zyada kabhi nahi.",
+    "how_it_works": "Per-entry failure counter + not-before timestamp. Gate stale-triggered refreshes par, reset naye entry par. Exponential growth with cap.",
+    "in_this_project": "Aaj ka code: `src/cache.ts` `getOrLoad` stale branch `if (!this.flights.has(key)) this.startLoad(key, loader, options, true);` aur `startLoad` catch. `Entry<V>` interface mein `value, weight, expiresAt, deadAt, negative`. Test helpers `test/support.ts` (`manualClock`, `flush`) aur setup pattern `test/swr.test.ts` jaisa. Neeche ka code repo mein NAHI hai.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::Entry",
+      "projects/20-cache/src/cache.ts::getOrLoad",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/swr.test.ts",
+      "projects/20-cache/test/support.ts::manualClock"
+    ],
+    "code_example": "// illustrative, NOT in the repo: changes to src/cache.ts\ninterface Entry<V> {\n  value: V; weight: number; expiresAt: number; deadAt: number; negative: boolean;\n  refreshFailures: number;   // new: failed refreshes in a row for THIS entry\n  refreshNotBefore: number;  // new: no stale-triggered refresh before this time\n}\n// LruCacheOptions: refreshBackoffMs?: number; maxRefreshBackoffMs?: number;\n// store(): this.map.set(key, { value, weight, expiresAt, deadAt: expiresAt + stale, negative, refreshFailures: 0, refreshNotBefore: 0 });\n\n// getOrLoad, stale branch\nthis.counters.staleHits++;\nthis.touch(key, entry);\nif (!this.flights.has(key) && this.now() >= entry.refreshNotBefore) this.startLoad(key, loader, options, true);\nreturn entry.value;\n\n// startLoad, catch\n} catch (error) {\n  const current = this.flights.get(key) === flight;\n  if (current) this.flights.delete(key);\n  if (!flight.controller.signal.aborted) {\n    this.counters.loadErrors++;\n    if (refresh) this.counters.refreshErrors++;\n    if (refresh && current) this.backOff(key);\n    emit(this.options.onEvent, { type: refresh ? \"refresh-error\" : \"load-error\", key, error });\n  }\n  throw error;\n}\n\nprivate backOff(key: K): void {\n  const base = this.options.refreshBackoffMs;\n  const entry = this.map.get(key);\n  if (base === undefined || entry === undefined) return;\n  entry.refreshFailures++;\n  const delay = Math.min(base * 2 ** (entry.refreshFailures - 1), this.options.maxRefreshBackoffMs ?? Infinity);\n  entry.refreshNotBefore = this.now() + delay;\n}\n\n// illustrative, NOT in the repo: test/swr-backoff.test.ts\nimport { describe, expect, it, vi } from \"vitest\";\nimport { LruCache } from \"../src/index.js\";\nimport { flush, manualClock } from \"./support.js\";\n\ndescribe(\"refresh backoff\", () => {\n  it(\"waits 50, then 100, then the 150 cap between failed refreshes; a set resets it\", async () => {\n    const clock = manualClock(1000);\n    const c = new LruCache<string, number>({ maxEntries: 10, ttlMs: 100, staleMs: 10_000, refreshBackoffMs: 50, maxRefreshBackoffMs: 150, now: clock.now });\n    c.set(\"k\", 1);\n    clock.advance(100); // stale\n    const failing = vi.fn(async () => { throw new Error(\"db down\"); });\n    const read = async () => { expect(await c.getOrLoad(\"k\", failing)).toBe(1); await flush(); };\n    await read(); // refresh 1 fails -> next not before +50\n    await read(); // too early: no refresh\n    expect(failing).toHaveBeenCalledTimes(1);\n    clock.advance(50);\n    await read(); // refresh 2 fails -> +100\n    clock.advance(99);\n    await read();\n    expect(failing).toHaveBeenCalledTimes(2);\n    clock.advance(1);\n    await read(); // refresh 3 fails -> min(200, 150)\n    clock.advance(149);\n    await read();\n    expect(failing).toHaveBeenCalledTimes(3);\n    c.set(\"k\", 5); // a new entry: no backoff\n    clock.advance(100);\n    expect(await c.getOrLoad(\"k\", async () => 6)).toBe(5);\n    await flush();\n    expect(c.peek(\"k\")).toBe(6);\n  });\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Failing DB par refresh pressure exponentially kam",
+      "State entry ke saath jeeti aur marti hai -- leak nahi",
+      "Default off, purana behaviour same"
+    ],
+    "disadvantages": [
+      "Recovery ke baad pehla refresh delay tak ruk sakta hai",
+      "Ek aur option aur do fields; model test extend karna padega",
+      "Jitter ke bina bahut keys sync mein retry kar sakti hain"
+    ],
+    "common_mistakes": [
+      "Backoff state alag Map mein rakhna aur delete/evict par saaf na karna",
+      "Plain miss ko bhi gate karna -- waiting caller ko na error na value",
+      "Non-current refresh ki failure se naye entry ko penalize karna"
+    ],
+    "follow_up_questions": [
+      "Jitter kaise add karoge aur test kaise karoge?",
+      "Grace khatam hone ke baad backoff ka kya role hai?",
+      "`TwoLevelCache` par iska kya asar hoga?"
+    ],
+    "concepts": [
+      "backoff",
+      "stale-while-revalidate",
+      "retry",
+      "coding-exercise"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Entry par state rakhne se lifecycle free mein milta hai, par Entry object thoda bada (har entry par do numbers). Alternative Map chhota par cleanup bugs ka risk.",
+      "failure_scenarios": "Clock: monotonic `performance.now()` use hota hai, toh wall-clock jump se backoff nahi bigadta. Hung refresh par backoff kuch nahi karta -- loader timeout phir bhi chahiye.",
+      "alternatives": "Circuit breaker per loader (projects/18 ka breaker) -- ek failing DB par saari keys ke refresh rok de, sirf ek key nahi. Ya global token bucket on refreshes.",
+      "scale_10x_100x": "10k hot keys outage mein: bina backoff 10k back-to-back refresh streams; backoff ke saath cap tak har key ka rate gir jaata hai. Jitter ke bina retries sync ho sakti hain.",
+      "production_improvements": "Jitter add karo, `refresh-error` ke saath delay bhi event mein do, aur per-dependency circuit breaker ko loader ke andar combine karo."
+    }
+  },
+  {
+    "id": "CKT-048",
+    "project_slug": "p20-cache",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a loader-timeout helper so a hung loader cannot hold a key's flight forever (NOT in the repo), plus a test.",
+    "answer_hinglish": "README Known kehta hai: 'A loader that never settles and ignores its signal keeps the key's flight forever for callers without a signal: put a timeout inside the loader'. Refresh ke liye aur bura: naya refresh start nahi hota aur grace ke baad sab callers stuck refresh join karte hain. cache-kit khud timeout nahi lagata -- loader ki responsibility hai. Toh ek chhota wrapper likhte hain jo kisi bhi `Loader<V>` ko time-limited bana de.\n\nApproach: `withLoadTimeout(loader, ms)` ek naya `Loader<V>` return karta hai. Andar `AbortSignal.timeout(ms)` aur cache ka signal `AbortSignal.any([...])` se combine (Node 20.3+, jo PLAN ka minimum hai). Combined signal original loader ko pass hota hai -- taaki DB driver ko bhi pata chale ki ruk jao. Aur ek promise race: combined signal abort ho toh reject karo, chahe loader signal ignore kare. Timeout ka error message alag taaki logs mein 'timed out' dikhe.\n\nKyun yeh cache ke contract ke saath fit hota hai: timeout par loader ka promise reject hota hai -> `startLoad` ka catch -> flight detach -> sab waiters ko error -> error cache nahi -> agla call fresh load. `loadErrors` badhta hai kyunki cache ka apna controller abort nahi hua (aborted loads hi error count se bahar hain). Refresh ke case mein: `refresh-error`, stale value bachi, agla stale read retry.\n\nTest real timers ke saath chhote ms (30) par -- repo ka 'Redis hanging' test bhi real 30 ms timer use karta hai. Do callers ek hung loader par: dono timeout error paate hain, loader ka signal aborted, stats `loads: 1, coalesced: 1, loadErrors: 1`, aur agla call naya load. tombstoneMs ko is timeout se upar rakhna (CKT-040) tab meaningful hota hai.",
+    "why_needed": "Bina timeout ke ek hung DB call ek key ko permanently stuck kar sakta hai -- aur `TwoLevelCache` ka tombstone guarantee bhi loader timeout maan ke chalta hai.",
+    "real_world_analogy": "Kisi ko bazaar bhejo aur bolo '30 minute mein nahi aaye toh hum maan lenge nahi mila, aur tum bhi wapas aa jaana' -- intezaar karne wale atke nahi rehte.",
+    "how_it_works": "Promise race: loader vs abort of a combined signal (caller-side cache signal + timer signal). Combined signal loader ko diya jaata hai taaki cooperative cancellation bhi ho.",
+    "in_this_project": "Aaj ke contracts: `src/cache.ts` mein `export type Loader<V> = (signal: AbortSignal, context: LoadContext) => Promise<V> | V`, aur catch mein `if (!flight.controller.signal.aborted)` -- isliye timeout ek load error ginta hai. Repo ka `withTimeout` (`src/two-level.ts`) sirf Redis calls ke liye hai, loaders ke liye nahi. Neeche ka helper repo mein NAHI hai.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::Loader",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/src/two-level.ts::withTimeout",
+      "projects/20-cache/test/load.test.ts"
+    ],
+    "code_example": "// illustrative, NOT in the repo: src/load-timeout.ts\nimport type { Loader } from \"./cache.js\";\n\nexport function withLoadTimeout<V>(loader: Loader<V>, ms: number): Loader<V> {\n  if (!(Number.isFinite(ms) && ms > 0)) throw new RangeError(\"ms must be a finite number > 0\");\n  return (signal, context) => {\n    const timer = AbortSignal.timeout(ms);\n    const both = AbortSignal.any([signal, timer]); // Node 20.3+\n    return new Promise<V>((resolve, reject) => {\n      const onAbort = () => reject(timer.aborted ? new Error(`load timed out after ${ms} ms`) : both.reason);\n      if (both.aborted) return onAbort();\n      both.addEventListener(\"abort\", onAbort, { once: true });\n      Promise.resolve()\n        .then(() => loader(both, context)) // a sync throw becomes a rejection\n        .then(resolve, reject)\n        .finally(() => both.removeEventListener(\"abort\", onAbort));\n    });\n  };\n}\n\n// illustrative, NOT in the repo: test/load-timeout.test.ts\nimport { describe, expect, it } from \"vitest\";\nimport { LruCache } from \"../src/index.js\";\nimport { withLoadTimeout } from \"../src/load-timeout.js\";\n\ndescribe(\"withLoadTimeout\", () => {\n  it(\"a hung loader fails after the timeout, the flight is released, the next call loads again\", async () => {\n    const c = new LruCache<string, number>({ maxEntries: 10 });\n    let seen: AbortSignal | undefined;\n    const hung = withLoadTimeout<number>((s) => ((seen = s), new Promise<number>(() => {})), 30);\n    const all = [c.getOrLoad(\"k\", hung), c.getOrLoad(\"k\", hung)];\n    for (const p of all) await expect(p).rejects.toThrow(/timed out after 30 ms/);\n    expect(seen!.aborted).toBe(true); // the driver was told to stop too\n    expect(c.stats()).toMatchObject({ loads: 1, coalesced: 1, loadErrors: 1 });\n    expect(await c.getOrLoad(\"k\", withLoadTimeout(async () => 7, 30))).toBe(7);\n  });\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Koi key hamesha stuck nahi",
+      "Loader ko cooperative cancellation signal bhi milta hai",
+      "Cache code mein koi badlaav nahi -- pure wrapper"
+    ],
+    "disadvantages": [
+      "Har load par ek timer aur ek combined signal",
+      "Timeout ke baad bhi signal ignore karne wala loader background mein chalta reh sakta hai",
+      "Real timers wala test thoda slow"
+    ],
+    "common_mistakes": [
+      "Timeout sirf caller side par lagana (cache ka flight phir bhi stuck)",
+      "Loader ko combined signal ki jagah original signal dena",
+      "Listener na hatana -- long-lived cache signal par leak"
+    ],
+    "follow_up_questions": [
+      "Timeout ko error kyun maana, aborted load kyun nahi?",
+      "tombstoneMs ko is timeout se kaise relate karoge?",
+      "Refresh aur normal load ke liye alag timeout chahiye?"
+    ],
+    "concepts": [
+      "timeouts",
+      "abort-signal",
+      "coding-exercise",
+      "promises"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-049",
+    "project_slug": "p20-cache",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "Is TwoLevelCache consistent across replicas? Defend the design: what it guarantees, what it deliberately does not, and what you would change for data that must never be stale.",
+    "answer_hinglish": "Strongly consistent nahi hai, aur design yeh claim karta bhi nahi -- README: 'This is a cache, not a consistency protocol'. Interview mein isko teen parts mein bolunga.\n\nGuarantees jo code aur tests prove karte hain: (1) process ke andar, delete/set/clear ke baad koi purana load stale value nahi likh sakta (flight versions). (2) Redis mein, load ka late write newer `set` ya tombstone ko overwrite nahi kar sakta (SET NX, tombstoneMs ke andar) -- real race test 20 rounds har baar A ki value. (3) Connected replicas ko invalidation milta hai aur woh L1 se key drop karte hain; reconnect par poora L1 clear, confirmed SUBSCRIBE ke baad. (4) L1 copy Redis copy se lambi nahi jeeti (PTTL cap). (5) Redis outage kabhi read fail nahi karta.\n\nJo deliberately nahi: linearizability; message delivery guarantee (pub/sub fire-and-forget); windows (a)-(g) README wali; cross-replica `clear()`; cross-replica single flight (N replicas = N loads possible). Yeh trade-offs simplicity ke liye: bring-your-own client, teen chhote interfaces, koi Lua nahi.\n\nJo data kabhi stale nahi hona chahiye (balance, stock count, permissions revoke) -- pehla jawab: use is cache se mat padho, ya L1 bypass karo. Agar caching zaroori hai toh options: har read par source se ek sasta version check (row version / updated_at) aur mismatch par reload; RESP3 client tracking jahan Redis khud invalidations push karta hai (not implemented); ya Redis Streams jisse reconnecting replica miss hue invalidations replay kare (not implemented). Aur saath mein bahut chhota L1 TTL. Har option latency ya complexity mein kimat leta hai -- isliye default design 'bounded staleness, short TTL' hai.",
+    "why_needed": "Senior interviews mein 'kya yeh consistent hai?' ka sahi jawab exact guarantees aur unke limits hain, marketing nahi.",
+    "real_world_analogy": "Bank ka passbook (L1) aur branch ka ledger (Redis) aur head office core banking (DB). Passbook update karna convenience hai; balance ka final sach head office hi hai, aur bade transfer se pehle wahi check hota hai.",
+    "how_it_works": "Eventual consistency with bounded staleness: writes source of truth mein, cache best-effort invalidation + TTL. Race-prone writes server-side conditional (NX) se guarded, time-bounded (tombstone).",
+    "in_this_project": "Guarantees ke tests: `test/load.test.ts` (no stale writes), `test/two-level.test.ts` (dono race orders, disconnected subscriber, outage), `test/redis-l2.test.ts` (real race, CLIENT KILL). Non-guarantees: README 'Known and NOT changed' aur 'NOT implemented' (CLIENT TRACKING, Streams, Cluster/Sentinel, clear across replicas).",
+    "implementation_files": [
+      "projects/20-cache/README.md",
+      "projects/20-cache/PLAN.md",
+      "projects/20-cache/src/two-level.ts::TwoLevelCache",
+      "projects/20-cache/src/cache.ts::isCurrent",
+      "projects/20-cache/test/redis-l2.test.ts"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Har guarantee test se backed",
+      "Simple, dependency-free design",
+      "Staleness ke knobs clear: TTL, tombstoneMs, loader timeout"
+    ],
+    "disadvantages": [
+      "Strong consistency nahi",
+      "Message loss ka sirf blunt mitigation (full L1 clear) aur TTL",
+      "Cross-replica stampede possible"
+    ],
+    "common_mistakes": [
+      "Cache ko source of truth jaisa use karna",
+      "Pub/sub ko guaranteed delivery samajhna",
+      "Critical reads ke liye lambi TTL"
+    ],
+    "follow_up_questions": [
+      "Version check per read ka cost kitna hoga?",
+      "CLIENT TRACKING kaise kaam karta hai?",
+      "Cross-replica single flight kaise banaoge?"
+    ],
+    "concepts": [
+      "consistency",
+      "distributed-cache",
+      "trade-offs",
+      "system-design"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Simplicity (pub/sub, NX, TTL) vs strictness (versions, leases, tracking). Is project ne simplicity choose ki aur har bachi window document ki. Strict designs har read par latency ya har write par Lua/version keys maangte.",
+      "failure_scenarios": "Partition, half-open subscriber, Redis failover (sab replicas L1 clear -> refill burst), slow loads > tombstoneMs, `set` false. Har ek bounded hai par zero nahi.",
+      "alternatives": "Lease-based invalidation (memcache leases), CDC (DB binlog) se invalidation, per-read version check, RESP3 CLIENT TRACKING, Redis Streams. Saare 'NOT implemented'.",
+      "scale_10x_100x": "10x replicas: invalidation fan-out 10x, cross-replica loads per key 10x tak (har replica apna). 100x: Redis read hot keys par bottleneck ho sakta hai; tab per-key cross-replica lock ya request routing by key sochna padega. Measured nahi.",
+      "production_improvements": "Data ko staleness tolerance se classify karo, critical paths bypass karein, `set`/`delete` false par retry ya alert, aur invalidation lag (publish se `invalidated` event tak) ko metric banao."
+    }
+  },
+  {
+    "id": "CKT-050",
+    "project_slug": "p20-cache",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "How does stale-while-revalidate behave across replicas when Redis holds only the fresh TTL and the stale grace lives in each replica's L1?",
+    "answer_hinglish": "PLAN ka decision: 'Redis holds only the fresh TTL; the stale grace is per replica.' Redis mein value sirf fresh TTL tak; har replica ka L1 us ke baad apni `staleMs` grace mein stale value serve karta hai.\n\nFlow: replica A ka L1 entry stale hua. `getOrLoad` purani value turant deta hai aur ek refresh flight start karta hai. Refresh ek ordinary flight hai, toh woh bhi `loadThrough` se jaata hai -- yaani PEHLE Redis padhta hai. Agar replica B ne already refresh karke Redis mein naya value likh diya, A ko loader call nahi karni padti: Redis hit, L1 copy ko `min(PTTL, call TTL)` milta hai. Test 'stale-while-revalidate: a refresh reads L2 first, so a value another replica already refreshed costs no load': A refresh loader se karta hai (v2), phir B ka stale read B ke refresh ko Redis mein v2 dikhata hai, `bLoader` call nahi hota, B ka L1 v2.\n\nAgar Redis mein kuch nahi (expire ho gaya), refresh loader chalata hai aur NX se Redis likhta hai. Do replicas ek saath stale hon aur Redis khaali ho, dono loader chala sakte hain -- per replica single flight hai, cross-replica nahi. Pehla NX jeetega, doosre ka write `l2WritesSkipped`. Toh N replicas = worst case N loader calls per key per refresh cycle.\n\nKyun grace Redis mein nahi? Agar Redis stale value bhi rakhta, toh har replica ko alag se pata karna padta ki Redis value fresh hai ya stale, aur kaun refresh karega -- ek distributed coordination problem. Per-replica grace ke saath Redis ka matlab simple: 'jo hai woh fresh hai'. Refresh ki value apne call ke `ttlMs` / `staleMs` ke saath store hoti hai (`startLoad` options se). Negative values ko grace nahi milti, Redis mein bhi unka short TTL (`loadedTtl`).",
+    "why_needed": "Multi-replica deployment mein SWR ka fayda tabhi hai jab refresh ek replica ka kaam doosre ke liye bhi useful ho -- warna har replica DB ko hit karega.",
+    "real_world_analogy": "Har branch ke paas purana price list hai jo kuch din aur chal sakta hai. Naya list lene se pehle branch regional office (Redis) check karti hai -- agar doosri branch pehle hi head office se le aayi aur wahan rakh di, toh head office jaane ki zaroorat nahi.",
+    "how_it_works": "Grace = L1-only concept. Refresh = L1 flight jiska loader L2-first hai. L2 sirf fresh values hold karta hai, NX se first-writer-wins.",
+    "in_this_project": "`src/two-level.ts` `loadThrough` (hit par TTL cap, miss par loader + NX write-behind) aur `TwoLevelCache.getOrLoad` jo `l1.getOrLoad` delegate karta hai; class comment 'L1 (with its single flight, stale-while-revalidate and negative caching) -> Redis -> loader'. `src/cache.ts` `startLoad` refresh ko `context.refresh = true` deta hai. PLAN 'Stage 2 decisions'.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::loadThrough",
+      "projects/20-cache/src/two-level.ts::getOrLoad",
+      "projects/20-cache/src/cache.ts::startLoad",
+      "projects/20-cache/test/two-level.test.ts",
+      "projects/20-cache/PLAN.md"
+    ],
+    "code_example": "// real, test/two-level.test.ts (trimmed)\nconst { clock, replica } = cluster({ ttlMs: 100, staleMs: 1000 });\nawait a.c.getOrLoad(\"1\", user(\"v1\"));\nawait b.c.getOrLoad(\"1\", user(\"never\")); // from L2\nawait a.c.flush();\nclock.advance(100); // both stale, Redis copy gone\nexpect(await a.c.getOrLoad(\"1\", user(\"v2\"))).toEqual({ name: \"v1\" }); // stale; A refreshes from the loader\nawait flush();\nawait a.c.flush();\nconst bLoader = vi.fn(user(\"never\"));\nexpect(await b.c.getOrLoad(\"1\", bLoader)).toEqual({ name: \"v1\" }); // stale; B's refresh finds v2 in Redis\nawait flush();\nexpect(bLoader).not.toHaveBeenCalled();",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek replica ka refresh baaki replicas ke liye bhi kaam ka",
+      "Redis semantics simple: jo hai fresh hai",
+      "SWR ke liye koi naya L2 code nahi"
+    ],
+    "disadvantages": [
+      "Cross-replica refresh dedupe nahi -- N replicas N loads kar sakte",
+      "Har replica apni grace mein alag purani value dikha sakta hai"
+    ],
+    "common_mistakes": [
+      "Stale value Redis mein bhi rakhna aur fresh/stale ka flag na rakhna",
+      "Sochna ek replica ka refresh doosre replicas ke L1 update karta hai -- nahi, sirf Redis",
+      "Refresh ko Redis skip karwana"
+    ],
+    "follow_up_questions": [
+      "Cross-replica refresh dedupe ke liye kya chahiye (lock, lease)?",
+      "Refresh-ahead yahan kaise help karta?",
+      "Negative value ka refresh kaise behave karta hai?"
+    ],
+    "concepts": [
+      "stale-while-revalidate",
+      "two-level-cache",
+      "distributed-cache",
+      "refresh"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Per-replica grace + fresh-only Redis = koi coordination nahi, par cross-replica dedupe bhi nahi. Redis mein grace rakhne se coordination (kaun refresh kare) problem aati.",
+      "failure_scenarios": "Redis down: refresh loader se, write fail, har replica apna load. Ek replica ka refresh fail: woh stale serve karta rehta hai jabki doosra replica already fresh ho sakta hai -- replicas temporarily alag values.",
+      "alternatives": "Redis mein `SET NX` based refresh lock (ek replica refresh kare, baaki stale serve karein), leases, ya refresh-ahead (stale hone se pehle refresh -- NOT implemented).",
+      "scale_10x_100x": "Replicas 10x: worst case 10x loader calls per hot key per TTL cycle jab Redis copy expire ho. 100x par yeh DB ke liye significant -- tab refresh lock ya jittered TTLs chahiye.",
+      "production_improvements": "Har replica ki TTL mein thoda jitter (sab ek saath stale na hon), `refreshes` vs `l2Hits` metric se dekho kitne refreshes Redis se serve hue, aur zaroorat ho toh NX-based refresh lock."
+    }
+  },
+  {
+    "id": "CKT-051",
+    "project_slug": "p20-cache",
+    "category": "Architecture & System Design",
+    "difficulty": "Intermediate",
+    "question": "Why is TwoLevelCache a wrapper around LruCache instead of an l2 option inside LruCache, and what role does the load context play in that design?",
+    "answer_hinglish": "PLAN ka reason: L2 async hai, L1 synchronous rehna chahiye. `LruCache` ke `get`, `set`, `delete`, `peek`, `has` sab sync hain -- O(1) aur bina await. Agar `LruCache` mein `l2` option hota, toh `set`/`delete` ko Redis await karna padta aur saare methods async ban jaate, ya phir sync methods chupchap Redis ko fire-and-forget karte. Wrapper ke saath: `l1` sync rehta hai, aur `TwoLevelCache` ke `set` / `delete` async hain aur `Promise<boolean>` dete hain.\n\nDoosra reason: Redis read L1 ke loader ke andar hai, toh single flight, stale-while-revalidate aur negative caching L2 par 'unchanged' apply hote hain. Wrapper sirf ek loader banata hai: `(signal, context) => this.loadThrough(...)`.\n\nIs composition ka seam hai load context -- loader ka doosra argument: `ttlMs`, `refresh`, `isCurrent()`. PLAN: 'exactly what an L2 needs', aur 'Recommended over special-casing Redis inside LruCache'. `ttlMs` loader ko value ka TTL badalne deta hai -- L2 hit par PTTL se cap. `isCurrent()` batata hai ki load abhi bhi key ka version hai -- Redis likhne se pehle check, taaki woh value Redis mein na jaaye jo L1 khud store nahi karega. Aur `l1.loadedTtl(value, ttl)` Redis ko wahi TTL deta hai jo L1 copy ko mila (negative ho toh short). `defaultTtlMs` getter `set()` ko Redis mein L1 ka default TTL dene deta hai.\n\nFayda: `LruCache` Redis ke baare mein kuch nahi jaanta, aur load context generic hai -- koi bhi loader HTTP `max-age` se TTL set kar sakta hai (README). `index.ts` ka comment: 'no framework, no runtime dependency'. Redis client bhi bring-your-own: `L2Client` (teen methods) aur `L2Subscriber` (ek method).",
+    "why_needed": "Layering galat ho toh har naya feature core class ko complex banata hai. Sahi seam se L2, framework helpers, sab bahar se plug hote hain.",
+    "real_world_analogy": "Ek achha rasoiya (L1) jo sirf khana banata hai. Godown se maal mangwana ek alag helper ka kaam hai jo rasoiye ke 'saaman lao' wale step mein plug hota hai -- rasoiya godown ka address nahi jaanta.",
+    "how_it_works": "Composition over configuration: core ek generic extension point (loader + context) deta hai; feature (L2) us point ko implement karta hai. Sync/async boundary wrapper par.",
+    "in_this_project": "`src/two-level.ts`: `readonly l1: LruCache<string, V>`, `getOrLoad` delegate, `set` mein `this.l1.set(...)` phir Redis, `redisTtl(options.ttlMs ?? this.l1.defaultTtlMs)`. `src/cache.ts`: `LoadContext` interface, `loadedTtl`, `defaultTtlMs` getter (comment 'TwoLevelCache reads it'). Stage 3 helpers (`Loadable` in `src/adapters/http.ts`) dono -- `LruCache<string, V>` aur `TwoLevelCache<V>` -- ko structurally accept karte hain.",
+    "implementation_files": [
+      "projects/20-cache/src/cache.ts::LoadContext",
+      "projects/20-cache/src/cache.ts::loadedTtl",
+      "projects/20-cache/src/two-level.ts::TwoLevelCache",
+      "projects/20-cache/src/adapters/http.ts::Loadable",
+      "projects/20-cache/PLAN.md"
+    ],
+    "code_example": "// real, src/cache.ts\nexport interface LoadContext {\n  ttlMs: number | undefined; // the loader may change it (TwoLevelCache: from Redis's PTTL)\n  readonly refresh: boolean; // true for a stale-while-revalidate background refresh\n  isCurrent(): boolean;      // still the key's load version: no delete / set / clear since it started\n}\nexport type Loader<V> = (signal: AbortSignal, context: LoadContext) => Promise<V> | V;",
+    "code_language": "typescript",
+    "advantages": [
+      "L1 sync aur fast rehta hai",
+      "L2 ko saari L1 guarantees free mein",
+      "Load context doosre use cases (HTTP max-age) ke liye bhi"
+    ],
+    "disadvantages": [
+      "Do objects: `cache.l1` aur `cache` -- galat wale par `set` karna (L1 only) easy hai",
+      "Keys L2 ke liye string hi honi chahiye"
+    ],
+    "common_mistakes": [
+      "`cache.l1.delete` call karna jab `cache.delete` chahiye tha (Redis aur doosre replicas tak nahi jaayega)",
+      "L1 ko async bana dena sirf L2 ke liye",
+      "Loader mein `isCurrent()` ignore karke kahin aur likhna"
+    ],
+    "follow_up_questions": [
+      "L2 ke liye keys string kyun?",
+      "Load context backward compatible kaise hai?",
+      "Teesra level (CDN) kaise add karoge?"
+    ],
+    "concepts": [
+      "composition",
+      "layering",
+      "two-level-cache",
+      "api-design"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "CKT-052",
+    "project_slug": "p20-cache",
+    "category": "Architecture & System Design",
+    "difficulty": "Senior/System Design",
+    "question": "For cross-replica invalidation, compare Redis pub/sub (what cache-kit uses), Redis Streams and RESP3 client-side caching (CLIENT TRACKING). Why pub/sub here, and what would make you switch?",
+    "answer_hinglish": "cache-kit pub/sub use karta hai: `set`/`delete` ke baad `PUBLISH` channel par `[instanceId, key]`, har replica ka subscriber key L1 se drop karta hai, sender apna message `id` se ignore karta hai. Channel default `prefix + \"invalidate\"`.\n\nPub/sub: simplest. Koi state nahi, koi consumer bookkeeping nahi. Kamzori: fire-and-forget -- disconnected subscriber messages kho deta hai. cache-kit ka mitigation: reconnect (confirmed SUBSCRIBE) par poora L1 clear, aur short L1 TTL as safety net. Half-open connection sirf TTL se bounded.\n\nRedis Streams: durable log. Har replica apni last-read ID yaad rakhe aur reconnect par wahan se replay kare -- toh missed invalidations bhi mil jaate, poora L1 clear nahi karna padta. PLAN: 'durable but needs consumer bookkeeping per replica' -- har replica ka offset, stream ki trimming (MAXLEN), aur naya replica kahan se start kare. Zyada moving parts.\n\nRESP3 CLIENT TRACKING: Redis khud yaad rakhta hai kis client ne kaunsi key padhi, aur key badalne par usko invalidation push karta hai. App ko publish karna hi nahi padta -- koi bhi write (doosre app se bhi) invalidate karta hai. PLAN: 'needs RESP3 and a client that supports it'; README: ioredis 5 ka default RESP2 hai. Tracking ki apni memory cost aur reconnect semantics bhi hain.\n\nTeeno mein se Streams aur CLIENT TRACKING dono 'NOT implemented' hain. Switch kab: agar L1 TTL lamba rakhna zaroori ho (reconnect par full clear mehenga ho) -> Streams. Agar Redis ko doosre services bhi likhte hain jo cache-kit ka publish nahi karte -> tracking, kyunki pub/sub sirf cache-kit ke apne `set`/`delete` ko cover karta hai. Redis Cluster par classic pub/sub saare nodes par broadcast hota hai (generic Redis knowledge) -- yahan cluster test nahi hua.",
+    "why_needed": "Invalidation transport cache consistency ki reedh ki haddi hai. Har option ka failure mode alag hai, aur galat choice ya toh complexity ya chupi hui staleness laati hai.",
+    "real_world_analogy": "Pub/sub = loudspeaker announcement (jo nahi sun raha, chook gaya). Streams = notice board register (wapas aake padh sakte ho). Tracking = har customer ka personal SMS jab uska order badle -- dukaan yaad rakhti hai kisne kya liya.",
+    "how_it_works": "Push invalidation ke teen models: at-most-once broadcast (pub/sub), at-least-once log with consumer offsets (Streams), server-side read tracking with push (CLIENT TRACKING).",
+    "in_this_project": "`src/two-level.ts`: `invalidateOthers` (`JSON.stringify([this.id, key])`), `onMessage` (malformed message -> `l2-error` op `message`, apna `id` ignore), `onResubscribed` (L1 clear). `L2Subscriber` interface itna chhota hai (ek `subscribe`) ki Streams-based subscriber bhi usi interface ke peeche likha ja sakta tha -- par woh NOT implemented hai. README 'NOT implemented': RESP3 client-side caching, Streams instead of pub/sub, Redis Cluster / Sentinel specifics.",
+    "implementation_files": [
+      "projects/20-cache/src/two-level.ts::invalidateOthers",
+      "projects/20-cache/src/two-level.ts::onMessage",
+      "projects/20-cache/src/two-level.ts::L2Subscriber",
+      "projects/20-cache/PLAN.md",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// real, src/two-level.ts\nprivate async invalidateOthers(key: string): Promise<boolean> {\n  const ok = (await this.call(\"publish\", key, () => this.redis.publish(this.channel, JSON.stringify([this.id, key])))) !== FAILED;\n  if (ok) this.counters.invalidationsSent++;\n  return ok;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Pub/sub: zero state, chhota adapter",
+      "Message format simple aur validated",
+      "Interface itna chhota ki transport badalna possible"
+    ],
+    "disadvantages": [
+      "Message loss ka sirf blunt fix (full L1 clear)",
+      "Sirf cache-kit ke writes invalidate hote hain, Redis ke doosre writers nahi",
+      "Har replica ko ek extra connection"
+    ],
+    "common_mistakes": [
+      "Pub/sub ko queue samajhna",
+      "Streams ko 'bas reliable pub/sub' samajhna -- offsets aur trimming bhoolna",
+      "Tracking ko RESP2 client ke saath expect karna"
+    ],
+    "follow_up_questions": [
+      "Streams-based subscriber `L2Subscriber` ke peeche kaise likhoge?",
+      "Sharded pub/sub (Redis 7) cluster mein kya badalta hai?",
+      "Tracking ki memory cost Redis par kaise control hoti hai?"
+    ],
+    "concepts": [
+      "pub-sub",
+      "redis-streams",
+      "client-tracking",
+      "cache-invalidation",
+      "system-design"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Pub/sub simplicity vs Streams durability vs tracking automation. cache-kit ne pub/sub + TTL safety net choose kiya kyunki 'bring your own client' aur chhote interfaces goal the.",
+      "failure_scenarios": "Pub/sub: disconnect/half-open par lost messages. Streams: consumer lag, trimming se purane entries gaye toh replay incomplete. Tracking: client reconnect par tracking state reset, invalidation flood on mass writes.",
+      "alternatives": "DB CDC (binlog) se invalidations, message broker (Kafka) topic, ya cache hi na rakhna critical data ke liye.",
+      "scale_10x_100x": "Replicas 10x: pub/sub fan-out 10x per write, Redis ke liye usually sasta. Writes 100x: invalidation traffic aur L1 churn badhega; batching ya coarse invalidation (prefix) sochna padega -- jo yahan nahi hai.",
+      "production_improvements": "Invalidation lag metric, publish failures par alert (`set`/`delete` false), aur agar Redis ke doosre writers hain toh ya toh woh bhi publish karein ya tracking/CDC par move karo."
+    }
+  }
+]

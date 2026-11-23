@@ -497,6 +497,37 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 19, slug: "p20-cache", dir: "projects/20-cache", name: "Cache Library (cache-kit)",
+    tagline: "An in-process LRU cache with single-flight loading, stale-while-revalidate and an optional Redis layer shared by every replica -- plus Express and NestJS helpers.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "Redis (optional L2)", "Express + NestJS helpers", "Vitest"],
+    features: [
+      "LRU bounded by entries and by weight, TTL with lazy expiry and an optional background sweep; checked against a naive model over 8 seeds x 3000 random steps",
+      "Single-flight loading: 100 concurrent misses run the loader once (no cache stampede); errors are shared but never cached; a load is aborted only when every waiting caller has gone",
+      "Stale-while-revalidate (one background refresh per key) and negative caching (1000 lookups of a missing id -> 1 loader call)",
+      "Two-level cache: in-process L1 + Redis L2 shared by replicas, pub/sub invalidation, every Redis call time-bounded so an outage degrades to L1 + loader",
+      "A real-Redis test found a cross-replica race (a slow load overwriting a newer write) -- fixed with SET NX and short-lived delete tombstones",
+      "The benchmark found evictions walking the holes in V8's Map table (10.4 us per evicting insert); one long-lived iterator brought it to about 0.55-0.66 us",
+      "Express cachedJson and NestJS @CachedRoute / @Cached: cache handler data with a required key (per-user data in the key), X-Cache hit / stale / miss / bypass",
+      "Built in three stages (the first two by delegated agents in separate worktrees, reviewed and merged); 119 distinct deliberate code breaks (99 over stages 1-2, 20 in stage 3): every behaviour-changing one caught, 3 shown to be equivalent",
+    ],
+    tests: "178 passing, incl. real Redis, real Express 4 and NestJS 10 apps, and two Express instances sharing one Redis L2",
+    run: "docker compose -f infra/docker-compose.yml up -d redis && cd projects/20-cache && npm ci && npm test && npm run bench",
+    docs: ["README", "PLAN"],
+    benches: [
+      {
+        title: "Per-operation cost on a 10 000-entry cache, before vs after the eviction fix", unit: "ns per operation", log: true,
+        note: "Windows 11 PC, AMD Ryzen 5 4500, Node 20.20.1; single thread, median of 7 rounds of 1 000 000 operations after warm-up. 'before' = a fresh Map iterator per eviction; 'after' = one long-lived iterator (two runs). The PC was busy: read the numbers as orders of magnitude.",
+        source: "projects/20-cache/bench/reference-results/2026-11-23-win32-before-iterator-fix.json", series: ["before fix", "after fix, run 1", "after fix, run 2"],
+        rows: [
+          { label: "set (evicts LRU)", "before fix": 10401.9, "after fix, run 1": 548.8, "after fix, run 2": 664.6 },
+          { label: "set existing key", "before fix": 548.2, "after fix, run 1": 279.8, "after fix, run 2": 346.4 },
+          { label: "get hit", "before fix": 562.1, "after fix, run 1": 413.7, "after fix, run 2": 403.9 },
+          { label: "get miss", "before fix": 51.9, "after fix, run 1": 48.6, "after fix, run 2": 60.2 },
+        ],
+      },
+    ],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);

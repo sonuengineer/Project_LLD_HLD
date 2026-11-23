@@ -297,7 +297,7 @@ Keys are strings. L1 is your `LruCache` (its TTL, grace, negative caching and li
 
 ## What the tests show
 
-`npm test` -- 175 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files; stage 3 added 27):
+`npm test` -- 178 tests in `test/` (stage 1: 67; stage 2 added 84 and extended two stage-1 files; stage 3 added 27):
 
 | File | Proves |
 |---|---|
