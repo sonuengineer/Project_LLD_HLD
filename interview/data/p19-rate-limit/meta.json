@@ -1,0 +1,198 @@
+{
+ "project_slug": "p19-rate-limit",
+ "project": "Rate limiter library, built by hand (A20)",
+ "source_dir": "projects/19-rate-limit",
+ "summary": "A TypeScript library (ratelimit-kit, private package, zero runtime dependencies, Node 20+) that rate-limits any Node app with two algorithms: a token bucket (bursts up to a capacity, then a steady refill rate; lazy refill with no timer; a clock going backwards neither adds nor removes tokens) and a sliding window counter (this window's count + the previous window's count weighted by the share still inside the sliding window; approximate, O(1) memory per client, denied requests not counted). Stage 1: each algorithm exists twice -- a TypeScript step() used by MemoryStore, and project 1's Lua script reused unchanged and run by RedisStore with EVALSHA (NOSCRIPT -> SCRIPT LOAD, SHA checked, one retry; other errors such as READONLY passed through; Redis's own TIME by default via an empty time argument; an unexpected reply shape is an error, never a guessed decision). The app brings its own Redis client through a two-method interface (evalsha, scriptLoad); an ioredis adapter is included. A parity test against a real Redis 7 runs the same seeded random sequence (3 seeds x 200 steps per algorithm, 3 keys, costs 1-3) through both versions and requires identical decisions; it caught a precision bug in the first TypeScript version, which replied from the value rounded like Lua's tostring (%.14g, 14 significant digits) instead of the full-precision variable -- failed at step 91 of seed 1 with resetMs 1135 vs 1136; fixed by replying from the full value and storing the rounded one (luaToString). Atomicity: 3 clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed; sliding window 200 concurrent, limit 40 -> exactly 40. MemoryStore is bounded by maxKeys (LRU, default 100 000; dropping a key resets that client; 100 000 keys with maxKeys 1000 stay at 1000) and has no per-key expiry (mutation M3 showed the earlier expiry check changed no decision, so it was removed). RateLimiter validates before touching the store: non-empty key of at most 512 characters, integer cost >= 1, and a cost above the limit is a RateLimitError. Stage 2: Express middleware (ratelimit-kit/express, written against Node http types, tested with Express 4.21.2) and a NestJS @RateLimit decorator that attaches a guard instance with no DI (ratelimit-kit/nestjs, tested with NestJS 10.4.15 on platform-express), stackable (first denial wins), a key returning undefined = not limited by that limiter, cost per request; RateLimit-Limit / RateLimit-Remaining / RateLimit-Reset headers (seconds, rounded up) and a 429 with Retry-After (at least 1 s) and a generic rate_limited body. Safe client IP: X-Forwarded-For ignored by default (5 requests with 5 forged addresses -> 2 allowed, 3 denied), trustedProxies: n reads the n-th entry from the right, IPv4-mapped IPv6 normalised, IPv6 keyed per /64, zone id dropped, a non-IP -> not limited by IP. Two Express instances sharing one Redis: 30 concurrent requests -> exactly 10 allowed. Stage 3: FailoverStore(primary, { guard, fallback, onError }) -- a structural guard with resilience-kit's execute(op, signal) shape, e.g. its CircuitBreaker + TimeoutPolicy (a hanging store got the fallback's answer after a 100 ms timeout; an open breaker called a dead store only 3 times for 10 checks); a MemoryStore fallback whose decisions are marked degraded (per instance, up to N x the limit with N instances); no fallback or a failing fallback -> StoreUnavailableError; a throwing onError is contained. Both adapters take onStoreError per limit: error (default, the framework's error handling), allow (fail open, no RateLimit headers) or deny (fail closed: 503, Retry-After 5, rate_limit_unavailable -- 503 not 429); a RateLimitError (a bug) is never failed open, and neither is an error thrown by the app's own key or cost function (both run outside the store call; the first stage-3 version computed the cost inside it, so a throwing cost function failed open with allow -- found while writing this interview bank and fixed, with a test per adapter); onStoreError covers every other error from consume, not only StoreUnavailableError; tested with a real ioredis client pointed at a closed port. Load test (bench/load.mjs: 3 Express instances as separate Node processes on one Redis, client round-robin with 32 concurrent connections; Windows 11, Ryzen 5 4500, Node 20.20.1, Redis 7 in Docker on the same PC): run 1, one shared key with a sliding window limit of 500 -> exactly 500 allowed and 503 denied across the 3 instances, versus 1116 allowed and 0 denied with per-instance MemoryStores; run 2 sent only 410 requests to the shared key and proves nothing about the cap, and its memory run (956 allowed, 0 denied) did not reach a per-instance limit either. Throughput was NOT validly measured: the CPU was at 90% (run 1) and 100% (run 2) from other programs, and no limiter came out slower than with a limiter (348 vs 490 and 161 vs 256 req/s), which cannot be real; the numbers stay in the JSON files but no conclusion is drawn. 91 tests pass (Windows, Node 20), 10 of them against a real Redis 7. Mutation checks on the final stage 3 code against all 90 tests (the 91st, a throwing cost function, was added afterwards): 51 breaks (24 stage 1, 15 stage 2, 12 stage 3), 49 caught, 2 equivalent (S6: max(retry, 1) never changes the value; H5: a zone id only sits in the last group, which the /64 key never keeps); from the first stage-1 run, M3 exposed the redundant memory expiry and L3 (clock going backwards) survived and got a sharper test; stage 3's 12 were all caught at the first run. Not implemented: a valid throughput / latency measurement (needs an idle machine or a separate load generator), merging the fallback's per-instance counts back into Redis, cancelling an in-flight Redis call (a timeout only stops waiting), Redis Cluster (not tested; the sliding window builds two keys inside the script without declaring them in KEYS; hash tags not done), the newer combined RateLimit / RateLimit-Policy header fields, NestJS on Fastify, an Express 5 test, Koa / Hono adapters, a tested node-redis adapter (documented only), npm publishing.",
+ "pitch": {
+  "intro_30s": "Maine ek rate limiting library khud banayi hai, TypeScript mein, bina runtime dependency -- token bucket aur sliding window counter, memory mein ya Redis mein Lua script se atomically, taaki kitne bhi app instances ek hi limit share karein. Express middleware aur NestJS decorator, safe client IP, aur Redis down hone par har limit ke liye fail open ya fail closed. 91 tests, aur 51 mutation checks mein 49 caught, 2 equivalent.",
+  "explain_2min": "Har public API ko rate limit chahiye: login par brute force, OTP spam, ya ek client jo saari capacity kha jaaye. Project 1 mein maine paanch algorithms Python service ke andar Redis Lua scripts ki tarah banaye the; yeh project unmein se do sabse useful ko ek TypeScript library banata hai jo koi bhi Node app use kar sake.\n\nStage 1: token bucket (capacity tak burst, phir steady rate) aur sliding window counter (lagbhag N per window, O(1) memory). Har algorithm do baar likha hai -- TypeScript step() MemoryStore ke liye, aur project 1 ka Lua script unchanged RedisStore ke liye. Redis mein poora read-decide-write ek script hai, toh atomic hai: 3 clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed. Do implementations ka risk yeh hai ki dev (memory) aur production (Redis) alag behave karein, isliye ek parity test real Redis ke against same seeded random sequence dono mein chalata hai aur identical decisions maangta hai. Isne meri pehli TypeScript version ka precision bug pakda: resetMs 1135 vs 1136.\n\nStage 2: Express middleware aur NestJS @RateLimit decorator, RateLimit-* headers, 429 + Retry-After. Sabse important part client IP hai: X-Forwarded-For client khud likh sakta hai, toh default mein ignore, aur trusted proxies hon toh right se padhna. IPv6 per /64. Do Express instances ek Redis par: 30 concurrent requests, exactly 10 allowed.\n\nStage 3: Redis down. FailoverStore ek guard (resilience-kit ka breaker + timeout) ke through Redis try karta hai; fail ho toh MemoryStore fallback, decisions degraded marked. Fallback na ho toh har limit khud decide karti hai: general API limit fail open, login limit fail closed -- 503, 429 nahi. Bug kabhi fail open nahi hota.\n\nLoad test: 3 instances, shared limit 500 -> exactly 500 allowed. Throughput maine claim nahi kiya: PC 90-100% busy tha aur 'no limiter' limiter se slow aaya, jo real ho hi nahi sakta. 91 tests, 51 mutation checks, 49 caught, 2 equivalent.",
+  "deep_5min": "Ek login request ki poori journey, Express se Redis tak aur wapas.\n\nSetup. Module level par ek baar: loginLimit = new RateLimiter({ algorithm: slidingWindow({ limit: 5, windowMs: 15 minute }), store, prefix: 'rl:login:' }). Store hai new FailoverStore(new RedisStore(ioredisClient(redis)), { guard: wrap(new CircuitBreaker({ openMs: 10000 }), new TimeoutPolicy({ ms: 50 })) }) -- guard resilience-kit se, lekin yeh package usse import nahi karta, sirf execute() ka shape chahiye. Route: app.post('/login', rateLimit(loginLimit, { key: keyByIp({ trustedProxies: 1 }), onStoreError: 'deny' }), login).\n\nKey. Middleware pehle keyFn(req) await karta hai. keyByIp clientIp() call karta hai: trustedProxies 1 hai, toh X-Forwarded-For ki entries plus socket address ek chain banti hai, aur right se ek proxy chhod ke jo entry hai woh client hai -- woh address jo hamare nginx ne append kiya, client ka likha hua left wala nahi. Phir ipKey(): ::ffff:1.2.3.4 ko 1.2.3.4 banata hai, zone id hatata hai; IPv4 ho toh 'ip:1.2.3.4', IPv6 ho toh pehle chaar hextets ka /64 key. IP hi nahi toh undefined, aur undefined matlab yeh limiter is request par apply nahi hota -- seedha next().\n\nRateLimiter. consume(key, cost) store chhoone se pehle validate karta hai: non-empty, 512 characters tak, cost integer >= 1, aur cost limit se zyada ho toh RateLimitError -- aisi request kabhi allow ho hi nahi sakti, toh retry time dena jhooth hota. Phir prefix lagta hai: 'rl:login:ip:1.2.3.4'.\n\nFailoverStore. primary.consume ko guard.execute ke through chalata hai: breaker closed hai toh call aage jaati hai, timeout ka 50 ms timer chalu.\n\nRedisStore. load() Lua file ek baar padhta hai aur uska SHA1 cache karta hai. now option nahi diya, toh time argument EMPTY string. Args: limit, window, '', cost. ioredisClient isse evalsha(sha, 1, key, ...args) banata hai. Script Redis mein na ho (restart, SCRIPT FLUSH, failover) toh NOSCRIPT: store SCRIPT LOAD karta hai, lauta SHA check karta hai, aur ek baar retry. Koi aur error, jaise READONLY, seedha upar -- retry nahi.\n\nLua. sliding_counter.lua mein ARGV[3] empty hai toh redis.call('TIME') -- saare app instances Redis ki ghadi use karte hain, apni drift wali nahi. cur_start = now - now % window; current aur previous window ki keys '<key>:<start>' se banti hain. estimated = cur + prev x (window - elapsed) / window. estimated + cost > limit ho toh deny: retry = window ka baaki time ya woh time jab previous window ka weighted hissa kaafi nikal jaaye, jo pehle aaye; script INCRBY se pehle return karta hai, toh denied request count nahi hoti. Warna INCRBY aur PEXPIRE window x 2. Sab ek script mein, toh doosra instance beech mein ghus hi nahi sakta.\n\nDecision. toDecision check karta hai ki reply 4 numbers ka array hai; nahi toh error, guess nahi. Decision: allowed, limit, remaining, retryAfterMs, resetMs.\n\nResponse. Allowed: RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset (seconds, rounded up), phir next() aur login chalta hai. Denied: wahi headers plus Retry-After (kam se kam 1), status 429, body rate_limited -- login handler chalta hi nahi.\n\nAb Redis down. Redis hang kare toh TimeoutPolicy 50 ms par wait band karti hai (Redis call khud cancel nahi hoti, clients AbortSignal nahi lete); connection refused ho toh error turant. Failures se breaker open hota hai, phir openMs tak Redis ko call hi nahi kiya jaata. Is setup mein fallback nahi hai, toh FailoverStore error onError ko deta hai (agar diya ho) aur StoreUnavailableError cause ke saath throw karta hai. Middleware dekhta hai: RateLimitError nahi hai, mode 'deny' hai -> 503, Retry-After: 5, body rate_limit_unavailable, login nahi chalta. Redis down hone se attacker ko unlimited password guesses nahi milte. Agar MemoryStore fallback hota, toh har instance apna count rakhta aur decision degraded: true -- 3 instances matlab 5 ki jagah 15 tak attempts.\n\nSabse mushkil decisions. Pehla, do implementations aur parity test: memory ke liye alag simple version aasaan tha, lekin dev se production jaate hi behaviour chupke se badal jaata; parity ne dikhaya ki precision tak match chahiye -- Lua tostring 14 significant digits store karta hai, lekin reply full-precision variable se deta hai. Doosra, X-Forwarded-For: left-most entry trust karna har limit ko bypassable bana deta hai, isliye default 0 trusted proxies. Teesra, fail open vs fail closed per limit, 503 not 429, aur bug kabhi open nahi. Chautha, failover ek Store wrapper hai, adapter logic nahi, toh Express aur Nest dono ko ek jagah se milta hai. Paanchwa, load test ke throughput numbers maine result nahi maane: sirf correctness claim ki.",
+  "architecture_walkthrough": "src/types.ts: Decision (allowed, limit, remaining, retryAfterMs, resetMs, optional degraded), Algorithm<S> interface (name, limit, luaFile, args(), step(state, now, cost); pehle ek stateTtlMs() bhi tha jo kahin use nahi hota tha -- dead code samajh ke hata diya), RateLimitError (bug / bad input, kabhi fail open nahi) aur StoreUnavailableError. src/algorithms.ts: tokenBucket aur slidingWindow -- options validate karte hain (positive, windowMs integer), TypeScript step() jo Lua ka mirror hai, kaunsi Lua file aur uske ARGV; luaToString = Number(x.toPrecision(14)), Lua tostring jaisi rounding. src/lua/token_bucket.lua: HMGET tokens/ts, naya key full bucket, lazy refill math.max(now - ts, 0) ke saath, cost ho toh le lo warna retry = ceil((cost - tokens) x 1000 / rate), HSET tostring(tokens), PEXPIRE capacity/rate + 1 s. src/lua/sliding_counter.lua: '<key>:<window start>' wali do keys GET, weighted estimate, deny par INCRBY se pehle return, allow par INCRBY + PEXPIRE window x 2. Dono project 1 se unchanged copy, provenance line ke saath; ARGV[3] empty ho toh Redis TIME. src/redis-store.ts: RedisScriptClient (evalsha, scriptLoad), ioredisClient adapter (structural, ioredis import nahi), RedisStore -- script source aur SHA1 cache, EVALSHA, NOSCRIPT par SCRIPT LOAD + SHA check + ek retry, toDecision jo 4-number reply ke alawa sab reject karta hai. src/memory-store.ts: MemoryStore -- Map ki insertion order LRU ki tarah (delete + set = most recently used), maxKeys (default 100 000) se upar oldest drop; koi per-key expiry nahi. src/limiter.ts: Store interface (consume(algorithm, key, cost)) aur RateLimiter -- key aur cost validation store chhoone se pehle, prefix (default 'rl:'). src/failover-store.ts: Guard interface (execute(op, signal?)) aur FailoverStore -- guard ke through primary, fail par onError (throw contained), fallback ka decision degraded: true ke saath, fallback nahi ya woh bhi fail toh StoreUnavailableError with cause. src/adapters/http.ts: framework-free helpers -- clientIp (trustedProxies, right se), ipKey (IPv4, mapped IPv6, /64, zone id), keyByIp, rateLimitHeaders aur setHeaders, 429 aur 503 bodies, OnStoreError type, STORE_UNAVAILABLE_RETRY_AFTER_S = 5. src/adapters/express.ts: rateLimit(limiter, { key, cost, headers, onStoreError }) middleware -- async IIFE jiske errors .catch(next) se Express tak jaate hain. src/adapters/nestjs.ts: RateLimitGuard (CanActivate, limiter apne paas, DI nahi) aur @RateLimit() = applyDecorators(UseGuards(new RateLimitGuard(...))); 429 aur 503 HttpException se. src/index.ts: core exports; express aur nestjs alag entry points (package.json exports), @nestjs/common optional peer dependency. scripts/copy-lua.mjs: build par Lua files dist/ mein. test/: 7 files, 91 tests (algorithms 17, limiter 13, redis 9, ip 24, express 10, nestjs 5, failover 13); vitest.config.ts mein 20 s timeouts aur fileParallelism false (Redis tests ek server share karte hain). bench/load.mjs: 3 Express processes ek Redis par, results bench/reference-results/ mein.",
+  "difficult_decisions": [
+   "Har algorithm do baar (TypeScript step() aur Lua) aur unke beech parity test, memory ke liye alag simple implementation ki jagah. Warna tests aur dev memory par ek behaviour dikhate aur production Redis par doosra, aur koi notice nahi karta. Cost: precision tak match karna padta hai -- Lua tostring 14 significant digits store karta hai, toh TypeScript bhi stored value luaToString se round karta hai (mutation L1 parity test fail karta hai), lekin reply full-precision value se.",
+   "Project 1 ke Lua scripts unchanged reuse kiye (provenance line ke saath), aur client bring-your-own: sirf do methods, evalsha aur scriptLoad. Package ki koi runtime dependency nahi aur app apna ek Redis connection pool rakhta hai; ioredis adapter included, node-redis ka adapter README mein documented hai lekin tested nahi. EVALSHA + NOSCRIPT fallback chuna, har request par EVAL nahi, taaki script body sirf restart ke baad ek baar jaaye.",
+   "Redis ka apna clock (TIME) default: store empty time argument bhejta hai. App servers ki ghadiyan drift karti hain; agar har instance apna Date.now bheje toh ek hi key par alag instances alag 'now' bolenge. Tests apna clock inject karte hain, aur ek test exactly check karta hai ki bina clock ke argument '' hai (mutation R4 isko pakadta hai).",
+   "X-Forwarded-For default mein ignore, aur trustedProxies: n ho toh RIGHT se n-th entry. Har hop header mein likhta hai, client bhi; left-most trust kiya toh har request par nayi fake IP aur nayi limit. IPv6 ko /64 par key kiya kyunki ek subscriber aam taur par poora /64 control karta hai aur address rotate karke fresh limit le sakta. Express test: 5 forged addresses -> 2 allowed, 3 denied.",
+   "Fail open vs fail closed PER LIMIT (onStoreError: error / allow / deny), global nahi. Capacity wali API limit ke liye sabko refuse karna thodi der bina limit ke chalne se bura hai, toh allow; login / OTP / password reset ke liye attacker ko Redis down hone par unlimited guesses nahi milne chahiye, toh deny. Deny 503 + Retry-After 5 deta hai, 429 nahi -- problem server ki hai, client ki nahi. Aur RateLimitError (bug) kabhi fail open nahi hota, allow ke saath bhi error handler tak jaata hai.",
+   "Failover ek Store wrapper hai (FailoverStore), adapter logic nahi, aur guard structural hai. 'Redis ki jagah kya' ek jagah, har framework ke liye same; adapters sirf decide karte hain ki jab kuch bhi na ho toh request ko kya mile. resilience-kit ka breaker + timeout plug ho jaata hai bina packages ke beech dependency ke -- failover test usse dynamic import se laata hai."
+  ],
+  "biggest_challenges": [
+   "Parity test ka pakda hua precision bug: pehli TypeScript version stored value ko luaToString se round karti thi aur PHIR usi rounded value se reply (remaining, resetMs) banati thi. Lua script ka reply full-precision variable se banta hai -- sirf HSET mein tostring rounding hoti hai. Parity test seed 1 ke step 91 par fail hua: resetMs 1135 vs 1136. Fix: reply full value se, store rounded value. Lesson: 'same algorithm' ka matlab hai same arithmetic, same order, same rounding point -- ek millisecond ka farq bhi decision badal sakta hai.",
+   "Mutation M3 ne redundant code dikhaya: MemoryStore ke pehle version mein lazy per-key expiry check tha. Mutation run mein expiry ignore karne se koi test fail nahi hua. Survivor ka matlab weak test bhi ho sakta tha, lekin yahan reason yeh tha ki dono algorithms long-idle state ko already no-state jaisa treat karte hain (bucket full refill, do window peeche wali window match hi nahi hoti). Toh expiry ne koi decision nahi badla -- sirf memory free karti, aur memory maxKeys already bound karta hai. Expiry hata di, aur ek test add hai ki din bhar idle key bilkul fresh key jaisa jawab deti hai.",
+   "Mutation L3 weak test: 'clock backwards tokens badalta hai' wala break pehle stage-1 run mein survive kar gaya -- matlab us waqt ka test is galti ko pakad nahi paata tha. Test ko sharp kiya: ab ka naam 'a clock going backwards neither adds nor REMOVES tokens' hai aur woh exact remaining 8 check karta hai -- max(.., 0) ke bina 5 s peeche jaane par bucket 5 tokens kho deta aur 3 bachte. Lesson: test ko property ke dono taraf check karna chahiye.",
+   "Load test ka invalid throughput: dono runs mein 'no limiter' 'with a limiter' se SLOW aaya (run 1: 348 vs 490 req/s, run 2: 161 vs 256) -- jo real effect ho hi nahi sakta, kyunki limiter extra kaam hai. PC ka CPU doosre programs se 90% aur 100% par tha. Maine numbers JSON mein rakhe lekin koi conclusion nahi nikala; sirf correctness claim kiya (run 1: exactly 500 of 500 across 3 instances). Run 2 ne shared key par sirf 410 requests bheji, limit tak pahuncha hi nahi, toh woh cap ke baare mein kuch prove nahi karta -- yeh bhi README mein likha hai.",
+   "Coverage gap pehle dhundhna: stage 3 ka mutation run karne se pehle maine list banayi ki kya cover nahi hai, aur Nest ke liye 'a bug is never failed open' test add kiya. Isliye stage 3 ke 12 breaks pehli run mein hi sab caught the. Do equivalent mutants (S6 aur H5) ko maine test likh ke 'kill' karne ki koshish nahi ki -- README mein likha kyun woh by design catch nahi ho sakte."
+  ],
+  "failure_scenarios": [
+   "Redis hang (partition, overload): bina timeout ke har request Redis ke jawab ka wait karti. FailoverStore ka guard TimeoutPolicy wait band karta hai (test mein never-answering store, 100 ms baad fallback ka jawab), lekin Redis call khud cancel nahi hoti kyunki client AbortSignal nahi leta. Breaker open hone ke baad openMs tak Redis call hi nahi hota (test: 10 checks, dead store sirf 3 baar call hua).",
+   "Redis down aur fallback nahi: StoreUnavailableError, phir onStoreError. 'allow' wali API limit: request bina limit ke aur bina RateLimit headers ke jaati hai (200, 200, 200). 'deny' wali login limit: 503, Retry-After 5, rate_limit_unavailable, route nahi chalta. Default 'error': Express next(err) / Nest ka 500. Yeh real ioredis client ko closed port par point karke test kiya.",
+   "Redis down aur MemoryStore fallback: limit chalti rehti hai lekin per instance -- N instances matlab N x limit tak (closed-port test mein capacity 2 -> 200, 200, 429; load test mein MemoryStore ke saath 500 ki limit par 1116 allowed). Decisions degraded: true. Redis wapas aane par fallback ke counts merge nahi hote; Redis mein wahi state hai jo outage se pehle thi (ya expire ho chuki).",
+   "Redis restart, SCRIPT FLUSH ya failover: script cache khaali, EVALSHA par NOSCRIPT. Store SCRIPT LOAD karta hai, SHA match check karta hai aur ek baar retry -- test SCRIPT FLUSH ke baad bhi sahi decision dikhata hai. Agar client replica par chala gaya aur READONLY aaye, toh woh error retry nahi hota, seedha upar jaata hai (test: evalsha sirf ek baar call).",
+   "Client limit bypass karne ki koshish: forged X-Forwarded-For default mein ignore; IPv6 address rotation ek /64 ke andar ek hi key; IPv4-mapped IPv6 aur plain IPv4 ek hi client. Galat trustedProxies setting (asli proxies se zyada) phir bhi client ko left wali entry control karne de sakti hai -- yeh deploy karne wale ki zimmedari hai.",
+   "Distinct keys ka flood (bahut saari IPs) MemoryStore par: maxKeys (default 100 000) se upar least recently used key drop hoti hai, memory bounded rehti hai (100 000 keys, maxKeys 1000 -> 1000). Trade-off: drop hui key ka client fresh limit ke saath shuru karta hai. Redis par har key ka PEXPIRE hai, toh idle keys khud hat jaati hain."
+  ],
+  "improvements": [
+   "Valid throughput / latency measurement: abhi ka load test busy PC par tha (CPU 90-100%), toh numbers invalid hain. Idle machine par ya alag load-generator host se dobara chalana, aur per-check latency bhi measure karna (project 1 ne Lua scripts Python se measure kiye the; yahan repeat nahi kiya).",
+   "Redis Cluster support: abhi tested nahi. Token bucket ek declared key use karta hai, lekin sliding window script ke andar do keys '<key>:<window start>' banata hai jo KEYS mein declare nahi hain; cluster mein woh doosre node par ho sakti hain aur Redis non-local key refuse karta hai. Key mein hash tag (jaise {user42}) sab ko ek slot mein rakhega -- na kiya na tested.",
+   "Degraded counts merge back: Redis down rehne ke dauraan har instance ka MemoryStore alag ginta hai, aur Redis wapas aane par woh counts Redis mein nahi jaate. Ek option: degraded period ke allowed counts ko Redis mein INCRBY karna, ya recovery ke baad thodi der stricter limit -- abhi implement nahi.",
+   "Newer header fields: abhi IETF draft ke RateLimit-Limit / RateLimit-Remaining / RateLimit-Reset bhejta hai. Naye drafts ke combined RateLimit aur RateLimit-Policy fields nahi bheje jaate; ek option ke peeche add karne chahiye.",
+   "Zyada frameworks aur clients: NestJS sirf platform-express par tested hai, Fastify par nahi; Express adapter Node http types par likha hai lekin Express 5 ka test nahi chala; Koa / Hono adapters nahi hain; node-redis adapter sirf documented hai, tested nahi.",
+   "npm publish: package abhi private hai. Publish ke liye versioning, changelog aur CI chahiye, aur CI mein Redis service taaki 10 Redis tests skip na hon."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Token bucket with lazy refill",
+   "steps": [
+    "1. Concept: bucket mein capacity tak tokens; har request cost jitne tokens leti hai; tokens refillPerSec ki rate se wapas aate hain. Burst allow hota hai, phir steady rate.",
+    "2. Project need: zyada tar API limits aise hi hote hain -- thoda burst theek hai, lekin lagataar load nahi. Aur koi background timer nahi chahiye jo har client ka bucket bhare.",
+    "3. Code/API: algorithms.ts tokenBucket({ capacity, refillPerSec }) -> Algorithm; step(state, now, cost); token_bucket.lua mein wahi logic HMGET / HSET ke saath.",
+    "4. Detail: naya key full bucket; elapsed = max(now - ts, 0) (ghadi peeche jaaye toh na add na remove); tokens = min(capacity, tokens + elapsed x rate / 1000); deny par koi token nahi jaata aur retry = ceil((cost - tokens) x 1000 / rate); Redis key ka PEXPIRE capacity/rate + 1 s, kyunki tab tak bucket full ho chuka hota.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/algorithms.test.ts -t 'token bucket' -- burst 5 ke baad retryAfterMs 1000; half token par deny aur retry 250; clock backwards par remaining exactly 8.",
+    "6. Interviewer next: token bucket vs leaky bucket kya farq hai, aur capacity aur refill rate kaise choose karoge?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/algorithms.ts",
+    "projects/19-rate-limit/src/lua/token_bucket.lua",
+    "projects/19-rate-limit/test/algorithms.test.ts"
+   ]
+  },
+  {
+   "concept": "Sliding window counter",
+   "steps": [
+    "1. Concept: fixed window ka edge burst (window ke end aur next ke start par 2x) avoid karne ke liye: estimate = is window ka count + previous window ka count x previous window ka jo hissa abhi bhi sliding window mein hai.",
+    "2. Project need: login / OTP jaisi 'N per window' limits jo window edges par smooth rahein, aur memory per client O(1) ho -- sliding LOG har request ka timestamp rakhta.",
+    "3. Code/API: algorithms.ts slidingWindow({ limit, windowMs }); sliding_counter.lua mein '<key>:<window start>' wali do keys.",
+    "4. Detail: weight = (window - elapsed) / window; estimated + cost > limit -> deny, aur script INCRBY se pehle return karta hai (denied count nahi hoti); retry = window ka baaki time ya previous ka weighted hissa kaafi nikalne ka time, jo kam ho; approximate -- exact sirf jab previous window ki requests evenly spread hon; do window peeche wali count nahi hoti.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/algorithms.test.ts -t 'sliding window' -- 10 pichhli window mein, 25% andar -> 7.5 count, deny par retry exactly 3000 ms; denied requests window end se 1 ms pehle tak count nahi.",
+    "6. Interviewer next: is approximation ka worst-case error kya hai, aur sliding log kab better hai?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/algorithms.ts",
+    "projects/19-rate-limit/src/lua/sliding_counter.lua",
+    "projects/19-rate-limit/test/algorithms.test.ts"
+   ]
+  },
+  {
+   "concept": "Atomicity in Redis: Lua, EVALSHA / NOSCRIPT, Redis TIME",
+   "steps": [
+    "1. Concept: read -> decide -> write agar teen alag commands hon toh do instances ek saath last token padh ke dono allow kar dete hain (race). Lua script Redis mein ek atomic step chalta hai.",
+    "2. Project need: kitne bhi app instances ek limit share karein aur limit exactly hold kare; aur saare instances 'now' par agree karein.",
+    "3. Code/API: redis-store.ts RedisScriptClient (evalsha, scriptLoad), ioredisClient(client), new RedisStore(client, { now? }).",
+    "4. Detail: script source aur SHA1 ek baar cache; EVALSHA; NOSCRIPT par SCRIPT LOAD, SHA match check, ek retry; doosre errors (READONLY) retry nahi; now option na ho toh time argument '' aur script redis.call('TIME') padhta hai; reply 4 numbers ka array na ho toh error.",
+    "5. Demo: docker compose -f infra/docker-compose.yml up -d redis, phir cd projects/19-rate-limit && npx vitest run test/redis.test.ts -- 'atomic across instances' (3 clients, 300 requests, capacity 50 -> exactly 50), 'NOSCRIPT after SCRIPT FLUSH', 'errors other than NOSCRIPT are passed through'.",
+    "6. Interviewer next: Lua script lamba chale toh Redis par kya asar hota hai, aur Redis Cluster mein yeh scripts kaise chalenge (yahan tested nahi)?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/redis-store.ts",
+    "projects/19-rate-limit/src/lua/token_bucket.lua",
+    "projects/19-rate-limit/src/lua/sliding_counter.lua",
+    "projects/19-rate-limit/test/redis.test.ts"
+   ]
+  },
+  {
+   "concept": "Parity between two implementations",
+   "steps": [
+    "1. Concept: ek hi algorithm do jagah (TypeScript aur Lua) ho toh unhe ek dusre ke against test karo: same input sequence, identical output -- differential testing.",
+    "2. Project need: dev aur tests MemoryStore par, production RedisStore par; dono alag hue toh switch karte hi behaviour chupke se badal jaata.",
+    "3. Code/API: redis.test.ts ka parity() -- mulberry32 seeded PRNG, ek MemoryStore aur ek RedisStore limiter same injected clock ke saath; algorithms.ts luaToString.",
+    "4. Detail: har step random time jump, 3 keys mein se ek, cost 1-3; har step par expect(redis).toEqual(memory); 3 seeds x 200 steps per algorithm, aur check ki allowed aur denied dono hue. Lua tostring '%.14g' store karta hai, toh TypeScript stored value round karta hai, lekin reply full value se -- pehli version ne rounded value se reply kiya aur seed 1 step 91 par resetMs 1135 vs 1136 se fail hua.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/redis.test.ts -t 'IDENTICAL' -- dono parity tests; mutation L1 (full precision store) yahi test fail karta hai.",
+    "6. Interviewer next: seed kyun, aur failing sequence ko minimal case tak kaise shrink karoge?"
+   ],
+   "files": [
+    "projects/19-rate-limit/test/redis.test.ts",
+    "projects/19-rate-limit/src/algorithms.ts",
+    "projects/19-rate-limit/src/lua/token_bucket.lua",
+    "projects/19-rate-limit/README.md"
+   ]
+  },
+  {
+   "concept": "RateLimiter validation and a bounded MemoryStore",
+   "steps": [
+    "1. Concept: input validation store se pehle, aur client-controlled keys wali map ko bound karna (LRU).",
+    "2. Project need: keys IPs aur user ids se aati hain -- unbounded Map ek memory attack hai; aur galat cost ya key ek bug hai jise chupna nahi chahiye.",
+    "3. Code/API: limiter.ts RateLimiter({ algorithm, store, prefix }) aur consume(key, cost = 1); memory-store.ts new MemoryStore({ maxKeys, now }).",
+    "4. Detail: key non-empty, 512 characters tak; cost safe integer >= 1; cost > limit -> RateLimitError (kabhi allow nahi ho sakti); prefix har limit alag rakhta hai. MemoryStore: delete + set se key most recently used end par, size > maxKeys toh Map ki pehli key drop -- woh client reset ho jaata hai. Per-key expiry nahi (M3 ne dikhaya kuch nahi badalta).",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/limiter.test.ts -- 'rejects ... before touching the store', '100 000 distinct keys with maxKeys 1000 stay at 1000', 'a long-idle key behaves exactly like a new one'.",
+    "6. Interviewer next: LRU eviction ka attacker kaise faayda utha sakta hai, aur Redis store mein memory kaise bound hoti hai (PEXPIRE)?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/limiter.ts",
+    "projects/19-rate-limit/src/memory-store.ts",
+    "projects/19-rate-limit/src/types.ts",
+    "projects/19-rate-limit/test/limiter.test.ts"
+   ]
+  },
+  {
+   "concept": "Who is the client: X-Forwarded-For and IPv6 /64",
+   "steps": [
+    "1. Concept: X-Forwarded-For har hop likhta hai, client bhi. Sirf apne proxies ki appended entries trust ho sakti hain, aur woh right side par hoti hain.",
+    "2. Project need: IP-based limit tabhi kaam ki hai jab client usse bypass na kar sake -- fake header ya IPv6 address rotation se.",
+    "3. Code/API: adapters/http.ts clientIp(req, trustedProxies), ipKey(address), keyByIp({ trustedProxies }).",
+    "4. Detail: trustedProxies 0 -> socket address, header ignore; n -> chain (header entries + socket) mein right se n-th; kam entries ho toh left-most available; repeated headers join. ipKey: ::ffff: prefix hatao, zone id hatao, IPv4 'ip:a.b.c.d', IPv6 expand karke pehle chaar hextets '::/64' (leading zeros normalised); IP nahi toh undefined.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/ip.test.ts, aur npx vitest run test/express.test.ts -t 'forged' -- 5 forged addresses -> 200, 200, 429, 429, 429.",
+    "6. Interviewer next: CDN ke peeche (do proxies) kya set karoge, aur carrier-grade NAT ke peeche bahut users ek IP share karein toh?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/adapters/http.ts",
+    "projects/19-rate-limit/test/ip.test.ts",
+    "projects/19-rate-limit/test/express.test.ts"
+   ]
+  },
+  {
+   "concept": "Framework adapters: middleware, guard, headers and 429",
+   "steps": [
+    "1. Concept: library ko framework se jodna -- request se key nikalna, limiter chalana, headers lagana, deny par route rokna.",
+    "2. Project need: owner ke Express aur NestJS apps; har route par manually consume() likhna repeat aur error-prone hai.",
+    "3. Code/API: adapters/express.ts rateLimit(limiter, { key, cost, headers, onStoreError }); adapters/nestjs.ts @RateLimit(limiter, options) aur RateLimitGuard; adapters/http.ts rateLimitHeaders.",
+    "4. Detail: key undefined -> yeh limiter apply nahi; stacked limiters sab apply, pehla deny jeetta hai; RateLimit-Reset seconds rounded up, Retry-After kam se kam 1; headers: false sirf allowed responses se headers hatata hai, 429 par hamesha; Express mein async errors .catch(next); Nest decorator ek guard INSTANCE lagata hai (DI nahi), controller par lagao toh saare routes ek limit share karte hain.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/express.test.ts test/nestjs.test.ts -- 'two Express instances sharing one Redis' (30 requests -> exactly 10 allowed) aur 'stacked decorators'.",
+    "6. Interviewer next: 429 vs 503 kab, aur Fastify par NestJS ke liye kya badlega (yahan tested nahi)?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/adapters/express.ts",
+    "projects/19-rate-limit/src/adapters/nestjs.ts",
+    "projects/19-rate-limit/src/adapters/http.ts",
+    "projects/19-rate-limit/test/express.test.ts",
+    "projects/19-rate-limit/test/nestjs.test.ts"
+   ]
+  },
+  {
+   "concept": "Redis down: FailoverStore, guard, fail open / fail closed",
+   "steps": [
+    "1. Concept: dependency fail ho toh do sawaal -- uski jagah kya (fallback), aur kuch bhi na ho toh request ko kya mile (fail open: allow, fail closed: deny).",
+    "2. Project need: Redis ka outage poori API band na kare, lekin login / OTP limit attacker ke liye khul bhi na jaaye.",
+    "3. Code/API: failover-store.ts new FailoverStore(primary, { guard, fallback, onError }); Guard = execute(op, signal?); adapters ka onStoreError: 'error' | 'allow' | 'deny'.",
+    "4. Detail: guard (resilience-kit TimeoutPolicy + CircuitBreaker) hanging Redis ka wait band karta hai aur open breaker Redis ko skip karta hai; fallback decision degraded: true (per instance, N x limit); fallback nahi ya woh bhi fail -> StoreUnavailableError with cause; throwing onError ignore. Adapter: RateLimitError aur throwing key / cost function hamesha error handler (dono store call ke bahar), baaki har error par onStoreError; allow -> next() bina headers; deny -> 503, Retry-After 5, rate_limit_unavailable.",
+    "5. Demo: cd projects/19-rate-limit && npx vitest run test/failover.test.ts -- 'a HANGING primary times out after 100 ms', 'once open, the dead primary is not even called' (10 checks, 3 calls), aur real ioredis client closed port par: allow 200, deny 503, fallback ke saath 200, 200, 429.",
+    "6. Interviewer next: Redis wapas aane par degraded counts ka kya (yahan merge nahi hote), aur kaunsi limits fail open rakhoge?"
+   ],
+   "files": [
+    "projects/19-rate-limit/src/failover-store.ts",
+    "projects/19-rate-limit/src/adapters/express.ts",
+    "projects/19-rate-limit/src/adapters/nestjs.ts",
+    "projects/19-rate-limit/test/failover.test.ts",
+    "projects/19-rate-limit/test/nestjs.test.ts"
+   ]
+  },
+  {
+   "concept": "Measuring honestly: mutation checks and the load test",
+   "steps": [
+    "1. Concept: mutation check = ek jaan-boojh ke daala bug, poora suite chalao, dekho koi test fail hua ya nahi. Load test = asli processes aur network ke saath correctness aur throughput.",
+    "2. Project need: '91 tests pass' yeh nahi batata ki tests kuch pakadte hain; aur 'limit across instances hold karti hai' ko load ke under dikhana chahiye.",
+    "3. Code/API: bench/load.mjs (3 Express processes, round-robin client, 32 concurrent connections, modes none / memory / redis aur memory-shared / redis-shared); results bench/reference-results/ mein; README ka 'Mutation checks' table.",
+    "4. Detail: 51 breaks (24 + 15 + 12), 49 caught, 2 equivalent (S6, H5) jinke reasons documented hain; M3 survivor ne redundant expiry dikhayi, L3 ne weak test. Load run 1: shared limit 500 -> exactly 500 allowed, 503 denied; MemoryStore ke saath 1116 allowed. Throughput invalid: CPU 90-100% busy, 'no limiter' 348 vs limiter 490 req/s (run 1) -- impossible, isliye claim nahi.",
+    "5. Demo: cd projects/19-rate-limit && npm test (91 tests, Redis ke saath), aur npm run build && node bench/load.mjs (Redis chahiye; bench/reference-results/2026-11-23-win32-load-run1.json padho).",
+    "6. Interviewer next: kaise pata chalega ki benchmark machine ki wajah se galat hai, aur equivalent mutant ko kaise pehchanoge?"
+   ],
+   "files": [
+    "projects/19-rate-limit/bench/load.mjs",
+    "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+    "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run2.json",
+    "projects/19-rate-limit/README.md",
+    "projects/19-rate-limit/vitest.config.ts"
+   ]
+  }
+ ]
+}

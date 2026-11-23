@@ -478,6 +478,25 @@ export const PROJECTS: ProjectInfo[] = [
       },
     ],
   },
+  {
+    num: 18, slug: "p19-rate-limit", dir: "projects/19-rate-limit", name: "Rate Limiter Library (ratelimit-kit)",
+    tagline: "Token bucket and sliding window limits for Express and NestJS, in memory or shared by every instance through Redis -- and a clear answer for when Redis is down.",
+    stack: ["TypeScript", "Redis + Lua", "Express + NestJS adapters", "Vitest"],
+    features: [
+      "Token bucket and sliding window counter; project 1's Redis Lua scripts reused, so the read-decide-write is one atomic step (3 clients x 300 concurrent requests at a limit of 50 -> exactly 50)",
+      "Every algorithm written twice (TypeScript for memory, Lua for Redis) and a parity test on a real Redis requires identical decisions over 600 random steps -- it caught a precision bug (Lua stores 14 significant digits)",
+      "Redis's own clock by default, so app servers whose clocks drift still agree; script reloaded automatically after a Redis restart",
+      "Express middleware and a NestJS @RateLimit decorator: RateLimit-* and Retry-After headers, stackable per-IP and per-account limits",
+      "Client IP done safely: X-Forwarded-For only from your own proxies, read from the right; IPv6 limited per /64 so address rotation does not reset the limit",
+      "Redis down: a FailoverStore with resilience-kit's breaker + timeout and a memory fallback; fail open for capacity limits, fail closed (503) for login / OTP limits",
+      "Load test with 3 app instances on one Redis: exactly 500 of 500 allowed under load (throughput was not validly measurable on the busy PC, so no speed numbers are claimed)",
+      "51 deliberate code breaks: 49 caught, 2 shown to be equivalent (they cannot change behaviour)",
+    ],
+    tests: "91 passing, incl. tests against a real Redis 7, real Express 4 and NestJS 10 apps, and two Express instances sharing one limit",
+    run: "docker compose -f infra/docker-compose.yml up -d redis && cd projects/19-rate-limit && npm ci && npm test",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);

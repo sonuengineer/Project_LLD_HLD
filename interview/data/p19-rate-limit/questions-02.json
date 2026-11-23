@@ -1,0 +1,1285 @@
+[
+ {
+  "id": "RLK-027",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Beginner",
+  "question": "Why does a distributed rate limiter need the read-decide-write to be a single atomic step? What goes wrong with GET, then decide in the app, then SET?",
+  "answer_hinglish": "Kyunki read aur write ke beech ka gap hi race condition hai. Agar app pehle `GET` karke tokens padhe, app mein decide kare 'haan, 1 token bacha hai', aur phir `SET` kare, toh do instances ek hi millisecond mein dono '1 token bacha hai' padh sakte hain. Dono allow karenge, dono `SET tokens=0` likhenge -- last token do baar kharch ho gaya. Isko lost update ya check-then-act race kehte hain.\n\nSuppose 3 app servers hain aur ek user ke liye bucket mein sirf 1 token bacha hai. Teeno servers ke paas ek ek request aati hai. Teeno GET karte hain, teeno ko 1 dikhta hai, teeno allow karte hain. Limit 1 thi, 3 requests chali gayi. Load jitna zyada, gap utna zyada exploit hota hai -- aur attacker exactly yahi karta hai: parallel burst.\n\nIs project mein poora read-decide-write ek Lua script hai (`token_bucket.lua`, `sliding_counter.lua`). Redis ek time pe ek hi script chalata hai; script ke beech koi doosra command nahi ghus sakta. Toh `HMGET` (read), refill aur `tokens >= cost` (decide), aur `HSET` (write) -- sab ek indivisible step hai. Doosri request script ke khatam hone ke baad hi state padhegi, aur usse naya tokens value dikhega.\n\nREADME yahi kehta hai: 'The whole read-decide-write runs as ONE Lua script, so it is atomic', aur test isko prove karta hai: 3 alag clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed.",
+  "why_needed": "Bina atomicity ke distributed limiter sirf low traffic par sahi dikhta hai; jab sach mein zaroorat hoti hai (burst, attack) tabhi limit tootti hai.",
+  "real_world_analogy": "Ek hi movie ticket ki last seat do counters se bik rahi hai: dono counter clerk screen dekhte hain 'seat free', dono ticket kaat dete hain. Ek central booking system jo 'check aur book' ek saath karta hai, yeh nahi hone deta.",
+  "how_it_works": "Redis commands single-threaded execute hote hain, aur `EVALSHA` se chala Lua script ek unit ki tarah chalta hai -- script ke andar ke saare `redis.call` ke beech doosre clients ke commands interleave nahi hote. Isliye state read karna, decision lena aur state likhna ek atomic transaction ban jaata hai, bina locks ke.",
+  "in_this_project": "`src/redis-store.ts` ka `RedisStore.consume` sirf `evalsha(sha, [key], args)` bhejta hai; app mein koi GET/SET nahi hai. Decision Lua ke andar hota hai: `token_bucket.lua` mein `HMGET` -> lazy refill -> `if tokens >= cost` -> `HSET` + `PEXPIRE`. `test/redis.test.ts` ka test 'atomic across instances: 3 clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed' isko real Redis par check karta hai.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/lua/token_bucket.lua::HMGET",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "-- real, src/lua/token_bucket.lua (trimmed): read, decide, write in ONE script\nlocal state = redis.call('HMGET', KEYS[1], 'tokens', 'ts')\n-- ... lazy refill ...\nif tokens >= cost then\n  tokens = tokens - cost\n  allowed = 1\nelse\n  retry = math.ceil((cost - tokens) * 1000 / rate)\nend\nredis.call('HSET', KEYS[1], 'tokens', tostring(tokens), 'ts', tostring(now))",
+  "code_language": "lua",
+  "advantages": [
+   "Koi lock, WATCH ya retry loop nahi chahiye",
+   "Ek round trip mein poora decision",
+   "Kitne bhi app instances ho, ek hi sach (Redis) hai"
+  ],
+  "disadvantages": [
+   "Script chalte waqt Redis koi aur command nahi chalata -- script chhota aur O(1) rakhna zaroori hai",
+   "Logic do jagah hai (TypeScript aur Lua), isliye parity test chahiye"
+  ],
+  "common_mistakes": [
+   "Sochna ki `INCR` atomic hai toh poora limiter atomic hai -- INCR + alag EXPIRE + alag decision atomic nahi",
+   "Single instance par test karke race 'nahi dikhi' maan lena",
+   "Decision app mein lena aur sirf counter Redis mein rakhna"
+  ],
+  "follow_up_questions": [
+   "MULTI/EXEC ya WATCH se yeh kyun nahi kiya?",
+   "Lua script lamba chale toh Redis par kya asar hota hai?",
+   "Concurrency test mein 'exactly 50' kyun maanga, 'at most 50' kyun nahi?"
+  ],
+  "concepts": [
+   "atomicity",
+   "race-condition",
+   "check-then-act",
+   "lua-script",
+   "redis"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-028",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "How do the atomicity tests in test/redis.test.ts prove the Redis store is race-free across instances, and why are the parameters (refill 0.001 per second, a 60 second window) chosen that way?",
+  "answer_hinglish": "Do tests hain, dono real Redis ke saamne. Pehla: token bucket `capacity: 50, refillPerSec: 0.001`, teen `RateLimiter` jinke paas teen ALAG ioredis clients hain (teen alag connections, jaise teen app instances), aur `Promise.all` se 300 requests ek saath -- `limiters[i % 3]` se round-robin. Assertion: allowed exactly 50. Doosra: sliding window `limit: 40, windowMs: 60_000`, do clients, 200 concurrent requests, allowed exactly 40.\n\n'Exactly' important hai. 'At most 50' sirf over-allowing pakadta; agar koi bug kuch requests ko galat deny kar de (jaise denied request ko bhi count karna), woh bhi fail hona chahiye. Exactly 50 dono direction check karta hai.\n\nParameters kyun? `refillPerSec: 0.001` ka matlab ek token 1000 second mein -- test ke chalne ke dauraan refill practically zero hai. Agar refill tez hota, toh test ke beech naye tokens aa jaate aur allowed 51 ya 52 ho sakta, aur test flaky ho jaata ya bug chhupa leta. Same reason se sliding window 60 second ka hai: 200 requests itni jaldi chalti hain ki window ka boundary cross hone ka chance kam hai.\n\nAlag clients kyun? Ek hi ioredis connection par commands pipeline mein order se jaate hain; teen connections se Redis ko sach mein alag sources se interleaved commands milte hain -- production jaisa. Agar decision app mein hota (GET phir SET), toh 300 parallel requests mein kai ek hi purana value padhte aur allowed 50 se upar jaata. Mutation U2 (Lua: denied request still counted) bhi in real-Redis tests se pakda gaya.",
+  "why_needed": "Concurrency bugs normal unit tests mein nahi dikhte. Inhe pakadne ke liye sach mein parallel load, alag connections, aur ek exact count chahiye.",
+  "real_world_analogy": "Ek darwaze par 50 passes hain aur teen gate-keepers hain. Test yeh hai: 300 log teeno gates par ek saath dhakka dein, aur andar exactly 50 hi pahunche -- na 49, na 51.",
+  "how_it_works": "`Promise.all` saare 300 `consume` ek saath shuru karta hai; har ek `EVALSHA` bhejta hai. Redis inhe ek ek karke serialize karta hai; har script naya state dekhta hai. 50 ke baad har script `tokens >= cost` false paata hai aur `allowed = 0` deta hai.",
+  "in_this_project": "`test/redis.test.ts`: 'atomic across instances: 3 clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed' aur 'sliding window is atomic too: 200 concurrent, limit 40 -> exactly 40 allowed'. Clients `client()` helper se bante hain (har call naya `new Redis(URL_)`). Redis na mile toh `describe.skipIf(!available)` se tests SKIP hote hain aur notice print hota hai -- silently pass nahi.",
+  "implementation_files": [
+   "projects/19-rate-limit/test/redis.test.ts::reachable",
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// real, test/redis.test.ts\nit(\"atomic across instances: 3 clients, 300 concurrent requests, capacity 50 -> exactly 50 allowed\", async () => {\n  const algorithm = tokenBucket({ capacity: 50, refillPerSec: 0.001 });\n  const limiters = [0, 1, 2].map(() => new RateLimiter({ algorithm, store: new RedisStore(ioredisClient(client())), prefix: PREFIX }));\n  const results = await Promise.all(Array.from({ length: 300 }, (_, i) => limiters[i % 3]!.consume(\"hot\")));\n  expect(results.filter((d) => d.allowed)).toHaveLength(50);\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Exact count dono direction ke bugs pakadta hai",
+   "Real Redis, real connections -- mock nahi",
+   "Fast aur deterministic (refill negligible)"
+  ],
+  "disadvantages": [
+   "Ek hi machine par chalta hai; network latency ya Redis failover simulate nahi karta",
+   "Redis na ho toh tests skip hote hain -- CI mein Redis zaroori hai"
+  ],
+  "common_mistakes": [
+   "Concurrency test ek hi client se chalana",
+   "Tez refill rate rakhna jisse count flaky ho jaye",
+   "Sirf `<= limit` assert karna"
+  ],
+  "follow_up_questions": [
+   "Agar yeh test kabhi 51 de toh pehle kya check karoge?",
+   "Mock Redis se yeh test kyun bekaar hota?",
+   "Sliding window test window boundary cross kare toh kya hoga?"
+  ],
+  "concepts": [
+   "concurrency-testing",
+   "atomicity",
+   "flaky-tests",
+   "real-dependencies"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-029",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Intermediate",
+  "question": "Why does RedisStore use Redis's own clock (TIME) by default instead of the app server's Date.now(), and how does the store tell the script which clock to use?",
+  "answer_hinglish": "Kyunki multiple app servers ki clocks kabhi exactly same nahi hoti -- NTP ke baad bhi milliseconds se seconds tak drift ho sakta hai. Rate limiter ka poora math 'now' par chalta hai: token bucket mein `elapsed = now - ts` se refill, sliding window mein `now - (now % window)` se window start. Agar har instance apna 'now' bheje, toh ek hi key ke liye alag alag instances alag time bolenge.\n\nCode se ek concrete problem nikalta hai: token bucket har request par `ts = now` store karta hai. Suppose instance A ki clock 5 second aage hai. A request karta hai, `ts` = A ka time. Phir B (peeche wala) request karta hai: `elapsed = max(now - ts, 0) = 0`, aur ab `ts` B ka time ban jaata hai -- 5 second peeche. Agla A request `elapsed` ~5 second dekhega aur 5 seconds ka refill de dega jo sach mein hua hi nahi. A aur B alternate karein toh har baar free tokens. Yeh meri code-reading analysis hai, test nahi; isliye default Redis TIME hai.\n\nMechanism: `RedisStoreOptions.now` undefined hai toh store time argument EMPTY string bhejta hai: `const now = this.options.now === undefined ? \"\" : String(this.options.now())`. Lua mein `if ARGV[3] == '' then local t = redis.call('TIME') ...` -- Redis apna seconds + microseconds deta hai, script usse milliseconds banata hai. Ek Redis = ek clock, toh saare instances same 'now' par agree karte hain.\n\nTests ke liye `now` inject hota hai (parity test ko time control karna hai). Test 'without a clock option the time argument is EMPTY' args `[\"1\", \"1\", \"\", \"1\"]` vs `[\"1\", \"1\", \"1234\", \"1\"]` check karta hai, aur mutation R4 (hamesha app clock bhejo) isi se pakdi gayi.",
+  "why_needed": "Distributed system mein 'abhi kitne baje hain' ka ek hi source hona chahiye, warna har node apna alag sach banata hai.",
+  "real_world_analogy": "Teen referees alag alag ghadi se match ka time count karein toh kabhi match lamba, kabhi chhota. Ek stadium clock sab dekhein toh jhagda khatam.",
+  "how_it_works": "Redis `TIME` command `[seconds, microseconds]` deta hai. Script `now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)` se ms banata hai. Store ARGV ko `[...algorithm.args(), now, String(cost)]` banata hai, toh ARGV[3] time hai aur ARGV[4] cost.",
+  "in_this_project": "`src/redis-store.ts` mein `RedisStoreOptions.now` aur `RedisStore.consume`; dono Lua scripts mein `ARGV[3] == ''` branch. `test/redis.test.ts` mein 'uses Redis's own clock by default' aur 'without a clock option the time argument is EMPTY' tests. README: 'app servers whose clocks drift still agree; the store sends an empty time argument for that (tested)'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStoreOptions",
+   "projects/19-rate-limit/src/lua/token_bucket.lua::TIME",
+   "projects/19-rate-limit/src/lua/sliding_counter.lua::TIME",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "// real, src/redis-store.ts RedisStore.consume (trimmed)\nconst now = this.options.now === undefined ? \"\" : String(this.options.now());\nconst args = [...algorithm.args(), now, String(cost)];\n\n-- real, src/lua/token_bucket.lua\nif ARGV[3] == '' then\n  local t = redis.call('TIME')\n  now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)\nelse\n  now = tonumber(ARGV[3])\nend",
+  "code_language": "typescript",
+  "advantages": [
+   "Instances ki clock drift decisions ko affect nahi karti",
+   "Tests ke liye clock inject ho sakti hai",
+   "Koi extra round trip nahi -- TIME script ke andar hi hai"
+  ],
+  "disadvantages": [
+   "Redis ki clock khud jump kare (VM pause, NTP step) toh sabko same galat time dikhega",
+   "Do alag Redis (jaise cluster ke nodes) ki clocks phir bhi alag ho sakti hain"
+  ],
+  "common_mistakes": [
+   "App ka `Date.now()` bhej dena 'kyunki NTP hai'",
+   "Clock backwards jaane par refill negative hone dena (`max(now - ts, 0)` bhool jaana)",
+   "Test clock production mein bhi pass kar dena"
+  ],
+  "follow_up_questions": [
+   "Redis ki clock peeche chali jaye toh token bucket kya karega?",
+   "Redis 7 mein script ke andar TIME aur replication ka kya relation hai?",
+   "Sliding window mein drift ho toh kaunsa bug aata?"
+  ],
+  "concepts": [
+   "clock-drift",
+   "redis-time",
+   "distributed-time",
+   "lua-argv"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-030",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "With several app instances, what limit does a MemoryStore actually enforce compared with a RedisStore, and what evidence does this project have for both?",
+  "answer_hinglish": "MemoryStore har process ki apni `Map` hai. N instances = N alag counters, toh ek client effectively N x limit tak le sakta hai (load balancer ke spread par depend karta hai). RedisStore mein saare instances ek hi key par ek hi Lua script chalate hain, toh limit exactly limit hai.\n\nEvidence teen level par hai. Pehla, deterministic test `test/express.test.ts` 'two Express instances sharing one Redis': do real Express apps, har ek ka apna ioredis client, sliding window `limit: 10, windowMs: 60_000`, key hamesha 'shared-client', 30 requests dono instances par concurrently -> exactly 10 x 200 aur 20 x 429. Yeh har `npm test` mein chalta hai (Redis ho toh).\n\nDoosra, load test `bench/load.mjs`: 3 Express instances alag Node processes mein, 32 concurrent connections round-robin, ek shared key, sliding window limit 500 per 10 minute. Run 1 (Windows 11, Ryzen 5 4500, Redis Docker mein same PC par): `redis-shared` -> exactly 500 allowed, 503 denied, kuch aur status nahi. Same setup `memory-shared` -> 1116 allowed, 0 denied. 1116 > 500 -- 'N instances, up to N x the limit' measured. 1500 tak nahi pahuncha kyunki har instance ko apne 500 tak pahunchne layak requests hi nahi mili.\n\nTeesra, honesty: run 2 mein PC slow tha, shared key ko 3 second mein sirf 410 requests gayi, toh limit tak pahuncha hi nahi -- README kehta hai yeh cap ke baare mein kuch prove nahi karta; uska memory run (956 allowed, 0 denied) bhi kisi per-instance limit tak nahi pahuncha. Throughput numbers bhi valid nahi maane gaye (CPU 90-100% busy tha), toh main sirf correctness claim karta hoon.",
+  "why_needed": "Interview mein 'Redis kyun' ka jawab sirf theory nahi, measured evidence se dena strong hota hai -- aur yeh bhi batana ki kaunsa run kuch prove nahi karta.",
+  "real_world_analogy": "Teen darwaze, har ek ka apna register: har darwaze par guard 500 gin ke rokta hai, toh total 1500 andar aa sakte hain. Ek shared register (Redis) ho toh total 500.",
+  "how_it_works": "MemoryStore: `algorithm.step(this.entries.get(key), this.now(), cost)` -- sirf local state. RedisStore: `evalsha` -> ek shared key `rl:...` par atomic script. Load test mein `mode === \"memory-shared\"` aur `\"redis-shared\"` dono `slidingWindow({ limit: LIMIT, windowMs: 600_000 })` aur `key: () => \"shared\"` use karte hain; sirf store alag hai.",
+  "in_this_project": "`test/express.test.ts` (describe 'two Express instances sharing one Redis'), `bench/load.mjs` (correctness loop), raw results `bench/reference-results/2026-11-23-win32-load-run1.json` (`allowed: 500, denied: 503`; memory `allowed: 1116`) aur `-run2.json` (`allowed: 410, denied: 0`). `src/memory-store.ts` ka comment: 'N instances -> up to N x the limit'.",
+  "implementation_files": [
+   "projects/19-rate-limit/test/express.test.ts",
+   "projects/19-rate-limit/bench/load.mjs::LIMIT",
+   "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+   "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run2.json",
+   "projects/19-rate-limit/src/memory-store.ts::MemoryStore"
+  ],
+  "code_example": "// real, bench/reference-results/2026-11-23-win32-load-run1.json (correctness part)\n\"correctness\": [\n  { \"mode\": \"memory-shared\", \"limitPerWindow\": 500, \"instances\": 3, \"allowed\": 1116, \"denied\": 0, \"other\": {} },\n  { \"mode\": \"redis-shared\",  \"limitPerWindow\": 500, \"instances\": 3, \"allowed\": 500,  \"denied\": 503, \"other\": {} }\n]",
+  "code_language": "json",
+  "advantages": [
+   "Redis: limit instance count se independent",
+   "MemoryStore: zero network, single instance ya dev ke liye sahi",
+   "Dono same algorithm code share karte hain (parity tested)"
+  ],
+  "disadvantages": [
+   "Redis: har request par ek network round trip aur ek shared dependency",
+   "MemoryStore: autoscaling ke saath effective limit badalti rehti hai"
+  ],
+  "common_mistakes": [
+   "3 instances par MemoryStore lagake socha 'limit 100 hai'",
+   "Load test ke run 2 (410 requests) ko bhi 'Redis held the limit' ka proof bolna",
+   "Busy machine ke throughput numbers ko result maanna"
+  ],
+  "follow_up_questions": [
+   "Sticky sessions se MemoryStore kaafi ho jayega kya?",
+   "Run 2 ko kaise valid banate?",
+   "Instances ko limit/N dena kab theek hai?"
+  ],
+  "concepts": [
+   "multi-instance",
+   "shared-state",
+   "load-test",
+   "evidence"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Redis correctness deta hai par ek network hop aur ek dependency add karta hai; MemoryStore free hai par limit replicas ke saath scale hoti hai. Isliye design mein dono hain, aur FailoverStore Redis down hone par memory par girta hai (degraded, per instance).",
+   "failure_scenarios": "Redis down: shared limit gayi -- FailoverStore ho toh har instance apni MemoryStore se limit karta hai (N x limit), na ho toh onStoreError decide karta hai. Load balancer uneven spread kare toh MemoryStore ka effective limit unpredictable hota hai.",
+   "alternatives": "Har instance ko limit/N dena (Redis nahi chahiye, par autoscaling par galat), sticky routing per client (failover par reset), gossip-based counters (PLAN ke 'Not in scope' mein).",
+   "scale_10x_100x": "10x instances par MemoryStore ka over-allowance 10x tak badh sakta hai; Redis ka count same rehta hai par Redis par load 10x. 100x par ek Redis hot key bottleneck ban sakta hai -- tab keys ko shard karna (cluster, hash tags) ya local pre-check sochna padega. Is repo mein woh measure nahi hua.",
+   "production_improvements": "Load test idle machine ya alag load-generator host se dobara chalao (README yahi kehta hai), `degraded` decisions ka metric export karo taaki pata chale kab limit per-instance thi, aur instance count ke saath memory-mode alert lagao."
+  }
+ },
+ {
+  "id": "RLK-031",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Why use a Lua script for atomicity instead of MULTI/EXEC, WATCH with optimistic retries, or a plain INCR plus EXPIRE?",
+  "answer_hinglish": "Kyunki rate limiter ko 'padho, phir uske basis par decide karo, phir likho' chahiye -- aur in teeno alternatives mein se sirf Lua yeh ek round trip mein, bina retry ke karta hai.\n\nMULTI/EXEC: commands queue hote hain aur saath execute hote hain, lekin queue karte waqt tumhe pichle command ka result nahi milta. Token bucket ko pehle tokens padhne hain, phir refill calculate karna hai, phir `tokens >= cost` par branch karna hai. MULTI ke andar branch nahi ho sakta, toh read MULTI ke bahar karna padega -- aur wahi race wapas aa gaya.\n\nWATCH + MULTI (optimistic locking): key WATCH karo, GET karo, decide karo, MULTI/EXEC. Agar beech mein kisi ne key badli toh EXEC null deta hai aur retry karo. Kaam karta hai, par hot key par (ek popular user ya ek shared key) contention mein retries ka storm aata hai -- 300 concurrent requests mein bahut saare baar baar fail honge. Aur har attempt multiple round trips hai.\n\nINCR + EXPIRE: fixed window ke liye theek, par yeh do commands hain (INCR ke baad crash ho toh EXPIRE kabhi nahi lagta -- key forever), aur token bucket ka fractional refill ya sliding window ka weighted estimate INCR se nahi banta. Plus 'denied request count mat karo' -- INCR pehle hi count kar deta hai.\n\nLua mein yeh sab ek script hai: `sliding_counter.lua` dono GET, estimate, aur sirf allow hone par `INCRBY` + `PEXPIRE` -- deny path pehle hi `return` kar deta hai. Cost yeh hai ki script ke dauraan Redis kuch aur nahi chalata, isliye scripts O(1) hain: 2-4 commands, koi loop nahi. Project 1 ke scripts reuse kiye gaye hain kyunki woh wahan 3 replicas ke saath tested the (PLAN).",
+  "why_needed": "Interviewer dekhna chahta hai ki tum Redis ke atomicity tools ka farak samajhte ho, sirf 'Lua use kiya' nahi.",
+  "real_world_analogy": "MULTI ek sealed envelope mein instructions bhejna hai -- beech mein jawab dekh ke plan nahi badal sakte. WATCH ek 'agar kisi ne chheda toh dobara try karo' wala tareeka hai. Lua ek trusted aadmi ko andar bhejna hai jo khud dekh ke, decide karke, kaam karke wapas aata hai, aur jab tak woh andar hai darwaza band.",
+  "how_it_works": "Redis script ke saare `redis.call` ek atomic unit mein chalate hain. Script ke andar conditionals, arithmetic aur multiple keys allowed hain. Script ka body ek baar `SCRIPT LOAD` hota hai aur phir `EVALSHA` sirf SHA bhejta hai.",
+  "in_this_project": "`src/lua/sliding_counter.lua`: `GET cur_key`, `GET prev_key`, `estimated = cur + prev * weight`, deny par turant `return {0, ...}` (koi write nahi), allow par `INCRBY` aur `PEXPIRE cur_key window * 2`. `src/lua/token_bucket.lua`: `HMGET` -> refill -> decide -> `HSET` + `PEXPIRE`. Mutation U2 (Lua: denied request still counted in the sliding window) real-Redis tests se pakdi gayi.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/lua/sliding_counter.lua::INCRBY",
+   "projects/19-rate-limit/src/lua/token_bucket.lua::PEXPIRE",
+   "projects/19-rate-limit/PLAN.md"
+  ],
+  "code_example": "-- real, src/lua/sliding_counter.lua (trimmed)\nlocal cur = tonumber(redis.call('GET', cur_key) or '0')\nlocal prev = tonumber(redis.call('GET', prev_key) or '0')\nlocal estimated = cur + prev * weight\nif estimated + cost > limit then\n  -- ... retry calculation ...\n  return {0, math.max(math.floor(limit - estimated), 0), math.max(retry, 1), window - elapsed}\nend\ncur = redis.call('INCRBY', cur_key, cost)\nredis.call('PEXPIRE', cur_key, window * 2)",
+  "code_language": "lua",
+  "advantages": [
+   "Ek round trip, koi retry loop nahi",
+   "Conditional logic server-side, atomic",
+   "Hot key par bhi contention retries nahi"
+  ],
+  "disadvantages": [
+   "Script blocking hai: lamba script poore Redis ko rokta hai",
+   "Logic Lua mein hai -- debugging aur testing mushkil, isliye parity test",
+   "Redis Cluster mein saari keys same slot mein honi chahiye"
+  ],
+  "common_mistakes": [
+   "MULTI ko 'transaction = isolation' samajh lena",
+   "INCR ke baad alag EXPIRE call karna (crash par immortal key)",
+   "Script mein unbounded loop (jaise sliding LOG ke saare entries scan karna)"
+  ],
+  "follow_up_questions": [
+   "Redis 7 Functions (FUNCTION LOAD) scripts se kaise alag hain?",
+   "Script ke andar error aaye toh pehle ke writes ka kya hota hai?",
+   "Hot key par WATCH retries ka cost kaise estimate karoge?"
+  ],
+  "concepts": [
+   "lua-script",
+   "multi-exec",
+   "optimistic-locking",
+   "atomicity"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Lua: atomic + ek round trip, par logic Redis ke andar aur Redis-blocking. WATCH: logic app mein, par contention par retries. INCR+EXPIRE: simplest, par sirf fixed window ke liye aur do-command gap ke saath. Project ne Lua chuna kyunki dono algorithms ko read-then-branch chahiye.",
+   "failure_scenarios": "Script runtime error (jaise galat ARGV) par Redis error return karta hai aur script ke pehle ke writes rollback nahi hote -- isliye scripts mein pehle sab read/compute aur end mein write hai. Slow script (yahan nahi hai) poore Redis ki latency badhata hai.",
+   "alternatives": "Redis Functions (Redis 7), WATCH/MULTI optimistic loop, ek dedicated rate-limit service jo in-memory state rakhe, ya Redis ke modules (jaise redis-cell) -- inme se koi is repo mein nahi hai.",
+   "scale_10x_100x": "10x requests par script ki O(1) cost hi matter karti hai -- 2-4 commands per call. 100x par ek Redis instance ka single thread limit banta hai; tab keys ko nodes par shard karna padega (aur sliding window ke undeclared keys cluster mein problem hain).",
+   "production_improvements": "Redis ka `SLOWLOG` monitor karo taaki koi script slow na ho, script latency ka histogram app side se export karo, aur scripts ko version karo (SHA content se banta hai, toh change = naya SHA, purana automatically use nahi hota)."
+  }
+ },
+ {
+  "id": "RLK-032",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Beginner",
+  "question": "How do the Redis keys of this rate limiter get cleaned up, and why are the expiry values capacity/rate + 1 s for the token bucket and 2 x window for the sliding window?",
+  "answer_hinglish": "Redis keys `PEXPIRE` se khud expire hoti hain -- koi cleanup job nahi hai. Values aisi chuni gayi hain ki key tab hi mitti hai jab uska hona ya na hona decision par koi farak nahi daalta.\n\nToken bucket: `PEXPIRE KEYS[1], math.ceil(capacity * 1000 / rate) + 1000`. Ek khaali bucket `capacity / rate` seconds mein poora refill ho jaata hai. Us ke baad stored state 'full bucket' hai -- aur nayi key bhi full bucket se start hoti hai (`tokens = capacity`). Toh us time ke baad key delete karna decision nahi badalta. +1 second safety margin hai. Har request (deny bhi) `HSET` aur `PEXPIRE` karti hai, toh active client ki key zinda rehti hai. Example: capacity 2, rate 1 -> 2000 + 1000 = 3000 ms, aur test 'uses Redis's own clock by default ... sets an expiry on the key' check karta hai `pttl > 0` aur `<= 3000`.\n\nSliding window: har window ki apni key hai `<base>:<window start>`. Current window ki key ki zaroorat agle window mein bhi hai -- tab woh 'previous' ban jaati hai aur weighted count deti hai. Uske baad (do windows peeche) woh kabhi count nahi hoti. Isliye `PEXPIRE cur_key, window * 2`. Yeh sirf allowed path par lagta hai, `INCRBY` ke saath -- denied request kuch likhti hi nahi.\n\nKyun zaroori? Keys clients se aati hain (IP, email). Bina expiry ke har ek-baar aaya IP Redis memory mein hamesha rahega. Mutation U3 (Lua: no expiry on the token bucket key) isi test se pakdi gayi.",
+  "why_needed": "Rate-limit keys ki sankhya attacker control kar sakta hai; expiry na ho toh Redis memory dheere dheere bhar jaati hai.",
+  "real_world_analogy": "Gym ka visitor register: jo 30 din se nahi aaya uska page phaad do -- kyunki agar woh wapas aaya toh naye member jaisa hi treat hoga, toh purana page rakhne ka koi fayda nahi.",
+  "how_it_works": "`PEXPIRE key ms` key par millisecond TTL lagata hai; Redis expired keys ko lazily (access par) aur background sampling se hatata hai. Script har write ke baad TTL refresh karta hai, toh TTL 'last activity se' count hota hai.",
+  "in_this_project": "`src/lua/token_bucket.lua` line: `redis.call('PEXPIRE', KEYS[1], math.ceil(capacity * 1000 / rate) + 1000)`. `src/lua/sliding_counter.lua`: `redis.call('PEXPIRE', cur_key, window * 2)`. TypeScript MemoryStore mein koi per-key expiry nahi hai -- mutation M3 ne dikhaya ki woh koi decision nahi badalti thi, isliye hata di; memory `maxKeys` (LRU) se bounded hai. Test: `test/redis.test.ts` 'uses Redis's own clock by default (no now passed): works and sets an expiry on the key'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/lua/token_bucket.lua::PEXPIRE",
+   "projects/19-rate-limit/src/lua/sliding_counter.lua::PEXPIRE",
+   "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "-- real, src/lua/token_bucket.lua\n-- After capacity/rate seconds the bucket is full again, so state can be dropped.\nredis.call('PEXPIRE', KEYS[1], math.ceil(capacity * 1000 / rate) + 1000)\n\n-- real, src/lua/sliding_counter.lua\n-- Keep it for 2 windows: it is needed as \"previous\" during the next window.\nredis.call('PEXPIRE', cur_key, window * 2)",
+  "code_language": "lua",
+  "advantages": [
+   "Koi cron/cleanup job nahi",
+   "Memory idle clients ke liye apne aap free",
+   "Expiry decision ko kabhi nahi badalti"
+  ],
+  "disadvantages": [
+   "Bahut lambi window (jaise 15 minute) ke liye keys 30 minute rehti hain",
+   "Bahut saare unique clients ek saath aayein toh expiry se pehle memory badhti hai -- Redis `maxmemory` policy bhi socho"
+  ],
+  "common_mistakes": [
+   "TTL ko window ke barabar rakhna (previous window ka count jaldi gayab -- limit kamzor)",
+   "EXPIRE ko sirf key create hone par lagana (active client ki key beech mein mar jaye)",
+   "Expiry bilkul na lagana"
+  ],
+  "follow_up_questions": [
+   "TTL bahut chhota ho toh kya bug aayega?",
+   "Redis maxmemory full ho jaye toh rate limiter kaise behave karega?",
+   "MemoryStore mein expiry kyun hata di gayi?"
+  ],
+  "concepts": [
+   "ttl",
+   "pexpire",
+   "memory-bound",
+   "redis-keys"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-033",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Senior/System Design",
+  "question": "Would this rate limiter work on Redis Cluster? Explain the undeclared-keys problem in the sliding window script and how you would fix it.",
+  "answer_hinglish": "Seedha jawab: Redis Cluster par yeh TESTED nahi hai, aur sliding window script mein ek known problem hai. README isko 'NOT implemented' mein clearly likhta hai.\n\nCluster mein har key ek hash slot (16384 mein se ek) mein jaati hai aur har slot ek node par hai. Script ko jo keys `KEYS` mein di jaati hain, client unhi se decide karta hai ki script kis node par bhejna hai. Token bucket theek hai: ek hi key `KEYS[1]` per client.\n\nSliding window `KEYS[1]` sirf base key leta hai, aur andar do keys BANATA hai: `cur_key = KEYS[1] .. ':' .. cur_start` aur `prev_key`. Yeh KEYS mein declared nahi hain. Inka slot base key se alag ho sakta hai -- tab woh doosre node par hongi aur Redis non-local key access refuse kar deta hai. Aur declared keys ka rule Redis ka official contract bhi hai.\n\nFix kyun simple nahi? Keys declare karne ke liye app ko `cur_start` pehle pata hona chahiye -- yani app ka clock. Lekin default design Redis TIME use karta hai taaki drift na ho. Declare karna = app clock wapas lana. Trade-off.\n\nPractical fix: hash tag. Cluster sirf `{...}` ke andar ka hissa hash karta hai. Key `rl:login:{email:a@b.com}` ho toh `rl:login:{email:a@b.com}:1700000000000` bhi same slot mein jaayegi. Toh base key mein client id ko braces mein daal do -- teeno keys ek slot, ek node. Yeh bhi is repo mein 'not done or tested' hai. Production mein main pehle cluster par yeh test likhta (dono algorithms, keys ka slot check), phir hash-tag key helper. Dhyan: hash tag ka matlab ek client ki saari keys ek node par -- woh theek hai, kyunki yahi chahiye.",
+  "why_needed": "Scale par Redis Cluster common hai; 'Lua atomic hai' bolne ke baad interviewer zaroor poochta hai ki multi-key script cluster mein kaise chalega.",
+  "real_world_analogy": "Ek library ki multiple branches hain aur har book ki branch uske title ke pehle letter se tay hoti hai. Agar ek kaam ke liye teen books chahiye jinke title alag letters se shuru hote hain, toh ek branch mein sab nahi milengi. Hash tag yeh hai ki teeno ke title par ek hi sticker lagao jisse branch tay ho.",
+  "how_it_works": "Slot = CRC16(key) mod 16384, aur agar key mein `{...}` hai toh sirf braces ke andar ka text hash hota hai. Script ki saari keys ek slot mein honi chahiye; declared KEYS se client routing karta hai aur Redis cross-slot access par error deta hai.",
+  "in_this_project": "`src/lua/sliding_counter.lua` mein `local cur_key = KEYS[1] .. ':' .. cur_start` aur `local prev_key = KEYS[1] .. ':' .. prev_start`. `src/redis-store.ts` `evalsha(sha, [key], args)` sirf ek key bhejta hai. `src/limiter.ts` key ko `this.prefix + key` banata hai -- hash tag ka koi handling nahi. README 'NOT implemented': 'Redis Cluster: NOT tested ... A hash tag in the key (e.g. {user42}) would keep them together -- not done or tested here.'",
+  "implementation_files": [
+   "projects/19-rate-limit/src/lua/sliding_counter.lua::cur_key",
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/limiter.ts::RateLimiter",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// illustrative, NOT in the repo: a key with a hash tag so the script's derived keys share a slot\nconst loginLimit = new RateLimiter({ algorithm: slidingWindow({ limit: 5, windowMs: 900_000 }), store, prefix: \"rl:login:\" });\nawait loginLimit.consume(`{email:${email.toLowerCase()}}`);\n// Redis keys: rl:login:{email:a@b.com}  and  rl:login:{email:a@b.com}:<window start>  -> same slot",
+  "code_language": "typescript",
+  "advantages": [
+   "Hash tag se Lua script change nahi karna padta (project 1 ka script unchanged rehta hai)",
+   "Redis TIME wala design bacha rehta hai"
+  ],
+  "disadvantages": [
+   "Abhi kuch tested nahi hai",
+   "Hash tag user ki responsibility hai -- bhool gaye toh cluster mein error",
+   "Galat hash tag (jaise poora prefix braces mein) saare clients ko ek slot/node par daal deta hai -- hot node"
+  ],
+  "common_mistakes": [
+   "Script ke andar keys banana aur sochna cluster mein chalega",
+   "`{rl}` jaisa constant hash tag lagana -- sab ek node par",
+   "Single-node Redis par test pass hone ko cluster support maan lena"
+  ],
+  "follow_up_questions": [
+   "Keys ko KEYS mein declare karne ke liye app clock lena kitna bura hai?",
+   "Hash tag se hot slot problem kab aati hai?",
+   "Cluster failover ke time script ka kya hota hai?"
+  ],
+  "concepts": [
+   "redis-cluster",
+   "hash-slot",
+   "hash-tag",
+   "lua-keys"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Option 1: hash tag in key (script unchanged, Redis TIME bacha, par user ko braces lagane hain). Option 2: app cur/prev keys calculate karke KEYS mein bheje (contract-correct, par app clock wapas -- drift ka problem). Option 3: sliding window ko ek hash key mein rakho (fields = window start) -- script badalna padega aur project 1 ke tested script se divergence.",
+   "failure_scenarios": "Hash tag ke bina: cross-slot error har request par -> store error -> onStoreError/FailoverStore. Cluster resharding ke dauraan MOVED/ASK redirects -- RedisStore unhe NOSCRIPT ki tarah retry nahi karta, client (ioredis Cluster) ko handle karna hoga; tested nahi.",
+   "alternatives": "Redis Cluster ki jagah sharded single-node Redis instances with client-side consistent hashing; ya ek dedicated rate-limit service; ya per-region Redis.",
+   "scale_10x_100x": "10x par ek Redis node kaafi ho sakta hai (O(1) scripts); 100x par cluster ya sharding zaroori. Tab hash tags ka per-client distribution hi load spread karega -- isliye tag mein client id ho, constant nahi.",
+   "production_improvements": "Ek `clusterSafeKey(id)` helper jo braces lagaye aur id ke andar ke braces escape/reject kare, ek real Redis Cluster (docker) par test suite, aur RateLimiter mein validation jo cluster mode mein bina hash tag ki key reject kare."
+  }
+ },
+ {
+  "id": "RLK-034",
+  "project_slug": "p19-rate-limit",
+  "category": "Concurrency & Distributed Systems",
+  "difficulty": "Advanced",
+  "question": "Redis replication is asynchronous. What happens to rate-limit state when the Redis primary fails over to a replica, and what in this code helps or does not help?",
+  "answer_hinglish": "Seedha: kuch recent counts kho sakte hain, aur limit kuch time ke liye thodi loose ho sakti hai. Rate limiter ke liye yeh usually acceptable hai, par interview mein yeh bolna zaroori hai ki 'exactly 50' guarantee single Redis primary ke andar hai, failover ke across nahi.\n\nKyun? Primary write acknowledge karta hai aur replica ko baad mein bhejta hai. Agar primary crash ho jaye aur last kuch writes replica tak na pahunche, toh promoted replica purana state dekhega: token bucket mein zyada tokens, sliding window mein kam count. Clients ko kuch extra requests mil jaati hain -- over-allow, under-allow nahi.\n\nIs code mein kya help karta hai? Pehla, NOSCRIPT handling: naye primary ke paas script cache nahi ho sakta (Redis script cache persist/replicate hone ki guarantee nahi), toh `EVALSHA` NOSCRIPT dega; `RedisStore` script load karke ek baar retry karta hai. README failover ko NOSCRIPT ke reasons mein list karta hai. Doosra, Redis TIME: naye primary ka apna clock hai; agar woh pichle primary se alag ho toh `ts` ke against `elapsed` thoda galat -- token bucket ka `math.max(now - ts, 0)` backwards jump par tokens add nahi karta. Teesra, transition ke dauraan errors (connection reset, READONLY agar client abhi bhi purane node par likhe) store se throw hote hain -- `FailoverStore` + MemoryStore fallback ho toh decisions degraded par limited rehte hain.\n\nKya help nahi karta: lost counts recover karne ka koi mechanism nahi, aur failover scenario actually test nahi hua -- sirf `SCRIPT FLUSH` (NOSCRIPT) aur ek fake READONLY error test hue hain. Security limits (login) ke liye main `WAIT` jaisa synchronous replication sochta, latency ki keemat par -- yeh implement nahi hai.",
+  "why_needed": "Senior interviewer guarantees ki boundary poochta hai: 'exactly N' kis condition mein true hai aur kab nahi.",
+  "real_world_analogy": "Bank ka main branch apni ledger copy shaam ko doosri branch bhejta hai. Main branch dopahar mein jal jaye toh backup branch ki ledger mein subah tak ke hi entries hain -- kuch withdrawals ka record nahi, toh customer ko lagta hai paise zyada hain.",
+  "how_it_works": "Redis async replication: primary client ko OK pehle bhejta hai, replication stream baad mein. Sentinel/Cluster failover replica ko primary banata hai. Script cache par bharosa nahi kiya ja sakta: restart ke baad khaali hota hai, aur failover ke baad naye primary par script ho bhi sakta hai, nahi bhi -- isliye NOSCRIPT handling zaroori hai.",
+  "in_this_project": "`src/redis-store.ts` ka comment: 'If Redis does not know the script (restart, SCRIPT FLUSH, failover), it gets NOSCRIPT; the store loads the script and retries once.' `src/lua/token_bucket.lua` mein `math.max(now - ts, 0)`. `src/failover-store.ts` ka `FailoverStore` transition errors ko fallback par bhejta hai. Test sirf `admin.script(\"FLUSH\")` aur ek fake `READONLY` error se hain, real failover nahi.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/lua/token_bucket.lua",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Failover ke baad NOSCRIPT apne aap recover",
+   "Over-allow hi hota hai, legit users block nahi hote",
+   "Fallback ke saath transition window mein bhi limit rehti hai"
+  ],
+  "disadvantages": [
+   "Lost counts ka koi recovery nahi",
+   "Real failover test nahi hua",
+   "Security limits ke liye brief loose window risk hai"
+  ],
+  "common_mistakes": [
+   "'Lua atomic hai toh kabhi limit nahi tootegi' bolna -- atomicity aur durability alag cheezein hain",
+   "Script cache ko persistent maan lena",
+   "Har failover error ko retry karna (READONLY par retry purane node par hi jaata hai)"
+  ],
+  "follow_up_questions": [
+   "WAIT command latency ko kitna badhayega?",
+   "Sentinel vs Cluster failover mein client ka behaviour kaise alag hai?",
+   "Rate limiter ke liye AOF fsync always kabhi justified hai?"
+  ],
+  "concepts": [
+   "async-replication",
+   "failover",
+   "durability",
+   "noscript"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Rate limiting mein speed aur availability ke liye async replication aur kabhi kabhi over-allow accept kiya jaata hai; strong durability (WAIT, fsync always) har request ki latency badhati hai. Capacity limits ke liye loose theek, security limits ke liye sochna padta hai.",
+   "failure_scenarios": "Primary crash: last writes lost -> extra allowance. Split brain (do primaries thodi der): do alag counters -> limit roughly double us dauraan. Script cache missing: NOSCRIPT -> reload. Client purane primary se juda: READONLY -> error, retry nahi.",
+   "alternatives": "Synchronous replication via WAIT (Redis mein partial), per-region independent limits, ya ek consensus-based store (etcd jaisa) -- rate limiting ke liye usually bahut mehenga.",
+   "scale_10x_100x": "Zyada traffic par failover ke dauraan lost writes ki sankhya bhi badhti hai (same time window mein zyada writes). 100x par cluster ke multiple primaries hain; har ek ka failover independent hai, toh har shard ki keys alag time par loose hoti hain.",
+   "production_improvements": "Failover drill likho (docker Sentinel ke saath) jo check kare: NOSCRIPT recover hua, errors fallback par gaye, extra allowance kitna tha. Store errors aur degraded decisions ka metric aur alert. Login jaise limits ke liye fail-closed (`onStoreError: \"deny\"`) already available hai."
+  }
+ },
+ {
+  "id": "RLK-035",
+  "project_slug": "p19-rate-limit",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Walk through RedisStore.consume: how is the script SHA computed and cached, why EVALSHA instead of EVAL, and what does the SHA-mismatch check protect against?",
+  "answer_hinglish": "`RedisStore.consume` teen kaam karta hai: script ka SHA lo, `EVALSHA` chalao, aur NOSCRIPT par ek baar load karke retry karo.\n\nSHA: module-level `scripts` Map hai. `load(file)` pehli baar Lua file `readFileSync(new URL(`./lua/${file}`, import.meta.url))` se padhta hai aur `createHash(\"sha1\").update(source).digest(\"hex\")` se SHA1 nikalta hai -- yahi Redis bhi script ke liye calculate karta hai. Phir Map mein cache, toh file har request par nahi padhi jaati. `import.meta.url` relative path isliye ki build ke baad `scripts/copy-lua.mjs` Lua files ko `dist/` mein JS ke paas copy karta hai.\n\nEVALSHA kyun? `EVAL` har request par poora script body bhejta hai -- har call par extra bytes aur Redis ko har baar hash karna. `EVALSHA` sirf 40-character SHA bhejta hai. PLAN kehta hai: 'the script body is sent once per Redis restart, not on every request'.\n\nFlow: `evalsha(sha, [key], args)`. Error aaye toh message mein 'NOSCRIPT' check -- nahi hai toh `throw error` (koi retry nahi). Hai toh `scriptLoad(source)`, aur jo SHA Redis ne return kiya usse local `sha` se compare: `if (loaded !== sha) throw new Error(`script SHA mismatch ...`)`. Yeh guard karta hai ki hum jis SHA ko call karenge woh sach mein loaded script hai -- warna retry phir NOSCRIPT deta, ya kisi encoding/line-ending farak (jaise file alag tarah padhi gayi) ki wajah se galat assumption chhupi rehti. Phir ek baar `evalsha` retry. Result `toDecision` mein validate hota hai.\n\nMutations R1 (NOSCRIPT not handled -> 2 tests fail) aur R2 (every error retried -> 1 test fails) yeh flow guard karte hain.",
+  "why_needed": "Per-request overhead aur restart-resilience dono ek saath -- yeh EVALSHA pattern almost har production Redis-Lua code mein hota hai.",
+  "real_world_analogy": "Restaurant mein regular customer 'number 7' bolta hai, poori recipe nahi. Naya cook (Redis restart) '7 kya hai?' pooche toh customer ek baar recipe de deta hai, aur phir se '7' bolta hai.",
+  "how_it_works": "Redis script cache SHA1(body) se index karta hai. `SCRIPT LOAD` body store karke SHA return karta hai; `EVALSHA sha numkeys keys... args...` cache se chalata hai, na mile toh `NOSCRIPT No matching script` error.",
+  "in_this_project": "`src/redis-store.ts`: `const scripts = new Map<string, { source: string; sha: string }>()`, function `load`, class `RedisStore` ka `consume`. Test 'NOSCRIPT after SCRIPT FLUSH (e.g. a Redis restart): loads the script and carries on' real Redis par `SCRIPT FLUSH` karke check karta hai ki agla call `{ allowed: true, remaining: 1 }` deta hai.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::load",
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/scripts/copy-lua.mjs",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "// real, src/redis-store.ts RedisStore.consume (trimmed)\nconst { source, sha } = load(algorithm.luaFile);\ntry {\n  raw = await this.client.evalsha(sha, [key], args);\n} catch (error) {\n  if (!String((error as Error)?.message ?? error).includes(\"NOSCRIPT\")) throw error;\n  const loaded = await this.client.scriptLoad(source);\n  if (loaded !== sha) throw new Error(`script SHA mismatch for ${algorithm.luaFile}`);\n  raw = await this.client.evalsha(sha, [key], args);\n}\nreturn toDecision(raw, algorithm.limit);",
+  "code_language": "typescript",
+  "advantages": [
+   "Har request par sirf SHA jaata hai",
+   "Restart/flush/failover ke baad apne aap recover",
+   "SHA mismatch silently ignore nahi hota"
+  ],
+  "disadvantages": [
+   "Pehli request restart ke baad do extra round trips leti hai",
+   "NOSCRIPT detection error message ke string par depend karta hai"
+  ],
+  "common_mistakes": [
+   "Har request par EVAL use karna",
+   "NOSCRIPT par infinite retry loop",
+   "SHA hardcode karna aur script badalne par update bhoolna"
+  ],
+  "follow_up_questions": [
+   "Ek hi instance par 100 concurrent requests ko NOSCRIPT mile toh kitne SCRIPT LOAD honge?",
+   "Error message string match karna fragile kyun hai?",
+   "Script startup par preload karna better hoga?"
+  ],
+  "concepts": [
+   "evalsha",
+   "script-cache",
+   "sha1",
+   "noscript"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-036",
+  "project_slug": "p19-rate-limit",
+  "category": "Internal Implementation",
+  "difficulty": "Beginner",
+  "question": "How do the arguments reach the Lua script? Explain the KEYS/ARGV layout and what the ioredisClient adapter does.",
+  "answer_hinglish": "Redis script ko do arrays milte hain: `KEYS` (jin keys ko script chhoota hai) aur `ARGV` (baaki values, sab strings). Is project mein dono scripts ka layout same hai: `KEYS[1]` = client ki key (prefix ke saath, jaise `rl:login:email:a@b.com`), `ARGV[1]` aur `ARGV[2]` = algorithm ke numbers, `ARGV[3]` = now (ya empty), `ARGV[4]` = cost.\n\nTypeScript side: har algorithm ek `args()` deta hai -- token bucket `[String(capacity), String(rate)]`, sliding window `[String(limit), String(window)]`. `RedisStore.consume` usme do aur jodta hai: `const args = [...algorithm.args(), now, String(cost)]`. Lua side har cheez `tonumber` se number banata hai. Sab string kyun? Redis protocol mein arguments bulk strings hi hote hain.\n\n`ioredisClient` ek chhota adapter hai. Store ka apna interface `RedisScriptClient` hai: `evalsha(sha, keys, args)` aur `scriptLoad(script)`. ioredis ka signature alag hai: `evalsha(sha, numKeys, ...keysAndArgs)` aur `script(\"LOAD\", body)`. Adapter translate karta hai: `client.evalsha(sha, keys.length, ...keys, ...args)` -- `numKeys` Redis ko batata hai ki pehle kitne arguments keys hain. Aur `String(await client.script(\"LOAD\", script))`.\n\nAdapter structural hai -- ioredis import nahi karta, sirf shape maangta hai. Isliye package ki koi runtime dependency nahi. Test 'without a clock option the time argument is EMPTY' exact args check karta hai: `[\"1\", \"1\", \"\", \"1\"]`.",
+  "why_needed": "KEYS aur ARGV ka sahi istemal cluster routing aur script correctness dono ke liye zaroori hai; aur adapter pattern se library kisi bhi client ke saath chalti hai.",
+  "real_world_analogy": "Courier form: 'kis address par' (KEYS) alag box mein, 'kya bhejna hai' (ARGV) alag box mein. Adapter ek translator hai jo tumhara form courier company ke format mein bhar deta hai.",
+  "how_it_works": "`EVALSHA sha 1 rl:x 5 3 '' 1` -- yahan `1` numkeys hai, `rl:x` KEYS[1], baaki ARGV[1..4]. Lua arrays 1-indexed hain.",
+  "in_this_project": "`src/algorithms.ts` mein `args: () => [String(capacity), String(rate)]`; `src/redis-store.ts` mein `RedisScriptClient`, `ioredisClient`, aur `consume` ka `args` array; Lua header comments: `-- ARGV[1] = capacity, ARGV[2] = refill_per_sec, ARGV[3] = now_ms ('' => Redis TIME), ARGV[4] = cost`.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::ioredisClient",
+   "projects/19-rate-limit/src/redis-store.ts::RedisScriptClient",
+   "projects/19-rate-limit/src/algorithms.ts::tokenBucket",
+   "projects/19-rate-limit/src/lua/token_bucket.lua"
+  ],
+  "code_example": "// real, src/redis-store.ts\nexport function ioredisClient(client: {\n  evalsha(sha: string, numKeys: number, ...keysAndArgs: string[]): Promise<unknown>;\n  script(subcommand: \"LOAD\", script: string): Promise<unknown>;\n}): RedisScriptClient {\n  return {\n    evalsha: (sha, keys, args) => client.evalsha(sha, keys.length, ...keys, ...args),\n    scriptLoad: async (script) => String(await client.script(\"LOAD\", script)),\n  };\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Do methods ka interface -- koi bhi Redis client fit ho jaata hai",
+   "Koi runtime dependency nahi",
+   "ARGV layout dono scripts mein same"
+  ],
+  "disadvantages": [
+   "Positional ARGV -- order galat toh silently galat numbers",
+   "Sab strings, toh number formatting (String(0.001)) par bharosa"
+  ],
+  "common_mistakes": [
+   "Keys ko ARGV mein bhejna (cluster routing toot jaati hai)",
+   "`numKeys` galat dena",
+   "Lua mein 0-indexed array samajhna"
+  ],
+  "follow_up_questions": [
+   "Agar ARGV ka order kabhi badle toh kaunsa test pakdega?",
+   "Lua mein `tonumber('')` kya deta hai?",
+   "node-redis ka adapter kaisa dikhega?"
+  ],
+  "concepts": [
+   "keys-argv",
+   "adapter-pattern",
+   "lua-script",
+   "ioredis"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-037",
+  "project_slug": "p19-rate-limit",
+  "category": "Internal Implementation",
+  "difficulty": "Advanced",
+  "question": "What is luaToString, and why does the TypeScript token bucket store a rounded token count but reply from the full-precision value?",
+  "answer_hinglish": "Redis ka Lua jab ek number ko `tostring()` se string banata hai, toh `%.14g` format use karta hai -- sirf 14 significant digits. Token bucket fractional tokens store karta hai (`HSET ... 'tokens', tostring(tokens)`), toh Redis mein jo value jaati hai woh 14 digits par rounded hoti hai. JavaScript ka number ~17 digits rakhta hai. Agar memory store full precision rakhe aur Redis 14 digits, toh hazaaron steps baad dono ke tokens thode alag honge, aur kisi boundary par ek allow karega aur doosra deny.\n\nIsliye `luaToString = (x) => Number(x.toPrecision(14))` -- exactly wahi rounding. Test: `luaToString(1 / 3)` -> `0.33333333333333`, `luaToString(4.999999999999999)` -> `5`.\n\nAb subtle part. Lua script mein `tokens` variable full precision hai; `tostring` sirf HSET ke waqt string banata hai. Reply -- `math.floor(tokens)` aur `reset = math.ceil((capacity - tokens) * 1000 / rate)` -- usi full-precision variable se banta hai. Pehle TypeScript version ne pehle round kiya aur phir rounded value se reply banaya. Parity test seed 1 ke step 91 par fail hua: `resetMs` 1135 vs 1136. `ceil` ke saath ek chhota sa farak (14th digit) ek poora millisecond ban gaya.\n\nFix: `step()` reply full value se banata hai aur sirf return kiye gaye `state` mein `luaToString(tokens)` lagata hai. Code comment: 'The reply uses the FULL-precision value (the Lua variable); only the STORED value is rounded by tostring().' Mutation L1 (store full precision) parity test fail karta hai -- toh rounding bhi necessary hai, sirf decorative nahi.\n\nEk aur detail: Lua file ka purana comment 'Store state with full precision (tostring keeps the fraction)' imprecise hai -- file ke top par ab ek note hai ki `tostring` 14 significant digits (`%.14g`) rakhta hai; script ka code project 1 se unchanged hai.",
+  "why_needed": "Do implementations 'same' tabhi hain jab woh floating point tak same hon. Yeh question dikhata hai ki tumne sach mein dono ko bit-level par compare kiya.",
+  "real_world_analogy": "Do accountants same hisaab rakhte hain, ek 14 decimal tak likhta hai aur doosra 17 tak. Mahino baad kisi din ek ka total 1135 aata hai aur doosre ka 1136 -- aur ek customer ko refund milta hai, doosre ko nahi.",
+  "how_it_works": "Lua 5.1 (Redis) `tostring(number)` = `string.format('%.14g', n)`. `toPrecision(14)` JavaScript mein same significant-digit rounding deta hai, aur `Number(...)` wapas number banata hai. State rounded, reply full.",
+  "in_this_project": "`src/algorithms.ts::luaToString` aur `tokenBucket` ka `step`: `resetMs: Math.ceil(((capacity - tokens) * 1000) / rate)` full `tokens` se, phir `return { state: { tokens: luaToString(tokens), ts: now }, decision }`. `test/algorithms.test.ts` mein `describe(\"luaToString\")`. README section 'Parity: the TypeScript and the Lua versions must agree'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/algorithms.ts::luaToString",
+   "projects/19-rate-limit/src/lua/token_bucket.lua::tostring",
+   "projects/19-rate-limit/test/algorithms.test.ts",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "// real, src/algorithms.ts tokenBucket step (trimmed)\n// The reply uses the FULL-precision value (the Lua variable); only the STORED value is rounded by tostring().\nconst decision: Decision = {\n  allowed,\n  limit: capacity,\n  remaining: Math.floor(tokens),\n  retryAfterMs: retry,\n  resetMs: Math.ceil(((capacity - tokens) * 1000) / rate),\n};\nreturn { state: { tokens: luaToString(tokens), ts: now }, decision };",
+  "code_language": "typescript",
+  "advantages": [
+   "Memory aur Redis bilkul same decisions dete hain (600 steps tested per algorithm)",
+   "Bug ka exact cause code comment mein documented"
+  ],
+  "disadvantages": [
+   "Redis ke Lua version ki implementation detail par depend karta hai -- Redis ka Lua badle toh parity test hi pakdega",
+   "Code reader ko surprise lagta hai ki rounding kyun"
+  ],
+  "common_mistakes": [
+   "Float comparison ko 'close enough' maan lena",
+   "State aur reply dono ek jaise round karna",
+   "Lua ke `tostring` ko lossless samajhna"
+  ],
+  "follow_up_questions": [
+   "Tokens ko integer milli-tokens mein store karte toh yeh problem hoti?",
+   "Parity test ne step 91 tak yeh kyun nahi pakda?",
+   "Redis Lua ke saath aur kaunse numeric gotchas hain (jaise reply mein float truncation)?"
+  ],
+  "concepts": [
+   "floating-point",
+   "parity",
+   "lua-tostring",
+   "precision"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Do implementations rakhne ka cost yahi hai: har numeric detail match karni padti hai. Alternative ek hi implementation (sirf Lua) hai, par tab memory store ko bhi Redis chahiye ya ek Lua interpreter. Project ne duplication + parity test chuna.",
+   "failure_scenarios": "Redis ka Lua runtime ya number formatting kabhi badle toh memory aur Redis decisions diverge karenge -- sirf parity test (real Redis ke saath) pakdega, isliye CI mein Redis zaroori hai.",
+   "alternatives": "Integer arithmetic (milli-tokens) se float ka problem khatam hota, par project 1 ka Lua script badalna padta -- jo 'unchanged reuse' decision ke against hai.",
+   "scale_10x_100x": "Scale se yeh problem nahi badalta; yeh correctness ka mamla hai. Zyada steps/time par divergence ka chance badhta hai, isliye parity test random seeds par chalta hai.",
+   "production_improvements": "Parity test ko zyada seeds aur lambe sequences ke saath nightly chalao, aur Redis version upgrade par pehle parity suite chalao."
+  }
+ },
+ {
+  "id": "RLK-038",
+  "project_slug": "p19-rate-limit",
+  "category": "Internal Implementation",
+  "difficulty": "Intermediate",
+  "question": "Why does RedisStore check the shape of the script's reply, and why does every value the Lua scripts return go through math.floor or math.ceil?",
+  "answer_hinglish": "`toDecision` check karta hai ki reply exactly 4 numbers ka array hai: `[allowed, remaining, retry, reset]`. Kuch aur aaya -- `null`, string, 2 elements -- toh `throw new Error(`unexpected reply from the rate-limit script: ...`)`. README: 'An unexpected reply shape is an error, never a guessed decision.'\n\nKyun? Rate limiter ka sabse khatarnak bug silent hota hai. Agar code `raw[0] === 1` blindly padhe aur reply galat shape ka ho (koi aur script same SHA naam se nahi ho sakta, par galat client adapter, RESP3 mapping, ya script edit ho sakta hai), toh `undefined === 1` false -> sab deny; ya kisi aur mapping mein sab allow. Error throw karne se problem turant dikhti hai aur onStoreError/FailoverStore ka path chalta hai, jo explicit decision hai. Test 'an unexpected reply shape is an error, not a guess' fake client `[1, 2]` return karta hai; mutation R3 (reply shape not checked) isi se pakdi gayi.\n\nAb floor/ceil. Redis jab Lua number ko reply mein convert karta hai toh use INTEGER reply banata hai -- fraction truncate ho jaata hai. Agar script `tokens` (jaise 2.7) seedha return kare toh client ko 2 milega, aur yeh rounding direction implicit hogi. Isliye script khud explicit karta hai: `math.floor(tokens)` remaining ke liye (2.7 token = 2 poori requests), `math.ceil(...)` retry aur reset ke liye (time hamesha upar round -- jaldi retry karna fail hoga). Isi wajah se `typeof x === \"number\"` check bhi kaam karta hai: ioredis integer replies ko JS numbers deta hai.\n\nTypeScript `step()` bhi same floor/ceil karta hai, warna parity toot jaati. Mutation L5 (retry rounded down) yeh guard karta hai.",
+  "why_needed": "Boundary par validation (network/external system se aaya data) ek general engineering principle hai; Lua-Redis number conversion ek specific gotcha hai jo interviewers poochte hain.",
+  "real_world_analogy": "Bank ATM agar 'balance' field mein kuch ajeeb (khaali ya text) paye toh paise dene ya mana karne ki jagah 'service unavailable' dikhata hai -- guess nahi karta.",
+  "how_it_works": "Lua number -> Redis integer reply (truncate towards zero); Lua table -> array reply; Lua `false` -> nil. `toDecision` `Array.isArray(raw) && raw.length === 4 && raw.every(x => typeof x === \"number\")` check karta hai, phir `allowed === 1` se boolean.",
+  "in_this_project": "`src/redis-store.ts::toDecision`. Lua returns: `token_bucket.lua` -> `return {allowed, math.floor(tokens), retry, reset}` jahan `retry` aur `reset` `math.ceil` se bane hain; `sliding_counter.lua` -> `math.max(math.floor(limit - estimated), 0)`, `math.max(retry, 1)`. Test `test/redis.test.ts` 'an unexpected reply shape is an error, not a guess'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::toDecision",
+   "projects/19-rate-limit/src/lua/token_bucket.lua",
+   "projects/19-rate-limit/src/lua/sliding_counter.lua",
+   "projects/19-rate-limit/test/redis.test.ts"
+  ],
+  "code_example": "// real, src/redis-store.ts\nfunction toDecision(raw: unknown, limit: number): Decision {\n  if (!Array.isArray(raw) || raw.length !== 4 || !raw.every((x) => typeof x === \"number\")) {\n    throw new Error(`unexpected reply from the rate-limit script: ${JSON.stringify(raw)}`);\n  }\n  const [allowed, remaining, retry, reset] = raw as number[];\n  return { allowed: allowed === 1, limit, remaining: remaining!, retryAfterMs: retry!, resetMs: reset! };\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Galat reply turant error, silent wrong decision nahi",
+   "Rounding direction explicit aur dono implementations mein same",
+   "Error message mein actual reply hai -- debugging aasaan"
+  ],
+  "disadvantages": [
+   "Reply format change karna ho toh TS aur Lua dono badalne padte hain",
+   "Check sirf shape ka hai, values ki range ka nahi"
+  ],
+  "common_mistakes": [
+   "Lua se float return karke expect karna ki client ko float milega",
+   "Reply ko `as any` karke padh lena",
+   "Retry time ko round down karna (client jaldi retry karke phir deny hoga)"
+  ],
+  "follow_up_questions": [
+   "Lua se float chahiye ho toh kaise bhejoge?",
+   "`allowed` ko boolean ki jagah 1/0 kyun bheja?",
+   "Values ki range bhi validate karni chahiye?"
+  ],
+  "concepts": [
+   "input-validation",
+   "lua-reply",
+   "integer-truncation",
+   "fail-loud"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-039",
+  "project_slug": "p19-rate-limit",
+  "category": "Failure Scenarios",
+  "difficulty": "Intermediate",
+  "question": "Redis restarts in the middle of traffic. Walk through exactly what happens to requests on your three app instances, and what would happen if the retry also failed.",
+  "answer_hinglish": "Restart ke baad Redis ka script cache khaali hota hai, toh har instance ki agli `EVALSHA` NOSCRIPT error paayegi. Har instance independently recover karta hai: `RedisStore.consume` error message mein 'NOSCRIPT' dekhta hai, `scriptLoad(source)` karta hai, SHA compare karta hai, aur ek baar `evalsha` retry karta hai. User ko kuch nahi dikhta, bas us request par do extra round trips.\n\nTeen instances par: teeno apna apna SCRIPT LOAD karenge -- koi coordination nahi chahiye kyunki SCRIPT LOAD idempotent hai (same body = same SHA). Ek hi instance par agar 20 requests ek saath NOSCRIPT paayein, toh code mein koi single-flight nahi hai -- 20 SCRIPT LOAD jaayenge. Woh correct hai (idempotent), bas thoda waste.\n\nState ka kya? Agar Redis persistence (RDB/AOF) nahi hai toh saare counters gaye -- har client ko fresh limit. Rate limiter ke liye yeh over-allow hai, ek baar. Keys ke TTL chhote hain (bucket full time + 1 s, ya 2 windows), toh persistence ka fayda bhi limited hai.\n\nAgar retry bhi fail ho? Code sirf EK retry karta hai. Retry ka error (connection refused, ya phir NOSCRIPT) seedha throw hota hai -- koi loop nahi. Woh error RateLimiter se upar jaata hai: FailoverStore ho toh `onError` call hota hai aur MemoryStore fallback degraded decision deta hai; nahi toh `StoreUnavailableError`, aur Express/Nest adapter ka `onStoreError` decide karta hai: 'error' (500 via error handler), 'allow' (fail open), ya 'deny' (503 + `Retry-After: 5`). Restart ke dauraan jab Redis abhi tak listen hi nahi kar raha, yahi path chalta hai.\n\nTest: real Redis par `admin.script(\"FLUSH\")` ke baad agla consume `{ allowed: true, remaining: 1 }` -- state bachi (flush sirf scripts hatata hai) aur script reload hua. Mutation R1 ise 2 tests se pakadti hai.",
+  "why_needed": "Restart production ka routine event hai (deploy, upgrade, crash). Limiter ko isme bina human intervention ke recover karna chahiye.",
+  "real_world_analogy": "Shop ka naya cashier (restart) price list bhool gaya. Har counter ka salesman ek baar list de deta hai aur kaam chalta rehta hai. Agar cashier hi nahi aaya (Redis down), toh manager ka rule (onStoreError) decide karta hai -- shop khuli rakho ya band.",
+  "how_it_works": "NOSCRIPT -> SCRIPT LOAD -> EVALSHA (once). Koi bhi doosra error ya retry ka error -> throw -> FailoverStore (fallback ya StoreUnavailableError) -> adapter ka onStoreError.",
+  "in_this_project": "`src/redis-store.ts` (`RedisStore.consume`), `src/failover-store.ts` (`FailoverStore`), `src/adapters/express.ts` (`onStoreError` branches), `src/adapters/http.ts` (`STORE_UNAVAILABLE_RETRY_AFTER_S = 5`). Test `test/redis.test.ts` 'NOSCRIPT after SCRIPT FLUSH'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/src/adapters/express.ts::onStoreError",
+   "projects/19-rate-limit/src/adapters/http.ts::STORE_UNAVAILABLE_RETRY_AFTER_S"
+  ],
+  "code_example": "// real, test/redis.test.ts\nit(\"NOSCRIPT after SCRIPT FLUSH (e.g. a Redis restart): loads the script and carries on\", async () => {\n  const limiter = new RateLimiter({ algorithm: tokenBucket({ capacity: 3, refillPerSec: 1 }), store: new RedisStore(ioredisClient(client())), prefix: PREFIX });\n  await limiter.consume(\"flush\");\n  await admin.script(\"FLUSH\");\n  expect(await limiter.consume(\"flush\")).toMatchObject({ allowed: true, remaining: 1 });\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Restart ke baad automatic recovery",
+   "Ek hi retry -- infinite loop ka risk nahi",
+   "Total failure par explicit, configurable behaviour"
+  ],
+  "disadvantages": [
+   "Concurrent NOSCRIPT par duplicate SCRIPT LOADs",
+   "Bina persistence ke restart par saare limits reset"
+  ],
+  "common_mistakes": [
+   "NOSCRIPT ko 'Redis down' samajh ke fallback par chale jaana",
+   "Retry ko loop mein daalna",
+   "Restart test sirf SCRIPT FLUSH se karna aur sochna ki connection drop bhi cover ho gaya"
+  ],
+  "follow_up_questions": [
+   "SCRIPT LOAD ko single-flight kaise karoge?",
+   "Startup par script preload karna kaafi hai kya?",
+   "Login limit ke liye restart par counters reset hona kitna bura hai?"
+  ],
+  "concepts": [
+   "redis-restart",
+   "noscript",
+   "recovery",
+   "fail-open-closed"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-040",
+  "project_slug": "p19-rate-limit",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "RedisStore retries once on NOSCRIPT but passes every other error through, for example READONLY from a replica. Why is retrying those errors wrong?",
+  "answer_hinglish": "Kyunki retry tabhi sense banata hai jab retry ke pehle tum cause fix kar sakte ho. NOSCRIPT ka cause pata hai aur fix tumhare haath mein hai: script load karo, phir same call kaam karega. Baaki errors ke saath aisa nahi.\n\nREADONLY ka matlab: tumhara connection ek replica par hai (jaise failover ke baad purana primary demote hua, aur client ne abhi topology refresh nahi ki). Usi connection par turant retry -> wahi replica -> phir READONLY. Sirf latency double hui aur Redis par load bhi. Agar code 'har error par SCRIPT LOAD + retry' kare (yahi mutation R2 hai: 'every error retried as if NOSCRIPT'), toh READONLY replica par SCRIPT LOAD bhi bhejega -- bekaar, aur failure chhupa ke slow bana deta hai.\n\nConnection refused / timeout par bhi turant retry ka koi fayda nahi; Redis down hai toh 'retry storm' bas har request ko slow karta hai. Iske liye sahi jagah `FailoverStore` hai: guard (circuit breaker + timeout) aur fallback ek jagah. Circuit breaker dead Redis ko call karna hi band kar deta hai -- test mein 10 checks par dead store sirf 3 baar call hua.\n\nTo design yeh hai: `RedisStore` sirf apna specific, fixable case (NOSCRIPT) handle kare; baaki policy (retry, breaker, timeout, fallback) layer upar ho. Separation of concerns -- aur ek galat retry layer (store mein) aur ek sahi layer (failover) ek saath hone par retries multiply bhi ho jaate.\n\nTest 'errors other than NOSCRIPT are passed through, not retried' ek fake client se `READONLY You can't write against a read only replica.` throw karta hai aur check karta hai `calls` exactly 1 hai aur error READONLY hi hai.",
+  "why_needed": "Retry ek powerful tool hai jo galat jagah lage toh outage ko badha deta hai. Interviewer dekhna chahta hai ki tum retryable vs non-retryable errors alag kar sakte ho.",
+  "real_world_analogy": "Darwaza locked hai kyunki chabi galat thi (NOSCRIPT) -- sahi chabi lo aur ek baar phir kholo. Darwaza locked hai kyunki building hi band hai (READONLY, down) -- wahi darwaza 10 baar khatkhatane se kuch nahi hoga; doosra raasta (fallback) dhoondo.",
+  "how_it_works": "`if (!String(err.message).includes(\"NOSCRIPT\")) throw error;` -- non-NOSCRIPT errors turant upar. FailoverStore guard.execute(run) ke through breaker/timeout lagata hai aur catch mein fallback ya StoreUnavailableError.",
+  "in_this_project": "`src/redis-store.ts::RedisStore` catch block. Test `test/redis.test.ts` 'errors other than NOSCRIPT are passed through, not retried' (`expect(calls).toBe(1)`). `test/failover.test.ts` 'guarded by resilience-kit's circuit breaker: once open, the dead primary is not even called' (`expect(calls.n).toBe(3)`). Mutation R2 = 1 failed test.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/test/redis.test.ts",
+   "projects/19-rate-limit/test/failover.test.ts"
+  ],
+  "code_example": "// real, test/redis.test.ts\nit(\"errors other than NOSCRIPT are passed through, not retried\", async () => {\n  let calls = 0;\n  const store = new RedisStore({\n    evalsha: async () => {\n      calls++;\n      throw new Error(\"READONLY You can't write against a read only replica.\");\n    },\n    scriptLoad: async () => \"x\",\n  });\n  const limiter = new RateLimiter({ algorithm: tokenBucket({ capacity: 1, refillPerSec: 1 }), store });\n  await expect(limiter.consume(\"x\")).rejects.toThrow(/READONLY/);\n  expect(calls).toBe(1);\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Failure turant dikhta hai, chhupta nahi",
+   "Retry policy ek hi layer (FailoverStore/guard) mein",
+   "Dead Redis par load nahi badhta"
+  ],
+  "disadvantages": [
+   "READONLY ka recovery client library (topology refresh) par depend karta hai",
+   "Ek transient blip bhi poora error ban jaata hai agar fallback na ho"
+  ],
+  "common_mistakes": [
+   "'Har error par ek retry' generic wrapper store mein lagana",
+   "Retry aur circuit breaker dono layers mein retries rakhna (multiplication)",
+   "NOSCRIPT ko error code ki jagah poore message se match karne ki fragility ignore karna"
+  ],
+  "follow_up_questions": [
+   "Kaunse Redis errors genuinely retryable hain?",
+   "ioredis ka `maxRetriesPerRequest` is design ke saath kaise interact karta hai?",
+   "READONLY aaye toh client ko reconnect kaise karwaoge?"
+  ],
+  "concepts": [
+   "retry-policy",
+   "readonly",
+   "separation-of-concerns",
+   "circuit-breaker"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Store mein minimal retry (sirf NOSCRIPT) + upar ek policy layer vs store ke andar smart retries: pehla testable aur composable hai, doosra hidden behaviour aur retry multiplication deta hai.",
+   "failure_scenarios": "R2 jaisa bug: READONLY par SCRIPT LOAD + retry -> double latency, phir bhi fail. Dead Redis par retries -> har request ka latency budget kha jaata hai. Agar NOSCRIPT ka retry khud NOSCRIPT de (script load hua par doosre node par), toh error throw hota hai -- loop nahi.",
+   "alternatives": "Error codes ko class mein map karna (retryable/non-retryable) ek central jagah, ya client library ke built-in retry/reconnect par chhod dena, ya resilience-kit ka RetryPolicy guard mein add karna (ek hi layer mein).",
+   "scale_10x_100x": "Zyada instances par galat retries ka load Redis par multiply hota hai -- 100 instances x retry = recovering Redis par thundering herd. Breaker yahi rokta hai.",
+   "production_improvements": "Store errors ko type ke hisaab se metric mein label karo (NOSCRIPT, READONLY, ECONNREFUSED, timeout), READONLY par alert (topology problem), aur ioredis ko Sentinel/Cluster mode mein configure karo taaki topology refresh automatic ho."
+  }
+ },
+ {
+  "id": "RLK-041",
+  "project_slug": "p19-rate-limit",
+  "category": "Failure Scenarios",
+  "difficulty": "Advanced",
+  "question": "Redis is completely unreachable. What do requests get with and without a FailoverStore, and why did the dead-Redis tests configure ioredis with enableOfflineQueue false and no retries?",
+  "answer_hinglish": "Teen layers decide karti hain. Pehli: client kaise fail hota hai. Doosri: FailoverStore hai ya nahi. Teesri: adapter ka `onStoreError`.\n\nBina FailoverStore ke: `RedisStore` ka error seedha adapter tak aata hai. Express adapter mein `onStoreError` -- default 'error' ka matlab `next(err)` (app ka error handler, test mein 500 'error handler'); 'allow' = fail open, request chalti hai bina `RateLimit-*` headers ke (test: 200, 200, 200 aur `ratelimit-limit` null); 'deny' = fail closed, 503 + `Retry-After: 5` + `{\"error\":\"rate_limit_unavailable\"}`. 503 kyunki problem server ki hai, client ki nahi.\n\nFailoverStore + MemoryStore fallback ke saath: request MemoryStore se limit hoti hai, decision `degraded: true`. Test: capacity 2 -> 200, 200, 429 -- Redis down hai phir bhi limit hai, bas per instance.\n\nAb ioredis config. Test client: `new Redis(\"redis://127.0.0.1:1\", { enableOfflineQueue: false, maxRetriesPerRequest: 0, retryStrategy: () => null, lazyConnect: true })`. Comment: 'offline queue off + no retries: commands fail at once instead of waiting for a reconnect'. ioredis ka default offline queue disconnected state mein commands ko queue karke reconnect ka wait karta hai -- yani request fail nahi hoti, HANG hoti hai. Production mein yahi sabse bura case hai: Redis down = har request latak gayi. Isliye README timeout guard ko important bolta hai: 'The timeout is what keeps a HANGING Redis ... from hanging every request' -- test mein ek kabhi-na-jawab-dene wala store 100 ms TimeoutPolicy ke baad fallback se answer deta hai.\n\nEk caveat: Redis call cancel nahi hoti (clients AbortSignal nahi lete), timeout sirf wait karna band karta hai.\n\nEk aur cheez jo code se dikhti hai: adapter 'allow'/'deny' ko har non-`RateLimitError` error par lagata hai, sirf `StoreUnavailableError` par nahi -- isliye bare RedisStore ka raw ECONNREFUSED bhi fail open/closed hota hai.",
+  "why_needed": "Rate limiter khud ek dependency hai. Uske down hone par app ka behaviour pehle se decide hona chahiye, warna limiter hi outage ban jaata hai.",
+  "real_world_analogy": "Security guard ka radio (Redis) band ho gaya. Option: (a) manager ko bulao (error), (b) sabko andar jaane do (fail open), (c) sabko roko (fail closed), (d) apni notebook se gino (memory fallback, sirf apne gate ke liye).",
+  "how_it_works": "FailoverStore: `guard.execute(run)` -> error -> `onError` (throwing handler ignore) -> fallback ho toh `{ ...decision, degraded: true }`, warna `StoreUnavailableError` with cause. Adapter: `RateLimitError` hamesha throw; else mode 'error' throw, 'allow' next(), 'deny' 503.",
+  "in_this_project": "`test/failover.test.ts` describe 'Redis unreachable (real ioredis client, closed port)': `deadRedis()` helper, tests for allow/deny/error, 'with a FailoverStore + MemoryStore fallback: still limited (per instance) while Redis is down'. `src/adapters/express.ts` catch block, `src/failover-store.ts`. Nest ke liye `test/nestjs.test.ts`: allow -> 200, deny -> 503, default -> 500.",
+  "implementation_files": [
+   "projects/19-rate-limit/test/failover.test.ts::deadRedis",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+   "projects/19-rate-limit/src/types.ts::StoreUnavailableError"
+  ],
+  "code_example": "// real, test/failover.test.ts (trimmed)\nconst deadRedis = () => {\n  // offline queue off + no retries: commands fail at once instead of waiting for a reconnect\n  const c = new Redis(\"redis://127.0.0.1:1\", { enableOfflineQueue: false, maxRetriesPerRequest: 0, retryStrategy: () => null, lazyConnect: true });\n  c.on(\"error\", () => {});\n  return new RedisStore(ioredisClient(c));\n};\n// ...\nconst url = await app(\"deny\", new FailoverStore(deadRedis(), { fallback: new MemoryStore() }));\n// statuses: [200, 200, 429]  (capacity 2, from the local fallback)",
+  "code_language": "typescript",
+  "advantages": [
+   "Har limit ke liye alag failure policy",
+   "Fallback ke saath Redis down par bhi limit",
+   "Bugs (RateLimitError) kabhi fail open nahi"
+  ],
+  "disadvantages": [
+   "Fallback per instance hai -- N x limit",
+   "Timeout guard ke bina default ioredis config hang kar sakta hai",
+   "Timed-out Redis call cancel nahi hoti"
+  ],
+  "common_mistakes": [
+   "Default ioredis config ke saath sochna ki Redis down = turant error",
+   "Login limit par fail open",
+   "503 ki jagah 429 bhejna jab problem server ki hai"
+  ],
+  "follow_up_questions": [
+   "Production ioredis config mein `enableOfflineQueue` kya rakhoge?",
+   "Timeout ki value (jaise 50 ms) kaise choose karoge?",
+   "Degraded mode mein metrics mein kya dikhna chahiye?"
+  ],
+  "concepts": [
+   "fail-open",
+   "fail-closed",
+   "fallback",
+   "offline-queue",
+   "timeout"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Fail open: availability, par limit gayi. Fail closed: security, par Redis outage = feature outage. Memory fallback: beech ka raasta, N x limit. Project per-limit choice deta hai aur fallback alag layer (FailoverStore) mein rakhta hai.",
+   "failure_scenarios": "Hanging Redis (partition): bina timeout har request latak jaati hai -- sabse bura. Fallback khud fail: StoreUnavailableError, chhupaya nahi. Ek throwing onError (logger down): ignore, decision nahi badalta. Redis wapas aaye: fallback ke counts merge nahi hote.",
+   "alternatives": "Local token cache (har instance ko Redis se batch mein tokens lease), ya sidecar limiter, ya load balancer level limiting (nginx limit_req) as backstop -- inme se kuch bhi repo mein nahi.",
+   "scale_10x_100x": "Zyada instances par fallback mode ka over-allowance badhta hai (N x). 100x instances par Redis outage ke dauraan limits practically bekaar -- tab per-instance limit ko limit/N par set karna better fallback ho sakta hai (implement nahi).",
+   "production_improvements": "Degraded decisions aur StoreUnavailableError ka metric + alert, ioredis config production ke liye review (offline queue, connect timeout), aur guard mein breaker + timeout hamesha (README example: openMs 10_000, ms 50)."
+  }
+ },
+ {
+  "id": "RLK-042",
+  "project_slug": "p19-rate-limit",
+  "category": "Failure Scenarios",
+  "difficulty": "Senior/System Design",
+  "question": "Redis was down for a minute and the instances ran on their memory fallbacks. What is inconsistent when Redis comes back, and what are the subtle effects of a timed-out but still running Redis call?",
+  "answer_hinglish": "Do inconsistencies hain, aur dono README ke 'NOT implemented' mein honestly likhe hain.\n\nPehli: fallback ke counts Redis mein merge nahi hote. Degraded mode mein har instance ki MemoryStore ne apni requests gini. Redis wapas aaya toh Redis ke paas woh state hai jo outage se pehle thi (ya TTL se expire ho chuki). Toh ek client jisne outage mein instance A par apni poori limit use ki, Redis wapas aate hi phir se allowance pa sakta hai. Matlab outage + recovery ka total over-allowance: outage mein N x limit, plus recovery par Redis ka purana/khaali state. Capacity limit ke liye usually acceptable; brute-force sensitive limits ke liye login par `onStoreError: \"deny\"` ya fallback na rakhna better hai.\n\nDoosri, subtle: timeout guard sirf WAIT karna band karta hai, call cancel nahi karta -- `RedisScriptClient` mein AbortSignal hai hi nahi, aur FailoverStore ka `run` signal use nahi karta. Socho Redis slow hai, call 50 ms timeout par chhoda, fallback ne decision diya. Lekin woh `EVALSHA` Redis tak pahunch chuka tha aur baad mein execute ho gaya -- token Redis mein bhi kharch ho gaya. Ek request, do jagah count: Redis mein bhi aur memory mein bhi. Is direction mein limit TIGHT hoti hai (under-allow), loose nahi. Aur slow Redis par aise pending calls jama hote hain jo recovery ke baad bhi execute hote rehte hain.\n\nTeesra flap: circuit breaker half-open mein kuch requests Redis par aur kuch fallback par -- ek client ke decisions do alag states se aate hain.\n\nMain yeh sab accept karunga capacity limits ke liye, aur interview mein clearly bolunga ki degraded mode 'best effort' hai; `degraded: true` flag isliye hai ki caller/metrics ko pata ho.",
+  "why_needed": "Senior candidate se expect hota hai ki woh sirf failure nahi, recovery ke baad ki state bhi soche -- kaafi bugs 'Redis wapas aaya' ke baad hote hain.",
+  "real_world_analogy": "Bank server ek ghante down tha, branches ne kagaz par withdrawals likhe. Server wapas aaya, kagaz ki entries feed nahi hui -- ab system ke hisaab se customers ke paas zyada paise hain. Aur ek cheque jo 'timeout' maan ke wapas kar diya tha, woh actually clear bhi ho gaya.",
+  "how_it_works": "FailoverStore: `await (guard ? guard.execute(run) : run())` -- `run` ko signal pass nahi hota, toh underlying `evalsha` promise chalta rehta hai. Fallback ke decisions `degraded: true`. Koi reconciliation step nahi hai.",
+  "in_this_project": "`src/failover-store.ts` comment: 'the Redis call itself cannot be cancelled (clients take no AbortSignal) -- a timeout stops WAITING for it.' README 'NOT implemented': 'While degraded, the fallback's counts are per instance and are NOT merged back into Redis when it returns.' `src/types.ts`: `readonly degraded?: true`.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/src/failover-store.ts::Guard",
+   "projects/19-rate-limit/src/types.ts::degraded",
+   "projects/19-rate-limit/src/redis-store.ts::RedisScriptClient",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// real, src/failover-store.ts FailoverStore.consume (trimmed)\ntry {\n  const run = () => this.primary.consume(algorithm, key, cost); // no signal: the Redis call is not cancelled\n  return await (this.options.guard ? this.options.guard.execute(run) : run());\n} catch (error) {\n  // ...\n  const decision = await this.options.fallback.consume(algorithm, key, cost);\n  return { ...decision, degraded: true };\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Outage ke dauraan bhi kuch limit",
+   "`degraded` flag se observability",
+   "Simple: koi reconciliation complexity nahi"
+  ],
+  "disadvantages": [
+   "Recovery par over-allowance",
+   "Timed-out calls double-count kar sakte hain",
+   "Flapping par inconsistent decisions"
+  ],
+  "common_mistakes": [
+   "Timeout ko cancellation samajhna",
+   "Sochna ki fallback ke counts Redis mein pahunch jaayenge",
+   "Security limit par memory fallback lagana bina soche"
+  ],
+  "follow_up_questions": [
+   "Fallback counts ko Redis mein merge karna chahoge? Kaise, aur kya risk hai?",
+   "Pending Redis calls ki sankhya kaise bound karoge?",
+   "Breaker half-open mein kitni requests Redis par bhejoge?"
+  ],
+  "concepts": [
+   "recovery",
+   "reconciliation",
+   "cancellation",
+   "degraded-mode"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Reconciliation (fallback counts ko Redis mein add karna) consistency badhata hai par complexity aur naye bugs (double add, stale windows) laata hai. Project ne simple rakha aur 'NOT implemented' mein document kiya.",
+   "failure_scenarios": "Recovery ke baad extra allowance; timed-out-but-executed calls se under-allow; breaker flap mein mixed decisions; bahut slow Redis par pending calls pile up (memory aur sockets).",
+   "alternatives": "Recovery par ek short 'conservative' period (limit/2) rakhna; fallback ko limit/N per instance dena; INCRBY se fallback ke counts sliding window ke current key mein add karna (sirf sliding window ke liye aasaan).",
+   "scale_10x_100x": "10x instances par outage ka over-allowance 10x; 100x par recovery ke time sab instances ek saath Redis par aate hain -- breaker half-open ke saath staggered recovery zaroori.",
+   "production_improvements": "Outage duration aur degraded decision count ka metric, recovery ke baad alert, aur client library level par connection pool limits taaki pending calls bounded rahein."
+  }
+ },
+ {
+  "id": "RLK-043",
+  "project_slug": "p19-rate-limit",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Advanced",
+  "question": "The parity test failed with 'step 91, seed 1': resetMs 1135 from TypeScript vs 1136 from Redis. How would you investigate this, what was the cause, and what was the fix?",
+  "answer_hinglish": "Symptom: `expect(b, `step ${i}, seed ${seed}`).toEqual(a)` fail -- memory aur Redis ka decision sirf `resetMs` mein 1 ms alag. Baaki sab (allowed, remaining) same.\n\nInvestigation, step by step. Pehla, reproduce: PRNG seeded hai (mulberry32), toh `seed 1` se exact same sequence dobara chalta hai -- flaky nahi, deterministic. Yahi seeded design ka fayda hai. Doosra, narrow down: step 91 tak dono agree karte the, toh logic broadly sahi hai; farak tiny hai (1 ms) aur `resetMs` mein hai jo `math.ceil(...)` se banta hai. `ceil` ka matlab ek bahut chhota float farak bhi integer boundary cross karke poora 1 ms ban sakta hai. Teesra, Redis mein state dekho: `HGETALL` us key ka -- tokens string 14 significant digits ka. TypeScript ka state print karo. Ab Lua padho: `tokens` variable full precision hai, `tostring` sirf HSET mein lagta hai, aur `reset` usi full variable se banta hai.\n\nCause: pehle TypeScript version ne tokens ko pehle `luaToString` se round kiya aur phir REPLY bhi rounded value se banaya. Redis reply full precision se banata hai. Jab `(capacity - tokens) * 1000 / rate` exactly ek integer ke paas tha, rounded value ek taraf gayi aur full value doosri taraf -- 1135 vs 1136.\n\nFix: reply full-precision `tokens` se, store rounded `luaToString(tokens)`. Code comment ab yahi bolta hai. Aur mutation L1 confirm karta hai ki rounding bhi zaroori hai: stored value round na karo toh parity fail.\n\nLesson: aise bugs normal unit tests kabhi nahi pakadte -- 91 random steps ke baad ek specific float combination chahiye tha. Isliye random, seeded, real-Redis parity test.",
+  "why_needed": "Floating point aur 'do implementations' ka mismatch ek classic hard-to-find bug hai. Interviewer ko systematic debugging process sunna hai, sirf fix nahi.",
+  "real_world_analogy": "Do ghadiyan 91 minute tak same time dikhati hain, phir ek second ka farak. Pata chala ek ghadi second ko round karke dikhati hai aur andar bhi rounded time hi chalati hai; doosri andar exact chalti hai aur sirf screen par round karti hai.",
+  "how_it_works": "Parity loop: har step `t += floor(rand * maxAdvanceMs)`, key `k0..k2`, cost 1-3; same call memory limiter aur redis limiter dono par, `toEqual` compare. Failure message mein step aur seed -- replay possible.",
+  "in_this_project": "`test/redis.test.ts` function `parity` aur `rng` (mulberry32 comment). Token bucket parity: `tokenBucket({ capacity: 5, refillPerSec: 3 })`, seeds 1, 2, 3, 200 steps each, max advance 700 ms. Fix `src/algorithms.ts` `tokenBucket` step mein. README: 'the parity test failed at step 91 of seed 1 with resetMs 1135 vs 1136. Fixed: reply from the full value, store the rounded one.'",
+  "implementation_files": [
+   "projects/19-rate-limit/test/redis.test.ts::parity",
+   "projects/19-rate-limit/test/redis.test.ts::rng",
+   "projects/19-rate-limit/src/algorithms.ts::luaToString",
+   "projects/19-rate-limit/src/lua/token_bucket.lua",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// real, test/redis.test.ts parity loop (trimmed)\nfor (let i = 0; i < steps; i++) {\n  t += Math.floor(rand() * maxAdvanceMs);\n  const key = `k${Math.floor(rand() * 3)}`;\n  const cost = 1 + Math.floor(rand() * Math.min(3, algorithm.limit));\n  const a = await mem.consume(key, cost);\n  const b = await red.consume(key, cost);\n  expect(b, `step ${i}, seed ${seed}`).toEqual(a);\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Seeded PRNG se exact replay",
+   "Failure message mein step aur seed",
+   "Real Redis -- Lua ka actual behaviour, mock nahi"
+  ],
+  "disadvantages": [
+   "Redis chahiye; bina Redis test skip",
+   "Sirf 3 seeds x 200 steps -- rare cases miss ho sakte hain"
+  ],
+  "common_mistakes": [
+   "Float mismatch ko 'tolerance' laga ke chhupa dena",
+   "Random test bina seed ke (fail hua toh replay nahi)",
+   "Sirf allowed/denied compare karna, retry/reset fields nahi"
+  ],
+  "follow_up_questions": [
+   "Tolerance (+-1 ms) laga dete toh kya galat hota?",
+   "Seeds aur steps badhaane ka trade-off kya hai?",
+   "Is bug ke liye ek focused unit test kaise likhoge?"
+  ],
+  "concepts": [
+   "parity-test",
+   "floating-point",
+   "seeded-random",
+   "debugging"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Strict equality (`toEqual`) vs tolerance: strict ne real bug pakda; tolerance flakiness kam karti par silently divergent behaviour allow karti. Project strict raha kyunki memory -> Redis switch par behaviour badalna nahi chahiye.",
+   "failure_scenarios": "Bina is fix ke, production mein `RateLimit-Reset` header memory aur Redis mode mein kabhi kabhi 1 ms alag (seconds mein round hone se rarely dikhta), par agar kabhi `remaining` ya `allowed` boundary par alag hota toh ek mode allow karta aur doosra deny.",
+   "alternatives": "Property-based testing library (fast-check) shrinking ke saath -- failing sequence ko minimal bana deti; ya Lua ko hi memory mode mein chalana (ek implementation) -- dono repo mein nahi.",
+   "scale_10x_100x": "Scale ka direct asar nahi, par zyada traffic = zyada float combinations = rare divergence production mein zyada baar dikhega.",
+   "production_improvements": "Parity suite ko CI mein mandatory Redis ke saath chalao, nightly zyada seeds, aur failure par seed + step + dono states log karo."
+  }
+ },
+ {
+  "id": "RLK-044",
+  "project_slug": "p19-rate-limit",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "In the first mutation run, mutations L3 and M3 survived. What does a surviving mutant tell you, and how was each of these two handled differently?",
+  "answer_hinglish": "Mutation testing mein code mein jaan-boojh ke ek bug daalte hain aur poora suite chalate hain. Koi test fail hua -> mutant 'caught'. Koi fail nahi hua -> 'survived'. Survivor ka matlab teen mein se ek hai: test gap (code ka behaviour tested nahi), redundant code (jo code badla woh kuch karta hi nahi), ya equivalent mutant (by design koi farak padta hi nahi). Debugging ka kaam yeh decide karna hai ki kaunsa case hai.\n\nL3: 'a clock going backwards changes tokens' -- yani token bucket mein `Math.max(now - ts, 0)` ka guard hata do, toh clock peeche jaane par negative elapsed tokens GHATA deta hai. Pehle run mein yeh survive hua. Matlab clock-backwards ka test yeh prove nahi kar raha tha ki tokens remove nahi hote. Yeh test gap tha, toh test sharp kiya: ab test 'a clock going backwards neither adds nor REMOVES tokens' -- capacity 10, ek consume (9 left), clock -5000 ms, agla consume `remaining: 8` expect karta hai; comment kehta hai bina guard ke 3 bachte. Final run mein L3 = 1 failed test. Distributed angle: injected app clocks drift karein toh yeh guard hi bachata hai.\n\nM3: 'the memory store ignored its expiry'. Survive hua kyunki expiry kabhi decision badalti hi nahi thi: idle bucket waise bhi full refill ho jaata hai, aur do window purani state kabhi match nahi hoti. Yeh redundant code tha, test gap nahi. Toh test nahi, CODE badla: expiry hata di. Uski jagah ek test likha jo yeh property prove karta hai -- 'a long-idle key behaves exactly like a new one': ek din baad key ka decision fresh key ke barabar. Memory ab `maxKeys` (LRU) se bounded hai.\n\nTo ek survivor ne test sudhaara, doosre ne code ghataya.",
+  "why_needed": "Coverage percentage batata hai code chala ya nahi; mutation testing batata hai ki tests sach mein galat behaviour pakadte hain ya nahi. Survivors ka sahi interpretation senior skill hai.",
+  "real_world_analogy": "Fire drill mein ek alarm jaan-boojh ke band karo. Kisi ko pata nahi chala? Ya toh drill ka checklist kamzor hai (L3), ya woh alarm us kamre mein tha jahan koi jaata hi nahi -- alarm hi hatao (M3).",
+  "how_it_works": "Runner ek mutation lagata hai, poora suite (Redis ke saath) chalata hai, result note karta hai, revert karta hai. README ke mutation table mein har break ke saamne kitne tests fail hue.",
+  "in_this_project": "`test/algorithms.test.ts` 'a clock going backwards neither adds nor REMOVES tokens'; `src/algorithms.ts` mein `Math.max(now - ts, 0)`; `src/memory-store.ts` ka comment 'An earlier version had a lazy expiry check; a mutation check showed it changed no decision, so it was removed.'; `test/limiter.test.ts` 'a long-idle key behaves exactly like a new one (no expiry needed)'. Final: 51 mutation checks, 49 caught, 2 equivalent.",
+  "implementation_files": [
+   "projects/19-rate-limit/test/algorithms.test.ts",
+   "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+   "projects/19-rate-limit/test/limiter.test.ts",
+   "projects/19-rate-limit/src/algorithms.ts::tokenBucket",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// real, test/algorithms.test.ts\nit(\"a clock going backwards neither adds nor REMOVES tokens\", async () => {\n  const { limiter, advance } = memoryLimiter(tokenBucket({ capacity: 10, refillPerSec: 1 }));\n  await limiter.consume(\"a\"); // 9 left\n  advance(-5000);\n  // Without the max(.., 0) the bucket would lose 5 tokens (9 - 5 = 4 -> 3 left); with it, 9 - 1 = 8 left.\n  expect(await limiter.consume(\"a\")).toMatchObject({ allowed: true, remaining: 8 });\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Tests ki asli strength measure hoti hai",
+   "Redundant code bhi dikh jaata hai",
+   "Har survivor ka documented decision"
+  ],
+  "disadvantages": [
+   "Manual mutation runs time lete hain (poora suite har break par)",
+   "Sirf chosen mutations -- har possible bug nahi"
+  ],
+  "common_mistakes": [
+   "Har survivor ke liye test likh dena, bina sochke ki code redundant toh nahi",
+   "Coverage 100% ko 'tests strong hain' samajhna",
+   "Equivalent mutants ko 'test gap' maan ke ajeeb tests likhna"
+  ],
+  "follow_up_questions": [
+   "Mutation runner ko CI mein kaise chalaoge?",
+   "Expiry hatane ka memory par kya asar hai aur woh kaise handle hua?",
+   "Kaunse mutations tum is project mein aur add karte?"
+  ],
+  "concepts": [
+   "mutation-testing",
+   "test-quality",
+   "redundant-code",
+   "clock-skew"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-045",
+  "project_slug": "p19-rate-limit",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Intermediate",
+  "question": "Two mutants, S6 and H5, survived the final run and are documented as equivalent. How do you prove a mutant is equivalent rather than a missing test?",
+  "answer_hinglish": "Equivalent ka matlab hai: mutated code har possible input par original jaisa hi behave karta hai, toh koi bhi test use pakad nahi sakta. Proof ek argument hai -- 'yeh values kabhi aisi ho hi nahi sakti jahan farak pade' -- sirf 'mujhe test nahi soojha' nahi.\n\nS6: 'retry may be 0 when denied' -- sliding window mein `Math.max(retry, 1)` hata do. Kya retry kabhi 0 ho sakta hai? Retry do candidates ka minimum hai. Pehla `window - elapsed`: `elapsed = now - curStart` aur `curStart = now - (now % window)`, toh `elapsed = now % window`, jo hamesha `< window` -- toh yeh >= 1 ms (integer ms). Doosra `Math.ceil((needed / prev) * window)` sirf tab jab `prev > 0`; denial ka matlab `estimated + cost > limit`, toh `needed > 0`, toh ceil >= 1. Dono >= 1, toh `max(.., 1)` kabhi value nahi badalta. Kept kyun? Lua script mein `math.max(retry, 1)` hai aur TS usko mirror karta hai -- parity ke liye code shape same rakha. Code comment bhi yahi kehta hai.\n\nH5: 'IPv6 zone id not stripped'. Zone id (`%eth0`) address ke END par hota hai -- last group mein. IPv6 key /64 hai, yani pehle 4 groups. Toh zone strip ho ya na ho, key same -- README ka argument yahi hai. Clarity ke liye kept.\n\nJo bhi equivalent claim karo, README mein reason likho -- taaki agle run mein koi 'naya test gap' na samjhe. Aur U1-U3 Lua mutations real Redis tests se pakdi gayi, equivalent nahi.",
+  "why_needed": "Mutation score 100% nahi hota; interviewer dekhna chahta hai ki tum 'equivalent' ko lazy excuse ki tarah nahi, proof ke saath use karte ho.",
+  "real_world_analogy": "Ek building mein ek extra lock hai jo sirf tab kaam aata jab darwaza bina chaukhat ke ho -- par building mein aisa darwaza hai hi nahi. Lock hatao, kuch nahi badalta. Yeh saabit karne ke liye building ka naksha dikhana padta hai, sirf 'koi chor nahi aaya' kehna kaafi nahi.",
+  "how_it_works": "Equivalence proof = input domain ka invariant dikhana: S6 mein `0 <= elapsed < window` aur denial par `needed > 0`; H5 mein zone id sirf address ke end mein aur key sirf first 4 hextets.",
+  "in_this_project": "`src/algorithms.ts` slidingWindow step ka comment: 'Both candidates are >= 1 ms (elapsed < window; needed > 0), so the max(.., 1) below never changes the value -- kept to mirror the Lua script'. `src/lua/sliding_counter.lua`: `math.max(retry, 1)`. `src/adapters/http.ts` `ipKey`: `const zone = a.indexOf(\"%\")` aur `expandIpv6(a).slice(0, 4)`. README mutation table: S6 = 0, H5 = 0.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/algorithms.ts::slidingWindow",
+   "projects/19-rate-limit/src/lua/sliding_counter.lua",
+   "projects/19-rate-limit/src/adapters/http.ts::ipKey",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// real, src/algorithms.ts slidingWindow step (trimmed)\nlet retry = window - elapsed;\n// Both candidates are >= 1 ms (elapsed < window; needed > 0), so the max(.., 1) below never changes the\n// value -- kept to mirror the Lua script; a mutation removing it is equivalent (documented in the README).\nif (prev > 0) {\n  const needed = estimated + cost - limit;\n  const ms = Math.ceil((needed / prev) * window);\n  if (ms < retry) retry = ms;\n}\n// ... retryAfterMs: Math.max(retry, 1),",
+  "code_language": "typescript",
+  "advantages": [
+   "Har equivalent ka written proof",
+   "TS aur Lua ka shape same rehta hai",
+   "Future runs mein confusion nahi"
+  ],
+  "disadvantages": [
+   "Proof galat ho toh real test gap chhup jaata hai",
+   "Dead-ish code rakhna padta hai (clarity/parity ke liye)"
+  ],
+  "common_mistakes": [
+   "'Koi test nahi soocha' ko equivalent bol dena",
+   "Equivalent code ko hata dena bina sochke ki Lua mein woh hai",
+   "Non-integer windowMs jaise edge cases bhool jaana (yahan `windowMs` integer enforce hai)"
+  ],
+  "follow_up_questions": [
+   "Agar windowMs fractional allowed hota toh S6 ka proof bachta?",
+   "Equivalent mutant ko hata dena better hai ya rakhna?",
+   "Is invariant ko ek assertion se enforce karna chahiye?"
+  ],
+  "concepts": [
+   "equivalent-mutant",
+   "mutation-testing",
+   "invariants",
+   "proof"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-046",
+  "project_slug": "p19-rate-limit",
+  "category": "Debugging & Troubleshooting",
+  "difficulty": "Beginner",
+  "question": "After deploying three instances, support reports that some users get about three times their limit. How do you investigate?",
+  "answer_hinglish": "Sabse pehle shak: limit shared nahi hai -- har instance apna alag count rakh raha hai. '3 instances, 3x limit' exactly MemoryStore ka signature hai. README warn karta hai: 'N instances each with their own MemoryStore allow up to N x the limit', aur load test mein yahi measure hua: limit 500, memory mode mein 1116 allowed.\n\nInvestigation order:\n\n1. Config check: limiter ka `store` kya hai? `new MemoryStore()` (jaise README ka `apiLimit` example, jo 'single instance / dev' ke liye hai) ya `new RedisStore(...)`? Ek environment variable galat ho toh production mein bhi memory chal sakti hai.\n\n2. Degraded mode: FailoverStore lagaya hai toh shayad Redis down ya slow tha aur fallback chal raha tha. Decisions par `degraded: true` aata hai, aur `onError` callback mein errors log hone chahiye (README example `logger.warn(..., \"rate-limit store failed\")`). Logs mein yeh warning dikhe toh cause Redis connectivity hai, limiter nahi.\n\n3. Redis mein keys dekho: `redis-cli --scan --pattern 'rl:*'` -- user ki key hai? Uski value (token bucket ka `HGETALL`, sliding window ke counter keys) request count se match karti hai?\n\n4. Prefix aur key: teeno instances same `prefix` aur same key function use karte hain? Agar ek instance ka key IP par hai aur trusted proxy setting alag hai (`trustedProxies`), toh same user ki alag keys ban sakti hain.\n\n5. Tests: CI mein Redis tests sach mein chale ya SKIP hue? Bina Redis ke `[redis.test] SKIPPED` notice print hota hai -- green run ka matlab yeh nahi ki multi-instance test chala.\n\nFix usually: production mein RedisStore, aur Redis outage ke liye degraded metric par alert.",
+  "why_needed": "Yeh real production complaint ka shape hai. Systematic checklist se root cause minutes mein milta hai, guesswork se ghanton mein.",
+  "real_world_analogy": "Teen gates par teen guards, har ek apni diary mein ginta hai. Ek visitor teeno gates se ghoom ke teen guna andar aata hai. Pehla sawaal: kya guards ek shared register use kar rahe hain?",
+  "how_it_works": "MemoryStore per-process Map hai. RedisStore ek shared key par atomic script. FailoverStore primary fail hone par fallback use karta hai aur `degraded: true` lagata hai. Prefix + key milkar Redis key banate hain.",
+  "in_this_project": "`src/memory-store.ts` comment 'N instances -> up to N x the limit'; `src/failover-store.ts` (`onError`, `degraded`); `src/limiter.ts` (prefix + key); `test/redis.test.ts` aur `test/express.test.ts` ka skip notice; load test result `bench/reference-results/2026-11-23-win32-load-run1.json`: memory-shared `allowed: 1116` vs redis-shared `allowed: 500`.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/src/limiter.ts::RateLimiter",
+   "projects/19-rate-limit/test/express.test.ts",
+   "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json"
+  ],
+  "code_example": "// real, README example: FailoverStore with an onError hook (logs the reason for degraded decisions)\nconst store = new FailoverStore(new RedisStore(ioredisClient(redis)), {\n  guard: wrap(new CircuitBreaker({ openMs: 10_000 }), new TimeoutPolicy({ ms: 50 })),\n  fallback: new MemoryStore(),\n  onError: (e) => logger.warn({ err: e }, \"rate-limit store failed\"),\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Symptom (3 instances -> ~3x) seedha cause ki taraf ishaara karta hai",
+   "`degraded` flag aur `onError` debugging ke liye ready hain"
+  ],
+  "disadvantages": [
+   "Library khud degraded mode ka metric export nahi karti -- app ko `onError` mein karna hoga"
+  ],
+  "common_mistakes": [
+   "Pehle algorithm ko blame karna",
+   "CI green dekh ke maan lena ki Redis tests chale",
+   "Instances ke beech alag prefix/key config"
+  ],
+  "follow_up_questions": [
+   "Degraded decisions ko metric mein kaise expose karoge?",
+   "Trusted proxy setting galat ho toh kya symptom aata?",
+   "Sticky sessions isko chhupa sakte hain kya?"
+  ],
+  "concepts": [
+   "troubleshooting",
+   "multi-instance",
+   "memory-store",
+   "observability"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-047",
+  "project_slug": "p19-rate-limit",
+  "category": "Coding Exercises",
+  "difficulty": "Advanced",
+  "question": "Write a hash-tag key helper so the sliding window's derived keys land in the same Redis Cluster slot, plus a test that proves it. (Not in the repo.)",
+  "answer_hinglish": "Yeh is repo mein NAHI hai -- README Redis Cluster ko 'NOT tested' aur hash tag ko 'not done or tested here' bolta hai. Exercise yeh hai ki minimal, safe helper banao aur slot-level test likho, bina Lua script badle.\n\nIdea: Cluster slot = CRC16 of key mod 16384, par agar key mein `{...}` hai (non-empty) toh sirf braces ke andar ka part hash hota hai. Sliding window script `KEYS[1]` (base key) se `KEYS[1] .. ':' .. cur_start` banata hai. Agar base key `rl:login:{email:a@b.com}` hai, toh derived keys bhi `{email:a@b.com}` hi hash karengi -- teeno same slot.\n\nHelper ke rules: (1) id ko braces mein lapeto; (2) id mein khud `{` ya `}` ho toh reject karo -- warna pehla `{...}` pair galat jagah ban sakta hai aur attacker apni key ka slot control kar sakta hai; (3) empty id reject (empty `{}` hash tag ignore hota hai). Prefix braces ke BAHAR rehna chahiye -- `{rl}` jaisa constant tag sab clients ko ek slot (ek node) par daal deta.\n\nTest: `cluster-key-slot` package (ioredis ki dependency, `node_modules` mein maujood) ka default export use karo -- ek function jo key ka slot deta hai (test mein naam `calculateSlot` rakha hai). Base key aur kuch window starts ke derived keys ka slot same hona chahiye; aur do alag users ke keys ka slot (generally) alag hona chahiye taaki load spread ho. Yeh test single-node par bhi chal sakta hai kyunki yeh sirf slot calculation hai -- real cluster test alag se chahiye (docker cluster) jo is exercise ke bahar hai.\n\nUse: `limiter.consume(clusterKey(`email:${email}`))` -- RateLimiter prefix lagayega: `rl:login:{email:...}`. Key length 512 limit ke andar rakhna padega.",
+  "why_needed": "Cluster par multi-key Lua ka standard fix hash tags hain; ise khud likh ke test karna dikhata hai ki tum slot mechanics samajhte ho, sirf naam nahi jaante.",
+  "real_world_analogy": "Ek courier company pincode se warehouse chunti hai. Teen parcel ek saath deliver karne hain toh teeno par same pincode ka sticker lagao -- baaki address kuch bhi ho, warehouse ek hi hoga.",
+  "how_it_works": "Slot function: braces ka pehla `{` aur uske baad ka pehla `}` dhundta hai; beech mein kuch ho toh sirf woh hash hota hai. Isliye id ke andar braces allow karna dangerous hai.",
+  "in_this_project": "Abhi `src/limiter.ts` key ko as-is prefix ke saath use karta hai (`this.prefix + key`) aur `src/lua/sliding_counter.lua` `KEYS[1] .. ':' .. cur_start` se keys banata hai. Helper `src/adapters/http.ts` ke `ipKey` ki tarah ek chhota pure function ho sakta hai. `cluster-key-slot` `projects/19-rate-limit/node_modules` mein ioredis ke through installed hai, par package.json ki direct dependency nahi.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/lua/sliding_counter.lua::prev_key",
+   "projects/19-rate-limit/src/limiter.ts::RateLimiter",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// illustrative, NOT in the repo: src/cluster-key.ts\nimport { RateLimitError } from \"./types.js\";\n\nexport function clusterKey(id: string): string {\n  if (id.length === 0) throw new RateLimitError(\"id must be non-empty\");\n  if (/[{}]/.test(id)) throw new RateLimitError(\"id must not contain { or }\");\n  return `{${id}}`;\n}\n\n// illustrative, NOT in the repo: test/cluster-key.test.ts\nimport calculateSlot from \"cluster-key-slot\";\nimport { describe, expect, it } from \"vitest\";\nimport { clusterKey } from \"../src/cluster-key.js\";\n\ndescribe(\"clusterKey\", () => {\n  it(\"the sliding window's derived keys share the base key's slot\", () => {\n    const base = \"rl:login:\" + clusterKey(\"email:a@b.com\");\n    const slot = calculateSlot(base);\n    for (const start of [0, 1_700_000_000_000, 1_700_000_060_000]) {\n      expect(calculateSlot(`${base}:${start}`)).toBe(slot); // what sliding_counter.lua builds\n    }\n  });\n  it(\"different clients spread over slots (no constant tag)\", () => {\n    const slots = new Set(Array.from({ length: 50 }, (_, i) => calculateSlot(\"rl:\" + clusterKey(`user:${i}`))));\n    expect(slots.size).toBeGreaterThan(40);\n  });\n  it(\"rejects braces inside the id\", () => {\n    expect(() => clusterKey(\"x}{y\")).toThrow();\n  });\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Lua script unchanged rehta hai",
+   "Pure function -- aasaan test",
+   "Slot spread bhi test hota hai"
+  ],
+  "disadvantages": [
+   "Sirf slot math test hota hai, real cluster behaviour nahi",
+   "User ko helper use karna yaad rakhna padega"
+  ],
+  "common_mistakes": [
+   "Poore prefix ko braces mein daalna (`{rl:login}`) -- sab ek slot par",
+   "Id ke andar ke braces allow karna",
+   "Sirf token bucket test karke sliding window bhool jaana"
+  ],
+  "follow_up_questions": [
+   "RateLimiter mein hi option `cluster: true` daalna better hoga?",
+   "50 users mein se 40+ alag slots ka assertion flaky ho sakta hai kya?",
+   "Real Redis Cluster test kaise setup karoge?"
+  ],
+  "concepts": [
+   "redis-cluster",
+   "hash-tag",
+   "coding-exercise",
+   "key-design"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Helper (opt-in, simple) vs RateLimiter mein built-in cluster mode (automatic, par API complex) vs script badal ke keys declare karna (contract-correct, app clock chahiye). Helper sabse kam invasive hai.",
+   "failure_scenarios": "Hash tag bhoolna -> cross-slot error -> store error path. Constant tag -> hot node. Id mein braces -> attacker slot choose kar sakta hai.",
+   "alternatives": "Sliding window state ek hash key mein (fields = window starts) -- ek key, koi tag nahi chahiye, par Lua script badalna padega; ya app-computed KEYS.",
+   "scale_10x_100x": "Per-client tag ka matlab load clients ke saath spread hota hai -- 100x users par bhi theek. Ek hi bahut hot client (shared key, jaise load test ka 'shared') ek slot par rahega -- us case mein sharding help nahi karti.",
+   "production_improvements": "Real cluster integration test (3 masters docker), RateLimiter mein optional validation ki key mein hash tag hai, aur docs mein cluster section."
+  }
+ },
+ {
+  "id": "RLK-048",
+  "project_slug": "p19-rate-limit",
+  "category": "Coding Exercises",
+  "difficulty": "Intermediate",
+  "question": "Write a node-redis adapter for RedisStore and a test that runs it against a real Redis. (The README documents the adapter but says it is not tested; it is not in the repo.)",
+  "answer_hinglish": "README aur `redis-store.ts` ka comment node-redis ke liye adapter ka shape dete hain, par yeh 'documented, not tested' hai aur `node-redis` package is repo mein install bhi nahi hai. Exercise: adapter ko ek function banao aur ek real-Redis test likho jo `ioredisClient` wale tests ka mirror ho.\n\nAdapter: `RedisScriptClient` ke do methods. node-redis v4 mein `client.evalSha(sha, { keys, arguments })` aur `client.scriptLoad(script)` hain. Toh `evalsha: (sha, keys, args) => client.evalSha(sha, { keys, arguments: args })`. Structural type rakho (node-redis import mat karo) taaki package ki zero runtime dependency bachi rahe -- `ioredisClient` ka bhi yahi pattern hai.\n\nSabse important test NOSCRIPT ka hai. `RedisStore` NOSCRIPT ko `String(error.message).includes(\"NOSCRIPT\")` se pehchanta hai. Agar node-redis ka error message alag format mein ho (jaise error object ka shape alag), toh retry kabhi nahi hoga aur Redis restart ke baad har request fail. Isliye test: ek consume, `SCRIPT FLUSH`, phir consume -- `{ allowed: true, remaining: 1 }` aana chahiye.\n\nDoosra test: reply shape. node-redis integer replies ko JS numbers deta hai; `toDecision` `typeof x === \"number\"` check karta hai. Agar kabhi RESP3 ya koi option strings/BigInt de, toh 'unexpected reply' error aayega -- test pakdega.\n\nTeesra: atomicity ek chhote version mein (2 clients, 100 requests, capacity 20 -> exactly 20).\n\nRedis na ho toh `describe.skipIf` se skip with notice -- repo ka existing convention.",
+  "why_needed": "Bring-your-own-client design tabhi kaam ka hai jab har adapter ke saath woh edge cases (NOSCRIPT, reply types) verify hon jo store assume karta hai.",
+  "real_world_analogy": "Ek universal charger ka naya plug adapter: sirf 'fit ho gaya' kaafi nahi, check karo current sahi direction mein aata hai (NOSCRIPT detection) aur voltage sahi hai (reply types).",
+  "how_it_works": "Adapter sirf method signatures map karta hai. `RedisStore` ke assumptions: error message mein 'NOSCRIPT' text, `scriptLoad` SHA string return kare, reply array of numbers ho.",
+  "in_this_project": "`src/redis-store.ts` comment: 'node-redis: { evalsha: (sha, keys, args) => c.evalSha(sha, { keys, arguments: args }), scriptLoad: (s) => c.scriptLoad(s) }'. README: 'node-redis adapter: documented, not tested.' Test pattern `test/redis.test.ts` se (`reachable`, `describe.skipIf`, NOSCRIPT test).",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisScriptClient",
+   "projects/19-rate-limit/src/redis-store.ts::ioredisClient",
+   "projects/19-rate-limit/test/redis.test.ts",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// illustrative, NOT in the repo: src/redis-store.ts addition\nexport function nodeRedisClient(client: {\n  evalSha(sha: string, options: { keys: string[]; arguments: string[] }): Promise<unknown>;\n  scriptLoad(script: string): Promise<string>;\n}): RedisScriptClient {\n  return {\n    evalsha: (sha, keys, args) => client.evalSha(sha, { keys, arguments: args }),\n    scriptLoad: (script) => client.scriptLoad(script),\n  };\n}\n\n// illustrative, NOT in the repo: test/node-redis.test.ts (needs `npm i -D redis`)\nimport { createClient } from \"redis\";\n\ndescribe.skipIf(!available)(\"RedisStore with node-redis\", () => {\n  it(\"NOSCRIPT after SCRIPT FLUSH is recognised and retried\", async () => {\n    const c = createClient({ url: URL_ });\n    await c.connect();\n    try {\n      const limiter = new RateLimiter({ algorithm: tokenBucket({ capacity: 3, refillPerSec: 1 }), store: new RedisStore(nodeRedisClient(c)), prefix: PREFIX });\n      await limiter.consume(\"flush\");\n      await c.scriptFlush();\n      expect(await limiter.consume(\"flush\")).toMatchObject({ allowed: true, remaining: 1 });\n    } finally {\n      await c.quit();\n    }\n  });\n});",
+  "code_language": "typescript",
+  "advantages": [
+   "Zero runtime dependency bachi rehti hai",
+   "NOSCRIPT detection real error ke against verify hota hai",
+   "Existing test conventions reuse"
+  ],
+  "disadvantages": [
+   "Dev dependency add karni padegi",
+   "node-redis ke major versions mein API badalti hai -- adapter version-specific"
+  ],
+  "common_mistakes": [
+   "Sirf happy path test karna aur NOSCRIPT ko assume karna",
+   "node-redis ko runtime dependency bana dena",
+   "Test ko Redis ke bina 'pass' hone dena"
+  ],
+  "follow_up_questions": [
+   "NOSCRIPT detection ko error message ki jagah error code se kaise karoge?",
+   "node-redis ka cluster client is adapter ke saath chalega?",
+   "Adapter ka type test (tsc) bhi chahiye?"
+  ],
+  "concepts": [
+   "adapter-pattern",
+   "node-redis",
+   "integration-test",
+   "coding-exercise"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-049",
+  "project_slug": "p19-rate-limit",
+  "category": "Advanced",
+  "difficulty": "Senior/System Design",
+  "question": "The tests show 'exactly 50 of 300' and 'exactly 500' under load. What consistency guarantee does this rate limiter really give, and under which conditions does it break?",
+  "answer_hinglish": "Guarantee: ek single Redis primary ke andar, ek key ke liye, decisions linearizable hain -- har request ka script ek total order mein chalta hai aur har script pichle ka likha state dekhta hai. Isliye 'at most limit' bhi aur 'exactly limit' bhi, chahe kitne app instances hon. Evidence: 3 clients x 300 -> 50; 2 clients x 200 sliding -> 40; do Express instances, 30 requests -> 10; load test run 1, 3 processes -> 500 of 500.\n\nKab tootta hai -- aur yeh list hi senior answer hai:\n\n1. Store Redis nahi hai: MemoryStore ya FailoverStore ka fallback -> per instance, N x limit. Decisions par `degraded: true`.\n2. Redis failover: async replication se last writes lost -> over-allow.\n3. Recovery: fallback counts merge nahi hote.\n4. Timeout ke baad bhi execute hui call: same request do baar count -> under-allow.\n5. App clocks inject kiye (`now` option): drift se token bucket free refill de sakta hai; default Redis TIME isse bachata hai.\n6. Sliding window khud approximate hai: estimate assume karta hai ki pichli window ki requests evenly spread thi. Toh 'exactly 40' 'estimate ke hisaab se exactly' hai -- ek true sliding log se alag ho sakta hai. Window ke andar concurrency ka exactness alag cheez hai, algorithm ki accuracy alag.\n7. Redis Cluster: tested nahi; sliding window ki undeclared keys.\n8. Key design: galat `trustedProxies` ya bina IPv6 /64 grouping ke attacker ko fresh keys -- consistency sahi, par 'client' ki definition galat.\n\nInterview mein main ise aise frame karta hoon: 'atomicity solved hai; durability aur availability trade-offs explicit aur configurable hain' -- fail open/closed per limit, aur degraded flag.",
+  "why_needed": "Senior interview mein 'exactly' sunte hi follow-up aata hai: kis model mein, kin assumptions par? Clear boundary batana trust banata hai.",
+  "real_world_analogy": "Ek single cashier wali dukaan mein hisaab perfect hai -- jab tak cashier wahi hai. Cashier badla, bijli gayi, ya doosri branch se bhi saaman bika -- tab hisaab ki guarantee alag hai.",
+  "how_it_works": "Linearizability source: Redis ka single-threaded command execution + script atomicity. Weak points: replication (async), fallback (local), clock (injectable), algorithm (approximate estimate), routing (cluster slots).",
+  "in_this_project": "Tests: `test/redis.test.ts` (atomicity), `test/express.test.ts` (two instances), `bench/load.mjs` + `bench/reference-results/2026-11-23-win32-load-run1.json`. Limits documented: README 'NOT implemented' (cluster, merge-back, cancellation). `src/types.ts` `degraded`. Sliding window approximation: `src/algorithms.ts` comment 'Approximate (exact only if the previous window's requests were evenly spread)'.",
+  "implementation_files": [
+   "projects/19-rate-limit/test/redis.test.ts",
+   "projects/19-rate-limit/test/express.test.ts",
+   "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+   "projects/19-rate-limit/src/types.ts::degraded",
+   "projects/19-rate-limit/src/algorithms.ts::slidingWindow"
+  ],
+  "code_example": "",
+  "code_language": "text",
+  "advantages": [
+   "Normal operation mein exact, instance-count independent",
+   "Weak points documented aur flagged (degraded)",
+   "Failure policy per limit"
+  ],
+  "disadvantages": [
+   "Failover/recovery mein guarantee weak",
+   "Sliding window approximate hai",
+   "Cluster untested"
+  ],
+  "common_mistakes": [
+   "'Lua atomic hai' ko 'har situation mein exact' bolna",
+   "Algorithm ki approximation aur concurrency ki exactness ko mix karna",
+   "Fallback ke decisions ko shared samajhna"
+  ],
+  "follow_up_questions": [
+   "Kis limit ke liye tum strict guarantee chahoge aur uski keemat kya hogi?",
+   "Sliding log se exact karte toh memory kitni lagti?",
+   "Multi-region mein ek global limit kaise doge?"
+  ],
+  "concepts": [
+   "consistency",
+   "linearizability",
+   "guarantees",
+   "trade-offs"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Single Redis = simple aur exact, par ek dependency aur ek failure domain. Strong durability ya multi-region exactness ki keemat latency hai. Project ne normal path exact aur failure path explicit-best-effort rakha.",
+   "failure_scenarios": "Failover lost writes, fallback N x, recovery reset, timed-out double count, clock injection drift, cluster cross-slot -- har ek ka direction (over/under allow) alag hai aur upar list kiya.",
+   "alternatives": "Per-region limits with periodic sync (eventually consistent), token leasing (instance Redis se batch mein tokens le), CRDT counters, ya ek dedicated limiter service -- PLAN ne 'distributed limits without Redis (gossip)' ko out of scope rakha.",
+   "scale_10x_100x": "10x par same model; Redis load badhta hai. 100x par ek key ki hotness aur ek Redis ka single thread limit -- tab sharding (cluster + hash tags) ya local leasing chahiye, aur dono guarantee ko weaker banate hain.",
+   "production_improvements": "Guarantee ko docs mein ek table mein likho (condition -> behaviour), degraded/store-error metrics, failover drill test, aur security limits ko fail-closed default."
+  }
+ },
+ {
+  "id": "RLK-050",
+  "project_slug": "p19-rate-limit",
+  "category": "Advanced",
+  "difficulty": "Advanced",
+  "question": "Every rate-limited request costs one Redis round trip. If traffic grew 100x, how would you reduce the load on Redis, and what would each option cost in correctness?",
+  "answer_hinglish": "Pehle honesty: is project mein per-check latency ya throughput validly measure nahi hua -- README kehta hai PC 90-100% CPU par tha aur 'no limiter' 'with a limiter' se slow aaya, jo real effect nahi ho sakta. Toh main numbers nahi, design options bataunga, aur pehla step hoga idle machine par proper measurement.\n\nAbhi: har request = ek `EVALSHA` = ek round trip, script O(1) (token bucket: HMGET, HSET, PEXPIRE; sliding: 2 GET, INCRBY, PEXPIRE). 100x par teen pressure points: network round trips, Redis ka single thread, aur hot keys.\n\nOptions:\n\n1. Local pre-check (MemoryStore pehle, Redis baad): jo client local limit se hi bahar hai usko Redis tak bhejo hi mat -- abuse traffic Redis tak nahi pahunchta. Correctness: allowed path abhi bhi Redis par; bas local deny thoda strict ho sakta hai. `src/memory-store.ts` ka comment MemoryStore ko 'a first line in front of Redis' bhi kehta hai, par aisa combined store implement nahi hai.\n\n2. Token leasing: instance Redis se ek saath 10 tokens le, locally kharch kare. Round trips 10x kam. Cost: instance crash par leased tokens waste, aur limit granularity kharab (ek instance ke paas tokens, doosre ke paas nahi).\n\n3. Sharding: Redis Cluster ya multiple Redis, key se route. Load spread hota hai. Cost: cluster untested hai aur sliding window ko hash tags chahiye.\n\n4. Pipelining/auto-pipelining (ioredis option): round trips batch hote hain; correctness same, latency thodi badh sakti hai.\n\n5. Cheaper limits pehle: per-IP limit gateway/nginx par, expensive per-user limit app mein.\n\nMera order: measure -> pipelining (free) -> local pre-check for abuse -> sharding -> leasing sirf agar zaroori.",
+  "why_needed": "Scale question mein interviewer chahta hai ki tum bottleneck pehchano aur har optimization ka correctness cost bolo -- 'Redis fast hai' kaafi jawab nahi.",
+  "real_world_analogy": "Har customer ke liye head office phone karna (round trip) vs branch ko roz subah 100 approvals ka quota de dena (leasing): phone bill kam, par branch band hui toh quota bekaar.",
+  "how_it_works": "Redis ek thread par commands chalata hai; har script us thread ka time leta hai. Round trip latency network par depend karti hai. Hot key = ek slot/node par concentrated load, sharding se bhi nahi bantti.",
+  "in_this_project": "`src/redis-store.ts` (ek `evalsha` per consume), `src/memory-store.ts` comment 'Right for a single instance, tests, or a first line in front of Redis', `bench/load.mjs` (measurement harness, results not valid for throughput), README 'Throughput: NOT a valid measurement' aur 'Not measured: throughput / latency per check'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+   "projects/19-rate-limit/bench/load.mjs",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// illustrative, NOT in the repo: a local pre-check in front of Redis (abuse never reaches Redis)\nclass TwoTierStore implements Store {\n  constructor(private readonly local: Store, private readonly shared: Store) {}\n  async consume<S>(algorithm: Algorithm<S>, key: string, cost: number): Promise<Decision> {\n    const l = await this.local.consume(algorithm, key, cost);\n    if (!l.allowed) return l;              // already over the limit on this instance alone\n    return this.shared.consume(algorithm, key, cost); // the real, shared decision\n  }\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "Options incremental hain -- sabse sasta pehle",
+   "Store interface (`consume`) ki wajah se naye stores bina adapter badle plug ho sakte hain"
+  ],
+  "disadvantages": [
+   "Har optimization correctness ya simplicity mein kuch leti hai",
+   "Abhi koi valid baseline number nahi hai"
+  ],
+  "common_mistakes": [
+   "Bina measure kiye optimize karna",
+   "Busy machine ke throughput numbers par decision",
+   "Leasing ko free lunch samajhna"
+  ],
+  "follow_up_questions": [
+   "Two-tier store mein local limit kitni rakhoge?",
+   "ioredis auto-pipelining ka latency par kya asar hoga?",
+   "Hot shared key (jaise global API limit) ko kaise scale karoge?"
+  ],
+  "concepts": [
+   "scalability",
+   "redis-load",
+   "token-leasing",
+   "measurement"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Har round trip Redis par = exactness; har bachaya round trip = kuch exactness ya simplicity kam. Local pre-check sirf deny path ko local karta hai (cheap, safe); leasing allow path ko local karta hai (expensive in correctness).",
+   "failure_scenarios": "Two-tier mein local store ka state Redis se independent hai -- local deny jab Redis allow karta (strict side). Leasing mein crash = tokens lost. Sharding mein node failure = us shard ke clients degraded.",
+   "alternatives": "nginx/gateway level limiting, Redis Cluster, token leasing, ya ek in-memory dedicated limiter service with consistent hashing.",
+   "scale_10x_100x": "10x: shayad sirf pipelining aur ek bada Redis. 100x: sharding + local pre-check; hot global keys ke liye leasing ya hierarchical limits (per-instance sub-limits).",
+   "production_improvements": "Pehle idle machine/alag load generator par baseline (README ka next step), phir Redis CPU, command latency aur per-check p99 ka dashboard, phir option by option measure."
+  }
+ },
+ {
+  "id": "RLK-051",
+  "project_slug": "p19-rate-limit",
+  "category": "Architecture & System Design",
+  "difficulty": "Intermediate",
+  "question": "Why does RedisStore take a two-method RedisScriptClient instead of depending on ioredis directly? What does that design buy in a distributed setup?",
+  "answer_hinglish": "Kyunki library ko Redis se sirf do cheezein chahiye: `evalsha(sha, keys, args)` aur `scriptLoad(script)`. PLAN ka decision: 'Bring your own Redis client through a two-method interface ... No runtime dependency, and the app keeps one Redis connection pool.'\n\nFayde:\n\n1. Ek connection pool: app ke paas pehle se ek configured Redis client hai (TLS, password, Sentinel/Cluster config, reconnect strategy, timeouts). Library apna client banati toh doosra pool, doosra config, aur doosra jagah jahan failover settings galat ho sakti hain. Yahan tum `ioredisClient(new Redis(...))` dete ho -- wahi client jiske settings tumne production ke liye tune kiye.\n\n2. Zero runtime dependency: `package.json` mein ioredis sirf test ke liye. Library user node-redis use kare toh teen line ka adapter (README mein documented, par tested nahi).\n\n3. Testability: interface itna chhota hai ki fake banana trivial hai. Tests mein fake clients se READONLY error, galat reply shape `[1, 2]`, aur ARGV capture (`seen.push(a)`) test hue -- bina Redis ke.\n\n4. Distributed setup mein: Sentinel ya Cluster support library ka kaam nahi, client ka hai. Library bas ek SHA aur keys bhejti hai.\n\nCost: library ko client ke error format par depend karna padta hai (NOSCRIPT string match), aur reply types (numbers) par. Isi liye har naye adapter ke saath NOSCRIPT test chahiye.\n\nYahi pattern resilience-kit guard ke saath bhi hai: `Guard` structural interface (`execute(op, signal)`), import nahi.",
+  "why_needed": "Library design mein dependency choices long-term maintenance aur production config ko affect karti hain; interviewer 'dependency inversion' ka practical example sunna chahta hai.",
+  "real_world_analogy": "Ek appliance jo kisi bhi standard socket mein lagta hai, apna generator saath nahi laata. Ghar ka wiring (connection pool, safety) wahi rehta hai.",
+  "how_it_works": "Structural typing (TypeScript): koi bhi object jiske paas sahi shape ke methods hon woh `RedisScriptClient` hai. `ioredisClient` ioredis ki shape ko is interface mein map karta hai.",
+  "in_this_project": "`src/redis-store.ts` (`RedisScriptClient`, `ioredisClient`), `src/failover-store.ts` (`Guard`), tests `test/redis.test.ts` ke fake clients. README 'node-redis instead of ioredis' snippet aur 'node-redis adapter: documented, not tested'.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/redis-store.ts::RedisScriptClient",
+   "projects/19-rate-limit/src/redis-store.ts::ioredisClient",
+   "projects/19-rate-limit/src/failover-store.ts::Guard",
+   "projects/19-rate-limit/PLAN.md"
+  ],
+  "code_example": "// real, src/redis-store.ts\n// The two Redis commands the store needs, so ANY client fits: pass a small adapter (see ioredisClient below for\n// ioredis; node-redis: { evalsha: (sha, keys, args) => c.evalSha(sha, { keys, arguments: args }),\n// scriptLoad: (s) => c.scriptLoad(s) }). This package therefore has no runtime dependency on a Redis library.\nexport interface RedisScriptClient {\n  evalsha(sha: string, keys: string[], args: string[]): Promise<unknown>;\n  scriptLoad(script: string): Promise<string>;\n}",
+  "code_language": "typescript",
+  "advantages": [
+   "App ka ek hi tuned connection pool",
+   "Koi runtime dependency nahi",
+   "Fakes se failure cases aasaani se test"
+  ],
+  "disadvantages": [
+   "Error format (NOSCRIPT) aur reply types client par depend",
+   "Har naye client ka adapter alag verify karna padta hai"
+  ],
+  "common_mistakes": [
+   "Library ke andar `new Redis(url)` banana",
+   "Interface mein zaroorat se zyada methods daalna",
+   "Adapter ko test kiye bina 'supported' bolna"
+  ],
+  "follow_up_questions": [
+   "Interface mein `ping` ya `quit` kyun nahi?",
+   "Redis Cluster client is interface ke saath kaisa behave karega?",
+   "Error classification ko adapter mein move karna chahiye?"
+  ],
+  "concepts": [
+   "dependency-inversion",
+   "adapter-pattern",
+   "connection-pool",
+   "structural-typing"
+  ],
+  "advanced": null
+ },
+ {
+  "id": "RLK-052",
+  "project_slug": "p19-rate-limit",
+  "category": "Architecture & System Design",
+  "difficulty": "Senior/System Design",
+  "question": "Design the deployment: three app instances behind one load balancer, one Redis, a login limit and a general API limit. Where does each piece of ratelimit-kit sit, and what is your single point of failure plan?",
+  "answer_hinglish": "Layout: Load balancer (ek nginx) -> 3 app instances -> ek Redis. Har instance mein do limiters, same config, same prefixes.\n\nClient identity: LB X-Forwarded-For mein client ka address right side append karta hai, toh `keyByIp({ trustedProxies: 1 })`. Default 0 hota toh saare requests LB ke IP se aate -- sab ek limit share karte. Aur left-most entry trust ki toh attacker header forge karke har request par fresh limit pata.\n\nAPI limit: `tokenBucket` (bursts + steady rate), `prefix: \"rl:api:\"`, `RedisStore` ke upar `FailoverStore` (guard = breaker + timeout, fallback = MemoryStore), aur `onStoreError: \"allow\"`. Capacity limit hai -- Redis outage mein sabko refuse karna worse hai.\n\nLogin limit: `slidingWindow({ limit: 5, windowMs: 15 * 60_000 })`, `prefix: \"rl:login:\"`, key per email (aur stack karke per IP bhi -- Nest mein do `@RateLimit` decorators, Express mein do middlewares). `onStoreError: \"deny\"` -> Redis down par 503 + `Retry-After: 5`. Kya fallback lagaun? Fallback ke saath har instance 5 deta hai -> 15 guesses per 15 min; brute force ke liye shayad acceptable, par strict chahiye toh fallback nahi, seedha fail closed.\n\nTime: Redis TIME (default) -- instance clocks irrelevant.\n\nSPOF: Redis. Plan: (1) timeout guard taaki hanging Redis requests ko na latkaye; (2) breaker taaki dead Redis par har request time waste na kare; (3) per-limit fail open/closed; (4) degraded metric + alert via `onError`; (5) Redis ko Sentinel/managed failover ke saath chalana -- library ke bahar, client config ka kaam; NOSCRIPT recovery built-in hai.\n\nVerification: `test/express.test.ts` ka two-instance test pattern (exactly 10 of 30) aur load test (500 of 500) isi architecture ko chhote scale par prove karte hain. Cluster nahi chahiye jab tak ek Redis kaafi ho -- aur cluster tested bhi nahi.",
+  "why_needed": "System design round mein library ke pieces ko real deployment mein jodna aur failure plan dena hi main test hai.",
+  "real_world_analogy": "Mall ke teen entrances, ek central visitor counter. Normal din central counter. Counter ka system band ho toh: food court (capacity) khula rakho apni notebook se gin ke; jewellery section (security) band kar do jab tak system wapas na aaye.",
+  "how_it_works": "Request -> LB (XFF append) -> instance -> adapter (key, cost) -> RateLimiter (validate, prefix) -> FailoverStore (guard -> RedisStore -> Lua; fail -> MemoryStore degraded / StoreUnavailableError) -> adapter (headers, 429, onStoreError).",
+  "in_this_project": "Pieces: `src/adapters/http.ts` (`keyByIp`, `clientIp`), `src/adapters/express.ts` / `src/adapters/nestjs.ts` (`rateLimit`, `RateLimit`), `src/limiter.ts`, `src/failover-store.ts`, `src/redis-store.ts`, `src/memory-store.ts`. README sections 'When Redis is down (stage 3)' aur 'Who is the client?'. Tests: `test/express.test.ts` two instances, `test/failover.test.ts` dead Redis behind Express.",
+  "implementation_files": [
+   "projects/19-rate-limit/src/adapters/http.ts::keyByIp",
+   "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+   "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimit",
+   "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+   "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+   "projects/19-rate-limit/README.md"
+  ],
+  "code_example": "// illustrative wiring, built only from the README's documented APIs\nconst redisStore = new RedisStore(ioredisClient(redis));\nconst apiLimit = new RateLimiter({\n  algorithm: tokenBucket({ capacity: 20, refillPerSec: 5 }),\n  store: new FailoverStore(redisStore, { guard: wrap(new CircuitBreaker({ openMs: 10_000 }), new TimeoutPolicy({ ms: 50 })), fallback: new MemoryStore(), onError: logStoreError }),\n  prefix: \"rl:api:\",\n});\nconst loginLimit = new RateLimiter({ algorithm: slidingWindow({ limit: 5, windowMs: 15 * 60_000 }), store: redisStore, prefix: \"rl:login:\" });\n\napp.use(\"/api\", rateLimit(apiLimit, { key: keyByIp({ trustedProxies: 1 }), onStoreError: \"allow\" }));\napp.post(\"/login\", express.json(),\n  rateLimit(loginLimit, { key: (req) => `email:${req.body?.email?.toLowerCase()}`, onStoreError: \"deny\" }),\n  login);",
+  "code_language": "typescript",
+  "advantages": [
+   "Limit instance count se independent",
+   "Har limit ki failure policy uske purpose ke hisaab se",
+   "Client identity spoofing se safe"
+  ],
+  "disadvantages": [
+   "Redis SPOF -- failover library ke bahar",
+   "Fallback mode mein N x limit",
+   "Cluster untested"
+  ],
+  "common_mistakes": [
+   "trustedProxies 0 rakhna LB ke peeche (sab ek IP)",
+   "Login limit par fail open",
+   "Har instance par alag prefix/config"
+  ],
+  "follow_up_questions": [
+   "Do LB layers ho (CDN + nginx) toh trustedProxies kya hoga?",
+   "Login par per-IP aur per-email dono kyun?",
+   "Redis Sentinel failover ke dauraan login users ko kya dikhega?"
+  ],
+  "concepts": [
+   "system-design",
+   "deployment",
+   "spof",
+   "fail-open-closed",
+   "client-identity"
+  ],
+  "advanced": {
+   "architecture_tradeoffs": "Ek Redis: simple, exact, par SPOF. Fallback: availability, par weaker limit. Per-limit policy: complexity thodi, par security aur availability dono sahi jagah. Express middleware vs Nest decorator -- same core, alag entry points.",
+   "failure_scenarios": "Redis down: API limited per instance (degraded), login 503. Redis hang: 50 ms timeout. LB config badla (do proxies): trustedProxies galat -> ya sab ek key, ya spoofable. Instance scale out: memory fallback ka over-allowance badhta hai.",
+   "alternatives": "Gateway (nginx `limit_req`) par coarse per-IP limit + app mein per-user limits; managed Redis with automatic failover; ya API gateway ka built-in limiter (tab app-level business keys jaise email nahi milte).",
+   "scale_10x_100x": "10x instances: Redis par 10x calls, fallback ka over-allowance 10x. 100x: Redis sharding (hash tags), local pre-check, gateway-level coarse limiting -- aur load test idle machine par dobara.",
+   "production_improvements": "Redis Sentinel/managed failover, degraded/StoreUnavailable metrics aur alerts, trustedProxies ko infra config ke saath versioned rakhna, aur staging mein failover drill."
+  }
+ }
+]

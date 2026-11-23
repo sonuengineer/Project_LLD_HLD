@@ -1,0 +1,1304 @@
+[
+  {
+    "id": "RLK-053",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Beginner",
+    "question": "How many Redis round trips does one rate-limit check cost, and what runs inside that one trip?",
+    "answer_hinglish": "Seedha jawab: normal case mein EK round trip -- ek `EVALSHA` command. Poora read-decide-write Redis ke andar Lua script mein chalta hai, isliye app server aur Redis ke beech sirf ek request aur ek reply jaata hai.\n\nUs ek trip ke andar Redis kya karta hai, algorithm par depend karta hai. Token bucket (`token_bucket.lua`): agar time argument khaali hai toh `TIME`, phir `HMGET` (tokens, ts), decision, `HSET` aur `PEXPIRE`. Sliding window (`sliding_counter.lua`): `TIME`, do `GET` (current aur previous window ki key), aur allowed hone par `INCRBY` + `PEXPIRE`. Denied request par sliding window INCRBY se pehle hi return kar deta hai. Yeh sab commands Redis ke andar hain -- network par nahi.\n\nException: agar Redis bole `NOSCRIPT` (restart, `SCRIPT FLUSH`, failover), toh `RedisStore` `scriptLoad` karta hai aur ek baar retry -- us request ke liye teen round trips. Uske baad phir ek.\n\nDo baatein interview mein zaroor bolunga. Pehli: stacked limiters (per IP + per account) ka matlab hai har limiter ka apna `consume`, yaani do limiters = do round trips, ek ke baad ek, kyunki middleware/guards sequence mein chalte hain. Doosri: per-check latency is project mein MEASURE nahi hui -- README ke \"NOT implemented\" mein likha hai ki project 1 ne Lua scripts Python se naape the, yahan repeat nahi kiya. Isliye main koi microsecond number claim nahi karunga.",
+    "why_needed": "Har API request par rate limit check hota hai, toh uska network cost seedha har request ki latency mein judta hai. Interviewer jaanna chahta hai ki tumhe pata hai cost kahan hai.",
+    "real_world_analogy": "Bank mein ek hi counter par jaake form dena aur wahi clerk andar sab check karke stamp lagakar wapas de de -- ek chakkar. Agar har check ke liye alag counter jaana pade (balance dekho, phir deduct karo) toh teen chakkar aur beech mein koi aur line tod de.",
+    "how_it_works": "`RedisStore.consume` script ka SHA (pehle se locally calculated) aur `[key]`, `args` ke saath `client.evalsha` call karta hai. Redis single-threaded hai aur script atomically chalti hai; reply `[allowed, remaining, retry, reset]` aata hai jise `toDecision` validate karta hai. Sirf `NOSCRIPT` error par `scriptLoad` + ek retry.",
+    "in_this_project": "`src/redis-store.ts` mein `consume`: `raw = await this.client.evalsha(sha, [key], args)`. `args` = `algorithm.args()` (capacity/rate ya limit/window) + `now` (default khaali string, matlab Redis TIME) + cost. Express mein `app.get(\"/x\", rateLimit(a), rateLimit(b), handler)` -- do middlewares, do `consume`, do trips. Load test ke \"redis\" mode mein bhi har request ek check karti hai (`tokenBucket({ capacity: 1e9, refillPerSec: 1e9 })`, taaki almost sab allowed rahe).",
+    "implementation_files": [
+      "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+      "projects/19-rate-limit/src/redis-store.ts::toDecision",
+      "projects/19-rate-limit/src/lua/token_bucket.lua",
+      "projects/19-rate-limit/src/lua/sliding_counter.lua",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/redis-store.ts (trimmed)\nlet raw: unknown;\ntry {\n  raw = await this.client.evalsha(sha, [key], args);          // 1 round trip, normal case\n} catch (error) {\n  if (!String((error as Error)?.message ?? error).includes(\"NOSCRIPT\")) throw error;\n  const loaded = await this.client.scriptLoad(source);         // +1\n  if (loaded !== sha) throw new Error(`script SHA mismatch for ${algorithm.luaFile}`);\n  raw = await this.client.evalsha(sha, [key], args);           // +1 (retry once)\n}\nreturn toDecision(raw, algorithm.limit);",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek trip mein atomic decision -- race condition nahi",
+      "Script ke andar ke commands network cost nahi badhate",
+      "NOSCRIPT recovery automatic, sirf us ek request ko mehnga padta hai"
+    ],
+    "disadvantages": [
+      "Har limited request mein ek network hop zaroor judta hai",
+      "Stacked limiters ke trips sequential hain, parallel nahi",
+      "Per-check latency is project mein naapi nahi gayi"
+    ],
+    "common_mistakes": [
+      "Ye kehna ki Lua ke andar ke HMGET/HSET alag round trips hain",
+      "Stacked limiters ka cost bhool jaana (2 limiters = 2 trips)",
+      "Bina measurement ke latency number bata dena"
+    ],
+    "follow_up_questions": [
+      "Stacked limiters ke do trips ko ek mein kaise milaoge?",
+      "Redis TIME script ke andar kyun, app ka clock kyun nahi?",
+      "Per-check latency validly kaise naapoge?"
+    ],
+    "concepts": [
+      "round trip",
+      "EVALSHA",
+      "Lua atomicity",
+      "latency budget"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-054",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Advanced",
+    "question": "Why does RedisStore use EVALSHA with a NOSCRIPT fallback instead of EVAL on every call? What does it save and what can go wrong?",
+    "answer_hinglish": "Short jawab: bandwidth aur Redis ka parse/compile kaam bachane ke liye. `EVAL` har call par poori script ka text bhejta hai; `EVALSHA` sirf 40-character SHA1 bhejta hai. PLAN.md ka decision exactly yahi hai: \"the script body is sent once per Redis restart, not on every request\".\n\nKaise: `load(file)` script file padhta hai, `createHash(\"sha1\")` se SHA nikalta hai aur module-level `scripts` Map mein cache karta hai -- ek baar per process. Har `consume` sirf SHA bhejta hai. Redis ke paas script cache mein na ho (restart, `SCRIPT FLUSH`, failover ke baad naya primary) toh woh `NOSCRIPT` error deta hai; store `scriptLoad(source)` karta hai, check karta hai ki Redis ka lautaya SHA hamare SHA se match kare (`script SHA mismatch` warna), aur EK baar retry karta hai.\n\nKitna bachta hai, maine naapa nahi -- yeh bytes ka seedha hisaab hai: token bucket script kuch sau bytes ki hai, har request par woh text na bhejna saaf bachat hai, khaas karke high request rate par. Koi measured number claim nahi karunga.\n\nKya galat ho sakta hai, aur tests kya cover karte hain: (1) NOSCRIPT na samjhein toh restart ke baad har check fail -- mutation R1 ne 2 tests fail kiye. (2) Har error ko NOSCRIPT samajhkar retry -- jaise `READONLY` (replica par likhna) -- toh bekaar double kaam; mutation R2 ek test se pakda gaya, aur test check karta hai `calls` = 1. (3) Restart ke baad bahut saare concurrent requests ek saath NOSCRIPT paate hain aur sab `SCRIPT LOAD` karte hain -- harmless (idempotent) par ek chhota burst. Yeh case test nahi hua.",
+    "why_needed": "Rate limiter har request par chalta hai -- per-call overhead multiply hota hai. Script cache ka sahi use ek standard Redis interview topic hai.",
+    "real_world_analogy": "Restaurant mein regular customer bolta hai \"mera usual\" -- poora order dobara nahi padhna padta. Naya waiter (restart) bolega \"usual kya hai?\" (NOSCRIPT) -- tab ek baar poora order bata do, phir se \"usual\".",
+    "how_it_works": "Redis scripts ko unke SHA1 se cache karta hai. `EVALSHA sha numkeys key args` cache se chalata hai. Cache memory mein hai, persistence nahi -- restart, `SCRIPT FLUSH` ya failover par khaali. Client-side SHA tabhi kaam karta hai jab woh Redis ke SHA se match kare -- isliye load ke baad comparison.",
+    "in_this_project": "`src/redis-store.ts`: `const scripts = new Map<string, { source: string; sha: string }>()`, `function load(file)`, aur `consume` ka catch block jo sirf `includes(\"NOSCRIPT\")` par retry karta hai. `test/redis.test.ts` mein \"NOSCRIPT after SCRIPT FLUSH\" test `admin.script(\"FLUSH\")` ke baad bhi `allowed: true, remaining: 1` expect karta hai; \"errors other than NOSCRIPT are passed through, not retried\" test `READONLY` ke saath `calls` 1 check karta hai.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/redis-store.ts::load",
+      "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+      "projects/19-rate-limit/test/redis.test.ts",
+      "projects/19-rate-limit/PLAN.md",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/redis-store.ts\nconst scripts = new Map<string, { source: string; sha: string }>();\n\nfunction load(file: string): { source: string; sha: string } {\n  let s = scripts.get(file);\n  if (s === undefined) {\n    const source = readFileSync(new URL(`./lua/${file}`, import.meta.url), \"utf8\");\n    s = { source, sha: createHash(\"sha1\").update(source).digest(\"hex\") };\n    scripts.set(file, s);\n  }\n  return s;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Har request par sirf SHA jaata hai, script body nahi",
+      "Restart/failover ke baad khud recover",
+      "SHA mismatch par clear error, galat script nahi chalti"
+    ],
+    "disadvantages": [
+      "Restart ke baad pehli request ko extra 2 trips",
+      "Error ko message string se pehchaanna (`includes(\"NOSCRIPT\")`) client ke error format par depend karta hai",
+      "Bandwidth bachat naapi nahi gayi"
+    ],
+    "common_mistakes": [
+      "Har error par retry karna (READONLY jaise errors ko bhi)",
+      "SHA locally na nikaalna aur har baar SCRIPT LOAD karna",
+      "Maan lena ki script cache restart ke baad bhi rahega"
+    ],
+    "follow_up_questions": [
+      "Redis 7 Functions (FUNCTION LOAD) se yeh kaise badlega?",
+      "Restart ke baad thundering SCRIPT LOAD ko kaise rokoge?",
+      "Redis Cluster mein script cache har node par alag hai -- kya farak padega?"
+    ],
+    "concepts": [
+      "EVALSHA",
+      "script cache",
+      "NOSCRIPT",
+      "idempotent retry"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "EVALSHA + fallback mein ek chhota code path badhta hai, par har request par body bhejne se bachte hain. Alternative EVAL simple hai par per-call bytes aur Redis par script lookup/compile ka kaam (Redis EVAL par bhi SHA se cache karta hai, par body bhejni padti hai).",
+      "failure_scenarios": "Failover ke baad naye primary par script nahi -- pehli request NOSCRIPT, phir load, phir retry. Agar `scriptLoad` khud fail ho (Redis down) toh error upar jaata hai aur FailoverStore/onStoreError decide karte hain. Replica se jud gaye toh READONLY -- retry nahi, seedha error.",
+      "alternatives": "Redis 7 Functions (`FUNCTION LOAD` persist hote hain, RDB/AOF mein) -- NOSCRIPT ka issue hi nahi. ioredis ka `defineCommand` bhi yahi EVALSHA-fallback khud karta hai. Is project ne bring-your-own client ke liye do-method interface rakha, isliye logic khud likha.",
+      "scale_10x_100x": "10x traffic par body bhejne ki bachat aur zaroori ho jaati hai. Cluster mein har master ka apna script cache -- har node par pehli baar NOSCRIPT aayega; logic same rehta hai par Cluster is project mein TESTED NAHI hai.",
+      "production_improvements": "Startup par warm-up `SCRIPT LOAD` (ya FUNCTION LOAD), NOSCRIPT counter metric, aur error ko message string ki jagah client ke error code se pehchaanna jahan client deta ho."
+    }
+  },
+  {
+    "id": "RLK-055",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Intermediate",
+    "question": "What does one MemoryStore check cost, and how is its memory bounded? What do you know and not know about memory per key?",
+    "answer_hinglish": "Ek `consume` O(1) operations karta hai: `Map.get`, algorithm ka `step` (kuch arithmetic), `delete` + `set` (key ko most-recently-used end par le jaane ke liye), aur agar size `maxKeys` se upar gaya toh `keys().next()` se sabse purani key nikaal ke `delete`. Koi timer nahi, koi network nahi.\n\nMemory bound: `maxKeys`, default 100 000. Kyun zaroori: rate-limit keys aksar client se aati hain (IP, user id). Bina bound ke attacker har request mein naya IP/ID bhej ke Map ko anant badha sakta hai -- memory attack. Test: 100 000 alag keys `maxKeys: 1000` ke saath -> exactly 1000 bachti hain. Trade-off README mein likha hai: key drop hone ka matlab us client ka limit RESET -- woh full allowance ke saath wapas aata hai.\n\nPer-key expiry nahi hai -- jaanbujh ke. Dono algorithms lambe idle state ko \"no state\" jaisa treat karte hain (bucket full ho jaata hai, do window purani count match nahi karti). Pehle version mein expiry thi; mutation M3 ne dikhaya ki woh koi decision nahi badalti, isliye hata di. Memory sirf `maxKeys` se bound hai.\n\nMemory per key: main honestly bolunga ki naapa NAHI gaya. Kya store hota hai woh pata hai: token bucket ke liye `{ tokens, ts }`, sliding window ke liye `{ start, count, prevCount }`, plus key string (prefix + key, key max 512 chars). Real number ke liye heap snapshot lena padega -- aur long keys (jaise email) short IP keys se kaafi zyada lengi. Generic andaaza bhi dunga toh \"few hundred bytes per entry, typically\" -- measured nahi.",
+    "why_needed": "Single instance ya dev mein MemoryStore hi chalega, aur Redis down hone par FailoverStore ka fallback bhi yahi hai. Uska memory behaviour attack ke time decide karta hai ki process bachega ya OOM.",
+    "real_world_analogy": "Parking lot jismein 1000 hi gaadi aa sakti hain: nayi gaadi aaye aur jagah full ho, toh sabse der se khadi gaadi bahar. Lot kabhi overflow nahi hota -- bas bahar kiye gaye ka \"kitni der khade the\" ka hisaab reset ho jaata hai.",
+    "how_it_works": "JavaScript `Map` insertion order yaad rakhta hai. Delete + re-insert key ko end par le jaata hai, toh pehli key = least recently used. Size limit cross hone par pehli key delete. Ek consume mein max ek eviction.",
+    "in_this_project": "`src/memory-store.ts`: `entries = new Map<string, unknown>()` (\"insertion order = least recently used first\"), constructor `maxKeys` validate karta hai (integer >= 1, warna RangeError). `test/limiter.test.ts`: \"keeps at most maxKeys keys, dropping the least recently used (which resets that client)\" aur \"100 000 distinct keys with maxKeys 1000 stay at 1000 (memory bounded)\". Mutations M1 (never evicts) aur M2 (recency refresh nahi) dono pakde gaye.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+      "projects/19-rate-limit/test/limiter.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/memory-store.ts\nasync consume<S>(algorithm: Algorithm<S>, key: string, cost: number): Promise<Decision> {\n  const { state, decision } = algorithm.step(this.entries.get(key) as S | undefined, this.now(), cost);\n  // Re-insert: moves the key to the most-recently-used end.\n  this.entries.delete(key);\n  this.entries.set(key, state);\n  if (this.entries.size > this.maxKeys) {\n    const oldest = this.entries.keys().next().value as string;\n    this.entries.delete(oldest);\n  }\n  return decision;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Network nahi -- sabse sasta check",
+      "Memory hard-bounded, key flood se OOM nahi",
+      "Expiry timer ka koi kharcha nahi"
+    ],
+    "disadvantages": [
+      "Eviction = us client ka limit reset; attacker apni key evict karwa sakta hai (bahut saari nayi keys bhej ke)",
+      "Har instance ka alag count -- N instances, upto N x limit",
+      "Memory per key naapi nahi"
+    ],
+    "common_mistakes": [
+      "maxKeys ko 'unlimited' set kar dena",
+      "Map ko LRU samajhna bina re-insert ke (sirf `get` order nahi badalta)",
+      "Memory per key ka number bina heap snapshot ke bata dena"
+    ],
+    "follow_up_questions": [
+      "Attacker 100 000 nayi IPs bhej ke kisi victim ka limit reset karwa sakta hai -- kaise bachoge?",
+      "maxKeys kaise choose karoge?",
+      "Memory per key kaise naapoge?"
+    ],
+    "concepts": [
+      "LRU",
+      "bounded memory",
+      "Map insertion order",
+      "memory attack"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-056",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Advanced",
+    "question": "Is MemoryStore's LRU eviction really O(1)? What did the sibling cache project find about the same pattern?",
+    "answer_hinglish": "Honest jawab: code O(1) dikhta hai, par ek V8 detail ki wajah se eviction amortized O(1) se zyada ho sakta hai -- aur yeh is project mein naapa NAHI gaya.\n\nPattern: `this.entries.keys().next()` -- har eviction par NAYA iterator. V8 ka Map deleted entries ki jagah table mein \"hole\" chhod deta hai jab tak agla rehash na ho, aur naya iterator slot 0 se shuru hota hai -- toh woh pichhle saare holes par chalta hai. MemoryStore har consume par `delete` + `set` karta hai (recency ke liye), toh holes bahut bante hain.\n\nYahi pattern sibling project cache-kit (`projects/20-cache`) mein benchmark ne pakda: wahan \"10.4 us per evicting set on a 10 000-entry cache\" measure hua, aur fix tha EK long-lived iterator jo sirf victim dhoondhne ke liye rakha jaata hai (spec ke hisaab se Map iterator deleted entries skip karta hai aur baad mein add hui entries bhi visit karta hai). Us fix ke baad wahan ka number 0.55-0.66 us tha (commit message ke mutabiq), aur ek test guard karta hai ki `keys()` dobara call na ho.\n\nratelimit-kit mein kya hai: test \"100 000 distinct keys with maxKeys 1000\" sirf SIZE check karta hai, time nahi. Toh main claim nahi kar sakta ki yahan bhi problem hai ya kitni -- par same pattern hai, isliye yeh pehla suspect hoga. Kab dikhega: jab store full ho aur har naye client par eviction ho -- jaise key-flood attack ke time, jo exactly woh time hai jab hum chahte hain limiter sasta rahe. Fix wahi hoga jo cache-kit mein: ek `oldest` iterator field, aur ek benchmark pehle-baad.",
+    "why_needed": "\"O(1)\" claim karna aasaan hai; interviewer dekhna chahta hai ki tum runtime ke andar ki reality jaante ho aur bina naape claim nahi karte.",
+    "real_world_analogy": "Register mein jo naam kaate gaye unki line khaali chhod di jaati hai. Har baar \"sabse pehla zinda naam\" dhoondhne ke liye page 1 se padhna shuru karo toh kaati hui lines bhi padhni padti hain. Bookmark (long-lived iterator) rakh lo toh wahi se aage padho.",
+    "how_it_works": "V8 ka OrderedHashMap entries ko insertion order mein ek array mein rakhta hai; delete entry ko mark karta hai, hatata nahi. Rehash (grow/shrink) par compaction hota hai. Naya iterator index 0 se chalta hai aur deleted marks skip karta hai -- yeh skipping hi cost hai. Ek purana iterator apni position yaad rakhta hai.",
+    "in_this_project": "`src/memory-store.ts` mein `const oldest = this.entries.keys().next().value as string;`. Comparison ke liye `projects/20-cache/src/cache.ts` mein `private oldest: Iterator<K> = this.map.keys();` aur `evictOldest` ke upar comment jo 10.4 us measurement ka hawala deta hai. ratelimit-kit ka koi benchmark eviction time nahi naapta. README ke 'Known and not changed' section mein yeh ab documented hai: fresh iterator per eviction, projects/20-cache ne yahi pattern slow measure kiya, yahan measure nahi hua, aur distinct-IP flood mein har request evict karti hai -- isliye pehli cheez measure aur fix karne ki.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+      "projects/19-rate-limit/test/limiter.test.ts",
+      "projects/20-cache/src/cache.ts::evictOldest",
+      "projects/20-cache/README.md"
+    ],
+    "code_example": "// illustrative fix, NOT in ratelimit-kit (same idea as projects/20-cache)\nprivate oldest: Iterator<string> = this.entries.keys();\n\nprivate evictOne(): void {\n  let r = this.oldest.next();\n  if (r.done) {                         // iterator exhausted: start a fresh one (rare)\n    this.oldest = this.entries.keys();\n    r = this.oldest.next();\n  }\n  this.entries.delete(r.value as string);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Long-lived iterator: holes dobara nahi chalne padte",
+      "Fix chhota hai aur behaviour same rehta hai",
+      "Sibling project mein measured aur test-guarded"
+    ],
+    "disadvantages": [
+      "Iterator state ek aur cheez jo sahi rakhni padti hai (re-insert hui keys iterator ke aage aati hain -- spec ke hisaab se theek)",
+      "ratelimit-kit mein problem abhi measured nahi -- fix bina benchmark ke 'blind' hoga"
+    ],
+    "common_mistakes": [
+      "Big-O ko runtime implementation se alag samajhna",
+      "Size test ko performance test samajh lena",
+      "Doosre project ka number is project ka number bata dena"
+    ],
+    "follow_up_questions": [
+      "Is cost ko ratelimit-kit mein kaise naapoge?",
+      "Map iterator deleted/added entries ke saath kaise behave karta hai (spec)?",
+      "Key-flood attack ke time limiter ka CPU kaise monitor karoge?"
+    ],
+    "concepts": [
+      "V8 Map internals",
+      "amortized complexity",
+      "LRU eviction",
+      "benchmark-driven fix"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Simple `keys().next()` padhne mein saaf hai; long-lived iterator ek field aur edge case (done) jodta hai. Fayda tabhi jab eviction bahut ho -- jo exactly attack ka case hai.",
+      "failure_scenarios": "Key flood (har request naya IP ya /64): store full, har consume eviction karta hai, har eviction holes par chalta hai -> CPU badhta hai, event loop lag, legit requests slow. Limiter jo bachane ke liye tha wahi bottleneck.",
+      "alternatives": "Doubly linked list + Map (classic LRU, strict O(1)), ya `lru-cache` jaisi library -- par project ka zero-dependency rule. Ya eviction batch mein (10% ek saath) -- kam baar iterator.",
+      "scale_10x_100x": "maxKeys 100 000 se 1 000 000 karo toh holes aur zyada; rehash ka cost bhi bada. 100x instances par yeh per-instance cost hai, Redis par asar nahi.",
+      "production_improvements": "Ek micro-benchmark (evicting consume per us, store full), fix, aur cache-kit jaisa test jo `keys()` calls gin kar regression rokta hai. Eviction count metric bhi -- attack detect karne ke liye."
+    }
+  },
+  {
+    "id": "RLK-057",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Beginner",
+    "question": "Describe the load test in bench/load.mjs: what was set up, and what did it actually show?",
+    "answer_hinglish": "Setup: `bench/load.mjs` 3 Express instances chalata hai -- teen alag Node processes (`fork`), jaise 3 replicas. Load balancer nahi hai; client khud round-robin karke requests baant-ta hai, 32 concurrent connections ke saath. Teeno ek hi Redis (Docker, same PC) par limit karte hain. Machine: Windows 11, Ryzen 5 4500, Node 20.20.1.\n\nDo hisse hain. Throughput run: modes \"none\" (koi limiter nahi), \"memory\", \"redis\"; 1.5 s warm-up, phir 8 s measure; req/s aur p50/p99. Correctness run: EK shared key, sliding window limit 500 per 10 minute, 3 seconds.\n\nKya dikha -- sirf correctness valid hai. Run 1: Redis ke saath teeno instances milake EXACTLY 500 allowed, 503 denied, kuch aur nahi. MemoryStore ke saath (har instance apna count) 1116 allowed, 0 denied. Yeh README ki warning \"N instances, up to N x the limit\" ka measured roop hai -- shared Redis ke bina limit 500 ka matlab hi nahi raha.\n\nRun 2 ne shared key ko 3 seconds mein sirf 410 requests bheji (PC slow tha), toh limit tak pahuncha hi nahi -- woh cap ke baare mein kuch prove nahi karta; aur run 2 ka memory run (956 allowed, 0 denied) bhi kisi per-instance limit tak nahi pahuncha.\n\nThroughput numbers JSON mein rakhe hain par unse koi conclusion nahi: PC 90-100% CPU par tha aur \"no limiter\" \"limiter\" se SLOW aaya, jo real effect ho hi nahi sakta. Same property har `npm test` par deterministic test bhi check karta hai: do Express instances, ek Redis, 30 concurrent requests -> exactly 10 of 10.",
+    "why_needed": "Multi-instance correctness hi Redis wale limiter ka poora point hai. Load ke neeche bhi limit hold karti hai ya nahi -- yeh dikhaana zaroori hai, aur honestly batana ki kya nahi dikha.",
+    "real_world_analogy": "Teen gate wala stadium, 500 ticket. Ek central counter (Redis) ho toh total 500 hi andar jaate hain. Har gate apna register rakhe (memory) toh har gate 500 tak ginega -- 1116 log andar aa gaye aur kisi gate ne mana nahi kiya.",
+    "how_it_works": "Driver `startInstances(mode)` se 3 processes fork karta hai, har ek port bhejta hai. `run(urls, ms, record)` 32 async workers chalata hai jo `urls[n++ % urls.length]` par fetch karte hain. Status codes gine jaate hain; correctness mein allowed = 200, denied = 429.",
+    "in_this_project": "`bench/load.mjs`: `INSTANCES = 3`, `CONCURRENCY = 32`, `DURATION_MS = 8000`, `WARMUP_MS = 1500`, `LIMIT = 500`. Correctness modes `memory-shared` / `redis-shared`, key `() => \"shared\"`. Raw results `bench/reference-results/2026-11-23-win32-load-run1.json` (redis-shared: allowed 500, denied 503; memory-shared: allowed 1116, denied 0) aur `-run2.json` (redis-shared: allowed 410, denied 0).",
+    "implementation_files": [
+      "projects/19-rate-limit/bench/load.mjs::CONCURRENCY",
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run2.json",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, bench/reference-results/2026-11-23-win32-load-run1.json (correctness part)\n\"correctness\": [\n  { \"mode\": \"memory-shared\", \"limitPerWindow\": 500, \"instances\": 3, \"allowed\": 1116, \"denied\": 0, \"other\": {} },\n  { \"mode\": \"redis-shared\",  \"limitPerWindow\": 500, \"instances\": 3, \"allowed\": 500,  \"denied\": 503, \"other\": {} }\n]",
+    "code_language": "json",
+    "advantages": [
+      "Real processes, real Redis, real HTTP -- unit test se zyada realistic",
+      "Raw JSON rakha hai, koi bhi verify kar sake",
+      "Memory vs Redis ka farak ek number mein dikh jaata hai"
+    ],
+    "disadvantages": [
+      "Client, instances aur Redis ek hi busy PC par",
+      "Correctness run sirf 3 seconds, ek key",
+      "Run 2 limit tak pahuncha hi nahi"
+    ],
+    "common_mistakes": [
+      "1116 ko 'memory 3x allow karta hai' bolna -- yahan har instance ~372 par tha, 500 tak nahi pahuncha; sirf itna dikha ki limit hold nahi hui",
+      "Run 2 ke 410 ko correctness proof maan lena",
+      "Throughput numbers quote kar dena"
+    ],
+    "follow_up_questions": [
+      "Run 2 ko valid kaise banaoge?",
+      "Load balancer ke peeche test karte toh kya badalta?",
+      "Correctness ke liye deterministic test aur load test dono kyun?"
+    ],
+    "concepts": [
+      "load testing",
+      "multi-instance correctness",
+      "shared state",
+      "honest reporting"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-058",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Senior/System Design",
+    "question": "Your load test's throughput numbers were declared invalid. Why, and how would you design a measurement that is valid?",
+    "answer_hinglish": "Kyun invalid: PC ka CPU dusre programs se run 1 mein 90% aur run 2 mein 100% par tha, aur numbers khud chilla rahe the -- dono runs mein \"no limiter\" \"with a limiter\" se SLOW aaya: run 1 mein 348 vs 490 req/s, run 2 mein 161 vs 256 req/s. Limiter ek extra kaam hai; usse throughput badh nahi sakta. Matlab measurement noise effect se bada tha. Isliye README aur PLAN dono kehte hain: numbers JSON mein hain, conclusion koi nahi; sirf correctness claim hai.\n\nValid measurement ke liye kya chahiye, step by step:\n1. Idle machine, ya load generator ALAG host par -- abhi client, 3 instances aur Redis sab ek hi CPU ke liye lad rahe the. Ideal: app hosts, Redis host aur load-gen alag.\n2. Run ke dauran CPU monitor karna aur result ke saath record karna -- load-gen khud saturated ho toh result app ka nahi, client ka hai.\n3. Sanity checks pehle se likhe: baseline (none) >= memory >= redis hona chahiye; ulta aaye toh run reject.\n4. Kai runs, order badal ke (modes ko interleave/shuffle), aur spread report karna -- ek run nahi. Abhi modes hamesha none -> memory -> redis order mein chalte hain, toh time ke saath badalta background load ek mode ko bias kar sakta hai.\n5. Closed-loop (32 workers, response ka wait) ke saath open-loop (fixed arrival rate) bhi -- closed-loop slow server par khud load kam kar deta hai aur latency chhupa deta hai (coordinated omission).\n6. Per-check cost alag naapna (sirf `consume` loop mein), taaki HTTP/Express ka kharcha limiter ke kharche ko na dhak de -- README ka \"Not measured: throughput / latency per check\".\n\nInvalid result ko reject karke reason likhna -- yahi asli engineering hai.",
+    "why_needed": "Senior role mein benchmarks par decisions hote hain (capacity, cost). Galat benchmark se galat decision. Interviewer dekhta hai ki tum apne hi numbers par shak kar sakte ho.",
+    "real_world_analogy": "Traffic jam mein do gaadiyon ki top speed compare karna -- jo pehle nikli use jam mila, jo baad mein nikli use khali road. Result gaadi ka nahi, road ka hai. Khali track (idle machine) chahiye.",
+    "how_it_works": "Closed-loop load: N workers, har ek response aane ke baad hi agli request. Throughput = N / latency. Agar machine saturated hai toh latency client-side scheduling se bhi badhti hai -- jo app ka nahi hai. Open-loop fixed rate par requests bhejta hai, queueing dikhti hai.",
+    "in_this_project": "`bench/load.mjs` ka `run()` closed-loop hai (`while (performance.now() < end) { await fetch(...) }`, 32 workers). Modes ka order fixed: `for (const mode of [\"none\", \"memory\", \"redis\"])`. Raw JSON: run 1 none 348 / memory 490 / redis 283 req/s; run 2 none 161 / memory 256 / redis 255 req/s -- sab \"not valid\" ke label ke saath README mein.",
+    "implementation_files": [
+      "projects/19-rate-limit/bench/load.mjs::DURATION_MS",
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run2.json",
+      "projects/19-rate-limit/README.md",
+      "projects/19-rate-limit/PLAN.md"
+    ],
+    "code_example": "// real, bench/load.mjs (trimmed) -- closed loop, fixed mode order\nfor (const mode of [\"none\", \"memory\", \"redis\"]) {\n  const procs = await startInstances(mode);\n  const urls = procs.map((x) => x.url);\n  await run(urls, WARMUP_MS, false);\n  const { lat, statuses } = await run(urls, DURATION_MS, true);\n  await stopInstances(procs);\n  // ...\n}",
+    "code_language": "javascript",
+    "advantages": [
+      "Invalid data ko invalid bolna -- trust banta hai",
+      "Raw data rakha hai, baad mein dobara analyse ho sakta hai",
+      "Correctness aur throughput ko alag claims rakha"
+    ],
+    "disadvantages": [
+      "Abhi koi valid throughput/latency number nahi hai",
+      "Same-host setup client aur server ko alag nahi kar sakta",
+      "Fixed mode order background drift ko ek mode par daal deta hai"
+    ],
+    "common_mistakes": [
+      "Ek run ka number publish karna",
+      "Load generator ka CPU check na karna",
+      "Closed-loop latency ko user-facing latency samajhna"
+    ],
+    "follow_up_questions": [
+      "Coordinated omission kya hai?",
+      "Per-check overhead HTTP ke bina kaise naapoge?",
+      "Kitne runs kaafi hain aur spread kaise report karoge?"
+    ],
+    "concepts": [
+      "benchmark validity",
+      "closed vs open loop",
+      "noise",
+      "sanity checks"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Same-PC benchmark sasta aur turant hai, par sirf correctness ke liye theek. Alag hosts mehnga hai par hi valid throughput deta hai. Project ne sahi trade kiya: correctness claim, throughput nahi.",
+      "failure_scenarios": "Load-gen saturate ho jaaye toh sab modes ek jaise dikhte hain (\"limiter free hai\" ka galat conclusion). Background process beech mein aaye toh ek mode ka result gire. Redis Docker mein ho toh Docker ka networking aur VM overhead bhi beech mein.",
+      "alternatives": "autocannon / k6 / wrk jaise tools (open-loop support), dedicated cloud instances, ya sirf micro-benchmark (`consume` in a loop) -- har ek alag sawaal ka jawab.",
+      "scale_10x_100x": "10x/100x traffic ke liye capacity planning tabhi possible hai jab ek host ka valid number ho; uske bina Redis ki capacity ka andaaza bhi nahi. 100x par Redis CPU aur network pehle saturate honge -- unke metrics bhi capture karne honge (INFO commandstats).",
+      "production_improvements": "CI ya dedicated box par benchmark, results ke saath CPU/load metadata, automatic sanity rule (baseline slower than limiter -> run reject), aur kai runs ka median + spread."
+    }
+  },
+  {
+    "id": "RLK-059",
+    "project_slug": "p19-rate-limit",
+    "category": "Performance & Scalability",
+    "difficulty": "Senior/System Design",
+    "question": "What happens when one rate-limit key gets very hot in Redis, and how would you scale past it?",
+    "answer_hinglish": "Seedha: ek key = Redis mein ek jagah = ek CPU thread. Redis commands ek-ek karke chalata hai, aur Lua script poori atomic chalti hai -- toh ek hot key (global limit, ya ek bada tenant jiske saare users ek key share karte hain) ki saari checks serialize hoti hain. Load test ka \"redis-shared\" mode exactly yahi tha: teeno instances ki har request ek hi key \"shared\" par.\n\nIs project mein kya hai: Redis ek single node (Docker), Cluster TESTED NAHI. Hot key ke liye koi special handling implement NAHI hai. Ek detail cluster mein bhi matter karegi: sliding window script `<key>:<window start>` jaisi do keys andar banata hai jo KEYS mein declare nahi hain -- cluster mein woh doosre node par ho sakti hain aur Redis mana kar dega. README hash tag (`{user42}`) suggest karta hai, par \"not done or tested\".\n\nScale karne ke options (production mein, yahan nahi bane):\n1. Local pre-limit: har instance par ek MemoryStore limiter (limit / N ke aas paas) Redis se pehle -- MemoryStore ke comment mein bhi likha hai \"a first line in front of Redis\". Bahut saari requests Redis tak pahunchti hi nahi. Cost: thoda approximate.\n2. Key ko shard karna: limit L ko k sub-keys mein baanto (har ek L/k), request random sub-key par. Load k nodes par bant jaata hai; per-user fairness thodi dheeli.\n3. Local batching / leasing: instance Redis se ek saath 50 tokens \"lease\" kare aur locally kharch kare -- round trips 50x kam, par instance crash par lease khoya.\n4. Hot key ke liye coarser algorithm ya bada window.\n\nInterview mein main trade-off saaf bolunga: exactness vs throughput. Exactly-L sirf ek central atomic counter de sakta hai; scale ke liye thoda approximation maanna padta hai.",
+    "why_needed": "Global ya per-tenant limits real systems mein common hain, aur Redis ka single-threaded model ek hot key par ceiling laga deta hai. Senior interview mein yeh standard follow-up hai.",
+    "real_world_analogy": "Ek hi ATM par puri colony ki line -- ATM kitna bhi fast ho, ek waqt mein ek. Do raste: aur ATM (sharding), ya har building mein chhota cash box jo ATM se bulk mein paise le aaye (leasing / local pre-limit).",
+    "how_it_works": "Redis Cluster key ke hash slot se node chunta hai; ek key hamesha ek node par. Lua script ke saare keys same slot mein hone chahiye. Hash tag `{...}` sirf braces ke andar ka part hash karta hai, toh related keys ek slot mein.",
+    "in_this_project": "`src/lua/sliding_counter.lua`: `local cur_key = KEYS[1] .. ':' .. cur_start` aur `prev_key` -- undeclared keys. `bench/load.mjs` redis-shared mode: `rateLimit(limiter, { key: () => \"shared\" })`. `src/memory-store.ts` ka comment: \"Right for a single instance, tests, or a first line in front of Redis.\" README \"NOT implemented\": Redis Cluster not tested.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/lua/sliding_counter.lua",
+      "projects/19-rate-limit/src/memory-store.ts::MemoryStore",
+      "projects/19-rate-limit/bench/load.mjs",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// illustrative, NOT in the repo: a local first line in front of Redis (stacked limiters)\nconst localFirst = new RateLimiter({\n  algorithm: tokenBucket({ capacity: 50, refillPerSec: 20 }),   // per instance, cheap\n  store: new MemoryStore(),\n  prefix: \"rl:tenant-local:\",\n});\nconst shared = new RateLimiter({\n  algorithm: slidingWindow({ limit: 5000, windowMs: 60_000 }),  // the real, global limit\n  store: new RedisStore(ioredisClient(redis)),\n  prefix: \"rl:tenant:\",\n});\napp.use(\"/api\", rateLimit(localFirst, { key: tenantKey }), rateLimit(shared, { key: tenantKey }));",
+    "code_language": "typescript",
+    "advantages": [
+      "Atomic single key = exact limit",
+      "Local pre-limit Redis load seedha kam karta hai",
+      "Stacking API pehle se hai -- local + shared limiter bina naye code ke"
+    ],
+    "disadvantages": [
+      "Hot key Redis ke ek thread ko saturate karta hai",
+      "Cluster tested nahi, sliding window ki undeclared keys cluster mein toot sakti hain",
+      "Sharding/leasing exactness kam karte hain"
+    ],
+    "common_mistakes": [
+      "Redis ko 'infinitely fast' maan lena",
+      "Cluster mein bina hash tag ke multi-key script chalana",
+      "Local pre-limit ko global limit ke barabar set karna (tab woh kuch nahi rokta)"
+    ],
+    "follow_up_questions": [
+      "Token leasing mein instance crash ho toh?",
+      "Hash tag se hot slot problem badhti hai ya ghatti hai?",
+      "Hot key ko detect kaise karoge (redis-cli --hotkeys, metrics)?"
+    ],
+    "concepts": [
+      "hot key",
+      "Redis single-threaded",
+      "sharding",
+      "Redis Cluster hash tags"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Exactness (ek atomic counter) vs throughput (distributed approximate counting). Simple single-key design abhi ki needs ke liye sahi hai; hot key tab problem hai jab ek key ki rate Redis ke ek thread ki capacity ke kareeb ho.",
+      "failure_scenarios": "Hot key par Redis latency badhti hai -> har request slow -> FailoverStore ka timeout fire -> fallback memory par -> limit per instance ho jaata hai (degraded). Yaani overload khud limit ko dheela kar deta hai.",
+      "alternatives": "API gateway level limiting (Envoy global rate limit service), approximate counters (local aggregate + periodic sync), ya per-tenant dedicated Redis.",
+      "scale_10x_100x": "10x: local pre-limit + pipelining kaafi ho sakta hai. 100x: Cluster, hash tags, sharded sub-keys, aur shayad leasing. Har step par measure karna -- jo is project mein abhi nahi hua.",
+      "production_improvements": "Hot key metrics (per key rate), cluster-safe keys (KEYS mein sab declare ya hash tag), aur ek tested Cluster setup."
+    }
+  },
+  {
+    "id": "RLK-060",
+    "project_slug": "p19-rate-limit",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "Walk through what the Express middleware does for one request, step by step, including how it handles async errors.",
+    "answer_hinglish": "`rateLimit(limiter, options)` ek middleware lautata hai. Options ek baar resolve hote hain: `keyFn` (default `keyByIp()`), `sendHeaders` (default true), `onStoreError` (default \"error\").\n\nHar request par:\n1. Middleware ek async IIFE chalata hai: `void (async () => { ... })().catch(next)`. Middleware khud `void` return karta hai, promise nahi -- isliye Express 4 (jo rejected promises nahi pakadta) aur 5 dono mein same chalta hai. Koi bhi throw `.catch(next)` se Express ke error handler tak.\n2. `await keyFn(req)` -- key function async bhi ho sakta hai (KeyFn `Promise<string | undefined>` allow karta hai). `undefined` aaye toh `next()` -- yeh limiter is request par lagta hi nahi.\n3. `const cost = options.cost?.(req) ?? 1` -- try ke BAHAR, taaki throwing cost function (app ka bug) `.catch(next)` se error handler tak jaaye, kabhi fail open na ho. (Pehle stage-3 version mein cost try ke andar tha; review mein pakda aur fix hua, test ke saath.)\n4. `limiter.consume(key, cost)` try ke andar. Error par: `RateLimitError` (bug) ya `onStoreError === \"error\"` -> rethrow -> `next(err)`. \"allow\" -> `next()` (fail open, headers nahi). \"deny\" -> 503, `retry-after: 5`, JSON body.\n5. Decision aaya: `if (sendHeaders || !decision.allowed) setHeaders(res, decision)`.\n6. Allowed -> `next()`. Denied -> status 429, content-type JSON, `TOO_MANY_REQUESTS_BODY`, `res.end`. Route chalti hi nahi.\n\nEk baat jo main highlight karunga: har raste par ya `next()` call hota hai ya response end hota hai -- koi raasta request ko latka ke nahi chhodta. Mutation E4 (store errors swallowed) ne yahi dikhaya: error nigal lo toh request HANG hoti hai, aur 4 tests fail hue.",
+    "why_needed": "Middleware ka control flow -- next, error, end -- galat ho toh ya toh limit bypass hota hai ya request hang. Yahi asli internals hain.",
+    "real_world_analogy": "Building ka security guard: ID check karo (key), register dekho (consume), phir ya andar bhejo (next), ya mana karo aur reason likh do (429). Guard kabhi visitor ko gate par khada chhod ke chai peene nahi ja sakta.",
+    "how_it_works": "Express middleware signature `(req, res, next)`. Async kaam ke liye IIFE + `.catch(next)` sabse portable pattern hai. `setHeaders` pehle `res.headersSent` check karta hai, phir lowercase header names set karta hai.",
+    "in_this_project": "`src/adapters/express.ts` ka `rateLimit` aur andar `rateLimitMiddleware`. Tests `test/express.test.ts`: \"allows `limit` requests with RateLimit-* headers, then 429 with Retry-After; the route does not run\" (`ran` = 3), \"a store error ... goes to the app's error handler\", \"a key function that throws also goes to the error handler\".",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimitMiddleware",
+      "projects/19-rate-limit/src/adapters/http.ts::setHeaders",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/adapters/express.ts (trimmed)\nreturn function rateLimitMiddleware(req: IncomingMessage, res: ServerResponse, next: Next): void {\n  void (async () => {\n    const key = await keyFn(req);\n    if (key === undefined) return next();\n    // Computed OUTSIDE the try: a throwing cost function is a bug in the app, never a store error to fail open on.\n    const cost = options.cost?.(req) ?? 1;\n    let decision: Decision;\n    try {\n      decision = await limiter.consume(key, cost);\n    } catch (error) {\n      if (error instanceof RateLimitError || onStoreError === \"error\") throw error;\n      if (onStoreError === \"allow\") return next();\n      res.statusCode = 503; /* + retry-after, JSON body, res.end */ return;\n    }\n    if (sendHeaders || !decision.allowed) setHeaders(res, decision);\n    if (decision.allowed) return next();\n    res.statusCode = 429; /* + content-type, body */\n  })().catch(next);\n};",
+    "code_language": "typescript",
+    "advantages": [
+      "Express 4 aur 5 dono mein same (promise return nahi karta)",
+      "Har error ek jagah -- `.catch(next)`",
+      "Denied request handler tak pahunchti hi nahi"
+    ],
+    "disadvantages": [
+      "`next()` agar handler ke andar throw kare toh `.catch(next)` us error ko dobara next ko de sakta hai (ek edge case, test nahi hua)",
+      "Express 5 test nahi hua -- sirf 4.21.2"
+    ],
+    "common_mistakes": [
+      "Async middleware se promise return karke Express 4 par bharosa karna",
+      "Error path mein na next na end -- hanging request",
+      "429 ke baad bhi next() call kar dena"
+    ],
+    "follow_up_questions": [
+      "Express 5 mein yeh middleware async function ho sakta tha -- kyun nahi kiya?",
+      "Key function DB call kare toh latency ka kya?",
+      "Response pehle hi bheja ja chuka ho toh setHeaders kya karta hai?"
+    ],
+    "concepts": [
+      "Express middleware",
+      "async error handling",
+      "fail open/closed",
+      "control flow"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-061",
+    "project_slug": "p19-rate-limit",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "How does the NestJS @RateLimit decorator work without dependency injection, and how does a denial become a 429?",
+    "answer_hinglish": "`@RateLimit(limiter, options)` andar sirf yeh karta hai: `applyDecorators(UseGuards(new RateLimitGuard(limiter, options)))`. Matlab decorator evaluate hote hi ek guard INSTANCE ban jaata hai jo apna limiter pakad ke rakhta hai. Nest ko guard class nahi, ready object milta hai -- toh DI container ko kuch resolve nahi karna padta, koi `@Injectable`, koi Reflector metadata nahi.\n\n`canActivate(context)`:\n1. `context.switchToHttp()` se `getRequest<IncomingMessage>()` aur `getResponse<ServerResponse>()` -- Node http types, platform-express ke saath.\n2. Key function; `undefined` -> `return true` (yeh guard lagta hi nahi).\n3. `limiter.consume`. Error par: RateLimitError ya mode \"error\" -> rethrow (Nest ka exception layer -> 500). \"allow\" -> `true`. \"deny\" -> `retry-after: 5` header set, phir `HttpException(STORE_UNAVAILABLE_BODY, SERVICE_UNAVAILABLE)` -> 503.\n4. Headers set (agar `headers` true ya denied).\n5. Allowed -> `true`. Denied -> `throw new HttpException(TOO_MANY_REQUESTS_BODY, HttpStatus.TOO_MANY_REQUESTS)`.\n\nTrick yeh hai: headers PEHLE se `res` par set ho chuke hote hain, phir exception throw hota hai, aur Nest ka exception layer status 429 aur body likhta hai -- headers wahi rehte hain. Test yeh confirm karta hai: 429 par `retry-after` >= 1 aur `ratelimit-limit` \"2\", body `{ error: \"rate_limited\", ... }`, aur `handled` sirf 2.\n\nMutations: N2 (429 par headers nahi) aur N3 (403 instead of 429) dono pakde gaye -- N3 ne 3 tests fail kiye. 403 isliye aata kyunki guard `false` lautaye toh Nest ForbiddenException deta hai -- isliye guard `false` nahi, khud HttpException throw karta hai.",
+    "why_needed": "Nest mein guards aur DI ka model alag hai; limiter jaisi stateful cheez ko guard tak kaise pahunchaaya -- yeh design ka core sawaal hai.",
+    "real_world_analogy": "Gatekeeper ko HR se hire karwana (DI) vs ek pehle se trained guard ko seedha gate par khada kar dena (instance). Doosra turant kaam karta hai, par HR ke records (config, DI services) uske paas nahi.",
+    "how_it_works": "`UseGuards` class ya instance dono le sakta hai. Instance diya toh Nest use as-is use karta hai. Guard `false` return kare toh Nest `ForbiddenException` (403) throw karta hai; isliye 429 ke liye guard ko khud `HttpException` throw karni padti hai.",
+    "in_this_project": "`src/adapters/nestjs.ts`: class `RateLimitGuard implements CanActivate`, constructor mein `this.keyFn = options.key ?? keyByIp()`, function `RateLimit` jo `applyDecorators(UseGuards(new RateLimitGuard(limiter, options)))` lautata hai. `test/nestjs.test.ts` -- real Nest 10 app (platform-express), `@RateLimit(limiter(2, \"rl:login:\"))` wala `login` route.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimitGuard",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimit",
+      "projects/19-rate-limit/test/nestjs.test.ts",
+      "projects/19-rate-limit/PLAN.md"
+    ],
+    "code_example": "// real, src/adapters/nestjs.ts (trimmed)\nif ((this.options.headers ?? true) || !decision.allowed) setHeaders(res, decision);\nif (decision.allowed) return true;\n// Headers are already on the response; Nest's exception layer writes status and body.\nthrow new HttpException(TOO_MANY_REQUESTS_BODY, HttpStatus.TOO_MANY_REQUESTS);\n\nexport function RateLimit(limiter: RateLimiter, options: RateLimitGuardOptions = {}) {\n  return applyDecorators(UseGuards(new RateLimitGuard(limiter, options)));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "DI ya module setup ki zaroorat nahi -- import karo aur lagao",
+      "Har decorator ka apna guard, isliye stacking free mein",
+      "429 + headers sahi, 403 nahi"
+    ],
+    "disadvantages": [
+      "Limiter decorator evaluation time (class define hote waqt) par chahiye -- ConfigService se inject nahi ho sakta",
+      "Sirf platform-express tested; Fastify ka response object alag hai"
+    ],
+    "common_mistakes": [
+      "Guard se `false` lautana aur 429 expect karna (Nest 403 deta hai)",
+      "Headers exception ke BAAD set karna",
+      "Guard instance ke andar per-request state rakhna (instance shared hai)"
+    ],
+    "follow_up_questions": [
+      "Agar limiter ko ConfigService se banana ho toh?",
+      "Fastify par kya tootega?",
+      "Global guard (APP_GUARD) ke saath yeh kaise milega?"
+    ],
+    "concepts": [
+      "NestJS guards",
+      "decorators",
+      "HttpException",
+      "no-DI design"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-062",
+    "project_slug": "p19-rate-limit",
+    "category": "Internal Implementation",
+    "difficulty": "Advanced",
+    "question": "How does stacking limiters work in Express and NestJS, and what is the side effect on the limiters that already ran?",
+    "answer_hinglish": "Stacking matlab ek route par kai limiters -- jaise login par per IP AND per account. Express mein yeh bas middleware chain hai: `rateLimit(a), rateLimit(b), handler`. Nest mein do `@RateLimit` decorators = do `UseGuards` = do guard instances. Dono mein sequence mein chalte hain aur pehla denial jeet-ta hai: woh 429 bhejta hai aur aage kuch nahi chalta.\n\nSide effect jo log miss karte hain: jo limiter PEHLE chala aur allow kiya, usne apna unit kharch kar diya -- chahe baad wala deny kare. Express test dekho: per-IP limit 10, per-user limit 1, do requests -> 200, 429. Doosri request par per-IP limiter ne token le liya tha (10 mein se ab 8 bache) aur per-user ne deny kiya. Koi refund nahi hai -- `Store` interface mein sirf `consume` hai, \"un-consume\" nahi.\n\nKya yeh problem hai? Mostly nahi: generous limiter (per IP) pehle aur strict (per account) baad mein -- toh strict deny par generous ka thoda budget jaata hai. Ulta order rakho toh strict limiter generous wale ki denials par bhi kharch hoga. Isliye order matter karta hai. README \"the first denial wins\" kehta hai, aur 'Known and not changed' section mein yeh side effect bhi likha hai (allow karne wale limiter ka unit kharch ho jaata hai) -- lekin order ka rule nahi deta.\n\nEk aur side effect (README mein bhi): har limiter `RateLimit-*` headers set karta hai, toh client ko LAST limiter ki values dikhti hain -- strict limiter pehle ho aur generous baad mein, toh headers generous wale ke honge.\n\nNest mein ek aur baat: decorators ka order aur guards ka run order TypeScript decorator evaluation par depend karta hai (decorators neeche se upar apply hote hain). Test sirf outcome check karta hai ([200, 429, 200, 200, 200]), order nahi -- toh main order par claim nahi karunga bina check kiye.\n\nController-level: `@RateLimit` controller par = ek guard instance saare routes ke liye, same limiter, same key -> ek shared budget. Test: `/limited/a` 200, phir `/limited/b` 429.",
+    "why_needed": "Login jaise routes par multi-dimensional limits standard hain. Unka interaction (kaun kharch hua, kaun nahi) samajhna correctness aur fairness dono ke liye zaroori hai.",
+    "real_world_analogy": "Do toll booth ek ke baad ek: pehle ne toll kaat liya, doosre ne gaadi rok di. Pehla toll wapas nahi milta. Isliye sasta toll pehle rakho.",
+    "how_it_works": "Express: middlewares array mein order se. Nest: `UseGuards` metadata mein guards jodta hai; guards order mein chalte hain aur jo pehla false/throw kare wahi final. Har limiter ka alag prefix hona chahiye warna do limiters ek hi Redis key share kar lenge.",
+    "in_this_project": "`test/express.test.ts`: \"two limiters stacked (per IP and per user): the first denial wins, the route never runs\" -- `memoryLimiter(10, \"rl:ip:\")` aur `memoryLimiter(1, \"rl:u:\")`, `ran` = 1. `test/nestjs.test.ts`: `me()` par `limiter(100, \"rl:me-ip:\")` aur `limiter(1, \"rl:me-user:\")` with `x-user` key; `LimitedController` par controller-level `@RateLimit(limiter(1, \"rl:ctrl:\"))`.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimit",
+      "projects/19-rate-limit/src/limiter.ts::Store",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/nestjs.test.ts"
+    ],
+    "code_example": "// real, test/nestjs.test.ts (trimmed)\n@Get(\"me\")\n@RateLimit(limiter(100, \"rl:me-ip:\"))\n@RateLimit(limiter(1, \"rl:me-user:\"), { key: (req: IncomingMessage) => (req.headers[\"x-user\"] as string | undefined) })\nme(): string { return \"me\"; }\n\n// alice, alice, bob, anonymous, anonymous -> [200, 429, 200, 200, 200]",
+    "code_language": "typescript",
+    "advantages": [
+      "Kai dimensions par limit bina naye API ke",
+      "Pehla denial turant -- baaki kaam nahi hota",
+      "Har limiter ka apna prefix, state alag"
+    ],
+    "disadvantages": [
+      "Pehle chale limiters ka unit wapas nahi milta",
+      "Har limiter = alag store call (Redis par alag round trip)",
+      "Order ka rule documented nahi, developer par chhoda (side effect README mein documented hai)",
+      "Client ko sirf LAST limiter ke RateLimit-* headers dikhte hain"
+    ],
+    "common_mistakes": [
+      "Strict limiter pehle rakhna aur generous ka budget bachana samajhna (ulta hota hai)",
+      "Dono limiters ka same prefix -- ek doosre ka state kha jaate hain",
+      "Nest decorator order ko bina test ke maan lena"
+    ],
+    "follow_up_questions": [
+      "Dono checks ek atomic Redis script mein kaise karoge?",
+      "Refund (un-consume) API kaisa hoga aur race kya hai?",
+      "Controller aur method dono par decorator ho toh?"
+    ],
+    "concepts": [
+      "stacked limiters",
+      "middleware chain",
+      "guards",
+      "partial consumption"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Independent limiters simple aur composable hain, par non-transactional -- ek allow, doosra deny toh pehle ka kharch reh jaata hai. Ek combined multi-key script exact hota par har combination ke liye naya Lua.",
+      "failure_scenarios": "Per-account limit pehle aur attacker galat password ke saath bahut accounts try kare -- per-account limiters deny nahi karte, per-IP pakadta hai; par order ulta ho toh per-IP ka budget legit users ke liye bhi kharch. Same prefix ki galti -> do limits mix.",
+      "alternatives": "Single Lua script jo saari keys check kare aur sab allow ho tabhi sab consume (all-or-nothing). Ya `peek` pehle, consume baad -- par yeh race kholta hai.",
+      "scale_10x_100x": "Stacking ka cost linear: k limiters = k round trips per request. 100x traffic par multi-key atomic script ya local pre-check zyada sasta.",
+      "production_improvements": "Documented ordering guidance (sasta/generous pehle), optional combined script, aur per-limiter metrics (kaun kitna deny kar raha hai)."
+    }
+  },
+  {
+    "id": "RLK-063",
+    "project_slug": "p19-rate-limit",
+    "category": "Internal Implementation",
+    "difficulty": "Beginner",
+    "question": "How are the RateLimit-* and Retry-After header values computed from a Decision, and why the rounding?",
+    "answer_hinglish": "Sab `rateLimitHeaders(d)` mein, `src/adapters/http.ts`:\n- `ratelimit-limit` = `d.limit` (token bucket ki capacity ya sliding window ka limit).\n- `ratelimit-remaining` = `d.remaining` -- whole units jo bache (algorithm pehle hi floor kar deta hai).\n- `ratelimit-reset` = `Math.ceil(d.resetMs / 1000)` -- seconds, UPAR round.\n- `retry-after` sirf jab `!d.allowed`: `Math.max(1, Math.ceil(d.retryAfterMs / 1000))` -- seconds, upar round, kam se kam 1.\n\nUpar kyun round: agar 1500 ms baaki hain aur hum \"1\" bolein, client 1 second baad aayega aur phir deny hoga -- humne jhooth bola. \"2\" bolo toh woh jab aayega tab sach mein allowed hoga. Test: resetMs 1500 -> \"2\"; retryAfterMs 2001 -> \"3\".\n\nKam se kam 1 kyun: 0 ka matlab \"abhi retry karo\" -- client turant loop mein hammer karega. Test: retryAfterMs 1 -> \"1\", retryAfterMs 0 -> bhi \"1\".\n\nMutations ne yeh dono guard kiye: H6 (Retry-After 0 ho sakta hai) aur H7 (Reset neeche round) -- dono 1-1 test se pakde gaye.\n\nEk detail jo interviewer pooch sakta hai: `ratelimit-reset` ka matlab algorithm par depend karta hai -- token bucket mein \"poora full hone tak\", sliding window mein \"current window khatam hone tak\". Yeh agle token tak ka time nahi hai; uske liye denied response ka `retry-after` hai.\n\n`setHeaders` names lowercase mein set karta hai (HTTP headers case-insensitive hain) aur `res.headersSent` true ho toh kuch nahi karta.",
+    "why_needed": "Headers client ka contract hain -- galat rounding se clients ya toh jaldi retry karke phir deny hote hain ya turant hammer karte hain.",
+    "real_world_analogy": "Doctor bole \"15 minute mein bulaata hoon\" jab 14.5 minute baaki hain -- theek. \"14 minute\" bole aur aap jaake phir baitho -- bura experience. Hamesha thoda upar batao.",
+    "how_it_works": "Decision milliseconds mein hai; HTTP headers seconds (integer) mein. Conversion `Math.ceil` se. Retry-After HTTP ka standard header hai (seconds ya date); RateLimit-* IETF draft ke names hain.",
+    "in_this_project": "`src/adapters/http.ts` ka `rateLimitHeaders` aur `setHeaders`. `test/ip.test.ts` ke \"rateLimitHeaders\" describe mein do tests: allowed (no Retry-After, reset \"2\") aur denied (Retry-After \"3\", \"1\", \"1\").",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/http.ts::rateLimitHeaders",
+      "projects/19-rate-limit/src/adapters/http.ts::setHeaders",
+      "projects/19-rate-limit/test/ip.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/adapters/http.ts\nexport function rateLimitHeaders(d: Decision): Record<string, string> {\n  const headers: Record<string, string> = {\n    \"ratelimit-limit\": String(d.limit),\n    \"ratelimit-remaining\": String(d.remaining),\n    \"ratelimit-reset\": String(Math.ceil(d.resetMs / 1000)),\n  };\n  if (!d.allowed) headers[\"retry-after\"] = String(Math.max(1, Math.ceil(d.retryAfterMs / 1000)));\n  return headers;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Pure function -- framework ke bina test hoti hai",
+      "Dono adapters same function use karte hain",
+      "Rounding hamesha client ke favour mein sach"
+    ],
+    "disadvantages": [
+      "Seconds granularity -- sub-second limits ke liye mota",
+      "Reset ka matlab algorithm ke hisaab se badalta hai"
+    ],
+    "common_mistakes": [
+      "Math.round ya floor use karna",
+      "Retry-After 0 bhejna",
+      "Reset ko 'next token' samajhna"
+    ],
+    "follow_up_questions": [
+      "Token bucket mein Reset 'full hone tak' kyun, 'next token tak' kyun nahi?",
+      "Retry-After date format kab use karoge?",
+      "headersSent true kab hota hai is flow mein?"
+    ],
+    "concepts": [
+      "HTTP headers",
+      "rounding",
+      "Retry-After",
+      "client contract"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-064",
+    "project_slug": "p19-rate-limit",
+    "category": "Core Concepts",
+    "difficulty": "Beginner",
+    "question": "What do the RateLimit-Limit, RateLimit-Remaining, RateLimit-Reset and Retry-After headers tell a client, and when does this library send them?",
+    "answer_hinglish": "Yeh headers client ko batate hain ki woh kahan khada hai, taaki woh khud dheema ho sake bajaye 429 khaane ke.\n\n- `RateLimit-Limit`: is limit ka size (jaise 100).\n- `RateLimit-Remaining`: kitne units abhi bache.\n- `RateLimit-Reset`: kitne seconds mein reset (token bucket: poora full; sliding window: current window khatam).\n- `Retry-After`: sirf denied response par -- kitne seconds baad yahi request allowed hogi. Yeh HTTP ka purana standard header hai; RateLimit-* names IETF ke \"RateLimit header fields\" draft se hain jo zyada libraries bhejti hain.\n\nLibrary kab bhejti hai:\n- Har limited response (allowed bhi) par RateLimit-* -- default `headers: true`.\n- Denied par hamesha: 429, RateLimit-*, Retry-After (>= 1), body `{\"error\":\"rate_limited\",...}`. Route nahi chalta.\n- `headers: false`: allowed responses par headers band, par 429 par phir bhi bhejte hain -- kyunki denied client ko Retry-After chahiye hi.\n- Key `undefined` (limiter lagu nahi) -> koi header nahi. Undecorated Nest route par bhi nahi (test).\n- Fail open (\"allow\", store down) -> request jaati hai bina RateLimit headers ke (test: `ratelimit-limit` null).\n- Fail closed (\"deny\") -> 503 + `Retry-After: 5`, RateLimit-* nahi (decision hi nahi tha).\n\nEk sawaal jo aata hai: 429 vs 503. 429 = client ne zyada bheja. 503 = server ki dikkat (limiter ka store down). Isliye fail-closed 503 deta hai.",
+    "why_needed": "Achhe clients headers padh ke backoff karte hain -- isse 429 kam, retries smooth. Headers ke bina client andhe mein retry karta hai.",
+    "real_world_analogy": "Petrol pump ka meter: tank capacity (Limit), kitna bacha (Remaining), aur agla tanker kab aayega (Reset). Pump band ho toh board: \"20 minute baad aayiye\" (Retry-After).",
+    "how_it_works": "Adapter decision se `rateLimitHeaders` banata hai aur `setHeaders` se response par lagata hai -- allowed par sirf agar `headers` true, denied par hamesha. 503 path decision ke bina hai, isliye sirf Retry-After.",
+    "in_this_project": "`src/adapters/http.ts` ke comment mein header list; `TOO_MANY_REQUESTS_BODY`, `STORE_UNAVAILABLE_RETRY_AFTER_S = 5`. Tests: express \"headers: false sends no RateLimit-* on allowed responses (still on the 429)\"; nestjs \"an undecorated route has no limit and no headers\"; failover `\"allow\"` test me `ratelimit-limit` null.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/http.ts::rateLimitHeaders",
+      "projects/19-rate-limit/src/adapters/http.ts::STORE_UNAVAILABLE_RETRY_AFTER_S",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/failover.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "HTTP/1.1 429 Too Many Requests\nratelimit-limit: 3\nratelimit-remaining: 0\nratelimit-reset: 3000\nretry-after: 1000\ncontent-type: application/json; charset=utf-8\n\n{\"error\":\"rate_limited\",\"message\":\"Too many requests. Try again later.\"}\n\n(illustrative response shape; the numbers depend on the limiter's settings)",
+    "code_language": "text",
+    "advantages": [
+      "Client khud throttle kar sakta hai",
+      "Retry-After se thundering retries kam",
+      "Ek hi helper, dono frameworks"
+    ],
+    "disadvantages": [
+      "Headers se limit ka size attacker ko bhi dikhta hai",
+      "Draft standard hai -- naye drafts ka combined format nahi bheja jaata"
+    ],
+    "common_mistakes": [
+      "429 par Retry-After na bhejna",
+      "Store down par 429 bhejna (client ki galti nahi hai)",
+      "headers:false ka matlab 429 par bhi headers band samajhna"
+    ],
+    "follow_up_questions": [
+      "Newer draft ka combined `RateLimit` header kaisa hai?",
+      "Headers kab hide karna chahoge?",
+      "Client side backoff kaise likhoge in headers se?"
+    ],
+    "concepts": [
+      "rate limit headers",
+      "429",
+      "503",
+      "Retry-After"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-065",
+    "project_slug": "p19-rate-limit",
+    "category": "Core Concepts",
+    "difficulty": "Intermediate",
+    "question": "How do you choose the key for a limit -- per IP, per user, per email -- and what does a key function returning undefined mean?",
+    "answer_hinglish": "Key decide karta hai KAUN limit ho raha hai. Galat key = ya toh innocent log saath mein limit (ek office ka NAT), ya attacker bypass.\n\nIs library mein key ek function hai `(req) => string | undefined | Promise<...>`:\n- Default `keyByIp()`: socket address, X-Forwarded-For ignore (`trustedProxies: 0`). Proxy ke peeche `keyByIp({ trustedProxies: 1 })`. IPv6 per /64.\n- Per user: `(req) => req.user ? \"user:\" + req.user.id : undefined`.\n- Per email (login): README ka example `email:${req.body?.email?.toLowerCase()}` -- lowercase isliye ki `Alice@x.com` aur `alice@x.com` alag limit na paayein.\n\n`undefined` ka matlab: YEH limiter is request par lagta hi nahi -- `next()` / guard `true`, koi header nahi. Use case: per-user limit, par request anonymous hai. Test: alice, alice -> 200, 429; bob 200; anonymous teeno baar 200.\n\nIsliye aksar stacking karte hain: per IP (sab par) + per account (jab account pata ho). Login par dono: attacker ek IP se bahut accounts -> per-IP pakdega; botnet bahut IPs se ek account -> per-account pakdega.\n\nDo baatein dhyan rakhni: (1) Har limit ka alag `prefix` (`rl:login:`, `rl:api:`) -- `RateLimiter` key ke aage lagata hai, taaki same user ki do limits state share na karein. (2) Key max 512 chars, non-empty -- warna `RateLimitError` (bug, kabhi fail open nahi). Lambi email + prefix bhi isi limit mein aati hai.\n\nEk chhota caution: README ke email example mein agar body mein email hi na ho toh key `\"email:undefined\"` ban jaati hai -- saare aise requests ek key share karenge. Production mein email missing ho toh `undefined` lautana ya validation pehle karna behtar.",
+    "why_needed": "Rate limiting ka sabse common bug galat key hai -- algorithm perfect ho tab bhi.",
+    "real_world_analogy": "Library mein kitaabein limit karni hain: per card (user), per ghar (IP -- ek ghar mein kai log), ya per naam (email). Bina card wala visitor aaye toh \"per card\" rule uspar lagta hi nahi -- uske liye \"per ghar\" rule hai.",
+    "how_it_works": "Adapter `await keyFn(req)` karta hai; undefined par early return. Warna `limiter.consume(key)` jo `prefix + key` store ko deta hai.",
+    "in_this_project": "`src/adapters/http.ts`: `export type KeyFn = (req: IncomingMessage) => string | undefined | Promise<string | undefined>;` aur `keyByIp`. `src/limiter.ts`: `MAX_KEY_LENGTH = 512`, `this.prefix + key`. Tests: express \"custom key (per user) and undefined = not limited by this limiter\"; mutations E2 aur N1 (undefined key not skipped) dono pakde gaye.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/http.ts::KeyFn",
+      "projects/19-rate-limit/src/adapters/http.ts::keyByIp",
+      "projects/19-rate-limit/src/limiter.ts::RateLimiter",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/limiter.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, README.md (Express usage)\napp.use(\"/api\", rateLimit(apiLimit, { key: keyByIp({ trustedProxies: 1 }) })); // behind ONE nginx / load balancer\napp.post(\"/login\", express.json(), rateLimit(loginLimit, { key: (req) => `email:${req.body?.email?.toLowerCase()}` }), login);\n\n// illustrative: skip when there is no email instead of keying \"email:undefined\"\nconst byEmail: KeyFn = (req: any) => {\n  const e = req.body?.email;\n  return typeof e === \"string\" && e.length > 0 ? `email:${e.toLowerCase()}` : undefined;\n};",
+    "code_language": "typescript",
+    "advantages": [
+      "Key ek function -- koi bhi strategy, async bhi",
+      "undefined se optional limits clean",
+      "Prefix se alag limits kabhi mix nahi hoti"
+    ],
+    "disadvantages": [
+      "Key ki galti library nahi pakad sakti",
+      "NAT ke peeche per-IP innocent users ko saath limit karta hai",
+      "Async key (DB lookup) har request ki latency badhata hai"
+    ],
+    "common_mistakes": [
+      "Email normalize na karna (case)",
+      "Missing value se 'undefined' string key ban jaana",
+      "Per-user limit bina per-IP ke -- anonymous attacker free"
+    ],
+    "follow_up_questions": [
+      "Login par per-IP aur per-account dono kyun?",
+      "API key based limits kaise karoge?",
+      "Key mein user input ho toh 512 char limit ka kya role hai?"
+    ],
+    "concepts": [
+      "key strategy",
+      "per-user limits",
+      "stacking",
+      "prefix namespacing"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-066",
+    "project_slug": "p19-rate-limit",
+    "category": "Core Concepts",
+    "difficulty": "Beginner",
+    "question": "What is cost per request, how do you use it, and what does the library refuse?",
+    "answer_hinglish": "Cost = ek request kitne units khaati hai. Default 1. Par har request barabar nahi hoti: ek bulk endpoint jo 5 items process kare use 5 units ka charge karna fair hai.\n\nUse: `rateLimit(limiter, { cost: (req) => 5 })` (Nest guard mein bhi same option). Test: capacity 10, cost 5 -> 200, 200, 429. Request dynamic bhi ho sakti hai -- jaise body ke items ki ginti.\n\nAlgorithm cost ko kaise treat karta hai: token bucket mein `cost` tokens chahiye; kam hain toh deny aur ek bhi token nahi kat-ta. Sliding window mein `estimated + cost > limit` toh deny, aur denied request count nahi hoti. Retry-After bhi cost ke hisaab se -- \"kab ITNE units honge\".\n\nLibrary kya mana karti hai (`RateLimiter.consume` store chhoone se PEHLE):\n- cost integer nahi ya < 1 (0, 1.5) -> `RateLimitError`.\n- cost > limit -> `RateLimitError` (\"cost 6 exceeds the limit 5\"). Kyun: woh request kabhi allow ho hi nahi sakti; deny karke retry time dena jhooth hoga, client hamesha retry karta rahega.\n\nYeh errors bug maane jaate hain -- `onStoreError: \"allow\"` ke saath bhi kabhi fail open nahi hote; error handler tak jaate hain (Express aur Nest dono mein test: `cost: () => 99` -> 500).\n\nMutation E3 (cost option ignore) 2 tests se pakda gaya, Q2 (cost above limit not rejected) 3 se.",
+    "why_needed": "Sab requests ka load barabar nahi hota. Cost ke bina ek bulk call aur ek chhoti call ek jaisi ginti hain -- unfair aur capacity protect nahi hoti.",
+    "real_world_analogy": "Buffet mein plate ginti ke hisaab se nahi, item ke hisaab se: ek plate mein 5 items toh 5 coupon. 50 items ki plate jo limit 10 se zyada hai, woh kabhi nahi milegi -- counter seedha bolta hai \"yeh possible nahi\", \"baad mein aao\" nahi.",
+    "how_it_works": "Adapter `options.cost?.(req) ?? 1` nikalta hai aur `limiter.consume(key, cost)` ko deta hai. Limiter validate karta hai, phir store ko cost deta hai; Lua mein cost `ARGV[4]` hai.",
+    "in_this_project": "`src/limiter.ts`: `if (!Number.isSafeInteger(cost) || cost < 1)` aur `if (cost > this.options.algorithm.limit)`. `test/limiter.test.ts`: \"rejects ... before touching the store\" (cost 0, 1.5, 6 with limit 5) aur \"a cost equal to the limit are fine\". `test/express.test.ts`: \"cost per request (e.g. a bulk endpoint costs 5)\".",
+    "implementation_files": [
+      "projects/19-rate-limit/src/limiter.ts::RateLimiter",
+      "projects/19-rate-limit/src/adapters/express.ts::RateLimitMiddlewareOptions",
+      "projects/19-rate-limit/test/limiter.test.ts",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/nestjs.test.ts"
+    ],
+    "code_example": "// real, src/limiter.ts\nif (!Number.isSafeInteger(cost) || cost < 1) throw new RateLimitError(\"cost must be an integer >= 1\");\n// A cost above the limit can NEVER be allowed; say so instead of returning a retry time that will never work.\nif (cost > this.options.algorithm.limit) throw new RateLimitError(`cost ${cost} exceeds the limit ${this.options.algorithm.limit}`);\n\n// real, test/express.test.ts\napp.get(\"/bulk\", rateLimit(memoryLimiter(10), { cost: () => 5 }), (_req, res) => res.send(\"ok\"));\n// -> [200, 200, 429]",
+    "code_language": "typescript",
+    "advantages": [
+      "Expensive endpoints ka fair hisaab",
+      "Impossible request par clear error, jhootha retry nahi",
+      "Denied request kuch nahi kharchti"
+    ],
+    "disadvantages": [
+      "Cost function galat ho toh limit ka matlab badal jaata hai",
+      "Integer only -- fractional weights nahi"
+    ],
+    "common_mistakes": [
+      "Cost > limit ko 429 se handle karna",
+      "Body-based cost bina validation (client cost 0 bhej de)",
+      "Cost function mein heavy kaam karna"
+    ],
+    "follow_up_questions": [
+      "Cost body se aaye toh client manipulate kar sakta hai?",
+      "Response ke baad actual cost charge karna ho toh?",
+      "Sliding window mein denied request count kyun nahi hoti?"
+    ],
+    "concepts": [
+      "weighted requests",
+      "cost",
+      "validation",
+      "RateLimitError"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-067",
+    "project_slug": "p19-rate-limit",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "Your benchmark shows the app is FASTER with a rate limiter than without one. How do you investigate, and what did you conclude here?",
+    "answer_hinglish": "Symptom: run 1 mein \"no limiter\" 348 req/s aur \"memory limiter\" 490 req/s; run 2 mein 161 vs 256. Limiter extra kaam hai, isliye yeh physically galat hai -- pehla signal ki measurement toot gayi hai, code nahi.\n\nInvestigate kaise (meri order):\n1. Machine dekho: Task Manager / `top` -- CPU kitna busy tha? Yahan 90% (run 1) aur 100% (run 2) dusre programs se. Client, 3 instances aur Redis sab usi CPU par.\n2. Run ke andar consistency: p50/p99 dekho. Run 1 mein none ka p50 86.64 ms, memory ka 60.43 ms -- local HTTP ke liye dono bahut bade hain; yeh queueing / CPU starvation ka sign hai, app ka nahi.\n3. Order effect: modes fixed order mein chale (none pehle). Background load time ke saath badla toh pehla mode sabse zyada pita.\n4. Repeat: run 2 mein sab aur slow, aur ulta pattern wahi -- consistent bias, effect nahi.\n5. Correctness alag check: run 1 ka redis-shared exactly 500/503 -- yeh throughput se independent hai, toh woh claim bachta hai.\n\nConclusion jo maine liya: throughput numbers INVALID declare kiye. JSON files mein rakhe (raw data delete nahi kiya), README aur PLAN mein saaf likha \"no conclusion is drawn from them\", aur \"NOT implemented\" list mein \"a valid throughput / latency measurement\" daala. Fix code mein nahi, environment mein hai: idle machine ya alag load-generator host.\n\nInterview mein main yeh point dunga: debugging sirf code ka nahi hota -- measurement setup ka bhi hota hai. Sanity check (\"limiter can't make it faster\") pehle se socha ho toh aise result turant pakde jaate hain.",
+    "why_needed": "Benchmarks par decisions hote hain. Ek galat number ko sach maan lena production capacity ko galat estimate karwa deta hai.",
+    "real_world_analogy": "Weighing machine bole ki bag rakhne se weight KAM ho gaya -- aap bag par shak nahi karoge, machine (ya kisi ka haath tarazu par) par karoge.",
+    "how_it_works": "Closed-loop benchmark ka throughput = concurrency / latency. Agar latency CPU contention se aati hai toh throughput machine ki halat batata hai. Same-host load-gen aur server ek doosre se CPU cheente hain.",
+    "in_this_project": "`bench/reference-results/2026-11-23-win32-load-run1.json`: none `reqPerSec` 348, `p50ms` 86.64; memory 490, 60.43; redis 283, 91.8. `-run2.json`: 161 / 256 / 255. README section \"Load test (stage 3) -- correctness held, throughput not measurable on this PC\". PLAN: \"the load test's throughput numbers are not published as results\".",
+    "implementation_files": [
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run1.json",
+      "projects/19-rate-limit/bench/reference-results/2026-11-23-win32-load-run2.json",
+      "projects/19-rate-limit/bench/load.mjs",
+      "projects/19-rate-limit/README.md",
+      "projects/19-rate-limit/PLAN.md"
+    ],
+    "code_example": "// real, bench/reference-results/2026-11-23-win32-load-run1.json (throughput, NOT valid)\n{ \"mode\": \"none\",   \"requests\": 2787, \"reqPerSec\": 348, \"p50ms\": 86.64, \"p99ms\": 187.85 },\n{ \"mode\": \"memory\", \"requests\": 3917, \"reqPerSec\": 490, \"p50ms\": 60.43, \"p99ms\": 190.6 },\n{ \"mode\": \"redis\",  \"requests\": 2260, \"reqPerSec\": 283, \"p50ms\": 91.8,  \"p99ms\": 433.24 }",
+    "code_language": "json",
+    "advantages": [
+      "Physical sanity check se galat data turant pakda",
+      "Raw data rakha, conclusion nahi -- honest",
+      "Correctness claim alag reh gaya, bacha liya"
+    ],
+    "disadvantages": [
+      "Koi valid throughput number abhi nahi",
+      "CPU usage JSON mein record nahi hota -- sirf README mein likha"
+    ],
+    "common_mistakes": [
+      "Ulta result ko 'JIT warm-up' ya 'caching' bata ke explain kar dena",
+      "Achha dikhne wala number chun ke publish karna",
+      "Bad run delete karna (audit trail khatam)"
+    ],
+    "follow_up_questions": [
+      "Is bench mein CPU metadata automatically kaise record karoge?",
+      "Kitna variance acceptable hai?",
+      "Redis mode ka p99 433 ms -- kya isse kuch seekh sakte ho?"
+    ],
+    "concepts": [
+      "benchmark debugging",
+      "sanity checks",
+      "CPU contention",
+      "honest reporting"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Data rakhna vs delete karna: rakhne se transparency, par galat padhe jaane ka risk -- isliye README mein bold \"NOT a valid measurement\". Same-host vs alag host: sasta vs valid.",
+      "failure_scenarios": "Agar yeh numbers kisi ne quote kar diye (\"limiter makes it faster\") toh galat capacity planning. CI mein noisy runner par benchmark bhi yahi karega.",
+      "alternatives": "Dedicated benchmark machine, cloud instances, ya micro-benchmark jo sirf `consume` naape -- HTTP aur OS noise kam.",
+      "scale_10x_100x": "10x/100x load par same-host test aur bhi bekaar -- load-gen pehle saturate hoga. Distributed load-gen (k6 cloud, multiple hosts) chahiye.",
+      "production_improvements": "Benchmark script mein `os.loadavg()` / CPU usage sample karke JSON mein likhna, automatic rule \"none < memory -> INVALID\", aur modes ka shuffled order."
+    }
+  },
+  {
+    "id": "RLK-068",
+    "project_slug": "p19-rate-limit",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Intermediate",
+    "question": "Requests to a rate-limited route hang forever when Redis is down. What is the likely cause and how does this code prevent it?",
+    "answer_hinglish": "Symptom: client ka request timeout tak latka rehta hai -- na 429, na 500, na 200. Server logs mein kuch nahi.\n\nLikely cause: middleware ne error NIGAL liya. Express middleware ke paas teen hi raaste hain -- `next()`, `next(err)`, ya response khud khatam karna. Agar async `consume` reject hua aur code ne `catch` karke kuch nahi kiya, toh na next call hua na response gaya -- request hamesha ke liye pending. Express 4 rejected promise khud nahi pakadta, toh yeh silent hota hai.\n\nYeh project mein real hai: mutation E4 \"express: store errors swallowed (request hangs)\" exactly yahi bug daalta hai, aur 4 tests fail hue -- woh tests jo store error par error handler / 503 / allow expect karte hain.\n\nCode kaise bachata hai: poora async kaam `void (async () => {...})().catch(next)` mein. Store error ke liye catch block teen hi kaam karta hai -- rethrow (jo `.catch(next)` tak jaata hai), `next()` (allow), ya 503 + `res.end` (deny). Har raasta terminate karta hai.\n\nDoosra related cause: Redis HANG (partition) -- error nahi, bas jawab nahi. Tab bhi request latkegi jab tak client timeout na ho. Iska ilaaj FailoverStore ka `guard` (TimeoutPolicy) hai: test mein never-answering store 100 ms timeout ke baad fallback ka jawab deta hai. Bina guard ke yeh hang possible hai.\n\nInvestigate kaise: (1) curl ke saath `--max-time` -- hang hai ya slow? (2) Event loop zinda hai? (doosra route chalta hai?) (3) Redis client ka state -- ioredis offline queue mein commands pile hote hain (test mein `enableOfflineQueue: false` isliye ki fail turant ho). (4) Har branch dekho: kya har raasta next/end tak jaata hai?",
+    "why_needed": "Hanging requests sabse bure failures hain: connections aur memory pakad ke rakhte hain, aur error rate mein dikhte bhi nahi.",
+    "real_world_analogy": "Receptionist ne visitor ka form le liya, phone aaya, form drawer mein daal diya -- na andar bheja, na mana kiya. Visitor ghanton baitha raha.",
+    "how_it_works": "Promise rejection jo kisi ne handle nahi kiya: Express ko pata hi nahi chalta. `.catch(next)` rejection ko Express ke error pipeline mein daalta hai. Hang (promise kabhi settle hi nahi) ke liye sirf timeout madad karta hai.",
+    "in_this_project": "`src/adapters/express.ts`: `})().catch(next);`. `test/failover.test.ts`: \"guarded by resilience-kit: a HANGING primary times out after 100 ms and the fallback answers\"; dead Redis client `enableOfflineQueue: false, maxRetriesPerRequest: 0, retryStrategy: () => null`. README mutation table: E4 -> 4 failed.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/failover.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// the bug E4 introduced (illustrative)\ntry { decision = await limiter.consume(key, cost); }\ncatch { return; }            // swallowed: no next(), no res.end() -> the request hangs\n\n// real, src/adapters/express.ts -- every path ends\n} catch (error) {\n  if (error instanceof RateLimitError || onStoreError === \"error\") throw error;  // -> .catch(next)\n  if (onStoreError === \"allow\") return next();\n  res.statusCode = 503; /* retry-after, body */ res.end(JSON.stringify(STORE_UNAVAILABLE_BODY));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "`.catch(next)` ek jagah saare async errors pakadta hai",
+      "Mutation test ne is bug ko real mein pakda",
+      "Guard ka timeout hang ko bhi cover karta hai"
+    ],
+    "disadvantages": [
+      "Guard ke bina hanging Redis = hanging request",
+      "ioredis ki offline queue default mein commands ko wait karwati hai"
+    ],
+    "common_mistakes": [
+      "`catch {}` khaali chhodna",
+      "Sirf errors test karna, hangs nahi",
+      "ioredis defaults par bharosa (offline queue, retries)"
+    ],
+    "follow_up_questions": [
+      "ioredis ki offline queue kya hai aur kab band karoge?",
+      "Redis call cancel kyun nahi ho sakti?",
+      "Hang ko test mein kaise simulate karoge?"
+    ],
+    "concepts": [
+      "hanging requests",
+      "error propagation",
+      "timeouts",
+      "mutation testing"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-069",
+    "project_slug": "p19-rate-limit",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "All 91 tests pass. How do you know the adapter tests would actually catch a regression, and what did mutation testing show for the adapters?",
+    "answer_hinglish": "Tests pass hona kaafi nahi -- dekhna hai ki koi bug daalo toh woh FAIL hote hain ya nahi. Isliye mutation checks: ek jaan-boojh ke bug, poora suite (Redis ke saath), phir revert.\n\nStage 2 (adapters + headers + IP) ke 15 mutations aur stage 3 ke 12. Adapter wale kuch:\n- E5 (express 403 instead of 429): 9 tests fail -- bahut tests status check karte hain.\n- E4 (store errors swallowed, request hangs): 4.\n- E3 (cost ignored): 2. E1 (headers:false par 429 bhi bina headers): 1. E2 (undefined key skip nahi): 1.\n- N1 (nest undefined key), N2 (429 par headers nahi): 1-1. N3 (nest 403): 3.\n- H6 (Retry-After 0 ho sakta hai), H7 (Reset neeche round): 1-1.\n- Fail open/closed: O1 (express bug fail open) 1, O2 (503 ki jagah 429) 1, O3 (Retry-After nahi) 1, O4 (allow/deny swap) 2, O5-O7 nest wale 1-1.\n\nFinal: 51 mutations, 49 caught, 2 equivalent -- yeh run 90 tests ke against tha; 91st test (throwing cost function kabhi fail open nahi) baad mein joda gaya, jab review ne woh gap pakda. Equivalent ka matlab: code badla par behaviour nahi badla, isliye koi test pakad hi nahi sakta. H5 (IPv6 zone id strip nahi) -- zone id hamesha last group mein hota hai aur /64 key pehle chaar groups rakhta hai, toh key kabhi nahi badalti. S6 -- `max(retry, 1)` kabhi value nahi badalta.\n\nJo 1-test wale mutations hain woh signal hain: un behaviours ki coverage patli hai -- ek test hata do toh bug chupke se nikal jaayega. Process ka ek honest point: stage 3 se pehle missing coverage list ki, aur ek Nest test (\"a bug is never failed open\") RUN se pehle joda; tab saare 12 pehli baar mein pakde gaye.\n\nMutation testing ne stage 1 mein ek redundant feature bhi dikhaya: M3 (memory expiry ignore) bach gaya -- matlab expiry koi decision nahi badalti thi, isliye hata di.",
+    "why_needed": "Coverage % batata hai code chala; mutation testing batata hai ki tests ne galat behaviour pakda. Senior interviews mein test quality ka yahi sawaal hai.",
+    "real_world_analogy": "Smoke detector test karne ke liye button dabana kaafi nahi -- thoda dhuaan dikhao aur dekho bajta hai ya nahi. Har mutation ek chhota dhuaan hai.",
+    "how_it_works": "Har mutation ek chhota code change (operator, condition, constant). Suite chalao; koi test fail = \"killed/caught\". Koi fail nahi = \"survived\" -- ya toh test gap, ya equivalent mutant. Runner repo ke bahar rakha gaya (`H:\\` se start).",
+    "in_this_project": "README \"Mutation checks (2026-11-23)\" table: E1-E5, N1-N3, H1-H7, O1-O7 ki failed counts. Equivalent ki explanation README ke neeche. `test/nestjs.test.ts` ka `bug()` route (`onStoreError: \"allow\", cost: () => 99`) woh test hai jo run se pehle joda gaya.",
+    "implementation_files": [
+      "projects/19-rate-limit/README.md",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/nestjs.test.ts",
+      "projects/19-rate-limit/test/ip.test.ts",
+      "projects/19-rate-limit/src/adapters/http.ts::ipKey"
+    ],
+    "code_example": "// real, test/nestjs.test.ts -- added before the stage-3 mutation run (catches O7)\n// A bug (cost above the limit) must never be failed open, even with allow.\n@Get(\"bug\")\n@RateLimit(brokenLimiter(), { onStoreError: \"allow\", cost: () => 99 })\nbug(): string { return \"never\"; }\n// ...\nexpect((await fetch(`${base}/down/bug`)).status).toBe(500);",
+    "code_language": "typescript",
+    "advantages": [
+      "Test suite ki asli strength ka number",
+      "Redundant code bhi pakda (M3)",
+      "Thin coverage wale behaviours dikh jaate hain"
+    ],
+    "disadvantages": [
+      "Manual mutations -- list bias insaan ki hai, tool (Stryker) jaisa exhaustive nahi",
+      "Har mutation poora suite chalata hai -- slow"
+    ],
+    "common_mistakes": [
+      "Equivalent mutant ke liye zabardasti test likhna",
+      "Sirf line coverage par bharosa",
+      "Mutation runner repo ke andar chhod dena (accidentally commit)"
+    ],
+    "follow_up_questions": [
+      "Stryker jaisa tool kyun nahi use kiya?",
+      "Equivalent mutant ko kaise pehchaanoge?",
+      "1-test wale mutations ki coverage kaise badhaoge?"
+    ],
+    "concepts": [
+      "mutation testing",
+      "test quality",
+      "equivalent mutants",
+      "regression safety"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Manual list: chhoti, focused, har mutation ka reason likha. Tool: exhaustive par shor zyada aur slow (Redis ke saath full suite). Is size ke project ke liye manual list kaafi practical rahi.",
+      "failure_scenarios": "Ek test delete ya `.skip` ho jaaye toh 1-test mutations (N2, H6, O2...) wala behaviour bina kisi failure ke toot sakta hai. Redis na ho toh Redis tests SKIP -- us run ka mutation result alag hoga; isliye README kehta hai saare numbers Redis wale runs ke hain.",
+      "alternatives": "Stryker Mutator (JS/TS), property-based tests (fast-check) adapters ke liye, ya contract tests jo dono adapters ko ek hi spec se chalayein.",
+      "scale_10x_100x": "Zyada adapters (Koa, Hono, Fastify) aaye toh har ek ke liye same mutations repeat -- shared contract test suite banana zyada sasta hoga.",
+      "production_improvements": "CI mein mutation run (nightly), thin behaviours ke liye ek-ek extra test, aur ek shared adapter contract suite."
+    }
+  },
+  {
+    "id": "RLK-070",
+    "project_slug": "p19-rate-limit",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "Explain the line `if (sendHeaders || !decision.allowed) setHeaders(res, decision)`. What are all the cases where headers are or are not sent?",
+    "answer_hinglish": "Line ka matlab: headers bhejo agar user ne headers maange (`headers` option, default true) YA request deny hui hai. Yaani `headers: false` sirf allowed responses se headers hatata hai -- 429 par hamesha jaate hain, kyunki denied client ko Retry-After chahiye hi.\n\nSaare cases:\n1. Default, allowed -> RateLimit-Limit/Remaining/Reset. Retry-After nahi.\n2. Default, denied -> RateLimit-* + Retry-After, phir 429.\n3. `headers: false`, allowed -> kuch nahi.\n4. `headers: false`, denied -> sab headers, 429. (Mutation E1 ne isse tod ke dekha -- ek test pakadta hai: `[429, \"1\", true]`.)\n5. Key undefined -> line tak pahunchte hi nahi, koi header nahi.\n6. Store error + \"allow\" -> line tak nahi, headers nahi (failover test: `ratelimit-limit` null). Logical bhi hai -- koi decision hi nahi tha.\n7. Store error + \"deny\" -> sirf `retry-after: 5`, RateLimit-* nahi.\n8. FailoverStore fallback (degraded) -> normal decision hai, toh headers jaate hain -- par woh per-instance counts hain. `degraded` flag headers mein nahi dikhta.\n9. Stacked limiters -> har limiter apne headers set karta hai, same names, toh baad wala pehle wale ko OVERWRITE karta hai (`setHeader` replace karta hai). Client ko aakhri chalne wale limiter ka view milta hai. Yeh README ke 'Known and not changed' section mein ek known limitation ki tarah likha hai ('the LAST one's values are what the client sees'), lekin iska test nahi hai.\n\n`setHeaders` khud `res.headersSent` check karta hai, toh agar response pehle hi chala gaya ho toh crash nahi.\n\nNest guard mein same logic: `(this.options.headers ?? true) || !decision.allowed`.",
+    "why_needed": "Chhoti si boolean line par client ka poora contract tika hai. Interviewer line-by-line samajh check karta hai.",
+    "real_world_analogy": "Shop ke bahar \"stock board\" -- dukaandar chahe toh hamesha lagaye, na chahe toh na lagaye. Par jab \"sold out\" bolna ho toh board zaroor dikhaye ki agla stock kab aayega.",
+    "how_it_works": "Short-circuit OR: `sendHeaders` true toh doosri condition check hi nahi. False ho toh `!decision.allowed` decide karta hai. `setHeader` same name ko replace karta hai, append nahi.",
+    "in_this_project": "`src/adapters/express.ts`: `const sendHeaders = options.headers ?? true;` aur woh line. `src/adapters/nestjs.ts` mein same. `test/express.test.ts`: \"headers: false sends no RateLimit-* on allowed responses (still on the 429)\". `test/failover.test.ts`: allow mode mein `rs[0]!.headers.get(\"ratelimit-limit\")` null.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimitGuard",
+      "projects/19-rate-limit/src/adapters/http.ts::setHeaders",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/test/failover.test.ts"
+    ],
+    "code_example": "// real, test/express.test.ts\napp.get(\"/x\", rateLimit(memoryLimiter(1), { headers: false }), (_req, res) => res.send(\"ok\"));\nexpect((await fetch(`${base}/x`)).headers.get(\"ratelimit-limit\")).toBeNull();\nconst denied = await fetch(`${base}/x`);\nexpect([denied.status, denied.headers.get(\"ratelimit-limit\"), denied.headers.get(\"retry-after\") !== null])\n  .toEqual([429, \"1\", true]);",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek line, saaf rule: 429 par hamesha headers",
+      "Dono adapters mein same logic",
+      "headersSent check se safe"
+    ],
+    "disadvantages": [
+      "Stacked limiters ke headers ek doosre ko overwrite karte hain",
+      "Degraded decision headers mein dikhta nahi"
+    ],
+    "common_mistakes": [
+      "`headers: false` ka matlab 429 par bhi band samajhna",
+      "Fail-open response par stale/fake headers bhejna",
+      "Stacked limiters ke headers ko combined view samajhna"
+    ],
+    "follow_up_questions": [
+      "Stacked limiters ke liye sabse restrictive header kaise bhejoge?",
+      "Degraded mode client ko batana chahiye?",
+      "headers:false kab use karoge?"
+    ],
+    "concepts": [
+      "boolean logic",
+      "HTTP headers",
+      "header overwrite",
+      "fail open"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-071",
+    "project_slug": "p19-rate-limit",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "Look at the catch block in the adapters. Which errors can be failed open, and is there any bug-class error that slips through?",
+    "answer_hinglish": "Catch block: `if (error instanceof RateLimitError || onStoreError === \"error\") throw error;` phir \"allow\" -> next, \"deny\" -> 503. Toh fail open/closed un SAB errors par lagta hai jo `limiter.consume` se aate hain aur RateLimitError NAHI hain -- README ka 'Scope of onStoreError': sirf StoreUnavailableError nahi, bina FailoverStore ke raw `ECONNREFUSED` ya store ka \"unexpected reply\" error bhi.\n\nDesign rule (README): \"A RateLimitError (bad key / cost -- a bug) is NEVER failed open\". Limiter key/cost validate karke RateLimitError deta hai, toh cost 99 > limit -> 500 even with \"allow\" (Express aur Nest dono tested).\n\nEk bug-class gap pehle THA, aur interview bank likhte waqt code review mein pakda gaya: pehle stage-3 version mein `options.cost?.(req)` TRY ke ANDAR call hota tha: `decision = await limiter.consume(key, options.cost?.(req) ?? 1)`. Agar cost function khud throw kare -- jaise `req.body.items.length` jab body nahi hai -> TypeError -- toh woh RateLimitError nahi tha, aur \"allow\" mode mein request bina limit ke chali jaati; \"deny\" mode mein 503 aata jaise Redis down ho. Yaani ek BUG fail open ho sakta tha -- exactly jo design mana karta hai. Key function ke saath yeh nahi hota tha: woh try ke BAHAR tha.\n\nFix (ab code mein): cost ko bhi try se pehle nikaala -- `const cost = options.cost?.(req) ?? 1;` -- jaise key, comment ke saath 'a throwing cost function is a bug in the app, never a store error to fail open on'. Dono adapters mein. Ab throwing cost function `.catch(next)` (Express) / Nest ke exception layer se 500 deta hai, \"allow\" ke saath bhi. Har adapter ke liye ek test hai: `test/failover.test.ts` mein \"a throwing cost function (a bug) is never failed open either\" (yeh 91st test hai) aur `test/nestjs.test.ts` mein `/down/bug2` route -> 500. Mutation run is fix se pehle 90 tests par hua tha, toh is case ka mutation number nahi hai.\n\nJo bacha hai (by design): bina FailoverStore ke RedisStore ka \"unexpected reply\" error (plain Error) bhi store error maana jaata hai aur fail open / closed hota hai -- README yeh explicitly likhta hai. Stricter option: catch mein sirf `StoreUnavailableError` aur known connection errors ko onStoreError do.",
+    "why_needed": "Fail open ek security decision hai. Galti se bug ko fail-open karna ek bypass hai -- line-level review mein yahi pakadna senior ka kaam hai.",
+    "real_world_analogy": "Building ka rule: \"bijli gayi toh gate khol do (fire safety)\". Par agar gate ka sensor kisi aur wajah se crash ho aur system use bhi \"bijli gayi\" samjhe -- gate har kisi ke liye khul jaayega.",
+    "how_it_works": "JavaScript mein function arguments call se pehle evaluate hote hain -- agar woh evaluation `try` block ke andar ho, toh uska throw bhi isi catch mein aata hai (purana bug). Isliye key aur cost dono ab try se pehle compute hote hain; try mein sirf `limiter.consume`. `instanceof RateLimitError` se limiter ki validation errors alag hoti hain.",
+    "in_this_project": "`src/adapters/express.ts` aur `src/adapters/nestjs.ts` dono mein `const cost = ...cost?.(req) ?? 1;` try ke BAHAR, phir try mein `limiter.consume(key, cost)`. `src/types.ts`: `RateLimitError` (\"Never a reason to fail open\"), `StoreUnavailableError`. Tests: express/failover aur nestjs mein `cost: () => 99` (RateLimitError) aur throwing cost function (`test/failover.test.ts` \"a throwing cost function (a bug) is never failed open either\", `test/nestjs.test.ts` `/down/bug2`). README 'When Redis is down' mein yeh found-and-fixed likha hai.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimitMiddleware",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::canActivate",
+      "projects/19-rate-limit/src/types.ts::RateLimitError",
+      "projects/19-rate-limit/src/types.ts::StoreUnavailableError",
+      "projects/19-rate-limit/test/failover.test.ts"
+    ],
+    "code_example": "// first stage-3 version (before the fix): cost() ran INSIDE the try\ntry {\n  decision = await limiter.consume(key, options.cost?.(req) ?? 1);\n} catch (error) {\n  if (error instanceof RateLimitError || onStoreError === \"error\") throw error;\n  if (onStoreError === \"allow\") return next();                        // a TypeError from cost() landed here\n  // ...\n}\n\n// real, src/adapters/express.ts now\n// Computed OUTSIDE the try: a throwing cost function is a bug in the app, never a store error to fail open on.\nconst cost = options.cost?.(req) ?? 1;\nlet decision: Decision;\ntry {\n  decision = await limiter.consume(key, cost);\n} catch (error) {\n  if (error instanceof RateLimitError || onStoreError === \"error\") throw error;\n  if (onStoreError === \"allow\") return next();\n  // ... 503\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "RateLimitError ka rule saaf aur tested",
+      "Key aur cost function dono ka throw sahi raaste (error handler) jaata hai",
+      "Fix ek line ka tha, behaviour baaki same, har adapter ke liye test"
+    ],
+    "disadvantages": [
+      "Pehle version mein throwing cost function fail open ho sakta tha (allow) ya 503 deta tha (deny) -- ab fixed",
+      "Is fix ka mutation check nahi hua (mutation run fix se pehle 90 tests par tha)",
+      "Deny-list: RateLimitError ke alawa har error (raw Redis error, unexpected reply) onStoreError tak jaata hai"
+    ],
+    "common_mistakes": [
+      "Catch-all ko 'store errors' maan lena",
+      "Sirf RateLimitError par test karna aur user callbacks bhool jaana",
+      "Fail open ko default bana dena"
+    ],
+    "follow_up_questions": [
+      "Is gap ka test kaise likha gaya, aur mutation se kaise verify karoge?",
+      "Allow-list (sirf StoreUnavailableError fail open) vs deny-list -- kaunsa behtar?",
+      "Bina FailoverStore ke raw Redis errors ko kaise classify karoge?"
+    ],
+    "concepts": [
+      "fail open",
+      "error classification",
+      "code review",
+      "security"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Deny-list (RateLimitError ko chhod ke sab store error) simple hai aur bina FailoverStore ke raw Redis errors ko bhi cover karta hai; par user callbacks ke bugs bhi usi mein aa jaate hain. Allow-list (sirf StoreUnavailableError) zyada strict par tab FailoverStore lagana zaroori ho jaata.",
+      "failure_scenarios": "Fix se pehle: login route par \"allow\" galti se lagaya aur cost function ek malformed body par throw kare -- attacker malformed bodies bhej ke limit bypass karta. \"deny\" par wahi malformed request 503 paati aur on-call ko lagta Redis down hai -- galat debugging. Ab yeh 500 hai. Jo abhi bhi possible: bina FailoverStore ke ek corrupted reply (\"unexpected reply\") bhi allow par fail open hoga.",
+      "alternatives": "Cost ko try se bahar nikaalna (jo kiya gaya, minimal), ya cost errors ko RateLimitError mein wrap karna, ya FailoverStore ko mandatory karke sirf StoreUnavailableError par onStoreError.",
+      "scale_10x_100x": "Zyada routes aur custom cost functions = zyada chances. Fix ke baad user callbacks ke bugs 500 ki tarah dikhte hain, \"store errors\" ki tarah nahi -- scale par debugging saaf rehti hai.",
+      "production_improvements": "Fix + test ho chuka hai (har adapter ka ek). Baaki: is case ko mutation list mein jodna aur dobara run, fail-open requests ka counter / log (abhi kahin count nahi hote), aur onError metric mein error type alag."
+    }
+  },
+  {
+    "id": "RLK-072",
+    "project_slug": "p19-rate-limit",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "The Nest guard reads `http.getResponse<ServerResponse>()` and calls setHeader on it. What does that assume, and what would break on Fastify?",
+    "answer_hinglish": "Guard maan ke chalta hai ki Nest ka underlying HTTP platform Express hai (platform-express), jahan `getRequest()` aur `getResponse()` Express ke req/res dete hain -- jo Node ke `IncomingMessage` / `ServerResponse` ko extend karte hain. Isliye `setHeaders(res, decision)` seedha `res.setHeader(...)` call kar sakta hai, aur `keyByIp` `req.socket.remoteAddress` aur `req.headers` padh sakta hai.\n\nFastify (`@nestjs/platform-fastify`) par: `getResponse()` Fastify ka `FastifyReply` deta hai, Node ka `ServerResponse` nahi. `FastifyReply` par method `header()` hai, `setHeader` nahi -- toh `setHeaders` TypeError dega (runtime par; generics `getResponse<ServerResponse>()` sirf type cast hai, check nahi). Request side par `FastifyRequest` mein `headers` hai aur raw Node request `req.raw` par -- key functions jo Node shape maante hain woh bhi gadbad kar sakte hain.\n\nREADME seedha bolta hai: \"NestJS on Fastify ... not done\". Toh interview mein main claim nahi karunga ki chalega.\n\nKaise support karte: response ke liye chhota abstraction -- `typeof res.setHeader === \"function\" ? res.setHeader(k, v) : res.header(k, v)`, ya Fastify par `reply.raw` (Node ServerResponse) use karna -- par raw par headers lagana Fastify ke reply lifecycle ke saath conflict kar sakta hai, isliye `reply.header` behtar. Plus ek real Fastify Nest app ke saath test.\n\nEk aur assumption: headers exception throw karne se PEHLE set hote hain aur Nest ka exception filter unhe hatata nahi -- yeh platform-express par tested hai (429 par `retry-after` aata hai).",
+    "why_needed": "Framework adapters ka sabse aam bug: ek platform ke objects ko universal maan lena. Type cast runtime guarantee nahi deta -- yeh TypeScript ka classic trap hai.",
+    "real_world_analogy": "Universal charger samajh ke laaya, par plug sirf Indian socket ka hai. Hotel mein UK socket mila -- charger kaam ka nahi, jab tak adapter na lagao.",
+    "how_it_works": "`ExecutionContext.switchToHttp().getResponse<T>()` jo bhi platform ka response object hai woh lautata hai; `<T>` sirf compile-time hint hai. platform-express par woh Express `Response` hai (Node `ServerResponse` subclass).",
+    "in_this_project": "`src/adapters/nestjs.ts`: `const res = http.getResponse<ServerResponse>();` aur `setHeaders(res, decision)`; deny path mein `res.setHeader(\"retry-after\", ...)`. File ka pehla comment: \"NestJS adapter (platform-express)\". `test/nestjs.test.ts` sirf platform-express app banata hai. README NOT implemented: \"NestJS on Fastify\".",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimitGuard",
+      "projects/19-rate-limit/src/adapters/http.ts::setHeaders",
+      "projects/19-rate-limit/test/nestjs.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, src/adapters/nestjs.ts\nconst http = context.switchToHttp();\nconst req = http.getRequest<IncomingMessage>();\nconst res = http.getResponse<ServerResponse>();   // a type cast, not a runtime check\n\n// illustrative, NOT in the repo: tolerate Fastify's reply\nfunction setHeader(res: any, k: string, v: string): void {\n  if (typeof res.setHeader === \"function\") res.setHeader(k, v);   // Node / Express\n  else res.header(k, v);                                          // FastifyReply\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Express platform par bina kisi extra layer ke kaam karta hai",
+      "Node http types -- Express import nahi"
+    ],
+    "disadvantages": [
+      "Fastify par nahi chalega (documented)",
+      "Generic type cast galat safety ka ehsaas deta hai"
+    ],
+    "common_mistakes": [
+      "`getResponse<T>()` ko runtime check samajhna",
+      "Ek platform par test karke 'Nest supported' likhna",
+      "Fastify par `reply.raw` par headers likhna bina lifecycle samjhe"
+    ],
+    "follow_up_questions": [
+      "Platform-agnostic guard kaise likhoge?",
+      "Fastify ke liye key function ko kya badalna padega?",
+      "Nest ke exception filter headers hata sakte hain?"
+    ],
+    "concepts": [
+      "NestJS platforms",
+      "type assertions",
+      "adapter portability",
+      "Fastify"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-073",
+    "project_slug": "p19-rate-limit",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Add the newer combined `RateLimit` and `RateLimit-Policy` headers (newer IETF drafts) as an option, with a test.",
+    "answer_hinglish": "Pehle context: README ke \"NOT implemented\" mein likha hai -- \"The combined `RateLimit` / `RateLimit-Policy` fields of newer drafts of the header spec: not sent.\" Library abhi purane draft ke teen alag headers bhejti hai. Neeche wala code repo mein NAHI hai -- yeh exercise ka solution hai.\n\nNewer drafts mein do fields hain: `RateLimit-Policy` -- kaunsi policy hai (naam, quota `q`, window `w` seconds mein), aur `RateLimit` -- us policy ka current state (remaining `r`, seconds until reset `t`). Format structured fields wala hai, jaise `\"api\";q=100;w=60` aur `\"api\";r=42;t=30`. Ek caution: draft ka format versions ke beech badla hai, isliye implement karte waqt current draft ke saath exact syntax verify karunga -- yeh standard abhi final nahi.\n\nDesign decisions:\n1. Purane headers ko nahi hataaunga -- clients unpe depend karte hain. Naya option `draftHeaders: { policy: \"api\", windowSeconds?: 60 }`; diya toh dono sets jaate hain.\n2. Window algorithm se automatically nahi nikalta -- `Decision` mein window nahi hai, aur token bucket ka fixed window hota hi nahi. Isliye `windowSeconds` user deta hai (optional).\n3. Policy name ek token hona chahiye (letters, digits, `-`, `_`) -- quotes/commas header ko tod denge, isliye validate karke RangeError.\n4. Rounding same rakhi: `t` = `Math.ceil(resetMs / 1000)` -- existing headers ke saath consistent.\n\nWiring: `http.ts` mein pure function `rateLimitDraftHeaders(d, policy)`, aur `setHeaders` ke saath adapter mein `if (options.draftHeaders) ...`. Test pure function ka (framework ke bina), aur ek Express test ki 429 par dono sets hain.",
+    "why_needed": "Spec evolve hote rehte hain; existing clients ko tode bina naya format add karna real library maintenance hai.",
+    "real_world_analogy": "Naya menu card chhapna par purana bhi table par rehne dena jab tak regular customers aadat na daal lein.",
+    "how_it_works": "Structured field: `\"name\";key=value;key=value`. Dictionary/list ke rules RFC 8941 mein hain. Pure function headers ka map banata hai; adapter use `res.setHeader` se lagata hai.",
+    "in_this_project": "Abhi `src/adapters/http.ts` ka `rateLimitHeaders` sirf `ratelimit-limit`, `ratelimit-remaining`, `ratelimit-reset` (+ `retry-after`) banata hai. Exercise isi file mein ek naya function aur `RateLimitMiddlewareOptions` / `RateLimitGuardOptions` mein naya option jodta hai. Test `test/ip.test.ts` ke \"rateLimitHeaders\" describe ke style mein.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/http.ts::rateLimitHeaders",
+      "projects/19-rate-limit/src/adapters/express.ts::RateLimitMiddlewareOptions",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimitGuardOptions",
+      "projects/19-rate-limit/test/ip.test.ts",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// NOT in the repo -- exercise solution. src/adapters/http.ts\nexport interface DraftPolicy { name: string; windowSeconds?: number }\n\nexport function rateLimitDraftHeaders(d: Decision, p: DraftPolicy): Record<string, string> {\n  if (!/^[A-Za-z][A-Za-z0-9_-]*$/.test(p.name)) throw new RangeError(\"policy name must be a token\");\n  if (p.windowSeconds !== undefined && (!Number.isSafeInteger(p.windowSeconds) || p.windowSeconds < 1)) {\n    throw new RangeError(\"windowSeconds must be an integer >= 1\");\n  }\n  const name = `\"${p.name}\"`;\n  const w = p.windowSeconds === undefined ? \"\" : `;w=${p.windowSeconds}`;\n  return {\n    \"ratelimit-policy\": `${name};q=${d.limit}${w}`,\n    \"ratelimit\": `${name};r=${d.remaining};t=${Math.ceil(d.resetMs / 1000)}`,\n  };\n}\n\n// src/adapters/express.ts -- option + one extra line after setHeaders\n//   draftHeaders?: DraftPolicy;\nif (sendHeaders || !decision.allowed) {\n  setHeaders(res, decision);\n  if (options.draftHeaders && !res.headersSent) {\n    for (const [k, v] of Object.entries(rateLimitDraftHeaders(decision, options.draftHeaders))) res.setHeader(k, v);\n  }\n}\n\n// test (vitest)\nit(\"draft headers: policy and state, reset rounded up\", () => {\n  const d = { allowed: true, limit: 10, remaining: 7, retryAfterMs: 0, resetMs: 1500 };\n  expect(rateLimitDraftHeaders(d, { name: \"api\", windowSeconds: 60 })).toEqual({\n    \"ratelimit-policy\": '\"api\";q=10;w=60',\n    \"ratelimit\": '\"api\";r=7;t=2',\n  });\n  expect(() => rateLimitDraftHeaders(d, { name: 'a\"b' })).toThrow(RangeError);\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Backward compatible -- purane headers same",
+      "Pure function, aasaan test",
+      "Bad policy name par loud error"
+    ],
+    "disadvantages": [
+      "Draft final nahi -- syntax badal sakta hai",
+      "Window user ko dena padta hai",
+      "Stacked limiters ke liye ek hi policy dikhegi (overwrite)"
+    ],
+    "common_mistakes": [
+      "Purane headers hata dena",
+      "Policy name bina escape/validate ke header mein daalna",
+      "Token bucket ke liye fake window bana dena"
+    ],
+    "follow_up_questions": [
+      "Stacked limiters ko ek `RateLimit-Policy` list mein kaise dikhaoge?",
+      "Structured fields parse karne wali library loge ya khud likhoge?",
+      "Kab purane headers band karoge?"
+    ],
+    "concepts": [
+      "IETF RateLimit headers",
+      "structured fields",
+      "backward compatibility",
+      "API evolution"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Dono header sets bhejna: compatible par response thoda bada. Sirf naye: clean par purane clients tootenge. Option-based rollout safe beech ka raasta.",
+      "failure_scenarios": "Draft ka syntax badla aur clients naye parse karte hain -- humara format unke liye galat. Policy name mein quote aaya toh header malformed (isliye validation). Stacked limiters mein last writer wins -- client ko galat policy dikhegi.",
+      "alternatives": "Ek structured-fields library use karna (correct serialisation), ya headers ko ek pluggable `formatHeaders(decision)` callback bana dena taaki user khud format chune.",
+      "scale_10x_100x": "Header size per response chhota hai, par high traffic par bytes judte hain -- `headers: false` aur draft option dono configurable rakhne se tune ho sakta hai.",
+      "production_improvements": "Stacked limiters ke liye policies ki list (`RateLimit-Policy` multiple members), draft version ka config, aur client-side parser ke saath contract test."
+    }
+  },
+  {
+    "id": "RLK-074",
+    "project_slug": "p19-rate-limit",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a Koa adapter for ratelimit-kit that behaves like the Express one, plus a test.",
+    "answer_hinglish": "README kehta hai \"other frameworks (Koa, Hono): not done\", toh yeh code repo mein NAHI hai -- exercise solution hai, aur Koa project ki dependency bhi nahi hai.\n\nAchhi khabar: Koa ka `ctx.req` Node ka `IncomingMessage` hai, toh `KeyFn`, `keyByIp`, `rateLimitHeaders` -- sab `adapters/http.ts` se seedha reuse. Sirf response likhne ka tarika badalta hai: Koa mein `ctx.status`, `ctx.set(...)`, `ctx.body`; aur middleware `async (ctx, next)` hai jo `await next()` karta hai -- Koa promises natively samajhta hai, toh Express wala `.catch(next)` trick nahi chahiye; throw karo toh Koa ka error handling pakad leta hai.\n\nBehaviour Express jaisa hi rakhunga:\n1. Key undefined -> `return next()`.\n2. Cost ko try se BAHAR nikaalunga -- bilkul Express adapter ki tarah. Pehle stage-3 version mein Express aur Nest dono mein cost try ke andar tha, jisse ek throwing cost function \"allow\" mode mein fail open ho jaata; woh review mein pakda aur fix hua (har adapter ka test), toh naye adapter mein woh galti repeat nahi karni.\n3. RateLimitError ya \"error\" mode -> throw. \"allow\" -> next. \"deny\" -> 503 + Retry-After 5 + `STORE_UNAVAILABLE_BODY`.\n4. Headers: `sendHeaders || !allowed`.\n5. Allowed -> `await next()`. Denied -> 429 + `TOO_MANY_REQUESTS_BODY` (Koa object body ko JSON bana deta hai).\n\nTest real Koa app ke saath, Express tests ke pattern mein: capacity 2 -> 200, 200, 429; 429 par Retry-After; handler sirf 2 baar chala. Package.json mein `./koa` entry point aur `koa` ko optional peer dependency banana padega -- jaise `@nestjs/common` hai.",
+    "why_needed": "Adapter pattern ka asli test: naya framework jodna kitna sasta hai. Shared `http.ts` ka design yahi promise karta hai.",
+    "real_world_analogy": "Ek hi engine (limiter) ko naye gaadi ke model (framework) mein fit karna -- sirf mounting bracket (adapter) naya banta hai.",
+    "how_it_works": "Koa middleware onion model: `await next()` ke pehle request side, baad mein response side. Error throw karo toh upstream middleware ya Koa ka default handler pakadta hai.",
+    "in_this_project": "Reuse hoga: `src/adapters/http.ts` ke `keyByIp`, `rateLimitHeaders`, `STORE_UNAVAILABLE_BODY`, `STORE_UNAVAILABLE_RETRY_AFTER_S`, `TOO_MANY_REQUESTS_BODY`, `KeyFn`, `OnStoreError`. Reference implementation `src/adapters/express.ts`. Naya file hoga `src/adapters/koa.ts` aur `package.json` exports mein `./koa` -- dono abhi nahi hain.",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/http.ts::TOO_MANY_REQUESTS_BODY",
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/test/express.test.ts",
+      "projects/19-rate-limit/package.json",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// NOT in the repo -- exercise solution. src/adapters/koa.ts\nimport type { Context, Next } from \"koa\";\nimport type { RateLimiter } from \"../limiter.js\";\nimport { RateLimitError, type Decision } from \"../types.js\";\nimport { keyByIp, rateLimitHeaders, STORE_UNAVAILABLE_BODY, STORE_UNAVAILABLE_RETRY_AFTER_S,\n  TOO_MANY_REQUESTS_BODY, type KeyFn, type OnStoreError } from \"./http.js\";\n\nexport interface KoaRateLimitOptions {\n  key?: KeyFn; cost?: (ctx: Context) => number; headers?: boolean; onStoreError?: OnStoreError;\n}\n\nexport function rateLimit(limiter: RateLimiter, options: KoaRateLimitOptions = {}) {\n  const keyFn = options.key ?? keyByIp();\n  const sendHeaders = options.headers ?? true;\n  const onStoreError = options.onStoreError ?? \"error\";\n  return async function koaRateLimit(ctx: Context, next: Next): Promise<void> {\n    const key = await keyFn(ctx.req);\n    if (key === undefined) return next();\n    const cost = options.cost?.(ctx) ?? 1;          // outside the try: a buggy cost fn is never failed open\n    let decision: Decision;\n    try {\n      decision = await limiter.consume(key, cost);\n    } catch (error) {\n      if (error instanceof RateLimitError || onStoreError === \"error\") throw error;\n      if (onStoreError === \"allow\") return next();\n      ctx.status = 503;\n      ctx.set(\"retry-after\", String(STORE_UNAVAILABLE_RETRY_AFTER_S));\n      ctx.body = STORE_UNAVAILABLE_BODY;\n      return;\n    }\n    if (sendHeaders || !decision.allowed) ctx.set(rateLimitHeaders(decision));\n    if (decision.allowed) return next();\n    ctx.status = 429;\n    ctx.body = TOO_MANY_REQUESTS_BODY;\n  };\n}\n\n// test/koa.test.ts (vitest)\nit(\"koa: capacity 2 -> 200, 200, 429 with Retry-After; the handler runs twice\", async () => {\n  let ran = 0;\n  const app = new Koa();\n  app.use(rateLimit(new RateLimiter({ algorithm: tokenBucket({ capacity: 2, refillPerSec: 0.001 }), store: new MemoryStore() })));\n  app.use((ctx) => { ran++; ctx.body = \"ok\"; });\n  const server = app.listen(0, \"127.0.0.1\");\n  await once(server, \"listening\");\n  const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}/`;\n  try {\n    const rs = [await fetch(url), await fetch(url), await fetch(url)];\n    expect(rs.map((r) => r.status)).toEqual([200, 200, 429]);\n    expect(Number(rs[2]!.headers.get(\"retry-after\"))).toBeGreaterThanOrEqual(1);\n    expect(ran).toBe(2);\n  } finally {\n    server.closeAllConnections();\n    server.close();\n  }\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "http.ts ka saara logic reuse",
+      "Koa ke promise model se error handling simpler",
+      "Cost try ke bahar -- Express / Nest ka fixed pattern follow (pehle ki cost-in-try galti repeat nahi)"
+    ],
+    "disadvantages": [
+      "Ek aur entry point aur optional peer dependency maintain karni",
+      "Koa ka error handler headers reset kar sakta hai -- check karna padega"
+    ],
+    "common_mistakes": [
+      "Express ka `.catch(next)` pattern Koa mein copy karna",
+      "`await next()` bhool jaana (downstream chalega hi nahi ya order bigdega)",
+      "429 ke baad next() call karna"
+    ],
+    "follow_up_questions": [
+      "Koa ke default error handler aur rate-limit headers ka interaction?",
+      "Ek shared adapter contract test suite kaise banaoge?",
+      "Hono (Web Request/Response) ke liye kya badlega?"
+    ],
+    "concepts": [
+      "Koa middleware",
+      "adapter pattern",
+      "code reuse",
+      "framework integration"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-075",
+    "project_slug": "p19-rate-limit",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "Why are the adapters written against Node's http types and shipped as separate entry points instead of importing Express and Nest in the main package?",
+    "answer_hinglish": "Decision (PLAN.md): \"adapters are separate entry points written against Node's http types (Express not imported at runtime)\". Teen entry points: `ratelimit-kit`, `ratelimit-kit/express`, `ratelimit-kit/nestjs` (package.json `exports`).\n\nFayde:\n1. Zero runtime dependency. Main package kuch import nahi karta -- Redis client bhi aap laate ho. Express adapter sirf `node:http` ke TYPES use karta hai (`import type`), toh runtime par Express load nahi hota.\n2. Express 4 aur 5 dono -- kyunki Express ke req/res Node ke `IncomingMessage` / `ServerResponse` ko extend karte hain, aur middleware promise return nahi karta. (Honest: sirf 4.21.2 tested hai; Express 5 ka test README ke \"not done\" mein hai.)\n3. Nest optional: `@nestjs/common` optional peer dependency hai -- sirf `/nestjs` entry use karne wale ko chahiye. Express user ke node_modules mein Nest nahi aata.\n4. Framework-free core: `RateLimiter.consume` workers, queues, kisi bhi jagah chalta hai.\n5. Shared `http.ts`: client IP, headers, 429 body ek jagah -- dono adapters same behaviour.\n\nKeemat:\n- Express ki suvidhaayein nahi milti -- jaise `req.ip` aur `trust proxy`. Library apna `clientIp` / `trustedProxies` rakhti hai, matlab proxy config do jagah (Express aur limiter) -- mismatch ho sakta hai.\n- Har naye framework ke liye naya adapter (Koa, Hono, Fastify -- not done).\n- Types loose: Express ka `req.body` type nahi milta, key functions mein `(req as any).body` likhna padta hai (README ke Nest example mein dikhta hai).\n\nSame layout resilience-kit (project 18) mein bhi hai -- consistent toolkit.",
+    "why_needed": "Library design mein dependency choices users ke bundle, upgrade path aur version conflicts decide karti hain.",
+    "real_world_analogy": "Universal remote jo TV ke brand ka software nahi, sirf IR standard samajhta hai -- har brand par chalta hai, par brand-specific \"smart\" buttons nahi.",
+    "how_it_works": "`package.json` `exports` map subpaths ko alag files par point karta hai. `import type` compile ke baad mit jaata hai. Optional peer dependency: npm install nahi karta, par agar user install kare toh version range check hoti hai.",
+    "in_this_project": "`package.json`: `\"./express\": \"./dist/adapters/express.js\"`, `\"./nestjs\": \"./dist/adapters/nestjs.js\"`, `peerDependenciesMeta` mein `@nestjs/common` optional; devDependencies mein `express` 4.21.2. `src/adapters/express.ts` ka header comment. `src/index.ts` sirf framework-free helpers export karta hai.",
+    "implementation_files": [
+      "projects/19-rate-limit/package.json",
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/src/adapters/http.ts::clientIp",
+      "projects/19-rate-limit/src/index.ts",
+      "projects/19-rate-limit/PLAN.md"
+    ],
+    "code_example": "// real, src/adapters/express.ts (header)\n// Express adapter. Written against Node's http types (Express's req/res extend them), so it works with Express 4\n// and 5 without importing Express at runtime (tested with 4.21.2).\nimport type { IncomingMessage, ServerResponse } from \"node:http\";\n\n// real, package.json\n\"exports\": {\n  \".\": \"./dist/index.js\",\n  \"./express\": \"./dist/adapters/express.js\",\n  \"./nestjs\": \"./dist/adapters/nestjs.js\"\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Zero runtime dependencies",
+      "Express version se independent",
+      "Core kisi bhi Node context mein usable"
+    ],
+    "disadvantages": [
+      "Express ka `trust proxy` / `req.ip` reuse nahi -- proxy config duplicate",
+      "Express 5 untested",
+      "Loose types key functions mein"
+    ],
+    "common_mistakes": [
+      "Express ko main entry se import karna (sab users par dependency)",
+      "Express ka `req.ip` aur library ka `trustedProxies` alag set karna",
+      "'Works with Express 5' ko tested bolna"
+    ],
+    "follow_up_questions": [
+      "Express ke `trust proxy` setting ko reuse karna chahiye tha?",
+      "Peer dependency vs dependency kab?",
+      "ESM-only package ke CommonJS users ka kya?"
+    ],
+    "concepts": [
+      "package exports",
+      "peer dependencies",
+      "framework-agnostic design",
+      "Node http types"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "RLK-076",
+    "project_slug": "p19-rate-limit",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Advanced",
+    "question": "The NestJS decorator attaches a guard instance instead of an injectable guard with metadata. What do you gain and what do you lose?",
+    "answer_hinglish": "Decision (PLAN): \"the NestJS decorator attaches a guard INSTANCE (`UseGuards(new RateLimitGuard(limiter))`), so it needs no DI and no decorator metadata; stacking several decorators stacks guards.\"\n\nAlternative (jaise `@nestjs/throttler` karta hai): ek global/injectable guard, decorator sirf metadata likhta hai (`SetMetadata`), guard `Reflector` se padhta hai aur storage DI se inject hota hai.\n\nInstance approach ke fayde:\n- Zero setup: koi module import, `APP_GUARD`, provider nahi. Decorator lagao, kaam shuru.\n- Har decorator ka apna limiter -- alag algorithm, alag store, alag key. Stacking free: do decorators = do guards (test: per IP + per user).\n- Controller par lagao toh ek instance saare routes ke liye = ek shared limit (test: /limited/a 200, /limited/b 429).\n- Test karna aasaan: guard plain class hai.\n\nNuksaan:\n- Limiter decorator EVALUATION time par chahiye -- yaani module load par, jab class define hoti hai. Nest ka `ConfigService` ya DI se aaya Redis client wahan available nahi. Limits env se padhne hain toh module-level code mein; Redis connection module import par hi banta hai -- testing aur lifecycle (graceful shutdown) mushkil.\n- DI ke providers ko override karke test mein swap nahi kar sakte.\n- Global \"sab routes par default limit\" ke liye kuch nahi -- har jagah decorator.\n- Guard instance shared hai -- isme per-request state nahi rakh sakte (code rakhta bhi nahi).\n\nMera view: chhoti apps aur library ke liye instance approach simple aur explicit hai. Badi Nest app jahan config DI se aata hai, wahan ek injectable variant (decorator metadata + guard jo limiter registry DI se le) add karna chahiye -- yeh implement nahi hai.",
+    "why_needed": "Nest ka DI aur decorator model samajhna, aur jaan-boojh ke usse hatna -- yeh trade-off interviewer explain karwata hai.",
+    "real_world_analogy": "Ghar ke gate par khud ka chowkidar rakhna (instance) vs society ki security agency (DI) se lena. Apna chowkidar turant, par agency ke rules aur shift badalna (config) uske saath nahi aata.",
+    "how_it_works": "Decorators class definition time par evaluate hote hain. `UseGuards(instance)` metadata mein instance store karta hai; Nest request par wahi instance call karta hai. `UseGuards(Class)` par Nest DI se instance banata hai aur dependencies inject karta hai.",
+    "in_this_project": "`src/adapters/nestjs.ts`: comment \"A guard INSTANCE per decorated route/controller, holding its limiter: no dependency injection needed.\" `test/nestjs.test.ts` mein limiters module level par `limiter(2, \"rl:login:\")` jaise bante hain -- DI ke bahar. README: \"on a controller it is one limit shared by all its routes.\"",
+    "implementation_files": [
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimitGuard",
+      "projects/19-rate-limit/src/adapters/nestjs.ts::RateLimit",
+      "projects/19-rate-limit/test/nestjs.test.ts",
+      "projects/19-rate-limit/PLAN.md",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// real, test/nestjs.test.ts -- limiters are created at module load, outside Nest's DI\nconst limiter = (capacity: number, prefix: string) =>\n  new RateLimiter({ algorithm: tokenBucket({ capacity, refillPerSec: 0.001 }), store: new MemoryStore(), prefix });\n\n@Controller(\"limited\")\n@RateLimit(limiter(1, \"rl:ctrl:\"))      // one guard instance -> one limit for /limited/a and /limited/b\nclass LimitedController { /* ... */ }",
+    "code_language": "typescript",
+    "advantages": [
+      "Zero setup, explicit per route",
+      "Stacking aur controller-level sharing natural",
+      "Plain class -- aasaan test"
+    ],
+    "disadvantages": [
+      "Config/Redis DI se nahi aa sakte",
+      "Global default limit nahi",
+      "Module load par side effects (Redis connection)"
+    ],
+    "common_mistakes": [
+      "Guard instance mein request-specific state rakhna",
+      "Limiter ko decorator ke andar har baar naya banana (har decorator alag state -- theek hai, par galti se same route par do baar)",
+      "Socha ki ConfigService decorator mein mil jaayega"
+    ],
+    "follow_up_questions": [
+      "Injectable variant kaise design karoge (registry + metadata)?",
+      "@nestjs/throttler se comparison?",
+      "Graceful shutdown par Redis connection kaun band karega?"
+    ],
+    "concepts": [
+      "NestJS DI",
+      "guards",
+      "decorators",
+      "design trade-off"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Explicitness aur zero-setup vs DI ki configurability aur testability. Library ke liye pehla, badi app ke liye doosra -- ideal mein dono options.",
+      "failure_scenarios": "Redis client module load par bana aur env var abhi set nahi tha -> app start par crash ya galat Redis. Tests mein real Redis connect ho jaata hai kyunki DI override nahi ho sakta.",
+      "alternatives": "`SetMetadata` + global guard + `Reflector` + DI-provided limiter registry (throttler style). Ya factory: `RateLimitModule.forRoot({ redis })` jo named limiters provide kare aur decorator naam se refer kare.",
+      "scale_10x_100x": "Bahut saare routes / microservices par central config chahiye hoga (limits per environment, per tenant) -- instance approach mein har jagah code change; DI registry mein config change.",
+      "production_improvements": "Ek optional `RateLimitModule` with registry, decorator jo limiter instance YA naam le, aur graceful shutdown hook."
+    }
+  },
+  {
+    "id": "RLK-077",
+    "project_slug": "p19-rate-limit",
+    "category": "Architecture & System Design",
+    "difficulty": "Senior/System Design",
+    "question": "Design rate limiting for a login endpoint on a multi-instance Node service using this library. Walk through every piece.",
+    "answer_hinglish": "Goal: password guessing rokna -- ek attacker ek IP se bahut accounts (credential stuffing) aur bahut IPs se ek account (targeted guessing). Saath mein legit users ko tang nahi karna.\n\nPieces, library se:\n1. Store: `RedisStore(ioredisClient(redis))` -- teeno/saare instances ek limit share karein. MemoryStore se N instances = N x limit (load test: limit 500 par memory ne 1116 allow kiye, Redis ne exactly 500).\n2. Failover: `FailoverStore(redisStore, { guard: wrap(CircuitBreaker, TimeoutPolicy({ ms: 50 })), fallback: new MemoryStore(), onError: log })`. Timeout se hanging Redis request ko latkaata nahi; breaker se dead Redis ko baar-baar call nahi; fallback se Redis down par bhi per-instance limit (degraded).\n3. Algorithm: sliding window, jaise README: `slidingWindow({ limit: 5, windowMs: 15 * 60_000 })` -- login/OTP style \"about N per window\".\n4. Do limiters stacked, alag prefix: per IP (`keyByIp({ trustedProxies: 1 })` -- load balancer ke peeche; IPv6 per /64) aur per account (`email:` + lowercase). Generous wala (per IP) pehle, strict (per account) baad mein -- kyunki pehla allow kiya toh uska unit kharch ho jaata hai.\n5. `onStoreError: \"deny\"` -- security limit hai: Redis + fallback dono fail toh 503 + Retry-After 5, unlimited guesses nahi. (API capacity limit par \"allow\" hota.)\n6. Express: `app.post(\"/login\", express.json(), rateLimit(ipLimit, ...), rateLimit(accountLimit, ...), login)` -- body parser pehle, warna email key nahi milegi. Nest: do `@RateLimit` decorators.\n7. Headers: 429 par Retry-After; client ko pata kab try kare.\n\nHonest limitations jo bolunga: degraded mode mein N instances x limit; fallback counts Redis wapas aane par merge NAHI hote. Per-account limit ka ulta asar -- attacker kisi victim ka account lock kar sakta hai (limit = lockout); isliye per-account limit \"slow down\" hona chahiye, permanent lock nahi. Cluster tested nahi.",
+    "why_needed": "Login limiting sabse common real-world rate-limit design question hai, aur isme correctness, security aur failure teeno aate hain.",
+    "real_world_analogy": "Bank locker room: har visitor (IP) ke liye entry limit aur har locker (account) ke liye kitni baar chaabi try ho sakti hai. Central register (Redis); register kho jaaye toh har gate ka apna register (fallback); dono na hon toh gate band (fail closed).",
+    "how_it_works": "Request -> body parser -> per-IP limiter (consume via FailoverStore -> Redis Lua) -> per-account limiter -> login handler. Har limiter ka decision headers mein; pehla denial 429. Store fail -> fallback -> phir bhi fail -> onStoreError deny -> 503.",
+    "in_this_project": "README ka \"Use it\" (`loginLimit`, 5 per 15 minutes, prefix `rl:login:`), \"When Redis is down\" section (`onStoreError: \"deny\"` login ke liye), Nest example `@RateLimit(loginIpLimit)` + `@RateLimit(loginUserLimit, { key: ... email ... })`. `src/failover-store.ts`, `src/adapters/http.ts` (`keyByIp`, `OnStoreError`).",
+    "implementation_files": [
+      "projects/19-rate-limit/src/failover-store.ts::FailoverStore",
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/src/adapters/http.ts::keyByIp",
+      "projects/19-rate-limit/src/adapters/http.ts::OnStoreError",
+      "projects/19-rate-limit/src/redis-store.ts::RedisStore",
+      "projects/19-rate-limit/README.md"
+    ],
+    "code_example": "// illustrative wiring, built from the README's examples\nconst store = new FailoverStore(new RedisStore(ioredisClient(redis)), {\n  guard: wrap(new CircuitBreaker({ openMs: 10_000 }), new TimeoutPolicy({ ms: 50 })),\n  fallback: new MemoryStore(),\n  onError: (e) => logger.warn({ err: e }, \"rate-limit store failed\"),\n});\nconst ipLimit = new RateLimiter({ algorithm: slidingWindow({ limit: 20, windowMs: 15 * 60_000 }), store, prefix: \"rl:login-ip:\" });\nconst accountLimit = new RateLimiter({ algorithm: slidingWindow({ limit: 5, windowMs: 15 * 60_000 }), store, prefix: \"rl:login:\" });\n\napp.post(\"/login\", express.json(),\n  rateLimit(ipLimit, { key: keyByIp({ trustedProxies: 1 }), onStoreError: \"deny\" }),\n  rateLimit(accountLimit, {\n    key: (req: any) => (typeof req.body?.email === \"string\" ? `email:${req.body.email.toLowerCase()}` : undefined),\n    onStoreError: \"deny\",\n  }),\n  login);",
+    "code_language": "typescript",
+    "advantages": [
+      "Dono attack shapes cover (IP aur account)",
+      "Redis down par bhi limit (degraded) ya fail closed",
+      "Saare pieces library ke andar, sirf wiring"
+    ],
+    "disadvantages": [
+      "Degraded mode N x limit",
+      "Per-account limit lockout attack ka zariya",
+      "Do limiters = do Redis trips"
+    ],
+    "common_mistakes": [
+      "Body parser limiter ke baad lagana",
+      "Login par fail open",
+      "trustedProxies galat (0 behind LB -> sab ek IP; zyada -> spoofable)"
+    ],
+    "follow_up_questions": [
+      "Account lockout attack kaise rokoge?",
+      "CAPTCHA ya progressive delay kab?",
+      "Degraded mode ko monitor kaise karoge?"
+    ],
+    "concepts": [
+      "login protection",
+      "stacked limits",
+      "fail closed",
+      "failover"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Fail closed security ke liye sahi par Redis + fallback dono down = koi login nahi (availability loss). Per-account strict limit = security par lockout risk. Sliding window approximate -- login ke liye kaafi.",
+      "failure_scenarios": "Redis partition: timeout 50 ms -> fallback; breaker open -> seedha fallback; har instance apna count -> attacker instances ke beech spread karke N x guesses. LB ke peeche trustedProxies 0 rakha -> sab requests LB ki IP -> ek user ki galti se sab block.",
+      "alternatives": "Gateway/WAF level IP limits, progressive delays (har fail par wait badhe), CAPTCHA after N fails, device fingerprinting, ya auth server mein failed-attempt counter (sirf FAILED logins count karna -- yeh library har attempt ginti hai).",
+      "scale_10x_100x": "10x: Redis ka load per login 2 trips -- chhota. 100x / bada attack: per-IP keys ka flood Redis memory badhata hai (PEXPIRE saaf karta hai); gateway par pehle filter. Cluster ke liye sliding window keys ko hash tag.",
+      "production_improvements": "Sirf failed attempts count karna (consume after auth fail), degraded/503 metrics aur alerts, aur per-account limit ko lockout ki jagah slowdown."
+    }
+  },
+  {
+    "id": "RLK-078",
+    "project_slug": "p19-rate-limit",
+    "category": "Architecture & System Design",
+    "difficulty": "Senior/System Design",
+    "question": "Where should rate limiting live -- in-app middleware like this library, an API gateway, or both? How does this library fit a larger architecture?",
+    "answer_hinglish": "Mera jawab: dono, alag kaam ke liye. Layered.\n\nGateway / edge (nginx, Envoy, cloud WAF): sasta, request app tak pahunchne se pehle. Per-IP coarse limits, DDoS jaise floods. Par gateway ko business context nahi pata -- user id, account, plan, endpoint ka cost.\n\nIn-app (yeh library): jahan identity aur meaning hai. Per user, per email, per tenant, `cost(req)` (bulk endpoint 5 units), alag routes par alag limits, fail open vs closed PER LIMIT (login closed, general API open). Express middleware ya Nest decorator se route ke saath likha jaata hai.\n\nLibrary kahan fit hoti hai: `projects/18-resilience` OUTBOUND calls bachata hai (timeout, retry, breaker); ratelimit-kit INBOUND -- PLAN ise \"the inbound half of the toolkit\" kehta hai. Dono ka joint: FailoverStore ka guard resilience-kit ka breaker + timeout le sakta hai -- structural interface, dono packages ek doosre ko import nahi karte.\n\nShared state: multi-instance ke liye Redis zaroori; ek round trip per check per limiter. Agar gateway pehle hi bulk flood rok de toh Redis par load kam -- yeh layering ka performance fayda bhi hai.\n\nIs project mein kya NAHI hai aur architecture mein bolunga: gateway integration nahi; distributed limits bina Redis ke (gossip) scope se bahar; per-tenant config storage nahi (limits code mein); Redis Cluster tested nahi; degraded counts merge nahi hote. Aur throughput validly measure nahi hua -- isliye capacity planning ke liye pehle ek valid benchmark chahiye.\n\nDecision rule jo main dunga: \"Who are you and what are you doing\" wali limits app mein, \"how much traffic from where\" wali limits edge par. Dono ka overlap theek hai -- defence in depth.",
+    "why_needed": "System design mein rate limiting ka placement aksar poocha jaata hai; ek library banane wale se ummeed hai ki woh uski seemayein bhi jaane.",
+    "real_world_analogy": "Society ka main gate (gateway) har gaadi ginta hai; building ka guard (app) jaanta hai kaun kis flat mein jaa raha hai. Dono chahiye -- main gate flat nahi jaanta, building guard poori road ka traffic nahi rok sakta.",
+    "how_it_works": "Request flow: client -> edge limits (IP) -> load balancer -> app instance -> ratelimit-kit middleware (identity-aware, Redis-backed) -> handler -> outbound calls resilience-kit ke through.",
+    "in_this_project": "PLAN.md \"Why this project\": \"the inbound half of the toolkit, next to `projects/18-resilience` for outbound calls\"; \"Not in scope: Distributed limits without Redis (gossip), quotas over days with billing, per-tenant configuration storage.\" `src/failover-store.ts` ka `Guard` interface: \"Structural: this package does not import resilience-kit.\"",
+    "implementation_files": [
+      "projects/19-rate-limit/PLAN.md",
+      "projects/19-rate-limit/src/failover-store.ts::Guard",
+      "projects/19-rate-limit/src/adapters/express.ts::rateLimit",
+      "projects/19-rate-limit/README.md",
+      "projects/18-resilience/README.md"
+    ],
+    "code_example": "// real, src/failover-store.ts\n// Anything with resilience-kit's Policy shape -- e.g. wrap(new CircuitBreaker(...), new TimeoutPolicy({ ms: 50 }))\n// from projects/18-resilience. Structural: this package does not import resilience-kit.\nexport interface Guard {\n  execute<T>(operation: (signal: AbortSignal) => Promise<T>, signal?: AbortSignal): Promise<T>;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Identity-aware limits sirf app mein possible",
+      "Per-limit fail open/closed",
+      "Edge + app = defence in depth"
+    ],
+    "disadvantages": [
+      "App tak pahunchi request ka kuch kharcha ho chuka (TLS, parsing)",
+      "Limits code mein -- runtime config nahi",
+      "Redis ek aur critical dependency"
+    ],
+    "common_mistakes": [
+      "Sirf gateway par per-user limits ki koshish (identity nahi pata)",
+      "Sirf app mein limit aur DDoS ko bhi wahi rokne ki ummeed",
+      "Do layers ke limits bina coordination ke -- user ko confusing 429s"
+    ],
+    "follow_up_questions": [
+      "Gateway aur app ke 429 ko client kaise alag pehchaane?",
+      "Per-tenant limits runtime par kaise badloge?",
+      "Redis ki availability limiter ki availability kaise banti hai?"
+    ],
+    "concepts": [
+      "API gateway",
+      "defence in depth",
+      "inbound vs outbound resilience",
+      "system design"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Edge: sasta, coarse, context-free. App: mehnga (request andar aa chuki), rich context. Library ne app layer chuni aur use framework-agnostic rakha.",
+      "failure_scenarios": "Gateway misconfigure -> sab traffic app tak -> app limiter + Redis par poora load. Redis down -> degraded per-instance limits. Edge aur app dono same client ko alag reasons se 429 dein -> debugging mushkil (body `error` field se farak).",
+      "alternatives": "Envoy global rate limit service (gRPC, Redis-backed), cloud API gateways ke usage plans, ya service mesh level limits.",
+      "scale_10x_100x": "10x: edge pehle filter, app limiter Redis par. 100x: local pre-limit + Redis, Cluster with hash tags, per-tenant Redis. Gossip-based limits (scope ke bahar) tab socho jab Redis hi bottleneck ho.",
+      "production_improvements": "Limits ka runtime config (per tenant), gateway aur app ke 429 bodies distinguishable, degraded-mode metrics, aur ek valid benchmark capacity planning ke liye."
+    }
+  }
+]
