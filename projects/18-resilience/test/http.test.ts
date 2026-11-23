@@ -122,7 +122,7 @@ describe("over real HTTP (loopback server + fetch)", () => {
 
   it("404 is not retried", async () => {
     const s = await serve([status(404), json({ ok: 1 })]);
-    await expect(client()(s.url)).rejects.toMatchObject({ name: "HttpError", status: 404 });
+    await expect(client()(s.url)).rejects.toMatchObject({ name: "HttpError", upstreamStatus: 404 });
     expect(s.hits()).toBe(1);
   });
 
@@ -136,7 +136,7 @@ describe("over real HTTP (loopback server + fetch)", () => {
 
   it("all attempts 503: the last HttpError comes back unchanged", async () => {
     const s = await serve([status(503)]);
-    await expect(client()(s.url)).rejects.toMatchObject({ name: "HttpError", status: 503 });
+    await expect(client()(s.url)).rejects.toMatchObject({ name: "HttpError", upstreamStatus: 503 });
     expect(s.hits()).toBe(3);
   });
 

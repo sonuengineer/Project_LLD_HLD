@@ -1,4 +1,5 @@
 import { BrokenCircuitError } from "./errors.js";
+import { emit, type Observable } from "./events.js";
 import type { Operation, Policy } from "./types.js";
 
 export type CircuitState = "closed" | "open" | "half-open";
@@ -8,7 +9,7 @@ export interface StateChange {
   readonly to: CircuitState;
 }
 
-export interface CircuitBreakerOptions {
+export interface CircuitBreakerOptions extends Observable {
   failureRateThreshold?: number; // open when failures / calls in the window >= this; 0 < x <= 1, default 0.5
   windowSize?: number; // the last N recorded calls, default 20
   minimumCalls?: number; // no decision before this many calls are in the window, default 10 (<= windowSize)
@@ -85,10 +86,14 @@ export class CircuitBreaker implements Policy {
     signal?.throwIfAborted();
     this.refresh();
     if (this.current === "open") {
+      this.rejected("open");
       throw new BrokenCircuitError("open", Math.max(0, this.openedAt + this.openMs - this.now()));
     }
     if (this.current === "half-open") {
-      if (this.probesInFlight + this.probeSuccesses >= this.halfOpenMaxCalls) throw new BrokenCircuitError("half-open", 0);
+      if (this.probesInFlight + this.probeSuccesses >= this.halfOpenMaxCalls) {
+        this.rejected("half-open");
+        throw new BrokenCircuitError("half-open", 0);
+      }
       this.probesInFlight++;
     }
     const generation = this.generation;
@@ -101,6 +106,10 @@ export class CircuitBreaker implements Policy {
       this.record(generation, signal?.aborted ? "ignored" : isFailure(error) ? "failure" : "success");
       throw error;
     }
+  }
+
+  private rejected(state: "open" | "half-open"): void {
+    emit(this.options.onEvent, { type: "breaker-rejected", policy: this.options.name ?? "breaker", state });
   }
 
   private refresh(): void {
@@ -148,5 +157,6 @@ export class CircuitBreaker implements Policy {
     } catch {
       // A logging callback that throws must not turn a finished call into a failure.
     }
+    emit(this.options.onEvent, { type: "breaker-state", policy: this.options.name ?? "breaker", from, to });
   }
 }

@@ -1,5 +1,6 @@
 import { exponentialBackoff, type Backoff, type BackoffOptions } from "./backoff.js";
 import type { RetryBudget } from "./budget.js";
+import { emit, type Observable } from "./events.js";
 import { sleep as realSleep } from "./sleep.js";
 import type { Operation, Policy } from "./types.js";
 
@@ -17,7 +18,7 @@ export interface GiveUpEvent {
   readonly error: unknown;
 }
 
-export interface RetryOptions {
+export interface RetryOptions extends Observable {
   maxAttempts?: number; // including the first call; default 3
   backoff?: BackoffOptions | Backoff; // default exponentialBackoff() (100 ms, x2, max 10 s, full jitter)
   // Is this error worth another try? Default: yes for every error. In real use say no to errors that will not
@@ -78,6 +79,7 @@ export class RetryPolicy implements Policy {
 
         const giveUp = (reason: GiveUpReason): never => {
           o.onGiveUp?.({ attempts: attempt, reason, error });
+          emit(o.onEvent, { type: "give-up", policy: o.name ?? "retry", attempts: attempt, reason, error });
           throw error;
         };
         // A non-retryable error (e.g. 404) says nothing about the dependency's health: no budget change.
@@ -95,6 +97,7 @@ export class RetryPolicy implements Policy {
         if (o.deadlineMs !== undefined && now() + delayMs - startedAt >= o.deadlineMs) giveUp("deadline");
 
         o.onRetry?.({ attempt, delayMs, error });
+        emit(o.onEvent, { type: "retry", policy: o.name ?? "retry", attempt, delayMs, error });
         await sleep(delayMs, signal); // rejects at once if the caller aborts while we wait
       }
     }

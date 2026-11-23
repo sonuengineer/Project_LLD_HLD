@@ -22,6 +22,15 @@ export class BrokenCircuitError extends Error {
   }
 }
 
+// The abort reason used by the framework adapters when the HTTP client disconnects before the response.
+export class ClientClosedError extends Error {
+  override name = "ClientClosedError";
+
+  constructor() {
+    super("the client closed the connection before the response was sent");
+  }
+}
+
 // Thrown by Bulkhead without calling the operation: all slots busy and the queue is full.
 export class BulkheadRejectedError extends Error {
   override name = "BulkheadRejectedError";

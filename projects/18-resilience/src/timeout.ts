@@ -1,7 +1,8 @@
 import { TimeoutError } from "./errors.js";
+import { emit, type Observable } from "./events.js";
 import type { Operation, Policy } from "./types.js";
 
-export interface TimeoutOptions {
+export interface TimeoutOptions extends Observable {
   ms: number;
 }
 
@@ -14,7 +15,7 @@ export interface TimeoutOptions {
 export class TimeoutPolicy implements Policy {
   readonly ms: number;
 
-  constructor(options: TimeoutOptions) {
+  constructor(private readonly options: TimeoutOptions) {
     if (!Number.isFinite(options.ms) || options.ms <= 0) throw new RangeError("timeout ms must be a positive number");
     this.ms = options.ms;
   }
@@ -24,7 +25,10 @@ export class TimeoutPolicy implements Policy {
     const controller = new AbortController();
     const onCallerAbort = () => controller.abort(signal!.reason);
     signal?.addEventListener("abort", onCallerAbort, { once: true });
-    const timer = setTimeout(() => controller.abort(new TimeoutError(this.ms)), this.ms);
+    const timer = setTimeout(() => {
+      emit(this.options.onEvent, { type: "timeout", policy: this.options.name ?? "timeout", timeoutMs: this.ms });
+      controller.abort(new TimeoutError(this.ms));
+    }, this.ms);
 
     // Rejects as soon as the operation's signal is aborted, for whichever reason.
     const stopped = new Promise<never>((_, reject) => {

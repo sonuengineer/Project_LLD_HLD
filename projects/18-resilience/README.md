@@ -6,64 +6,98 @@ circuit breaker that stops calling a dependency that is down, and a bulkhead tha
 once. The core imports no framework, so the same code runs in an Express handler, a NestJS service, a worker or a
 script. No runtime dependencies.
 
-Status (2026-11-23): **stages 1 and 2 done** -- 130 tests pass (Windows, Node 20), including tests against a real
-HTTP server on loopback; 59 deliberate breaks, all caught (one only after a test was added, see "Mutation checks").
-Stage 3 (composition, Express / NestJS adapters, interview bank) is planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-23): **stages 1-3 done** -- 172 tests pass (Windows, Node 20), including tests against a real HTTP
+server on loopback, a real Express 4 app and a real NestJS 10 app; per-call overhead measured against cockatiel
+(see "Overhead"); all deliberate breaks of the last round caught (see "Mutation checks"). Not published to npm.
 
 ## Use it
 
 Everything wraps an `Operation<T> = (signal: AbortSignal) => Promise<T>`. Pass the signal on to whatever does the
-work (fetch, a driver), so a timeout or a cancelled caller really stops it.
+work (fetch, a driver), so a timeout, an open breaker or a client that went away really stops it.
 
 ```ts
-import { HttpError, isRetryableHttp, parseRetryAfter, RetryBudget, RetryPolicy, TimeoutPolicy } from "resilience-kit";
+import {
+  Bulkhead, CircuitBreaker, HttpError, isRetryableHttp, parseRetryAfter, RetryBudget, RetryPolicy, TimeoutPolicy, wrap,
+  type ResilienceEvent,
+} from "resilience-kit";
 
-// One budget per dependency, shared by every call to it.
-const smsBudget = new RetryBudget();
-const timeout = new TimeoutPolicy({ ms: 2000 }); // per attempt
-const retry = new RetryPolicy({
-  maxAttempts: 3,
-  shouldRetry: isRetryableHttp, // network errors, timeouts, 408, 429, 5xx except 501
-  retryAfterMs: (e) => (e instanceof HttpError ? e.retryAfterMs : undefined),
-  budget: smsBudget,
-  deadlineMs: 8000, // the whole thing, all attempts and waits
-  onGiveUp: (e) => console.warn("sms failed", e.reason, e.attempts),
-});
+// One set of policies PER DEPENDENCY, created once (module level / a singleton service), shared by every call.
+// (Illustrative: `logger` is your app's logger.)
+const onEvent = (e: ResilienceEvent) => logger.info({ resilience: e.type, policy: e.policy }); // or a metrics counter
+const sms = wrap(
+  new RetryPolicy({
+    name: "sms-retry", maxAttempts: 3, budget: new RetryBudget(), deadlineMs: 8000, onEvent,
+    shouldRetry: isRetryableHttp, // network errors, timeouts, 408, 429, 5xx except 501; never an open breaker
+    retryAfterMs: (e) => (e instanceof HttpError ? e.retryAfterMs : undefined),
+  }),
+  new CircuitBreaker({ name: "sms-breaker", isFailure: isRetryableHttp, onEvent }), // a 404 is not "down"
+  new Bulkhead({ name: "sms-pool", maxConcurrent: 20, maxQueue: 50, onEvent }),
+  new TimeoutPolicy({ name: "sms-timeout", ms: 2000, onEvent }), // per attempt
+);
 
-async function sendSms(body: unknown, signal?: AbortSignal) {
-  return retry.execute(
-    (s) => timeout.execute(async (t) => {
-      const res = await fetch("https://sms.example/send", { method: "POST", body: JSON.stringify(body), signal: t });
-      if (!res.ok) throw new HttpError(res.status, parseRetryAfter(res.headers.get("retry-after")));
-      return res.json();
-    }, s),
-    signal,
-  );
+export function sendSms(body: unknown, signal?: AbortSignal) {
+  return sms.execute(async (s) => {
+    const res = await fetch("https://sms.example/send", { method: "POST", body: JSON.stringify(body), signal: s });
+    if (!res.ok) throw new HttpError(res.status, parseRetryAfter(res.headers.get("retry-after")));
+    return res.json();
+  }, signal);
 }
 ```
 
-The order is `retry( timeout( call ) )`: each attempt gets its own timeout, and the retry decides what to do about a
-timed-out attempt. The other way round, one timeout would cover all attempts and the waits between them (that is
-what `deadlineMs` is for).
-
-**Express / NestJS (sketch, NOT tested in this repo yet -- the adapters are stage 3).** Nothing framework-specific is
-needed to call it; to stop the work when the client disconnects, pass a signal tied to the request:
+**Express** (`resilience-kit/express`; uses only Node's http types, so Express 4 and 5; tested with 4.21.2):
 
 ```ts
-// Express
+import { loadShedding, requestSignal, resilienceErrorHandler } from "resilience-kit/express";
+
 app.post("/notify", async (req, res, next) => {
-  const ac = new AbortController();
-  res.on("close", () => { if (!res.writableFinished) ac.abort(new Error("client went away")); });
-  try { res.json(await sendSms(req.body, ac.signal)); } catch (e) { next(e); }
+  try { res.json(await sendSms(req.body, requestSignal(req, res))); } // client disconnects -> the SMS call stops
+  catch (e) { next(e); }
 });
-
-// NestJS: a singleton service wraps the call (the policies and budget above are module-level: one per process);
-// controllers call smsService.send(dto)
-@Injectable()
-export class SmsService {
-  send(dto: SmsDto, signal?: AbortSignal) { return sendSms(dto, signal); }
-}
+app.use("/heavy", loadShedding(new Bulkhead({ maxConcurrent: 50 }))); // at most 50 requests in flight, else 503
+app.use(resilienceErrorHandler()); // open breaker / full bulkhead -> 503 (+ Retry-After), timeout -> 504
 ```
+
+**NestJS** (`resilience-kit/nestjs`, platform-express; `@nestjs/common` is an optional peer dependency; tested with
+10.4.15):
+
+```ts
+import { RequestSignal, ResilienceExceptionFilter } from "resilience-kit/nestjs";
+
+@Controller("notify")
+export class NotifyController {
+  @Post() send(@Body() dto: SmsDto, @RequestSignal() signal: AbortSignal) { return sendSms(dto, signal); }
+}
+// main.ts
+app.useGlobalFilters(new ResilienceExceptionFilter());
+```
+
+The response bodies are generic (`{"error":"dependency_timeout","message":"..."}`): a dependency's own error text
+is never sent to your client. Anything that is not a resilience error goes to the framework's normal handling.
+
+## Composition: why this order
+
+`wrap(a, b, c)` runs `a( b( c( call ) ) )`. The recommended order is **retry -> breaker -> bulkhead -> timeout**;
+each line below is a test in `test/wrap.test.ts`:
+
+| Placement | Right | Wrong, and what the test shows |
+|---|---|---|
+| timeout inside retry | hang, hang, ok -> ok: every attempt has its own deadline | timeout outside: one deadline for all attempts AND the waits; the 3rd attempt never happens |
+| breaker inside retry | 4 calls x 3 failed attempts = 12 outcomes: the breaker opens | breaker outside: 4 outcomes, it stays closed while the dependency is down |
+| breaker -> retry with `isRetryableHttp` | an open breaker stops the retry at once (0 retries) | -- |
+| bulkhead inside retry | a call in backoff does not hold a slot; another call gets through | bulkhead outside: the sleeping call holds the slot, the next call is rejected |
+
+## Events
+
+Every policy takes `name` and `onEvent`. One handler receives one typed union:
+`timeout`, `retry` (attempt, delayMs, error), `give-up` (attempts, reason, error), `breaker-state` (from, to),
+`breaker-rejected` (state), `bulkhead-rejected` (running, queued) -- each with `policy` (the name; default
+`timeout` / `retry` / `breaker` / `bulkhead`). A handler that throws is ignored: telemetry never changes what the
+caller gets (tested). The older per-policy callbacks (`onRetry`, `onGiveUp`, `onStateChange`) still work.
+
+**`HttpError` carries `upstreamStatus`, not `status`.** Found by the Express test: Express's default error handler
+sends `err.status` to the client, so with a `status` field a dependency's 404 became our 404 and its 401 would tell
+OUR client that THEY are unauthorized. Renamed in stage 3; an upstream error now reaches the client as a plain 500
+unless the app maps it on purpose.
 
 ## What each policy does
 
@@ -148,7 +182,7 @@ it and time out, 4 are refused at once).
 
 ## What the tests show
 
-`npm test` -- 130 tests in `test/`:
+`npm test` -- 172 tests in `test/`:
 
 | File | Proves |
 |---|---|
@@ -159,6 +193,10 @@ it and time out, 4 are refused at once).
 | `breaker.test.ts` | closed: pass-through, minimumCalls, exactly at the threshold, below it, the window slides, non-failures count as success, aborted calls not recorded; open: no call, retryAfterMs; lazy half-open; one probe vs a second call; probe success -> empty window; probe failure -> a new openMs; 3 probes needed and slots not reused; aborted probe frees its slot; stale results from earlier generations (3 cases); throwing onStateChange; sync throw; defaults; invalid options (28) |
 | `bulkhead.test.ts` | limit and immediate rejection, FIFO queue then rejection, slot freed on failure and sync throw, no barging, aborted waiter leaves the queue, abort listener removed at hand-off, already-aborted caller, the caller's signal passed on, 400 random steps (never above the limit, every accepted call runs exactly once), invalid options (12) |
 | `http.test.ts` | parseRetryAfter (11 cases), isRetryableHttp (14, incl. breaker / bulkhead rejections); against a real `node:http` server on 127.0.0.1 with `fetch`: 503-503-200, 404 not retried, 429 + `Retry-After: 1` waits 1000 ms, all 503 -> the HttpError, a hanging server -> TimeoutError AND the server sees the connection close, hang-hang-200, caller abort mid-request (server sees the close, no retry), a breaker opened by 503s (20 calls while open reach the server 0 times; after openMs one probe closes it), 404s do not open a breaker, a bulkhead in front of a hanging server (2 reach it, 4 refused), connection refused with a budget (36) |
+| `wrap.test.ts` | order of execution, the caller's signal reaches the operation, a caller abort through 4 layers, a timeout deep inside aborts the operation's signal; the 4 placement experiments in "Composition"; one event handler for all policies (exact event sequence and names), default names, a throwing handler changes nothing (13) |
+| `http-status.test.ts` | the 503 / 504 mapping, Retry-After never 0 (rounding cases), unmapped errors left alone (incl. an upstream 401), the body does not contain the dependency's message; requestSignal: one signal per response, aborts on an early close, not after a finished response (15) |
+| `express.test.ts` | real Express 4.21.2 app in front of a real upstream: pass-through (signal not aborted afterwards), hang -> 504, breaker -> 503 + Retry-After without calling the upstream, unmapped errors reach the app's own handler, an upstream 404 / 401 is NOT passed on by Express's default handler, a client disconnect cancels the upstream request, loadShedding (3rd concurrent request 503, slot freed after the response and after a disconnect) (8) |
+| `nestjs.test.ts` | real NestJS 10.4.15 app (platform-express): pass-through with `@RequestSignal()`, hang -> 504 and breaker -> 503 + Retry-After through the filter, full bulkhead -> 503, other errors keep Nest's own 500, an upstream 401 not passed on, a client disconnect aborts the signal and cancels the upstream request (6) |
 
 **Retry storm, measured in a simulation (deterministic, no timers; `budget.test.ts`):** 1000 calls with 3
 attempts each to a dependency that is down.
@@ -261,17 +299,82 @@ runs, and the clean suite never failed (8 of 8 runs). The stage 2 numbers and th
 `H:\` runs; the stage 1 table further up came from a lowercase-path run, so the re-run is the one to trust. Lesson: a noisy
 mutation count can make a break look caught when it is not -- check unexpected failures by name.
 
-## NOT implemented (after stage 2)
+**Stage 3 (2026-11-23, against the 172 tests, from `H:\`):** 22 new breaks, all caught at the first run, plus the 59
+earlier breaks re-run on the stage 3 code (B4 and B6 rewritten for the new event lines): all caught. 81 in total.
 
-- Composition helper, one event stream, Express / NestJS adapters (stage 3). The framework snippets above are
-  sketches, not tested here.
+| # | Break | Failed |
+|---|---|---|
+| W1 | wrap applies policies in reverse order | 6 |
+| W2 | wrap drops the caller's signal | 2 |
+| W3 | wrap passes the outer signal instead of each layer's own | 2 |
+| E1 | a throwing event handler is not contained | 1 |
+| E2 | timeout event not emitted | 1 |
+| E3 | retry event ignores the policy name | 1 |
+| E4 | give-up event not emitted | 2 |
+| E5 | breaker-rejected not emitted when open | 1 |
+| E6 | breaker-state not emitted | 1 |
+| E7 | bulkhead-rejected not emitted | 2 |
+| A1 | requestSignal aborts even after a finished response | 3 |
+| A2 | requestSignal listens on the request's close instead of the response's | 2 |
+| A3 | requestSignal not cached per response | 1 |
+| A4 | the error handler answers unknown errors itself instead of `next()` | 1 |
+| A5 | breaker 503 without Retry-After | 8 |
+| A6 | Retry-After may be 0 | 1 |
+| A7 | timeout mapped to 503 | 3 |
+| A8 | loadShedding frees the slot only on finish (not on a disconnect) | 1 |
+| A9 | the Nest filter writes no response | 3 |
+| A10 | `@RequestSignal()` returns a signal that never aborts | 1 |
+| A11 | the error body leaks the dependency's message | 2 |
+| H1 | `HttpError` field named `status` again | 3 |
+
+Earlier breaks on the stage 3 code: B1 1, B2 10, B3 2, B4 7, B5 12, B6 2, B7 1, B8 2, B9 2, B10 1, B11 2, B12 3,
+B13 1, B14 1, B15 2, B16 1, B17 1, B18 1; K1 13, K2 9, K3 2, K4 1, K5 1, K6 1, K7 1, K8 1, K9 3; R1 10, R2 2, R3 1,
+R4 3, R5 8, R6 1, R7 2, R8 2, R9 12, R10 3, R11 4, R12 1, R13 4, R14 1, R15 2, R16 1, R17 1, R18 6, R19 4, R20 2,
+R21 3, R22 1, R23 1, R24 1, R25 17, R26 1, R27 8, R28 1, R29 3, R30 1, R31 2, R32 1.
+
+The tests that catch A3, A4 and A6 (and one of A1's) were added before this run, after listing what the first
+adapter tests did not cover (a unit test for `requestSignal`, a test that unknown errors reach the app's own
+handler, Retry-After rounding). Whether those breaks would have survived without them was not checked.
+
+## Overhead, measured against cockatiel (stage 3)
+
+`npm run bench` (`bench/overhead.mjs`): the wrapper cost on a no-op operation (`async () => 1`), one call at a time,
+100 000 calls per round after 20 000 warm-up calls, median of 5 rounds. Same settings on both sides (retry 3
+attempts, a breaker with a 10 s open time, a bulkhead of 10, a 10 s timeout; cockatiel's cooperative timeout and a
+consecutive-failures breaker). This measures the WRAPPER, not resilience behaviour; any real network call costs
+far more. Raw results with every round: `bench/reference-results/2026-11-23-win32-run1.json` and `-run2.json`.
+
+Windows 11 PC, AMD Ryzen 5 4500, Node 20.20.1, cockatiel 3.2.1 -- two runs, ns per call:
+
+| Case | ours (run 1 / run 2) | cockatiel (run 1 / run 2) |
+|---|---|---|
+| bare call (no policy) | 146 / 131 | -- |
+| timeout | 7745 / 8194 | 30413 / 31551 |
+| retry | 361 / 353 | 382 / 411 |
+| circuit breaker | 229 / 247 | 350 / 370 |
+| bulkhead | 229 / 271 | 249 / 252 |
+| all four, wrapped | 11356 / 12075 | 35251 / 37269 |
+
+What the numbers say: the timeout is the expensive part for both (an AbortController, a timer and listeners per
+call); retry, breaker and bulkhead add a few hundred ns. Ours was about 4x cheaper for the timeout in these runs;
+the bulkhead is a tie (run 2 has cockatiel ahead). WHY cockatiel's timeout costs more was not investigated, and
+cockatiel does more than this library in places (events, cancellation tokens, more breaker kinds) -- this is a cost
+comparison, not a verdict. One machine, two runs.
+
+## NOT implemented (after stage 3)
+
 - The breaker's window is count-based only (no time-based window), and it has no "slow call" rate: put a
   `TimeoutPolicy` inside it so slow calls become failures.
 - Anything shared between processes: a budget, a breaker and a bulkhead live in one process's memory. Three API
   replicas have three of each (each replica learns on its own that a dependency is down).
 - Hedged requests, adaptive concurrency, fallbacks, caching.
-- Not benchmarked: the overhead of a policy per call has not been measured.
-- Not published to npm; use it from this repo (copy or a local path dependency).
+- Overhead measured on one Windows PC only (see "Overhead"); not under concurrency, not on Linux.
+- Adapters: NestJS only on platform-express (not Fastify); no Express 5 test (written against Node's http types,
+  which Express 5 also uses, but not run here); no adapter for other frameworks (Koa, Hono).
+- `@nestjs/platform-express` 10.x (a test-only dev dependency) pulls in multer 1.x, which npm reports as deprecated
+  with known vulnerabilities; nothing here uses multer and none of it is shipped.
+- Not published to npm; use it from this repo (copy or a local path dependency; the `exports` map lists
+  `resilience-kit`, `resilience-kit/express` and `resilience-kit/nestjs`).
 
 ## Run it
 
@@ -280,6 +383,7 @@ cd projects/18-resilience
 npm ci
 npm test
 npm run build   # dist/
+npm run bench   # overhead vs cockatiel, writes bench/reference-results/<date>-<platform>.json
 ```
 
 ## Files
@@ -294,5 +398,11 @@ npm run build   # dist/
 | `src/backoff.ts` | `exponentialBackoff`, jitter modes |
 | `src/budget.ts` | `RetryBudget` |
 | `src/sleep.ts` | cancellable `sleep` |
-| `src/errors.ts` | `TimeoutError`, `BrokenCircuitError`, `BulkheadRejectedError` |
-| `src/http.ts` | `parseRetryAfter`, `HttpError`, `isRetryableHttp` |
+| `src/errors.ts` | `TimeoutError`, `BrokenCircuitError`, `BulkheadRejectedError`, `ClientClosedError` |
+| `src/http.ts` | `parseRetryAfter`, `HttpError` (`upstreamStatus`), `isRetryableHttp` |
+| `src/wrap.ts` | `wrap` (composition, outermost first) |
+| `src/events.ts` | `ResilienceEvent`, `emit` |
+| `src/adapters/http-status.ts` | `mapResilienceError` (503 / 504 mapping shared by both adapters) |
+| `src/adapters/express.ts` | `requestSignal`, `resilienceErrorHandler`, `loadShedding` |
+| `src/adapters/nestjs.ts` | `@RequestSignal()`, `ResilienceExceptionFilter` |
+| `bench/overhead.mjs` | per-call overhead vs cockatiel; results in `bench/reference-results/` |

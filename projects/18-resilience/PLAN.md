@@ -2,7 +2,9 @@
 
 Status (2026-11-23): stage 1 DONE (timeout, retry with backoff and jitter, retry budget, HTTP helpers; 86 tests incl.
 a real loopback HTTP server; 32 mutation checks all caught). Stage 2 DONE (circuit breaker with generations, bulkhead
-with direct hand-off; 130 tests; 27 new mutation checks, 1 survivor closed with a test). Stage 3 not started.
+with direct hand-off; 130 tests; 27 new mutation checks, 1 survivor closed with a test). Stage 3 DONE (wrap and the
+order experiments, one event stream, Express and NestJS adapters tested against real apps, overhead measured vs
+cockatiel; 172 tests).
 
 ## Why this project
 
@@ -50,6 +52,16 @@ what each policy does and where it fails; stage 3 compares against one of them.
 - **Stage 2: the bulkhead hands a slot directly to the next waiter.** Releasing the slot and letting the waiter take
   it when it wakes up lets a newcomer barge in between; the hand-off keeps the queue fair (tested with a newcomer
   scheduled exactly in that gap).
+- **Stage 3: `wrap` is plain function composition, outermost first, with a RECOMMENDED order rather than an
+  enforced one** (retry -> breaker -> bulkhead -> timeout). Every placement claim is a test that also shows what
+  the wrong order does, so the recommendation is evidence, not folklore.
+- **Stage 3: adapters are separate entry points** (`resilience-kit/express`, `resilience-kit/nestjs`); the core
+  imports neither. The Express adapter is written against Node's http types, so it does not import Express at all;
+  the NestJS one needs `@nestjs/common` (optional peer dependency). Recommended over one package that imports both
+  frameworks, which would force them on every user.
+- **Stage 3: response bodies are generic** and never carry the dependency's error text (internal hostnames, tokens).
+- **Stage 3: `HttpError.upstreamStatus`, not `status`** -- found by the Express test (Express sends `err.status` to
+  the client).
 - **Test hooks instead of global fake time where possible:** `sleep`, `random` and `now` can be injected, so retry
   tests record waits instead of waiting. Fake timers are used where the real timer behaviour is the point.
 
@@ -59,7 +71,7 @@ what each policy does and where it fails; stage 3 compares against one of them.
 |---|---|---|
 | 1 | TimeoutPolicy, RetryPolicy (exponential backoff, full/equal/no jitter, shouldRetry, Retry-After, deadline, events), RetryBudget, HTTP helpers (parseRetryAfter, HttpError, isRetryableHttp) | DONE 2026-11-23 |
 | 2 | Circuit breaker (closed -> open -> half-open, failure rate over a count-based sliding window, minimum calls, probe calls in half-open, generations against stale results, BrokenCircuitError), bulkhead (max concurrent + bounded FIFO queue, direct hand-off, reject when full, cancellable waiting) | DONE 2026-11-23 |
-| 3 | Composition (`wrap(retry, breaker, timeout)` and why the order matters), one event stream for logs/metrics, Express middleware and NestJS interceptor adapters (tested with each framework), comparison with an established library, interview bank, portfolio page | not started |
+| 3 | Composition (`wrap`, order experiments), one event stream, Express adapter (request signal, error middleware, load shedding) and NestJS adapter (`@RequestSignal()`, exception filter) tested with real apps, overhead measured vs cockatiel, interview bank, portfolio page | DONE 2026-11-23 |
 
 ## Not in scope
 

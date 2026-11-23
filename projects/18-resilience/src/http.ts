@@ -15,15 +15,19 @@ export function parseRetryAfter(header: string | null | undefined, nowMs: number
   return Math.max(0, at - nowMs);
 }
 
-// A non-2xx answer as an error the retry policy can decide on.
+// A non-2xx answer FROM A DEPENDENCY, as an error the retry policy can decide on.
+//
+// The field is `upstreamStatus`, deliberately NOT `status` / `statusCode`: Express's default error handler (and
+// many others) send `err.status` to YOUR client. With `status`, a dependency's 401 would tell your client that THEY
+// are unauthorized, and its 404 that YOUR route does not exist (found by test/express.test.ts).
 export class HttpError extends Error {
   override name = "HttpError";
 
   constructor(
-    readonly status: number,
+    readonly upstreamStatus: number,
     readonly retryAfterMs: number | undefined,
   ) {
-    super(`HTTP ${status}`);
+    super(`upstream answered HTTP ${upstreamStatus}`);
   }
 }
 
@@ -33,6 +37,6 @@ export class HttpError extends Error {
 export function isRetryableHttp(error: unknown): boolean {
   if (error instanceof BrokenCircuitError || error instanceof BulkheadRejectedError) return false;
   if (!(error instanceof HttpError)) return true;
-  const s = error.status;
+  const s = error.upstreamStatus;
   return s === 408 || s === 429 || (s >= 500 && s !== 501);
 }

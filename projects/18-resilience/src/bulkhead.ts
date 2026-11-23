@@ -1,7 +1,8 @@
 import { BulkheadRejectedError } from "./errors.js";
+import { emit, type Observable, type ResilienceEventHandler } from "./events.js";
 import type { Operation, Policy } from "./types.js";
 
-export interface BulkheadOptions {
+export interface BulkheadOptions extends Observable {
   maxConcurrent: number; // calls running at once
   maxQueue?: number; // calls waiting for a slot; default 0 (reject at once when all slots are busy)
 }
@@ -25,6 +26,8 @@ const NEVER = new AbortController().signal;
 export class Bulkhead implements Policy {
   private readonly maxConcurrent: number;
   private readonly maxQueue: number;
+  private readonly name: string;
+  private readonly onEvent: ResilienceEventHandler | undefined;
   private active = 0;
   private readonly queue: Waiter[] = [];
 
@@ -36,6 +39,8 @@ export class Bulkhead implements Policy {
     if (!Number.isSafeInteger(maxQueue) || maxQueue < 0) throw new RangeError("maxQueue must be an integer >= 0");
     this.maxConcurrent = options.maxConcurrent;
     this.maxQueue = maxQueue;
+    this.name = options.name ?? "bulkhead";
+    this.onEvent = options.onEvent;
   }
 
   get running(): number {
@@ -53,6 +58,7 @@ export class Bulkhead implements Policy {
     } else if (this.queue.length < this.maxQueue) {
       await this.waitForSlot(signal); // resolves with the slot already ours
     } else {
+      emit(this.onEvent, { type: "bulkhead-rejected", policy: this.name, running: this.active, queued: this.queue.length });
       throw new BulkheadRejectedError(this.maxConcurrent, this.maxQueue);
     }
     try {
