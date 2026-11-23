@@ -269,7 +269,7 @@ new). 63 in total, **61 caught at first**:
 | P3 | a decline is retried | 8 |
 | P4 | exit window boundary exclusive | 1 |
 | P5 | exit window ignored | 3 |
-| P6 | payments not subtracted from the fee | 23 |
+| P6 | payments not subtracted from the fee | 12 |
 | P7 | lost-ticket penalty not added | 2 |
 | P8 | old ticket still valid after a lost-ticket report | 1 |
 | P9 | replacement ticket forgets earlier payments | 1 |
@@ -280,19 +280,27 @@ new). 63 in total, **61 caught at first**:
 | P14 | no NOTHING_DUE check | 2 |
 | P15 | a payment id can be recorded twice | 1 |
 | P16 | fake gateway not idempotent | 5 |
-| P17 | daily cap not applied to the last part-day | 12 |
+| P17 | daily cap not applied to the last part-day | 2 |
 | P18 | full days charged at 24 h instead of the cap | 2 |
-| P19 | exit gate charges even when nothing is due | 14 |
-| P20 | exit gate reports payment errors as DEVICE_FAILED | 9 |
+| P19 | exit gate charges even when nothing is due | 4 |
+| P20 | exit gate reports payment errors as DEVICE_FAILED | 7 |
 | P21 | a recorded station payment keeps the ticket locked | 8 |
 | P22 | the same payment key for every lock of a ticket | 3 |
-| P23 | the full fee recorded instead of the locked due amount | 7 |
+| P23 | the full fee recorded instead of the locked due amount | 6 |
 | P24 | exit gate without a card reader lets an unpaid car out | 1 |
 
-Stage 2 re-run: S1 9, S2 4, S3 4, S5 1, S6 1, S7 1, S8 12, S9 11, S10 2, S11 8, S12 2, S13 2, S14 1, S15 1, S16 12,
-S18 9, S19 10, S20 1, S21 20, S22 1, S23 7, S25 1. Stage 1 re-run: fits boundary 84, car fits small 7, duplicate
-plate 18, plate not normalised 7, locked before pricing 2, plate index kept 18, hours rounded down 7, grace boundary
-12, fee unchecked 4, ticket not frozen 1, release ignores the holder 1, counter ids 16.
+Stage 2 re-run: S1 9, S2 4, S3 4, S5 1, S6 1, S7 1, S8 12, S9 11, S10 2, S11 7, S12 2, S13 2, S14 1, S15 1, S16 1,
+S18 9, S19 10, S20 1, S21 20, S22 1, S23 7, S25 1. Stage 1 re-run: fits boundary 83, car fits small 7, duplicate
+plate 18, plate not normalised 6, locked before pricing 2, plate index kept 18, hours rounded down 7, grace boundary
+2, fee unchecked 3, ticket not frozen 1, release ignores the holder 1, counter ids 16.
+
+**Correction (2026-11-23).** The first stage 3 run started vitest from a lowercase drive path (`h:\...`). Found
+later in the resilience library (`projects/18-resilience/README.md`, "A test-environment finding"): from such a path
+vitest can intermittently load a module twice, so `instanceof` fails against the other copy and EXTRA tests fail. The
+whole stage 3 list was re-run from `H:\...`: every break is still caught, but 13 counts were inflated and the tables
+above now show the re-run values (e.g. P6 was 23, is 12; S16 was 12, is 1; grace boundary was 12, is 2). The stage 1
+and stage 2 tables further up came from the same kind of run on code that no longer exists, so their counts are as
+recorded then and were not re-verified.
 
 **The 2 that survived, and the fix:**
 - **S24** ("nearer" compares only the level) -- 0 failures. The "same level" allocation test put the compact spot
