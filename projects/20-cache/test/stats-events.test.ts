@@ -15,8 +15,8 @@ describe("stats", () => {
     await c.getOrLoad("a", async () => 0);
     await c.getOrLoad("c", async () => 0);
     expect(c.stats()).toEqual({
-      hits: 2, misses: 2, loads: 1, coalesced: 0, loadErrors: 0, rejected: 0,
-      evictions: { size: 0, weight: 0, expired: 0 },
+      hits: 2, misses: 2, staleHits: 0, negativeHits: 0, loads: 1, refreshes: 0, coalesced: 0, loadErrors: 0,
+      refreshErrors: 0, rejected: 0, evictions: { size: 0, weight: 0, expired: 0 },
     });
   });
 
