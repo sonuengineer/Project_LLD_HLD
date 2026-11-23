@@ -4,7 +4,7 @@ Status (2026-11-23): stage 1 DONE (token bucket + sliding window counter, in mem
 bring-your-own Redis client; parity between the TypeScript and the Lua versions tested against a real Redis).
 Stage 2 DONE (Express middleware, NestJS decorator, safe client-IP extraction, headers; real apps; two Express
 instances sharing one Redis limit). Stage 3 DONE in code (FailoverStore with a guard + memory fallback, fail open /
-closed per limit, load test across 3 instances; 90 tests; 51 mutation checks, 49 caught, 2 equivalent); its
+closed per limit, load test across 3 instances; 91 tests; 51 mutation checks, 49 caught, 2 equivalent); its
 interview bank and portfolio page follow.
 
 ## Why this project

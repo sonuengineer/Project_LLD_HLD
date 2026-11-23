@@ -7,7 +7,8 @@
 //     across all instances (Redis: must be exactly L; memory: up to N x L -- each instance counts alone)
 //
 // Run:  npm run build && node bench/load.mjs
-// Needs Redis (REDIS_URL or redis://127.0.0.1:56379). Writes bench/reference-results/<date>-<platform>-load.json.
+// Needs Redis (REDIS_URL or redis://127.0.0.1:56379). Writes bench/reference-results/<date>-<platform>-load.json;
+// the committed results were renamed by hand to -load-run1.json / -load-run2.json (one file per run).
 import { fork } from "node:child_process";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { cpus, platform, release } from "node:os";

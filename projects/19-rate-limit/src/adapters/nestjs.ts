@@ -44,9 +44,11 @@ export class RateLimitGuard implements CanActivate {
     const res = http.getResponse<ServerResponse>();
     const key = await this.keyFn(req);
     if (key === undefined) return true;
+    // Computed OUTSIDE the try: a throwing cost function is a bug in the app, never a store error to fail open on.
+    const cost = this.options.cost?.(req) ?? 1;
     let decision: Decision;
     try {
-      decision = await this.limiter.consume(key, this.options.cost?.(req) ?? 1);
+      decision = await this.limiter.consume(key, cost);
     } catch (error) {
       const mode = this.options.onStoreError ?? "error";
       if (error instanceof RateLimitError || mode === "error") throw error;

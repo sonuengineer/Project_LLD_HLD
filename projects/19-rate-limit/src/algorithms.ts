@@ -25,7 +25,6 @@ export function tokenBucket(options: { capacity: number; refillPerSec: number })
     limit: capacity,
     luaFile: "token_bucket.lua",
     args: () => [String(capacity), String(rate)],
-    stateTtlMs: () => Math.ceil((capacity * 1000) / rate) + 1000,
     step(state, now, cost) {
       let tokens = state?.tokens ?? capacity; // a new identity starts with a full bucket
       const ts = state?.ts ?? now;
@@ -72,7 +71,6 @@ export function slidingWindow(options: { limit: number; windowMs: number }): Alg
     limit,
     luaFile: "sliding_counter.lua",
     args: () => [String(limit), String(window)],
-    stateTtlMs: () => window * 2,
     step(state, now, cost) {
       const curStart = now - (now % window);
       // What Redis would find under the keys for the current and the previous window.

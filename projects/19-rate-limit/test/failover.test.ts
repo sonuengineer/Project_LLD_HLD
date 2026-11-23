@@ -129,6 +129,20 @@ describe("Redis unreachable (real ioredis client, closed port)", () => {
     expect(s).toEqual([200, 200, 429]); // capacity 2, from the local fallback
   });
 
+  it("a throwing cost function (a bug) is never failed open either", async () => {
+    const a = express();
+    const cost = () => {
+      throw new TypeError("cannot read properties of undefined");
+    };
+    a.get("/x", rateLimit(new RateLimiter({ algorithm, store: deadRedis() }), { onStoreError: "allow", cost }), (_q, res) => res.send("ran"));
+    a.use((_e: unknown, _q: express.Request, res: express.Response, _n: express.NextFunction) => res.status(500).send("error handler"));
+    const s = await new Promise<Server>((r) => {
+      const srv = a.listen(0, "127.0.0.1", () => r(srv));
+    });
+    servers.push(s);
+    expect(await (await fetch(`http://127.0.0.1:${(s.address() as AddressInfo).port}/x`)).text()).toBe("error handler");
+  });
+
   it("a bug (cost above the limit) is never failed open: it reaches the error handler even with allow", async () => {
     const a = express();
     a.get("/x", rateLimit(new RateLimiter({ algorithm, store: deadRedis() }), { onStoreError: "allow", cost: () => 99 }), (_q, res) => res.send("ran"));

@@ -5,7 +5,7 @@ window counter** (about N per window), either in memory (one process) or **atomi
 number of app instances share one limit. You pass your own Redis client; the package has no runtime dependency.
 The Lua scripts are project 1's (`projects/01-rate-limiter`), reused unchanged.
 
-Status (2026-11-23): **stages 1-3 done** -- 90 tests pass (Windows, Node 20), 10 of them against a real Redis 7
+Status (2026-11-23): **stages 1-3 done** -- 91 tests pass (Windows, Node 20), 10 of them against a real Redis 7
 (the repo's `infra/docker-compose.yml` Redis), including two Express instances sharing one limit through Redis;
 Express middleware and a NestJS decorator tested with real apps; Redis-down behaviour (failover, fail open / closed)
 tested with a real client on a dead port; a load test across 3 instances (correctness held; throughput NOT validly
@@ -18,7 +18,10 @@ measurable on this busy PC); 51 mutation checks: 49 caught, 2 equivalent.
 import { keyByIp, rateLimit } from "ratelimit-kit/express";
 
 app.use("/api", rateLimit(apiLimit, { key: keyByIp({ trustedProxies: 1 }) })); // behind ONE nginx / load balancer
-app.post("/login", express.json(), rateLimit(loginLimit, { key: (req) => `email:${req.body?.email?.toLowerCase()}` }), login);
+// No email -> undefined -> this limit is skipped (the per-IP one still applies). NOT `email:${undefined}`: that
+// would put every request without an email into ONE shared bucket.
+const byEmail = (req) => (typeof req.body?.email === "string" ? `email:${req.body.email.trim().toLowerCase()}` : undefined);
+app.post("/login", express.json(), rateLimit(loginLimit, { key: byEmail }), login);
 
 // NestJS -- ratelimit-kit/nestjs (platform-express; @nestjs/common is an optional peer dependency; tested with 10.4.15)
 import { RateLimit } from "ratelimit-kit/nestjs";
@@ -27,7 +30,7 @@ import { RateLimit } from "ratelimit-kit/nestjs";
 export class AuthController {
   @Post("login")
   @RateLimit(loginIpLimit)                                                    // per IP
-  @RateLimit(loginUserLimit, { key: (req) => `email:${(req as any).body?.email}` }) // AND per account
+  @RateLimit(loginUserLimit, { key: byEmail })                                // AND per account (as above)
   login(@Body() dto: LoginDto) { /* ... */ }
 }
 ```
@@ -120,7 +123,16 @@ app.post("/login", rateLimit(loginLimit, { onStoreError: "deny" }), login); // s
     protect SECURITY (login, OTP, password reset): an attacker must not get unlimited guesses because Redis is down.
     503, not 429: the server has the problem, not the client.
 - A `RateLimitError` (bad key / cost -- a bug) is NEVER failed open: it reaches the error handler even with
-  `"allow"` (tested for Express and Nest).
+  `"allow"` (tested for Express and Nest). Neither is an error thrown by YOUR key or cost function: both run outside
+  the store call. (The first stage-3 version computed the cost inside it, so a throwing cost function failed open
+  with `"allow"` -- found by a reviewer while writing the interview bank; fixed, with a test per adapter.)
+- **Scope of `onStoreError`:** it covers EVERY error from `limiter.consume` except `RateLimitError` -- not only
+  `StoreUnavailableError`. With a bare `RedisStore` (no FailoverStore), a raw `ECONNREFUSED` or the store's own
+  "unexpected reply" error is failed open / closed the same way.
+- Not exposed to the app: whether a decision was `degraded` (the adapters do not pass the Decision on; `onError`
+  on the FailoverStore is the signal), and requests failed open are not counted anywhere -- add logging around it.
+- After a guard TIMEOUT the Redis command may still run later (it cannot be cancelled), while the fallback has
+  already answered: that request can be counted in both stores. Inferred from the code, not tested.
 
 ## Load test (stage 3) -- correctness held, throughput not measurable on this PC
 
@@ -132,7 +144,8 @@ spreads requests round-robin over them with 32 concurrent connections. Raw resul
 **Correctness under load (run 1):** one shared key, sliding window limit 500, all 3 instances -> **exactly 500
 allowed**, 503 denied, nothing else. The same with MemoryStore (each instance counting alone): 1116 allowed, 0
 denied -- the "N instances, up to N x the limit" warning, measured. Run 2 sent only 410 requests to the shared key
-in its 3 seconds (the PC was slower), so it never reached the limit and proves nothing about the cap. The
+in its 3 seconds (the PC was slower), so it never reached the limit and proves nothing about the cap; its memory
+run (956 allowed, 0 denied) did not reach a per-instance limit either. The
 deterministic test (two Express instances, one Redis, 30 concurrent requests -> exactly 10 of 10) covers the same
 property on every `npm test`.
 
@@ -146,8 +159,12 @@ from them; a clean measurement needs an idle machine or a separate load-generato
 **Token bucket** `tokenBucket({ capacity, refillPerSec })` -- `src/lua/token_bucket.lua`
 - A new key starts full. Tokens refill lazily (computed from the elapsed time; no timer). A request of `cost`
   takes `cost` tokens if there are that many, otherwise it is denied and takes none.
-- `retryAfterMs` = time until `cost` tokens are there (rounded UP). A clock going backwards neither adds nor
-  removes tokens.
+- `retryAfterMs` = time until `cost` tokens are there (rounded UP). A request whose clock is BEHIND the stored
+  time neither adds nor removes tokens at that step (tested). **Limitation** (found while writing the interview
+  bank, not changed): that step stores the earlier time, so when the clock returns to the right time the same
+  stretch is refilled a second time (capped at capacity). With the default Redis TIME this needs Redis's own clock
+  to step back; with an app clock (`now` option) it can happen on NTP corrections. Fixing it means storing
+  `max(ts, now)` -- a change to project 1's Lua, not made.
 - Redis key: one hash per client, expiring after `capacity / refillPerSec` + 1 s of silence (by then it is full
   anyway).
 
@@ -187,7 +204,10 @@ denial with a retry time would be a lie).
 Each algorithm is written twice -- `step()` in TypeScript (memory store) and the Lua script (Redis). If they
 differed, moving from memory (dev, tests) to Redis (production) would silently change behaviour. `test/redis.test.ts`
 runs the same seeded random sequence (time jumps, 3 keys, costs 1-3) through both and requires IDENTICAL decisions:
-600 steps per algorithm, both outcomes (allowed and denied) exercised.
+600 steps per algorithm, both outcomes (allowed and denied) exercised. **Scope:** the random sequences only move
+time FORWARD. With a clock going backwards the two versions can differ for the sliding window (the TypeScript
+state remembers one window; Redis may still hold an earlier window's key, which lives for two windows) -- not
+tested, not fixed.
 
 Two precision details make this hold:
 - Redis's Lua stores the token count with `tostring()`, which keeps **14 significant digits** (`%.14g`). The
@@ -199,25 +219,25 @@ Two precision details make this hold:
 
 ## What the tests show
 
-`npm test` -- 90 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
+`npm test` -- 91 tests in `test/`. The Redis tests need Redis at `127.0.0.1:56379` (`docker compose -f
 infra/docker-compose.yml up -d redis`) or `REDIS_URL`; without it they are SKIPPED with a printed notice, never
 silently passed. All numbers below are from runs WITH Redis.
 
 | File | Proves |
 |---|---|
-| `algorithms.test.ts` | token bucket: burst then exact retry, lazy refill (half a token is not enough), never above capacity, multi-unit cost and a denial taking nothing, clock backwards neither adds nor removes tokens, independent keys, invalid options; sliding window: limit per window, the previous window weighted (7.5 of 10 at 25%; retry 3000 ms), two windows back no longer count, denied requests not counted (incl. 1 ms before the window ends), invalid options; luaToString (17) |
+| `algorithms.test.ts` | token bucket: burst then exact retry, lazy refill (half a token is not enough), never above capacity, multi-unit cost and a denial taking nothing, a backwards step neither adds nor removes tokens, independent keys, invalid options; sliding window: limit per window, the previous window weighted (7.5 of 10 at 25%; retry 3000 ms), two windows back no longer count, denied requests not counted (incl. 1 ms before the window ends), invalid options; luaToString (17) |
 | `limiter.test.ts` | prefixes, validation before the store is touched (empty key, 513 chars, cost 0 / 1.5 / above the limit), the 512 / cost = limit boundaries; MemoryStore LRU eviction (and that it resets the dropped client), a day-idle key equals a fresh one, 100 000 keys bounded to 1000, invalid maxKeys (13) |
 | `redis.test.ts` | real Redis: parity over 3 seeds x 200 steps for each algorithm, atomicity (3 clients, 300 requests, capacity 50 -> exactly 50; sliding window 200 -> exactly 40), Redis TIME by default and a key expiry set, NOSCRIPT after `SCRIPT FLUSH`, other errors not retried, the empty time argument without a clock, an unexpected reply rejected (9) |
 | `ip.test.ts` | clientIp: forged X-Forwarded-For ignored by default, 1 and 2 trusted proxies, repeated headers, fewer entries than proxies, invalid counts; ipKey: IPv4, mapped IPv6 (both cases), /64 grouping incl. leading zeros, `::`, `::1`, zone ids, one /64 = one client, non-IPs; the headers (rounding, Retry-After at least 1) (24) |
 | `express.test.ts` | real Express 4 app: limit then 429 with headers and the route not run, forged X-Forwarded-For gives no fresh limit, one trusted proxy, per-user key and `undefined` = not limited, two stacked limiters, cost, `headers: false`, a store error and a throwing key fn reach the error handler; **two Express instances sharing one Redis: 30 concurrent requests over both -> exactly 10 allowed** (10) |
-| `nestjs.test.ts` | real NestJS 10 app: headers then 429 with Retry-After and the handler not run, an undecorated route untouched, stacked per-IP + per-user decorators with anonymous skip, a decorator on a controller shared by its routes; store down: allow -> 200, deny -> 503 + Retry-After, default -> 500, a bug -> 500 even with allow (5) |
-| `failover.test.ts` | FailoverStore: primary used and not degraded, fallback marked degraded, no fallback -> StoreUnavailableError with the cause, a failing fallback reported, a throwing onError contained; with resilience-kit as the guard: a hanging primary times out (100 ms) to the fallback, an open breaker stops calling the dead primary (3 calls for 10 checks); a real ioredis client on a closed port behind Express: allow -> 200 without headers, deny -> 503 + Retry-After, default -> error handler, with a memory fallback still limited (200, 200, 429), a bug never failed open (12) |
+| `nestjs.test.ts` | real NestJS 10 app: headers then 429 with Retry-After and the handler not run, an undecorated route untouched, stacked per-IP + per-user decorators with anonymous skip, a decorator on a controller shared by its routes; store down: allow -> 200, deny -> 503 + Retry-After, default -> 500, a bug (cost above the limit, or a throwing cost function) -> 500 even with allow (5) |
+| `failover.test.ts` | FailoverStore: primary used and not degraded, fallback marked degraded, no fallback -> StoreUnavailableError with the cause, a failing fallback reported, a throwing onError contained; with resilience-kit as the guard: a hanging primary times out (100 ms) to the fallback, an open breaker stops calling the dead primary (3 calls for 10 checks); a real ioredis client on a closed port behind Express: allow -> 200 without headers, deny -> 503 + Retry-After, default -> error handler, with a memory fallback still limited (200, 200, 429), a bug (cost above the limit, a throwing cost function) never failed open (13) |
 
 ### Mutation checks (2026-11-23)
 
 One deliberate bug at a time, full suite with Redis, reverted (runner kept outside the repo, started from `H:\`).
 
-Final run on the stage 3 code against all 90 tests: 51 breaks (24 stage 1, 15 stage 2, 12 stage 3); **49 caught, 2 equivalent** (cannot be caught by design). From the first stage-1 run: M3 (the memory store ignored its expiry) survived and showed the expiry was redundant -- removed; L3 survived and got a sharper test. Stage 3: all 12 caught at the first run (one Nest test -- a bug is never failed open -- was added before the run, after listing what was not covered).
+Final run on the stage 3 code against all 90 tests (the 91st, a throwing cost function, was added afterwards): 51 breaks (24 stage 1, 15 stage 2, 12 stage 3); **49 caught, 2 equivalent** (cannot be caught by design). From the first stage-1 run: M3 (the memory store ignored its expiry) survived and showed the expiry was redundant -- removed; L3 survived and got a sharper test. Stage 3: all 12 caught at the first run (one Nest test -- a bug is never failed open -- was added before the run, after listing what was not covered).
 
 | # | Break | Failed |
 |---|---|---|
@@ -274,6 +294,16 @@ Final run on the stage 3 code against all 90 tests: 51 breaks (24 stage 1, 15 st
 | O7 | nest: a bug (RateLimitError) is failed open | 1 |
 
 Equivalent: **S6** -- both candidates for the retry are already >= 1 ms (`elapsed < window`, `needed > 0`), so `max(retry, 1)` never changes the value (kept to mirror the Lua). **H5** -- a zone id (`%eth0`) only ever sits in the LAST group of an address and the /64 key keeps the first four, so stripping it never changes a key (kept for clarity). U1-U3 break the Lua script itself; the tests against the real Redis catch them.
+
+## Known and not changed (from the interview-bank reviews)
+
+- **Stacked limiters:** each sets the `RateLimit-*` headers, so the LAST one's values are what the client sees; and
+  a limiter that allowed the request has spent its unit even if a later one denies it.
+- **MemoryStore eviction** takes `entries.keys().next()` -- a fresh iterator per eviction. projects/20-cache
+  measured exactly this pattern as slow (about 10 us per evicting insert on a 10 000-entry Map, from the holes
+  deleted entries leave) and fixed it with one long-lived iterator. Not measured here; under a flood of distinct IPs
+  every request evicts, so it is the first thing to measure and fix.
+- Token bucket with a clock that steps back, and parity with backwards time: see the algorithm and parity sections.
 
 ## NOT implemented (after stage 3)
 

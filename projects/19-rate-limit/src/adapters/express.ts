@@ -36,9 +36,11 @@ export function rateLimit(limiter: RateLimiter, options: RateLimitMiddlewareOpti
     void (async () => {
       const key = await keyFn(req);
       if (key === undefined) return next();
+      // Computed OUTSIDE the try: a throwing cost function is a bug in the app, never a store error to fail open on.
+      const cost = options.cost?.(req) ?? 1;
       let decision: Decision;
       try {
-        decision = await limiter.consume(key, options.cost?.(req) ?? 1);
+        decision = await limiter.consume(key, cost);
       } catch (error) {
         if (error instanceof RateLimitError || onStoreError === "error") throw error;
         if (onStoreError === "allow") return next();

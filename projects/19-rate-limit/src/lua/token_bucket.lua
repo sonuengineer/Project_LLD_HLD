@@ -1,4 +1,6 @@
 -- Copied from projects/01-rate-limiter/ratelimiter/limiter/lua/token_bucket.lua (unchanged below this line).
+-- Note: the comment below 'tostring keeps the fraction' is imprecise -- tostring keeps 14 significant digits
+-- (%.14g); see luaToString in src/algorithms.ts and the README 'Parity' section.
 -- Token bucket. Bucket holds up to `capacity` tokens and refills at `rate` tokens/sec.
 -- Allows bursts up to capacity, then a steady `rate`.
 -- KEYS[1] = hash key {tokens, ts}

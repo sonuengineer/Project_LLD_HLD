@@ -10,7 +10,7 @@ export interface Decision {
   readonly degraded?: true;
 }
 
-// A rate-limiting algorithm in two forms that MUST agree (tested by test/parity.test.ts):
+// A rate-limiting algorithm in two forms that MUST agree (the parity tests in test/redis.test.ts):
 //   step(): the TypeScript version, used by MemoryStore
 //   lua + args(): the Redis version, run atomically by RedisStore
 export interface Algorithm<S> {
@@ -20,7 +20,6 @@ export interface Algorithm<S> {
   args(): string[]; // ARGV[1], ARGV[2]; RedisStore appends now_ms and cost
   // One request at time `now` (ms) with `cost` units, given the stored state (undefined = never seen / expired).
   step(state: S | undefined, now: number, cost: number): { state: S; decision: Decision };
-  stateTtlMs(): number; // how long state is worth keeping after the last request
 }
 
 // A programming / input error (bad key, bad cost, bad options). Never a reason to fail open: always reported.

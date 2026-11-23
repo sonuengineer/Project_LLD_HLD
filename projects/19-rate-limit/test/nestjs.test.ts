@@ -76,6 +76,18 @@ class StoreDownController {
   bug(): string {
     return "never";
   }
+
+  // Nor a cost function that throws.
+  @Get("bug2")
+  @RateLimit(brokenLimiter(), {
+    onStoreError: "allow",
+    cost: () => {
+      throw new TypeError("bug in cost");
+    },
+  })
+  bug2(): string {
+    return "never";
+  }
 }
 
 @Module({ controllers: [DemoController, LimitedController, StoreDownController] })
@@ -126,6 +138,7 @@ describe("NestJS @RateLimit (real Nest 10 app, platform-express)", () => {
     expect([closed.status, closed.headers.get("retry-after"), (await closed.json()).error]).toEqual([503, "5", "rate_limit_unavailable"]);
     expect(dflt.status).toBe(500);
     expect((await fetch(`${base}/down/bug`)).status).toBe(500);
+    expect((await fetch(`${base}/down/bug2`)).status).toBe(500);
   });
 
   it("on a controller: one limit shared by all its routes", async () => {
