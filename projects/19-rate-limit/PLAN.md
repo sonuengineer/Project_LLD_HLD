@@ -5,7 +5,7 @@ bring-your-own Redis client; parity between the TypeScript and the Lua versions 
 Stage 2 DONE (Express middleware, NestJS decorator, safe client-IP extraction, headers; real apps; two Express
 instances sharing one Redis limit). Stage 3 DONE in code (FailoverStore with a guard + memory fallback, fail open /
 closed per limit, load test across 3 instances; 91 tests; 51 mutation checks, 49 caught, 2 equivalent); its
-interview bank and portfolio page follow.
+interview bank (105 questions) and portfolio page done.
 
 ## Why this project
 
@@ -59,7 +59,7 @@ workers): the inbound half of the toolkit, next to `projects/18-resilience` for 
 |---|---|---|
 | 1 | Algorithms (TypeScript + Lua), MemoryStore, RedisStore (EVALSHA, NOSCRIPT, Redis TIME), RateLimiter (prefix, validation), parity + atomicity tests against a real Redis | DONE 2026-11-23 |
 | 2 | Express middleware and NestJS `@RateLimit()` decorator; key strategies (IP behind a proxy, IPv6 /64, user id, skip); `RateLimit-*` and `Retry-After` headers; tested with real apps and two Express instances on one Redis | DONE 2026-11-23 |
-| 3 | Redis down: FailoverStore (guard = resilience-kit breaker + timeout, memory fallback, degraded decisions), fail open / closed per limit; a load test across 3 app instances on one Redis; interview bank; portfolio page | code DONE 2026-11-23; bank + portfolio in progress |
+| 3 | Redis down: FailoverStore (guard = resilience-kit breaker + timeout, memory fallback, degraded decisions), fail open / closed per limit; a load test across 3 app instances on one Redis; interview bank; portfolio page | DONE 2026-11-23 (bank: 105 questions; portfolio page without speed claims) |
 
 ## Not in scope
 
