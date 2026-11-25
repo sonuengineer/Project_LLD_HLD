@@ -19,4 +19,5 @@ export { PreferenceStore, quietUntil, type Preferences, type QuietHours } from "
 export { FakeSender, type ChannelSender, type FakeOutcome } from "./senders.js";
 export { escapeHtml, placeholders, renderTemplate, type Template } from "./template.js";
 export * from "./types.js";
+export { decodeCursor, encodeCursor, InboxSender, InMemoryInbox, type InboxItem, type InboxPage, type MarkResult } from "./inbox.js";
 export { checkPushToken, InMemoryUsers, MAX_PUSH_TOKENS, type PushTokenRegistry, type UserDirectory } from "./users.js";

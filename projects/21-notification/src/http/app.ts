@@ -10,6 +10,10 @@
 //   PUT  /users/:userId/preferences
 //   POST   /users/:userId/push-tokens          { token }  register a device (204; again = still registered)
 //   DELETE /users/:userId/push-tokens/:token            unregister it (204; 404 if it was not registered)
+//   GET    /users/:userId/inbox?limit=20&cursor=...  { items (newest first), nextCursor, unread }
+//   GET    /users/:userId/inbox/unread-count      { unread }
+//   POST   /users/:userId/inbox/:itemId/read      204 (already read: still 204); 404 if not THIS user's item
+//   POST   /users/:userId/inbox/read-all          { upTo: <newest item id the user saw> } -> { marked, unread }
 //   POST /webhooks/:channel        a provider's delivery receipt, signed with that channel's secret (not the API key)
 //        200 { result: "applied" | "unchanged" }, 202 { result: "parked" } (see receipts.ts)
 //
@@ -24,6 +28,7 @@ import { createHash, timingSafeEqual } from "node:crypto";
 import express, { type NextFunction, type Request, type Response } from "express";
 import { systemClock, type Clock } from "../clock.js";
 import { NotificationError, type NotificationErrorCode } from "../errors.js";
+import type { InMemoryInbox } from "../inbox.js";
 import type { PreferenceStore } from "../preferences.js";
 import type { QueuedNotifier } from "../queued-notifier.js";
 import { isReceiptEvent, SIGNATURE_HEADER, verifyWebhook } from "../receipts.js";
@@ -41,6 +46,9 @@ export interface AppOptions {
   webhookSecrets?: Partial<Record<Channel, string>>; // one per provider; a channel without one has no webhook (404)
   clock?: Clock; // for the webhook timestamp check; default the system clock
   pushTokens?: PushTokenRegistry; // device registration; without it those routes are 404
+  // The in-app inbox; without it those routes are 404. The caller (the app's backend) must check that the logged-in
+  // user IS :userId -- this API authenticates services, not end users.
+  inbox?: Pick<InMemoryInbox, "page" | "unreadCount" | "markRead" | "markAllRead">;
 }
 
 export const MIN_API_KEY_LENGTH = 16;
@@ -58,6 +66,7 @@ class HttpError extends Error {
 
 const STATUS_BY_CODE: Record<NotificationErrorCode, number> = {
   INVALID_REQUEST: 400,
+  INVALID_CURSOR: 400,
   IDEMPOTENCY_CONFLICT: 409,
   UNKNOWN_TYPE: 422,
   UNKNOWN_USER: 422,
@@ -203,6 +212,44 @@ export function createApp(options: AppOptions): express.Express {
     app.delete("/users/:userId/push-tokens/:token", (req, res) => {
       requireUser(req.params.userId!);
       if (!registry.removePushToken(req.params.userId!, req.params.token!)) throw new HttpError(404, "NOT_FOUND", "no such token");
+      res.status(204).end();
+    });
+  }
+
+  const inbox = options.inbox;
+  if (inbox) {
+    app.get("/users/:userId/inbox", (req, res) => {
+      requireUser(req.params.userId!);
+      const { limit, cursor } = req.query;
+      if (limit !== undefined && (typeof limit !== "string" || !/^\d{1,3}$/.test(limit))) {
+        throw new HttpError(400, "INVALID_REQUEST", "limit must be a whole number");
+      }
+      if (cursor !== undefined && typeof cursor !== "string") throw new HttpError(400, "INVALID_CURSOR", "one cursor at most");
+      res.json(
+        inbox.page(req.params.userId!, {
+          ...(limit !== undefined ? { limit: Number(limit) } : {}),
+          ...(cursor !== undefined ? { cursor } : {}),
+        }),
+      );
+    });
+    app.get("/users/:userId/inbox/unread-count", (req, res) => {
+      requireUser(req.params.userId!);
+      res.json({ unread: inbox.unreadCount(req.params.userId!) });
+    });
+    app.post("/users/:userId/inbox/read-all", (req, res) => {
+      requireUser(req.params.userId!);
+      requireJson(req);
+      const upTo: unknown = isPlainObject(req.body) ? req.body.upTo : undefined;
+      if (typeof upTo !== "string" || upTo === "") throw new HttpError(400, "INVALID_REQUEST", "upTo must be the id of the newest item the user saw");
+      const marked = inbox.markAllRead(req.params.userId!, upTo);
+      if (marked === undefined) throw new HttpError(404, "NOT_FOUND", "no such item in this inbox");
+      res.json({ marked, unread: inbox.unreadCount(req.params.userId!) });
+    });
+    app.post("/users/:userId/inbox/:itemId/read", (req, res) => {
+      requireUser(req.params.userId!);
+      if (inbox.markRead(req.params.userId!, req.params.itemId!) === "not_found") {
+        throw new HttpError(404, "NOT_FOUND", "no such item in this inbox");
+      }
       res.status(204).end();
     });
   }

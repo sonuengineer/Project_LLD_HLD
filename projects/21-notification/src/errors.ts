@@ -10,7 +10,8 @@ export type NotificationErrorCode =
   | "INVALID_PREFERENCES" // preferences: bad quiet hours or offset, unknown channel or category
   | "TEMPLATE_VARIABLE_MISSING" // a {{placeholder}} has no value in the request data
   | "NO_SENDER" // a channel the request would use has no sender configured
-  | "IDEMPOTENCY_CONFLICT"; // the key was used before with a different request
+  | "IDEMPOTENCY_CONFLICT" // the key was used before with a different request
+  | "INVALID_CURSOR"; // inbox: a cursor this API did not return
 
 export class NotificationError extends Error {
   constructor(

@@ -46,7 +46,8 @@ export class NotificationCatalog {
       if (channel === "email" && (typeof template.subject !== "string" || template.subject.trim() === "")) {
         invalid(`${def.id}: an email template needs a subject`);
       }
-      if (channel !== "email" && template.subject !== undefined) invalid(`${def.id}: only email has a subject`);
+      // in_app may have one (the item's title); sms and push have no subject line.
+      if ((channel === "sms" || channel === "push") && template.subject !== undefined) invalid(`${def.id}: ${channel} has no subject`);
       placeholders(template.body); // throws on a malformed placeholder
       if (template.subject !== undefined) placeholders(template.subject);
     }

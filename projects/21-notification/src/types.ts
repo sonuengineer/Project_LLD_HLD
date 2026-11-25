@@ -1,6 +1,6 @@
 // The shared vocabulary. Channels and categories are closed lists: adding one is a change here plus a sender.
 
-export const CHANNELS = ["email", "sms", "push"] as const;
+export const CHANNELS = ["email", "sms", "push", "in_app"] as const; // in_app: the inbox in the app (stage 3)
 export type Channel = (typeof CHANNELS)[number];
 
 export const CATEGORIES = ["transactional", "marketing"] as const;
@@ -47,10 +47,17 @@ export function isCategory(value: unknown): value is Category {
   return typeof value === "string" && (CATEGORIES as readonly string[]).includes(value);
 }
 
-// Every address the channel can reach: one email or phone, or each of the user's push tokens. Blank ones do not
-// count; duplicates are dropped.
+// Every address the channel can reach: one email or phone, each of the user's push tokens, or (in_app) the user's
+// own inbox -- every user has one. Blank ones do not count; duplicates are dropped.
 export function addressesFor(recipient: Recipient, channel: Channel): string[] {
-  const values = channel === "email" ? [recipient.email] : channel === "sms" ? [recipient.phone] : (recipient.pushTokens ?? []);
+  const values =
+    channel === "email"
+      ? [recipient.email]
+      : channel === "sms"
+        ? [recipient.phone]
+        : channel === "in_app"
+          ? [recipient.userId]
+          : (recipient.pushTokens ?? []);
   return [...new Set(values.filter((v): v is string => typeof v === "string" && v.trim() !== ""))];
 }
 

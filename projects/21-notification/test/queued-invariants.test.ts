@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { exponentialBackoff } from "resilience-kit";
 import { notificationStatus } from "../src/record.js";
 import type { Preferences } from "../src/preferences.js";
-import { CHANNELS, type Channel, type OutboundMessage, type Recipient, type SendResult } from "../src/types.js";
+import { type Channel, type OutboundMessage, type Recipient, type SendResult } from "../src/types.js";
 import { Worker } from "../src/worker.js";
 import { MIN } from "./helpers.js";
 import { setupQueued } from "./queued-helpers.js";
@@ -55,7 +55,7 @@ describe("randomized invariants, queued", () => {
         if (rand() < 0.6) u.phone = `+1000000${i}`;
         if (rand() < 0.6) u.pushTokens = [`tok-${i}`];
         users.push(u);
-        const p: Preferences = { mutedMarketing: CHANNELS.filter(() => rand() < 0.3) };
+        const p: Preferences = { mutedMarketing: (["email", "sms", "push"] as Channel[]).filter(() => rand() < 0.3) };
         if (rand() < 0.6) {
           const start = Math.floor(rand() * 96) * 15;
           let end = Math.floor(rand() * 96) * 15;

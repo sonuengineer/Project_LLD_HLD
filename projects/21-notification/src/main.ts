@@ -7,7 +7,7 @@
 import { exponentialBackoff } from "resilience-kit";
 import { createApp, MIN_API_KEY_LENGTH } from "./http/app.js";
 import { startServer } from "./http/server.js";
-import { CHANNELS, FakeSender, InMemoryJobQueue, InMemoryUsers, NotificationCatalog, PreferenceStore, QueuedNotifier, Worker } from "./index.js";
+import { CHANNELS, FakeSender, InboxSender, InMemoryInbox, InMemoryJobQueue, InMemoryUsers, NotificationCatalog, PreferenceStore, QueuedNotifier, Worker } from "./index.js";
 
 const apiKey = process.env.NOTIFY_API_KEY;
 if (!apiKey || apiKey.length < MIN_API_KEY_LENGTH) {
@@ -17,7 +17,7 @@ if (!apiKey || apiKey.length < MIN_API_KEY_LENGTH) {
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "127.0.0.1";
 const webhookSecrets = Object.fromEntries(
-  CHANNELS.flatMap((c) => {
+  CHANNELS.filter((c) => c !== "in_app").flatMap((c) => { // the inbox has no outside provider
     const secret = process.env[`NOTIFY_WEBHOOK_SECRET_${c.toUpperCase()}`];
     return secret ? [[c, secret]] : [];
   }),
@@ -35,13 +35,18 @@ catalog.register({
   id: "sale",
   category: "marketing",
   mode: "all",
-  channels: ["push", "email"],
-  templates: { push: { body: "{{pct}}% off today" }, email: { subject: "Sale: {{pct}}% off", body: "<p>{{pct}}% off today</p>" } },
+  channels: ["push", "email", "in_app"],
+  templates: {
+    push: { body: "{{pct}}% off today" },
+    email: { subject: "Sale: {{pct}}% off", body: "<p>{{pct}}% off today</p>" },
+    in_app: { subject: "Sale", body: "{{pct}}% off today" },
+  },
 });
 const users = new InMemoryUsers();
 users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushTokens: ["tok-1"], utcOffsetMinutes: 330 });
 const preferences = new PreferenceStore();
-const senders = [new FakeSender("push"), new FakeSender("sms"), new FakeSender("email")];
+const inbox = new InMemoryInbox();
+const senders = [new FakeSender("push"), new FakeSender("sms"), new FakeSender("email"), new InboxSender(inbox)];
 const notifier = new QueuedNotifier({
   catalog,
   users,
@@ -51,7 +56,7 @@ const notifier = new QueuedNotifier({
   retry: { maxAttempts: 3, backoff: exponentialBackoff({ initialMs: 1_000, maxMs: 60_000 }) },
 });
 
-const running = await startServer(createApp({ notifier, users, preferences, apiKey, webhookSecrets, pushTokens: users }), new Worker(notifier), { port, host });
+const running = await startServer(createApp({ notifier, users, preferences, apiKey, webhookSecrets, pushTokens: users, inbox }), new Worker(notifier), { port, host });
 console.log(`notification API on ${running.url} (fake senders; types: ${catalog.ids().join(", ")}; user: u1)`);
 console.log(`webhooks: ${Object.keys(webhookSecrets).join(", ") || "none (no NOTIFY_WEBHOOK_SECRET_* set)"}`);
 

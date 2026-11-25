@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API, delivery receipts and several push devices done. 177 tests; mutation checks in the README.
+Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API, delivery receipts, several push devices and the in-app inbox done. 192 tests; mutation checks in the README.
 
 ## Why this project
 
@@ -135,6 +135,22 @@ user, the in-app inbox, the interview bank, the portfolio page.
 - **A cap of 10 tokens per user, the oldest dropped; registering again moves a token to the newest place.** Users
   reinstall and change phones without unregistering. `POST /users/:id/push-tokens` and `DELETE .../:token`; the
   token list is never echoed back (a token is enough to push to that device).
+
+- **The in-app inbox is a fourth channel, `in_app`, whose "provider" stores the message** (`InboxSender` ->
+  `InMemoryInbox`). Recommended over a separate code path: the catalog, preferences (marketing mutes), modes,
+  retries and the queue all apply unchanged. Its address is the user id (every user has an inbox); it wakes nobody,
+  so quiet hours do not defer it; a template may have a subject, used as the item's title; not HTML-escaped (the
+  app renders text).
+- **Cursor paging, not page numbers.** Newest first, so `?page=2` shifts with every new arrival. The cursor is the
+  last item's sequence number ("older than this"), opaque (base64url `v1.<seq>`, only the canonical form accepted).
+- **A stored unread counter that changes only on a real state change.** O(1) to read on every page load; marking an
+  already-read item does nothing, so concurrent marks decrement once (the SQL shape: `UPDATE ... WHERE read_at IS
+  NULL`, decrement if a row changed). A randomized test recounts from scratch after every operation.
+- **"Mark all read" takes the newest item the user saw**, so an item that arrives during the click stays unread.
+- **Idempotent on the provider key** (`<id>:in_app`): a retried or redelivered job is one item.
+- **Items are looked up inside one user's inbox** (no cross-user access by id); the service API key does not identify
+  the end user, so the app's backend must check the logged-in user is `:userId`.
+- **Retention: 200 items per user, the oldest dropped** (an unread one dropped lowers the count).
 
 ## Stages
 

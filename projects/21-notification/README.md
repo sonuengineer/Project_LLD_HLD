@@ -5,9 +5,9 @@ channel, user preferences and quiet hours, channel fallback and idempotent reque
 leases and priorities, workers, retries with backoff, a circuit breaker and a timeout per channel, frequency caps and
 bounded idempotency keys (stage 2). Providers are fakes: nothing in this project sends a real email, SMS or push.
 
-Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API, delivery receipts, several push devices done) -- 177 tests; mutation checks in "Mutation checks" (stage 1) and
-"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (the in-app inbox) is
-planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API, delivery receipts, several push devices, in-app inbox done) -- 192 tests; mutation checks in "Mutation checks" (stage 1) and
+"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (the interview bank and the
+portfolio page) is planned in [PLAN.md](PLAN.md).
 
 Stage 2 uses three libraries from this repo as `file:` dependencies on their built `dist/`:
 [resilience-kit](../18-resilience) (backoff, timeout, circuit breaker), [ratelimit-kit](../19-rate-limit)
@@ -16,7 +16,7 @@ Stage 2 uses three libraries from this repo as `file:` dependencies on their bui
 ```
 npm run build:deps    # npm ci + npm run build in 18-resilience, 19-rate-limit and 20-cache
 npm ci
-npm test              # 177 tests
+npm test              # 192 tests
 npm run demo          # stage 1: OTP with fallback, a retried request, marketing deferred by quiet hours
 npm run demo:queue    # stage 2: a retry with backoff, a dead push provider (breaker open, OTP fails over), a cap
 ```
@@ -363,4 +363,50 @@ failing over to SMS -- no multi-device test opened the breaker).
 
 The push key changed from `<id>:push` to `<id>:push:<token>`; the 3 tests and the randomized checks that pinned the
 old key were updated, nothing else in stages 1 and 2 changed.
+
+## Stage 3: the in-app inbox
+
+A fourth channel, `in_app`. Its sender (`InboxSender`) stores the message in `InMemoryInbox`, so a notification type
+lists it like any channel: `channels: ["push", "email", "in_app"]`, `in_app: { subject: "Sale", body: "..." }` (the
+subject is the item's title).
+
+```
+GET  /users/u1/inbox?limit=20&cursor=<nextCursor>   -> { items: [newest first], nextCursor: string | null, unread }
+GET  /users/u1/inbox/unread-count                   -> { unread }
+POST /users/u1/inbox/<itemId>/read                  -> 204 (already read: 204 too); 404 if not u1's item
+POST /users/u1/inbox/read-all  {"upTo":"<itemId>"}  -> { marked, unread }
+```
+
+- **Channel rules:** the address is the user id, so `in_app` is never `no_address`; it wakes nobody, so quiet hours
+  do not defer it (a marketing push at night is deferred, its inbox copy is not); marketing mutes apply; not
+  HTML-escaped. The delivery's `providerId` is the inbox item id.
+- **Paging with a cursor**, newest first. New items arriving between two page loads do not shift the next page (a
+  page number would repeat items). The cursor is opaque and checked: anything this API did not return is
+  `400 INVALID_CURSOR`. `limit` is 1..100 (digits only; `1e1` is refused), default 20.
+- **The unread count is a stored counter**, changed only when an item really changes: marking an item that is already
+  read does nothing, so two tabs marking it read lower the count once. A randomized test (2000 random adds, reads,
+  read-alls and full page walks over 3 users) recounts the unread items from scratch after every step.
+- **Read-all up to the newest item the user saw:** an item that arrived while the user clicked stays unread.
+- **One item per message:** storing is keyed on the provider idempotency key `<id>:in_app`, so a retried or
+  redelivered job does not add it twice.
+- **Per-user lookups only:** an item id from another user's inbox is a 404, read or read-all.
+- **Retention:** 200 items per user, the oldest dropped; an unread one dropped lowers the count.
+- **Who may read whose inbox:** this API authenticates services (one API key), not end users. The app's backend must
+  check that the logged-in user is the `:userId` it asks for.
+
+Not built: a real-time push of new items to an open app (WebSocket / SSE; the app polls the count), deleting or
+archiving items, a "read" receipt from the inbox feeding back into the notification, a time-based expiry.
+
+| File | Tests | What |
+|---|---|---|
+| test/inbox.test.ts | 15 | paging (45 items in 20 / 20 / 5, each once, an exact fit has no empty extra page; new arrivals between pages; 5 bad cursors incl. a non-canonical one; limit bounds); idempotent add; mark read once / already read / another user's item; read-all up to the item seen; retention with read and unread items dropped; the randomized counter check; the channel end to end (inbox item with title, not escaped; quiet hours defer push not inbox; muted inbox opted_out; the same message twice is one item; catalog subject rules); HTTP (paging with the returned cursor, unread count, 6 bad limit / cursor queries, read twice, another user's item 404, read-all, unknown user, no inbox configured) |
+
+20 mutation checks on the inbox, each applied alone, all caught on the first run: cursor not canonical, the cursor
+item repeated on the next page, an empty extra page, add not idempotent, already-read decremented again, lookups
+across users, read-all marking newer items, retention miscounting read items or leaving dropped ones findable, the
+limit bound, the title dropped, a random storage key, `in_app` with no address, a subject refused for `in_app`, the
+API's digits-only limit, `upTo` unchecked, a 404 turned into 204, the user check, the counter not raised or lowered.
+One test was added before the run because the API's digits-only limit check was otherwise redundant for every case
+tested (`limit=1e1` is 10 to `Number()`). `src/main.ts` (the `npm start` wiring) is not under test; the parts it
+wires are.
 

@@ -4,7 +4,7 @@
 import { describe, expect, it } from "vitest";
 import { notificationStatus, type NotificationRecord } from "../src/notifier.js";
 import type { Preferences } from "../src/preferences.js";
-import { CHANNELS, type Channel, type OutboundMessage, type Recipient, type SendResult } from "../src/types.js";
+import { type Channel, type OutboundMessage, type Recipient, type SendResult } from "../src/types.js";
 import { MIN, setup } from "./helpers.js";
 
 function prng(seed: number) {
@@ -49,7 +49,7 @@ describe("randomized invariants", () => {
         if (rand() < 0.6) u.phone = `+1000000${i}`;
         if (rand() < 0.6) u.pushTokens = [`tok-${i}`];
         users.push(u);
-        const p: Preferences = { mutedMarketing: CHANNELS.filter(() => rand() < 0.3) };
+        const p: Preferences = { mutedMarketing: (["email", "sms", "push"] as Channel[]).filter(() => rand() < 0.3) };
         if (rand() < 0.6) {
           const start = Math.floor(rand() * 24 * 4) * 15;
           let end = Math.floor(rand() * 24 * 4) * 15;
