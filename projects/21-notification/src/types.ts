@@ -13,7 +13,7 @@ export interface Recipient {
   userId: string;
   email?: string;
   phone?: string;
-  pushToken?: string;
+  pushTokens?: string[]; // one per device (app install); several devices = several tokens (stage 3)
   utcOffsetMinutes?: number; // the user's local time = UTC + offset (fixed; DST not handled). Default 0.
 }
 
@@ -22,14 +22,17 @@ export interface OutboundMessage {
   notificationId: string;
   channel: Channel;
   to: string; // email address, phone number or push token
-  idempotencyKey: string; // "<notificationId>:<channel>", the same on every attempt: lets a provider drop a duplicate
+  idempotencyKey: string; // "<notificationId>:<channel>" (push: "<notificationId>:push:<token>"), the same on every
+  // attempt to that address: lets a provider drop a duplicate
   subject?: string; // email only
   body: string;
 }
 
 export type SendResult =
   | { status: "sent"; providerId: string }
-  | { status: "failed"; retryable: boolean; reason: string };
+  // invalidAddress: the address will never work again (an uninstalled app: FCM UNREGISTERED, APNs 410). Push tokens
+  // reported this way are removed from the user (stage 3).
+  | { status: "failed"; retryable: boolean; reason: string; invalidAddress?: boolean };
 
 export type DeliveryStatus = "pending" | "sending" | "sent" | "failed" | "skipped" | "deferred";
 
@@ -44,7 +47,13 @@ export function isCategory(value: unknown): value is Category {
   return typeof value === "string" && (CATEGORIES as readonly string[]).includes(value);
 }
 
+// Every address the channel can reach: one email or phone, or each of the user's push tokens. Blank ones do not
+// count; duplicates are dropped.
+export function addressesFor(recipient: Recipient, channel: Channel): string[] {
+  const values = channel === "email" ? [recipient.email] : channel === "sms" ? [recipient.phone] : (recipient.pushTokens ?? []);
+  return [...new Set(values.filter((v): v is string => typeof v === "string" && v.trim() !== ""))];
+}
+
 export function addressFor(recipient: Recipient, channel: Channel): string | undefined {
-  const value = channel === "email" ? recipient.email : channel === "sms" ? recipient.phone : recipient.pushToken;
-  return value && value.trim() !== "" ? value : undefined;
+  return addressesFor(recipient, channel)[0];
 }

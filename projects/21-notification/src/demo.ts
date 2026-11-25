@@ -35,7 +35,7 @@ catalog.register({
 });
 
 const users = new InMemoryUsers();
-users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushToken: "tok-1", utcOffsetMinutes: 330 });
+users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushTokens: ["tok-1"], utcOffsetMinutes: 330 });
 const preferences = new PreferenceStore();
 preferences.set("u1", { mutedMarketing: [], quietHours: { start: "22:00", end: "07:00" } });
 

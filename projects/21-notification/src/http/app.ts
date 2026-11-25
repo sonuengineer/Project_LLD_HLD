@@ -8,6 +8,8 @@
 //   GET  /notifications/:id        the record and its overall status
 //   GET  /users/:userId/preferences
 //   PUT  /users/:userId/preferences
+//   POST   /users/:userId/push-tokens          { token }  register a device (204; again = still registered)
+//   DELETE /users/:userId/push-tokens/:token            unregister it (204; 404 if it was not registered)
 //   POST /webhooks/:channel        a provider's delivery receipt, signed with that channel's secret (not the API key)
 //        200 { result: "applied" | "unchanged" }, 202 { result: "parked" } (see receipts.ts)
 //
@@ -27,7 +29,7 @@ import type { QueuedNotifier } from "../queued-notifier.js";
 import { isReceiptEvent, SIGNATURE_HEADER, verifyWebhook } from "../receipts.js";
 import { notificationStatus, type NotificationRecord } from "../record.js";
 import { isChannel, type Channel } from "../types.js";
-import type { UserDirectory } from "../users.js";
+import type { PushTokenRegistry, UserDirectory } from "../users.js";
 
 export interface AppOptions {
   notifier: QueuedNotifier;
@@ -38,6 +40,7 @@ export interface AppOptions {
   log?: (message: string, error: unknown) => void; // unexpected (500) errors; default console.error
   webhookSecrets?: Partial<Record<Channel, string>>; // one per provider; a channel without one has no webhook (404)
   clock?: Clock; // for the webhook timestamp check; default the system clock
+  pushTokens?: PushTokenRegistry; // device registration; without it those routes are 404
 }
 
 export const MIN_API_KEY_LENGTH = 16;
@@ -185,6 +188,24 @@ export function createApp(options: AppOptions): express.Express {
     preferences.set(req.params.userId!, req.body);
     res.json(preferences.get(req.params.userId!));
   });
+
+  // Devices register through the app's backend. The token list is never echoed back: a token is enough to push to
+  // that device with the provider's key, so it is not something to hand out.
+  const registry = options.pushTokens;
+  if (registry) {
+    app.post("/users/:userId/push-tokens", (req, res) => {
+      requireUser(req.params.userId!);
+      requireJson(req);
+      const token: unknown = isPlainObject(req.body) ? req.body.token : undefined;
+      registry.addPushToken(req.params.userId!, token as string); // throws INVALID_REQUEST (400) for a bad token
+      res.status(204).end();
+    });
+    app.delete("/users/:userId/push-tokens/:token", (req, res) => {
+      requireUser(req.params.userId!);
+      if (!registry.removePushToken(req.params.userId!, req.params.token!)) throw new HttpError(404, "NOT_FOUND", "no such token");
+      res.status(204).end();
+    });
+  }
 
   app.use(() => {
     throw new HttpError(404, "NOT_FOUND", "no such route");

@@ -90,14 +90,14 @@ describe("planChannel: the one rule", () => {
 
   it("transactional ignores mutes and quiet hours", () => {
     expect(planChannel("transactional", "sms", FULL_USER, quietMuted, night)).toEqual({ status: "pending", to: FULL_USER.phone });
-    expect(planChannel("transactional", "push", FULL_USER, quietMuted, night)).toEqual({ status: "pending", to: FULL_USER.pushToken });
+    expect(planChannel("transactional", "push", FULL_USER, quietMuted, night)).toEqual({ status: "pending", to: FULL_USER.pushTokens![0] });
   });
 
   it("marketing: muted channel skipped (even outside quiet hours), sms/push deferred at night, email never deferred", () => {
     expect(planChannel("marketing", "sms", FULL_USER, quietMuted, at(12))).toEqual({ status: "skipped", reason: "opted_out" });
-    expect(planChannel("marketing", "push", FULL_USER, quietMuted, night)).toEqual({ status: "deferred", to: FULL_USER.pushToken, notBefore: at(31) });
+    expect(planChannel("marketing", "push", FULL_USER, quietMuted, night)).toEqual({ status: "deferred", to: FULL_USER.pushTokens![0], notBefore: at(31) });
     expect(planChannel("marketing", "email", FULL_USER, quietMuted, night)).toEqual({ status: "pending", to: FULL_USER.email });
-    expect(planChannel("marketing", "push", FULL_USER, quietMuted, at(12))).toEqual({ status: "pending", to: FULL_USER.pushToken });
+    expect(planChannel("marketing", "push", FULL_USER, quietMuted, at(12))).toEqual({ status: "pending", to: FULL_USER.pushTokens![0] });
   });
 
   it("a muted channel is skipped even in quiet hours (opted out wins over deferred)", () => {

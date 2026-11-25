@@ -39,7 +39,7 @@ catalog.register({
   templates: { push: { body: "{{pct}}% off today" }, email: { subject: "Sale: {{pct}}% off", body: "<p>{{pct}}% off today</p>" } },
 });
 const users = new InMemoryUsers();
-users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushToken: "tok-1", utcOffsetMinutes: 330 });
+users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushTokens: ["tok-1"], utcOffsetMinutes: 330 });
 const preferences = new PreferenceStore();
 const senders = [new FakeSender("push"), new FakeSender("sms"), new FakeSender("email")];
 const notifier = new QueuedNotifier({
@@ -51,7 +51,7 @@ const notifier = new QueuedNotifier({
   retry: { maxAttempts: 3, backoff: exponentialBackoff({ initialMs: 1_000, maxMs: 60_000 }) },
 });
 
-const running = await startServer(createApp({ notifier, users, preferences, apiKey, webhookSecrets }), new Worker(notifier), { port, host });
+const running = await startServer(createApp({ notifier, users, preferences, apiKey, webhookSecrets, pushTokens: users }), new Worker(notifier), { port, host });
 console.log(`notification API on ${running.url} (fake senders; types: ${catalog.ids().join(", ")}; user: u1)`);
 console.log(`webhooks: ${Object.keys(webhookSecrets).join(", ") || "none (no NOTIFY_WEBHOOK_SECRET_* set)"}`);
 

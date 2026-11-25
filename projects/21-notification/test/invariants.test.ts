@@ -31,7 +31,8 @@ function inQuiet(now: number, offset: number, prefs: Preferences): boolean {
   return s < e ? m >= s && m < e : m >= s || m < e;
 }
 
-const ADDRESS: Record<Channel, keyof Recipient> = { email: "email", sms: "phone", push: "pushToken" };
+const ADDRESS = (user: Recipient, channel: Channel): string | undefined =>
+  channel === "email" ? user.email : channel === "sms" ? user.phone : user.pushTokens?.[0];
 const TYPES = ["otp", "order_shipped", "sale", "promo_first"] as const;
 
 describe("randomized invariants", () => {
@@ -46,7 +47,7 @@ describe("randomized invariants", () => {
         const u: Recipient = { userId: `u${i}`, utcOffsetMinutes: pick([-300, 0, 60, 330, 345, 600]) };
         if (rand() < 0.8) u.email = `u${i}@example.test`;
         if (rand() < 0.6) u.phone = `+1000000${i}`;
-        if (rand() < 0.6) u.pushToken = `tok-${i}`;
+        if (rand() < 0.6) u.pushTokens = [`tok-${i}`];
         users.push(u);
         const p: Preferences = { mutedMarketing: CHANNELS.filter(() => rand() < 0.3) };
         if (rand() < 0.6) {
@@ -69,7 +70,7 @@ describe("randomized invariants", () => {
         const rec = recordOfMsg(m);
         const user = userById.get(rec.userId)!;
         const prefs = prefsOf.get(rec.userId)!;
-        if (m.to !== user[ADDRESS[m.channel]]) violations.push(`wrong address ${m.channel}`);
+        if (m.to !== ADDRESS(user, m.channel)) violations.push(`wrong address ${m.channel}`);
         if (rec.category === "marketing") {
           if (prefs.mutedMarketing.includes(m.channel)) violations.push(`muted ${m.channel} sent`);
           if (m.channel !== "email" && inQuiet(s.clock.now(), user.utcOffsetMinutes ?? 0, prefs)) {
@@ -131,7 +132,7 @@ describe("randomized invariants", () => {
           expect(d.attempts).toBeLessThanOrEqual(1);
           attemptsInRecords += d.attempts;
           if (d.status === "sent") sentDeliveries++;
-          const hasAddress = Boolean(user[ADDRESS[d.channel]]?.toString().trim());
+          const hasAddress = Boolean(ADDRESS(user, d.channel)?.trim());
           expect(d.skipReason === "no_address").toBe(!hasAddress);
           const muted = r.category === "marketing" && hasAddress && prefs.mutedMarketing.includes(d.channel);
           expect(d.skipReason === "opted_out").toBe(muted);

@@ -5,10 +5,10 @@ import type { NotificationCatalog } from "./catalog.js";
 import { NotificationError } from "./errors.js";
 import { planChannel, type ChannelPlan } from "./policy.js";
 import type { PreferenceStore } from "./preferences.js";
-import type { Delivery, NotificationRecord, NotifyRequest } from "./record.js";
+import type { Delivery, DeviceResult, NotificationRecord, NotifyRequest } from "./record.js";
 import type { ChannelSender } from "./senders.js";
 import { renderTemplate } from "./template.js";
-import type { Channel, OutboundMessage, SendResult } from "./types.js";
+import { addressesFor, type Channel, type OutboundMessage, type SendResult } from "./types.js";
 import type { UserDirectory } from "./users.js";
 
 export const MAX_KEY_LENGTH = 255;
@@ -107,14 +107,15 @@ export function replan(deps: PlannerDeps, record: NotificationRecord, delivery: 
   return planChannel(record.category, delivery.channel, recipient, deps.preferences.get(record.userId), now);
 }
 
-export function outboundMessage(record: NotificationRecord, delivery: Delivery): OutboundMessage {
+export function outboundMessage(record: NotificationRecord, delivery: Delivery, to: string = delivery.to!): OutboundMessage {
   return {
     notificationId: record.id,
     channel: delivery.channel,
-    to: delivery.to!,
-    // The same for every attempt of this delivery, so a provider that supports idempotency keys drops a duplicate
-    // (stage 2's queue is at-least-once: a worker that lost its lease may have sent already).
-    idempotencyKey: `${record.id}:${delivery.channel}`,
+    to,
+    // The same for every attempt to this address, so a provider that supports idempotency keys drops a duplicate
+    // (stage 2's queue is at-least-once: a worker that lost its lease may have sent already). Push has one per
+    // device token: stable even when a device is added between two attempts.
+    idempotencyKey: delivery.channel === "push" ? `${record.id}:push:${to}` : `${record.id}:${delivery.channel}`,
     body: delivery.body,
     ...(delivery.subject !== undefined ? { subject: delivery.subject } : {}),
   };
@@ -151,3 +152,63 @@ export function recordResult(delivery: Delivery, result: SendResult): void {
   delivery.error = result.reason;
   delivery.retryable = result.retryable;
 }
+
+// One provider call's outcome as the notifiers see it: stage 2 adds "the circuit breaker refused the call".
+export type CallResult = SendResult | "circuit-open";
+
+// Stage 3: send one delivery to every address it has NOW -- one for email and SMS, one per device for push -- in
+// parallel, and fold the answers into one result for the delivery:
+//   any device accepted        -> sent (the user is reached; devices that failed this time are not retried)
+//   every call refused by an open circuit -> "circuit-open" (no provider call was made)
+//   else any retryable failure -> retryable (the retry goes to the devices that did not fail for good)
+//   else                       -> permanent failure
+// A token the provider reports dead (invalidAddress) is removed from the user at once (it is dead whoever holds the
+// job). The delivery itself is NOT changed here: the device log is returned, and the caller writes it -- the queued
+// notifier only after checking it still holds the job's lease. With one address the answer is passed through
+// unchanged: email, SMS and single-device push behave exactly as before.
+export async function sendToAddresses(
+  deps: PlannerDeps,
+  record: NotificationRecord,
+  delivery: Delivery,
+  call: (message: OutboundMessage) => Promise<CallResult>,
+): Promise<{ result: CallResult; called: boolean; sentIds: string[]; devices?: DeviceResult[] }> {
+  const targets = delivery.channel === "push" ? pushTargets(deps, record, delivery) : [delivery.to!];
+  const answers = await Promise.all(targets.map((to) => call(outboundMessage(record, delivery, to))));
+  const called = answers.some((a) => a !== "circuit-open");
+  const devices = delivery.channel === "push" ? deviceLog(deps, record, delivery, targets, answers) : undefined;
+  const sentIds = answers.flatMap((a) => (a !== "circuit-open" && a.status === "sent" ? [a.providerId] : []));
+  const out = (result: CallResult) => ({ result, called, sentIds, ...(devices ? { devices } : {}) });
+  if (answers.length === 1) return out(answers[0]!);
+
+  const sent = answers.find((a): a is SendResult & { status: "sent" } => a !== "circuit-open" && a.status === "sent");
+  if (sent) return out(sent);
+  if (!called) return out("circuit-open");
+  const reasons = answers.map((a, i) => `${targets[i]}: ${a === "circuit-open" ? "circuit open" : (a as { reason: string }).reason}`);
+  const retryable = answers.some((a) => a === "circuit-open" || (a.status === "failed" && a.retryable));
+  return out({ status: "failed", retryable, reason: `no device accepted (${reasons.join("; ")})` });
+}
+
+// The user's tokens at send time, minus those that already failed for good on an earlier attempt of THIS delivery.
+function pushTargets(deps: PlannerDeps, record: NotificationRecord, delivery: Delivery): string[] {
+  const recipient = deps.users.get(record.userId);
+  const dead = new Set((delivery.devices ?? []).filter((d) => d.status === "failed" && d.retryable === false).map((d) => d.token));
+  const tokens = recipient ? addressesFor(recipient, "push").filter((t) => !dead.has(t)) : [];
+  return tokens.length > 0 ? tokens : [delivery.to!]; // the planner saw an address a moment ago; never send to nobody
+}
+
+function deviceLog(deps: PlannerDeps, record: NotificationRecord, delivery: Delivery, targets: string[], answers: CallResult[]): DeviceResult[] {
+  const log = new Map((delivery.devices ?? []).map((d) => [d.token, d]));
+  targets.forEach((token, i) => {
+    const a = answers[i]!;
+    let entry: DeviceResult;
+    if (a === "circuit-open") entry = { token, status: "failed", error: "circuit open", retryable: true };
+    else if (a.status === "sent") entry = { token, status: "sent", providerId: a.providerId };
+    else {
+      entry = { token, status: "failed", error: a.reason, retryable: a.retryable };
+      if (a.invalidAddress === true && !a.retryable && deps.users.removePushToken?.(record.userId, token)) entry.removed = true;
+    }
+    log.set(token, entry);
+  });
+  return [...log.values()];
+}
+

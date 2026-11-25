@@ -19,7 +19,7 @@ describe("delivery modes", () => {
     expect(statuses(r)).toBe("push:sent email:sent");
     expect(notificationStatus(r)).toBe("delivered");
     expect(push.sent).toEqual([
-      { notificationId: r.id, channel: "push", to: "tok-1", idempotencyKey: `${r.id}:push`, body: "Order A<7> shipped" },
+      { notificationId: r.id, channel: "push", to: "tok-1", idempotencyKey: `${r.id}:push:tok-1`, body: "Order A<7> shipped" },
     ]);
     expect(email.sent).toEqual([
       {
@@ -235,13 +235,13 @@ describe("a due delivery is planned again at send time", () => {
 
   it("address changed meanwhile -> sent to the CURRENT address; address removed -> skipped (no_address)", async () => {
     const a = await deferredPush();
-    a.users.upsert({ ...FULL_USER, pushToken: "tok-new" });
+    a.users.upsert({ ...FULL_USER, pushTokens: ["tok-new"] });
     a.clock.set(Date.UTC(2026, 10, 24, 8, 0));
     await a.notifier.flushDue();
     expect(a.push.sent.map((m) => m.to)).toEqual(["tok-new"]);
 
     const b = await deferredPush();
-    b.users.upsert({ ...FULL_USER, pushToken: undefined });
+    b.users.upsert({ ...FULL_USER, pushTokens: undefined });
     b.clock.set(Date.UTC(2026, 10, 24, 8, 0));
     expect(await b.notifier.flushDue()).toBe(0);
     expect(b.notifier.get(b.id)!.deliveries[0]).toMatchObject({ status: "skipped", skipReason: "no_address" });
@@ -273,14 +273,14 @@ describe("errors mean nothing happened", () => {
   it("a variable missing only from a channel the user would skip is still an error (validity does not depend on the user)", async () => {
     const { notifier } = setup({
       types: [{ ...ORDER, templates: { ...ORDER.templates, email: { subject: "x", body: "{{onlyEmail}}" } } }],
-      users: [{ userId: "u1", pushToken: "t" }], // no email address
+      users: [{ userId: "u1", pushTokens: ["t"] }], // no email address
     });
     const request = { typeId: "order_shipped", userId: "u1", data: { orderId: "1" }, idempotencyKey: "o" };
     expect(await rejectCode(notifier.notify(request))).toBe("TEMPLATE_VARIABLE_MISSING");
   });
 
   it("a type channel without a sender -> NO_SENDER, even if this user has no address for it", async () => {
-    const s = setup({ users: [{ userId: "u1", pushToken: "t" }] });
+    const s = setup({ users: [{ userId: "u1", pushTokens: ["t"] }] });
     const { Notifier } = await import("../src/notifier.js");
     const n = new Notifier({ catalog: s.catalog, users: s.users, preferences: s.preferences, senders: [new FakeSender("push")] });
     expect(await rejectCode(n.notify(otp()))).toBe("NO_SENDER");

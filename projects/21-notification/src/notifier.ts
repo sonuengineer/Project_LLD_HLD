@@ -19,16 +19,17 @@ import {
   applyPlan,
   buildRecord,
   checkRequest,
-  outboundMessage,
   recordResult,
   replan,
   sendersByChannel,
   sendOnce,
+  sendToAddresses,
   type PlannerDeps,
 } from "./planner.js";
 import type { PreferenceStore } from "./preferences.js";
 import { markRestNotNeeded, type Delivery, type NotificationRecord, type NotifyRequest } from "./record.js";
 import type { ChannelSender } from "./senders.js";
+import type { SendResult } from "./types.js";
 import type { UserDirectory } from "./users.js";
 
 export {
@@ -166,8 +167,10 @@ export class Notifier {
     delivery.status = "sending";
     delivery.attempts += 1;
     delete delivery.notBefore;
-    const result = await sendOnce(sender, outboundMessage(record, delivery));
-    recordResult(delivery, result);
-    return result.status === "sent";
+    // Stage 3: every address the delivery has now (several devices for push); stage 1 never sees "circuit-open".
+    const { result, devices } = await sendToAddresses(this.deps, record, delivery, (message) => sendOnce(sender, message));
+    if (devices) delivery.devices = devices;
+    recordResult(delivery, result as SendResult);
+    return (result as SendResult).status === "sent";
   }
 }

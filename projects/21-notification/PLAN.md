@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API and delivery receipts done. 161 tests; mutation checks in the README.
+Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API, delivery receipts and several push devices done. 177 tests; mutation checks in the README.
 
 ## Why this project
 
@@ -119,6 +119,22 @@ user, the in-app inbox, the interview bank, the portfolio page.
   404-and-hope-the-provider-retries: not every provider retries a 4xx.
 - **A bounce makes that delivery count as failed** in the overall status. No fallback to the next channel after a
   bounce and no suppression list of bounced addresses (both documented, not built).
+
+- **Several push devices: one delivery, fanned out at send time, with a per-device log.** `pushTokens: string[]`
+  replaces `pushToken`. Recommended over one delivery per device: "first" mode means "the first channel that
+  reaches the user", and a phone plus a tablet are one channel, not two. The tokens are read when the job RUNS
+  (a device registered between two attempts gets the retry). Sent if any device accepted (the user is reached; the
+  devices that failed that round are not retried); otherwise retried while some failure was retryable, the retry
+  going only to devices that did not fail for good. An attempt is a round of calls, not a call, so `maxAttempts`
+  still means rounds.
+- **Per-device provider idempotency key `<id>:push:<token>`.** Stable when the device list changes between attempts
+  (a key per delivery would make the provider drop the second device's message as a duplicate of the first).
+- **Dead tokens are removed** when a provider answers `invalidAddress: true` with a permanent failure (FCM
+  `UNREGISTERED`, APNs 410). Removing the token happens at once, even by a worker that lost its lease (the token is
+  dead whoever holds the job); the delivery's device log is written only after the lease check.
+- **A cap of 10 tokens per user, the oldest dropped; registering again moves a token to the newest place.** Users
+  reinstall and change phones without unregistering. `POST /users/:id/push-tokens` and `DELETE .../:token`; the
+  token list is never echoed back (a token is enough to push to that device).
 
 ## Stages
 

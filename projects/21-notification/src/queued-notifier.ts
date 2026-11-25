@@ -32,11 +32,12 @@ import {
   applyPlan,
   buildRecord,
   checkRequest,
-  outboundMessage,
   recordResult,
   replan,
   sendersByChannel,
   sendOnce,
+  sendToAddresses,
+  type CallResult,
   type PlannerDeps,
 } from "./planner.js";
 import type { PreferenceStore } from "./preferences.js";
@@ -44,7 +45,7 @@ import type { ClaimedJob, JobQueue } from "./queue.js";
 import { mergeReceipt, type Receipt } from "./receipts.js";
 import { markRestNotNeeded, type Delivery, type NotificationRecord, type NotifyRequest } from "./record.js";
 import type { ChannelSender } from "./senders.js";
-import type { Channel, SendResult } from "./types.js";
+import type { Channel, OutboundMessage, SendResult } from "./types.js";
 import type { UserDirectory } from "./users.js";
 
 export const PRIORITY = { transactional: 0, marketing: 1 } as const;
@@ -290,29 +291,34 @@ export class QueuedNotifier {
 
     delivery.status = "sending";
     const sender = this.deps.senders.get(delivery.channel)!;
-    const message = outboundMessage(record, delivery);
-    let result: SendResult | "circuit-open";
+    const breaker = this.breakers.get(delivery.channel)!;
     let reopenInMs = 0;
-    try {
-      result = await this.breakers.get(delivery.channel)!.execute(() =>
-        this.timeout.execute(async (signal) => {
-          delivery.attempts += 1; // only when the provider is really called
-          const answer = await sendOnce(sender, message, signal);
-          if (answer.status === "failed" && answer.retryable) throw new ProviderFailure(answer);
-          return answer;
-        }),
-      );
-    } catch (error) {
-      if (error instanceof ProviderFailure) result = error.result;
-      else if (error instanceof TimeoutError) result = { status: "failed", retryable: true, reason: `timed out after ${error.timeoutMs} ms` };
-      else if (error instanceof BrokenCircuitError) {
-        result = "circuit-open";
-        reopenInMs = error.retryAfterMs;
-      } else result = { status: "failed", retryable: true, reason: String(error) };
-    }
+    // One provider call (one address), through the channel's breaker and a timeout. Several devices = several calls.
+    const call = async (message: OutboundMessage): Promise<CallResult> => {
+      try {
+        return await breaker.execute(() =>
+          this.timeout.execute(async (signal) => {
+            const answer = await sendOnce(sender, message, signal);
+            if (answer.status === "failed" && answer.retryable) throw new ProviderFailure(answer);
+            return answer;
+          }),
+        );
+      } catch (error) {
+        if (error instanceof ProviderFailure) return error.result;
+        if (error instanceof TimeoutError) return { status: "failed", retryable: true, reason: `timed out after ${error.timeoutMs} ms` };
+        if (error instanceof BrokenCircuitError) {
+          reopenInMs = Math.max(reopenInMs, error.retryAfterMs);
+          return "circuit-open";
+        }
+        return { status: "failed", retryable: true, reason: String(error) };
+      }
+    };
+    const { result, called, sentIds, devices } = await sendToAddresses(this.deps, record, delivery, call);
+    if (called) delivery.attempts += 1; // one attempt = one round of provider calls (none if every call was refused)
 
     now = this.clock.now();
     if (!this.queue.owns(job.id, job.leaseToken, now)) return this.lostLease();
+    if (devices) delivery.devices = devices;
 
     if (result === "circuit-open") {
       if (record.mode === "first") {
@@ -330,13 +336,16 @@ export class QueuedNotifier {
     if (result.status === "sent") {
       recordResult(delivery, result);
       this.stats.sent++;
-      const key = `${delivery.channel}:${result.providerId}`;
-      this.sentBy.set(key, record.id);
-      const early = this.parked.get(key);
-      if (early) {
-        delivery.receipt = mergeReceipt(delivery.receipt, early);
-        this.parked.delete(key);
-        this.stats.receiptsApplied++;
+      for (const providerId of sentIds) {
+        // Every device that accepted has its own provider id; a receipt for any of them is this delivery's.
+        const key = `${delivery.channel}:${providerId}`;
+        this.sentBy.set(key, record.id);
+        const early = this.parked.get(key);
+        if (early) {
+          delivery.receipt = mergeReceipt(delivery.receipt, early);
+          this.parked.delete(key);
+          this.stats.receiptsApplied++;
+        }
       }
       if (record.mode === "first") markRestNotNeeded(record);
       this.finish(job, record, now);

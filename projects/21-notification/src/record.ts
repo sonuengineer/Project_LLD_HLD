@@ -24,6 +24,16 @@ export interface Delivery {
   error?: string; // failed, or the last failure of a delivery waiting for a retry
   retryable?: boolean; // failed
   receipt?: Receipt; // stage 3: what the provider reported after accepting it (sent deliveries only)
+  devices?: DeviceResult[]; // stage 3, push only: the last answer for each device token tried
+}
+
+export interface DeviceResult {
+  token: string;
+  status: "sent" | "failed";
+  providerId?: string; // sent
+  error?: string; // failed
+  retryable?: boolean; // failed
+  removed?: boolean; // the provider said the token is dead; it was removed from the user
 }
 
 export type NotificationStatus = "in_progress" | "scheduled" | "delivered" | "failed" | "suppressed";

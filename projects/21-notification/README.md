@@ -5,8 +5,8 @@ channel, user preferences and quiet hours, channel fallback and idempotent reque
 leases and priorities, workers, retries with backoff, a circuit breaker and a timeout per channel, frequency caps and
 bounded idempotency keys (stage 2). Providers are fakes: nothing in this project sends a real email, SMS or push.
 
-Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API and delivery receipts done) -- 161 tests; mutation checks in "Mutation checks" (stage 1) and
-"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (several push devices, inbox) is
+Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API, delivery receipts, several push devices done) -- 177 tests; mutation checks in "Mutation checks" (stage 1) and
+"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (the in-app inbox) is
 planned in [PLAN.md](PLAN.md), not built.
 
 Stage 2 uses three libraries from this repo as `file:` dependencies on their built `dist/`:
@@ -16,7 +16,7 @@ Stage 2 uses three libraries from this repo as `file:` dependencies on their bui
 ```
 npm run build:deps    # npm ci + npm run build in 18-resilience, 19-rate-limit and 20-cache
 npm ci
-npm test              # 161 tests
+npm test              # 177 tests
 npm run demo          # stage 1: OTP with fallback, a retried request, marketing deferred by quiet hours
 npm run demo:queue    # stage 2: a retry with backoff, a dead push provider (breaker open, OTP fails over), a cap
 ```
@@ -131,7 +131,8 @@ channel check -- the test's type was also invalid for another reason).
 - **`flushDue()` is polled.** How late a deferred message goes out depends on how often it is called; a window with
   only a short gap (say quiet 00:15-00:00) needs flushes at least that often or the gap is missed and the message
   waits another day (the randomized test showed this with hourly flushes).
-- **One address per channel** (one push token per user); multiple devices and removing dead tokens are stage 3.
+- **One address per channel** (one push token per user). Stage 3 changed this for push: several devices per user,
+  dead tokens removed (see "Stage 3: several push devices").
 - **Marketing defaults to allowed** (opt-out model). Some jurisdictions require opt-in for marketing SMS / email; that
   is a policy change in one function, not built.
 
@@ -323,3 +324,43 @@ failed, signature not checked, parked answered 200, each receipt field check rem
 secrets accepted, a non-JSON body reaching the verifier, the system clock instead of the injected one, a default
 secret for channels without one. One test was tightened before the run: the parked-merge test sent delivered then
 bounced, which "last one wins" would also pass; it now sends bounced first.
+
+## Stage 3: several push devices
+
+A user has a token per device (`pushTokens: string[]`, replacing `pushToken`). One push delivery goes to all of them:
+
+```
+POST   /users/u1/push-tokens            {"token":"<device token>"}   -> 204 (again: still 204, moved to newest)
+DELETE /users/u1/push-tokens/<token>                                  -> 204, or 404 if it was not registered
+```
+
+- **Fan-out at send time.** The tokens are read when the job runs, and each gets its own provider call (in parallel,
+  each through the channel's breaker and timeout) with its own provider idempotency key `<id>:push:<token>`.
+  The delivery keeps a log, `devices: [{ token, status, providerId | error, retryable, removed? }]`.
+- **The delivery's result:** sent if any device accepted (the user is reached; devices that failed that round are not
+  retried). Otherwise: every call refused by an open circuit -> treated like stage 2's circuit open; some failure
+  retryable -> retried later, only to the devices that did not fail for good; all permanent -> failed
+  (`no device accepted (tok-a: ...; tok-b: ...)`), and `first` mode moves to the next channel.
+- **Attempts are rounds, not calls:** 2 devices x 3 rounds is 6 provider calls and 3 attempts.
+- **Dead tokens:** a permanent failure with `invalidAddress: true` (FCM `UNREGISTERED`, APNs 410) removes the token
+  from the user; when the last one goes, the next push is `skipped (no_address)`. The removal happens even if the
+  worker has lost its lease (the token is dead either way); the device log is written only after the lease check.
+- **At most 10 tokens per user**, the oldest dropped. Tokens are non-empty, without spaces, at most 4096 characters.
+  The API never returns the list: a token is enough to push to that device.
+- Email and SMS (one address) and single-device push take exactly the old path; both notifiers share the fan-out.
+
+Not built: per-device preferences (mute the tablet), the provider's own multicast API (one request for many tokens),
+removing an email address or phone number reported invalid (only push tokens are removed).
+
+| File | Tests | What |
+|---|---|---|
+| test/devices.test.ts | 16 | token rules (re-register moves to newest, cap drops the oldest, bad tokens and lists refused, returned copies cannot change the stored list); fan-out (a call and key per device in one round; one accepted + one dead -> sent and the dead one removed for next time; nobody accepted -> retry only to the device that can still work; all permanent -> failed and `first` moves on; all dead -> next push skipped no_address; 6 calls = 3 attempts; a device added between attempts gets the retry; a stalled worker does not overwrite the new owner's device log; `invalidAddress` on a retryable failure keeps the token; every device refused by an open circuit -> `first` fails over at once with no attempt used; a receipt for any device's id); the stage 1 Notifier fans out too; HTTP register / unregister / 404 / 400 / no registry |
+
+21 mutation checks on this part, each applied alone, all caught. Two survived the first run and were test gaps,
+now closed: D4 (a dead-token removal on a RETRYABLE failure flagged invalid -- no test sent that combination) and D6
+(every device refused by an open circuit treated as an ordinary retryable failure, so an OTP waited instead of
+failing over to SMS -- no multi-device test opened the breaker).
+
+The push key changed from `<id>:push` to `<id>:push:<token>`; the 3 tests and the randomized checks that pinned the
+old key were updated, nothing else in stages 1 and 2 changed.
+

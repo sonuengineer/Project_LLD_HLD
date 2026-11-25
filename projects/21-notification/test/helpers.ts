@@ -47,7 +47,7 @@ export const SALE: NotificationTypeDef = {
 
 export const PROMO_FIRST: NotificationTypeDef = { ...SALE, id: "promo_first", mode: "first" };
 
-export const FULL_USER: Recipient = { userId: "u1", email: "u1@example.test", phone: "+10000000001", pushToken: "tok-1" };
+export const FULL_USER: Recipient = { userId: "u1", email: "u1@example.test", phone: "+10000000001", pushTokens: ["tok-1"] };
 
 export function setup(options: { types?: NotificationTypeDef[]; users?: Recipient[]; now?: number } = {}) {
   const clock = new ManualClock(options.now ?? T0);

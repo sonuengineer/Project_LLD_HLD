@@ -35,7 +35,8 @@ function inQuiet(now: number, offset: number, prefs: Preferences): boolean {
   return s < e ? m >= s && m < e : m >= s || m < e;
 }
 
-const ADDRESS: Record<Channel, keyof Recipient> = { email: "email", sms: "phone", push: "pushToken" };
+const ADDRESS = (user: Recipient, channel: Channel): string | undefined =>
+  channel === "email" ? user.email : channel === "sms" ? user.phone : user.pushTokens?.[0];
 const TYPES = ["otp", "order_shipped", "sale", "promo_first"] as const;
 const MAX_ATTEMPTS = 3;
 const KEY_TTL_MS = 24 * 3_600_000; // QueuedNotifier's default
@@ -52,7 +53,7 @@ describe("randomized invariants, queued", () => {
         const u: Recipient = { userId: `u${i}`, utcOffsetMinutes: pick([-300, 0, 330, 600]) };
         if (rand() < 0.8) u.email = `u${i}@example.test`;
         if (rand() < 0.6) u.phone = `+1000000${i}`;
-        if (rand() < 0.6) u.pushToken = `tok-${i}`;
+        if (rand() < 0.6) u.pushTokens = [`tok-${i}`];
         users.push(u);
         const p: Preferences = { mutedMarketing: CHANNELS.filter(() => rand() < 0.3) };
         if (rand() < 0.6) {
@@ -78,8 +79,8 @@ describe("randomized invariants, queued", () => {
         const rec = s.notifier.get(m.notificationId)!;
         const user = userById.get(rec.userId)!;
         const prefs = prefsOf.get(rec.userId)!;
-        if (m.to !== user[ADDRESS[m.channel]]) violations.push(`wrong address ${m.channel}`);
-        if (m.idempotencyKey !== `${rec.id}:${m.channel}`) violations.push("wrong provider idempotency key");
+        if (m.to !== ADDRESS(user, m.channel)) violations.push(`wrong address ${m.channel}`);
+        if (m.idempotencyKey !== (m.channel === "push" ? `${rec.id}:push:${m.to}` : `${rec.id}:${m.channel}`)) violations.push("wrong provider idempotency key");
         if (rec.category === "marketing") {
           if (prefs.mutedMarketing.includes(m.channel)) violations.push(`muted ${m.channel} sent`);
           if (m.channel !== "email" && inQuiet(s.clock.now(), user.utcOffsetMinutes ?? 0, prefs)) {
@@ -151,7 +152,7 @@ describe("randomized invariants, queued", () => {
             // failed only for a reason: permanent, attempts used up, or failed over from an open circuit
             expect(d.retryable === false || d.attempts === MAX_ATTEMPTS || d.error === "circuit open").toBe(true);
           }
-          if (d.status === "sent") expect(successes.get(`${r.id}:${d.channel}`)).toBe(1); // dead workers never sent
+          if (d.status === "sent") expect(successes.get(d.channel === "push" ? `${r.id}:push:${d.to}` : `${r.id}:${d.channel}`)).toBe(1); // dead workers never sent
         }
       }
       expect(s.push.attempts.length + s.sms.attempts.length + s.email.attempts.length).toBe(attempts);

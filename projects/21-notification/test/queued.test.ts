@@ -57,7 +57,7 @@ describe("retries", () => {
     const r = notifier.notify(otpReq());
     await worker.drain();
     expect(notifier.get(r.id)!.deliveries[0]).toMatchObject({ status: "pending", nextAttemptAt: clock.now() + 1_000 });
-    users.upsert({ ...FULL_USER, pushToken: undefined });
+    users.upsert({ ...FULL_USER, pushTokens: undefined });
     clock.advance(1_000);
     await worker.drain();
     const pushDelivery = notifier.get(r.id)!.deliveries[0]!;
@@ -88,7 +88,7 @@ describe("retries", () => {
     expect(push1.attempts).toBe(3);
     expect(push1.nextAttemptAt).toBeUndefined();
     expect(push1.error).toBeUndefined();
-    expect(push.attempts.map((m) => m.idempotencyKey)).toEqual([`${r.id}:push`, `${r.id}:push`, `${r.id}:push`]);
+    expect(push.attempts.map((m) => m.idempotencyKey)).toEqual([`${r.id}:push:tok-1`, `${r.id}:push:tok-1`, `${r.id}:push:tok-1`]);
   });
 
   it('"all": attempts used up -> failed (the other channel is unaffected)', async () => {
@@ -250,7 +250,7 @@ describe("leases: at-least-once, never a lost job", () => {
     expect(d.providerId).toBe("push-1"); // B's result, not A's
     expect(notifier.stats.leaseLost).toBe(1);
     // the provider was called twice -- at-least-once -- with the SAME idempotency key, so it can drop one
-    expect(push.attempts.map((m) => m.idempotencyKey)).toEqual([`${r.id}:push`, `${r.id}:push`]);
+    expect(push.attempts.map((m) => m.idempotencyKey)).toEqual([`${r.id}:push:tok-1`, `${r.id}:push:tok-1`]);
   });
 
   it("a job redelivered after its delivery finished (crash before complete) sends nothing", async () => {

@@ -41,7 +41,7 @@ catalog.register({
 });
 
 const users = new InMemoryUsers();
-users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushToken: "tok-1", utcOffsetMinutes: 330 });
+users.upsert({ userId: "u1", email: "u1@example.test", phone: "+10000000001", pushTokens: ["tok-1"], utcOffsetMinutes: 330 });
 const preferences = new PreferenceStore();
 
 const down = { status: "failed", retryable: true, reason: "provider 503" } as const;
