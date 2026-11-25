@@ -104,3 +104,12 @@ describe("planChannel: the one rule", () => {
     expect(planChannel("marketing", "sms", FULL_USER, quietMuted, night)).toEqual({ status: "skipped", reason: "opted_out" });
   });
 });
+
+describe("preferences from untrusted input (stage 3: HTTP bodies)", () => {
+  it("not an object, or quietHours not an object -> INVALID_PREFERENCES, not a TypeError", () => {
+    const store = new PreferenceStore();
+    for (const bad of [null, "x", 7, { mutedMarketing: [], quietHours: null }, { mutedMarketing: [], quietHours: "22:00-07:00" }]) {
+      expect(errorCode(() => store.set("u1", bad as never))).toBe("INVALID_PREFERENCES");
+    }
+  });
+});

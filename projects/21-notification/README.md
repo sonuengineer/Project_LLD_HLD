@@ -5,8 +5,9 @@ channel, user preferences and quiet hours, channel fallback and idempotent reque
 leases and priorities, workers, retries with backoff, a circuit breaker and a timeout per channel, frequency caps and
 bounded idempotency keys (stage 2). Providers are fakes: nothing in this project sends a real email, SMS or push.
 
-Status (2026-11-25): stages 1 and 2 DONE -- 126 tests; mutation checks in "Mutation checks" (stage 1) and
-"Stage 2: mutation checks". Stage 3 is planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API done) -- 144 tests; mutation checks in "Mutation checks" (stage 1) and
+"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (receipts, several push devices, inbox) is
+planned in [PLAN.md](PLAN.md), not built.
 
 Stage 2 uses three libraries from this repo as `file:` dependencies on their built `dist/`:
 [resilience-kit](../18-resilience) (backoff, timeout, circuit breaker), [ratelimit-kit](../19-rate-limit)
@@ -15,7 +16,7 @@ Stage 2 uses three libraries from this repo as `file:` dependencies on their bui
 ```
 npm run build:deps    # npm ci + npm run build in 18-resilience, 19-rate-limit and 20-cache
 npm ci
-npm test              # 126 tests
+npm test              # 144 tests
 npm run demo          # stage 1: OTP with fallback, a retried request, marketing deferred by quiet hours
 npm run demo:queue    # stage 2: a retry with backoff, a dead push provider (breaker open, OTP fails over), a cap
 ```
@@ -228,3 +229,50 @@ stops it after 180 s and counts it as caught.
   pool that refills each slot as it frees is not built.
 - **Using the libraries found a gap in them.** All three built without type declarations, so this TypeScript
   consumer got no types. Fixed with `"declaration": true` in each library's `tsconfig.build.json`.
+
+## Stage 3: HTTP API
+
+```
+NOTIFY_API_KEY=<at least 16 characters> PORT=3000 npm start   # API + a worker, fake senders, demo user u1
+```
+
+```
+curl -i -X POST localhost:3000/notifications \
+  -H "Authorization: Bearer $NOTIFY_API_KEY" -H "Content-Type: application/json" -H "Idempotency-Key: login-7f3a" \
+  -d '{"typeId":"otp","userId":"u1","data":{"code":"482913"}}'
+# 202 Accepted, Location: /notifications/<id>    (the same request again: 200, Idempotent-Replayed: true)
+```
+
+| Endpoint | Answers |
+|---|---|
+| `POST /notifications` (`Idempotency-Key` header, `{ typeId, userId, data }`) | 202 queued + `Location`; 200 replay + `Idempotent-Replayed: true`; 409 same key, different body |
+| `GET /notifications/:id` | the record with each delivery and an overall `status`; 404 |
+| `GET /users/:userId/preferences` | `{ mutedMarketing, quietHours? }` (defaults if never set); 404 for an unknown user |
+| `PUT /users/:userId/preferences` | replaces them (not a merge); 200 with what was stored |
+
+- **Auth:** `Authorization: Bearer <NOTIFY_API_KEY>` on every route, checked before the body is parsed, compared in
+  constant time. There is no open mode; `createApp` refuses a key under 16 characters and `npm start` exits
+  without one. The key lives only in the environment.
+- **Errors** are `{ "error": { "code", "message" } }`. 400 malformed (`INVALID_JSON`, `INVALID_REQUEST`: missing or
+  bad `Idempotency-Key`, wrong field types), 401 `UNAUTHORIZED`, 404 `NOT_FOUND`, 409 `IDEMPOTENCY_CONFLICT`,
+  413 `BODY_TOO_LARGE` (64 KB), 415 `UNSUPPORTED_MEDIA_TYPE` (not JSON), 422 `UNKNOWN_TYPE` / `UNKNOWN_USER` /
+  `TEMPLATE_VARIABLE_MISSING` / `INVALID_PREFERENCES`, 500 `INTERNAL` (message hidden, the error logged). As in the
+  library, an error means nothing was stored and the idempotency key is still free.
+- **Shutdown:** Ctrl+C / SIGTERM stops accepting connections, finishes requests in progress, then waits for the
+  sends in progress. Tested through `startServer().close()`; the signal handler itself is not under test.
+- **Express 4.22.3**, not the 4.21.2 used by project 20's tests: 4.21.2's body-parser, path-to-regexp and qs have
+  published advisories, and here Express is a runtime dependency (`npm audit --omit=dev`: 0).
+
+| File | Tests | What |
+|---|---|---|
+| test/http.test.ts | 15 | real Express on a random port: auth (5 bad headers, 401 before parsing, key length), 202 / Location / worker sends, replay, conflict, 9 malformed requests (none stores anything, the key stays free), 422s, 415 and 413, NO_SENDER and an unexpected throw as a hidden 500 that is logged, 404s (incl. PUT for an unknown user stores nothing), preferences GET / PUT applied to the next notification, invalid preferences keep the stored ones |
+| test/server.test.ts | 2 | API + worker with real timers; `close()` waits for the send in progress, is one shutdown however often called, closes the port; a port in use rejects |
+| test/policy.test.ts | +1 | preferences from untrusted input: `null`, non-objects, `quietHours: null` are `INVALID_PREFERENCES`, not a TypeError |
+
+25 mutation checks on this layer (`src/http/`, the preference shape checks), each applied alone, the file restored
+byte for byte, all caught: auth removed or moved after body parsing, `Bearer ` optional, key length boundary,
+replay not detected, no `Location`, each body / header check removed, 422s turned into 400s, a 500 message not
+hidden, body-parser errors not mapped, JSON content type not required (POST and PUT), the user check removed (GET and
+PUT), no 404 fallback, no overall `status`, `startServer` not waiting for the worker / closing twice / not
+rejecting on a port in use. One survived the first run: H15, a PUT for an unknown user was stored -- no test sent
+one; added.

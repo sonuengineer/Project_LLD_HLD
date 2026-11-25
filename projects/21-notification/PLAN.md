@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys). 126 tests; 77 mutation checks, all caught (README). Stage 3 not started.
+Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API done (25 mutation checks, all caught). 144 tests.
 
 ## Why this project
 
@@ -75,6 +75,34 @@ test. Stage 2 adds the HLD half (queue, workers, retries, caps) using the librar
 - **The libraries are `file:` dependencies on their built `dist/`.** Using them from another project found a real
   gap: all three built without type declarations, so a TypeScript consumer got no types. Fixed with
   `"declaration": true` in each library's build config.
+
+## Stage 3 decisions (one recommendation each)
+
+Order: HTTP API first (receipts and the inbox are endpoints on it), then delivery receipts, several push devices per
+user, the in-app inbox, the interview bank, the portfolio page.
+
+- **Express 4, synchronous handlers.** Express 4.22.3, not 4.21.2 (the version project 20 uses in its tests):
+  4.21.2's body-parser, path-to-regexp and qs have published advisories, and here Express is a runtime dependency.
+  `notify()` does not await, so the handlers do not either; in Express 4 a synchronous throw reaches the error
+  handler, a rejected promise does not.
+- **For services, not browsers: one API key, required.** `Authorization: Bearer <key>`, the key from an environment
+  variable, at least 16 characters, compared in constant time (SHA-256 digests with `timingSafeEqual`, so the length
+  does not leak either). No "no auth" mode: an open notification API is a free SMS-spam service. Auth runs before
+  the body is parsed. No CORS, no per-user login; a real deployment would add per-caller keys and scopes.
+- **Idempotency over HTTP.** The `Idempotency-Key` header is required. 202 + `Location` for a new request (it is
+  queued, not sent), 200 + `Idempotent-Replayed: true` for a replay (Stripe's header name), 409 for the same key with
+  a different body. New vs replay is decided by a `getByKey` just before `notify()`: both synchronous, nothing can
+  run between them.
+- **Status codes by whose fault it is.** 400 malformed (bad JSON, missing header, wrong types), 422 well-formed but
+  impossible (unknown type or user, missing template variable, bad preferences), 415 not JSON, 413 over 64 KB,
+  500 the server's own fault (a channel with no sender) with the message hidden and logged. One error shape,
+  `{ error: { code, message } }`.
+- **Preferences are a whole replacement (PUT), for known users only (404 otherwise).** Storing preferences for a
+  typo'd user id would silently never apply. Validating them found a gap: `PreferenceStore.set` assumed typed input
+  and threw a TypeError on `null` quiet hours; it now checks the shape.
+- **One process runs the API and a worker** (`startServer`). `close()` stops accepting connections, finishes the
+  requests in progress, then waits for the worker's sends in progress. Queued jobs stay queued (lost with an
+  in-memory queue).
 
 ## Stages
 

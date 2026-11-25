@@ -53,11 +53,16 @@ export function quietUntil(now: number, utcOffsetMinutes: number, quiet: QuietHo
 export class PreferenceStore {
   private readonly prefs = new Map<string, Preferences>();
 
+  // Input may come straight from an HTTP body (stage 3), so the shape is checked, not assumed.
   set(userId: string, prefs: Preferences): void {
+    if (prefs === null || typeof prefs !== "object") throw new NotificationError("INVALID_PREFERENCES", "preferences must be an object");
     if (!Array.isArray(prefs.mutedMarketing) || !prefs.mutedMarketing.every(isChannel)) {
       throw new NotificationError("INVALID_PREFERENCES", "mutedMarketing must be a list of channels");
     }
     if (prefs.quietHours !== undefined) {
+      if (prefs.quietHours === null || typeof prefs.quietHours !== "object") {
+        throw new NotificationError("INVALID_PREFERENCES", "quietHours must be an object { start, end }");
+      }
       const start = parseHhMm(prefs.quietHours.start);
       const end = parseHhMm(prefs.quietHours.end);
       if (start === end) {
