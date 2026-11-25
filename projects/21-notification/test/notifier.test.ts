@@ -18,9 +18,18 @@ describe("delivery modes", () => {
     });
     expect(statuses(r)).toBe("push:sent email:sent");
     expect(notificationStatus(r)).toBe("delivered");
-    expect(push.sent).toEqual([{ notificationId: r.id, channel: "push", to: "tok-1", body: "Order A<7> shipped" }]);
+    expect(push.sent).toEqual([
+      { notificationId: r.id, channel: "push", to: "tok-1", idempotencyKey: `${r.id}:push`, body: "Order A<7> shipped" },
+    ]);
     expect(email.sent).toEqual([
-      { notificationId: r.id, channel: "email", to: FULL_USER.email, subject: "Order A<7>", body: "<p>Hi Asha, order A&lt;7&gt; shipped</p>" },
+      {
+        notificationId: r.id,
+        channel: "email",
+        to: FULL_USER.email,
+        idempotencyKey: `${r.id}:email`,
+        subject: "Order A<7>",
+        body: "<p>Hi Asha, order A&lt;7&gt; shipped</p>",
+      },
     ]);
     expect(r.deliveries.every((d) => d.attempts === 1 && typeof d.providerId === "string")).toBe(true);
   });

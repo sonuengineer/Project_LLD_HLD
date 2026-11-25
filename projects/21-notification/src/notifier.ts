@@ -1,4 +1,6 @@
-// The notifier: one request -> one notification record with one delivery per channel of its type.
+// Stage 1: the in-process notifier. One request -> one notification record with one delivery per channel of its
+// type; notify() sends right away and resolves when the immediate sends are done. (Stage 2's QueuedNotifier puts the
+// sends on a queue instead; both share planner.ts.)
 //
 // notify() has two halves:
 //   1. synchronous: validate, look up type / user / preferences, render every channel's template, plan every channel,
@@ -13,54 +15,29 @@ import { randomUUID } from "node:crypto";
 import type { NotificationCatalog } from "./catalog.js";
 import { systemClock, type Clock } from "./clock.js";
 import { NotificationError } from "./errors.js";
-import { planChannel } from "./policy.js";
+import {
+  applyPlan,
+  buildRecord,
+  checkRequest,
+  outboundMessage,
+  recordResult,
+  replan,
+  sendersByChannel,
+  sendOnce,
+  type PlannerDeps,
+} from "./planner.js";
 import type { PreferenceStore } from "./preferences.js";
+import { markRestNotNeeded, type Delivery, type NotificationRecord, type NotifyRequest } from "./record.js";
 import type { ChannelSender } from "./senders.js";
-import { renderTemplate } from "./template.js";
-import type {
-  Category,
-  Channel,
-  DeliveryMode,
-  DeliveryStatus,
-  OutboundMessage,
-  SendResult,
-  SkipReason,
-} from "./types.js";
 import type { UserDirectory } from "./users.js";
 
-export interface NotifyRequest {
-  typeId: string;
-  userId: string;
-  data: Record<string, unknown>;
-  idempotencyKey: string; // the caller's id for THIS request; a retry of the same request sends the same key
-}
-
-export interface Delivery {
-  channel: Channel;
-  status: DeliveryStatus;
-  to?: string; // absent when skipped for no_address
-  subject?: string;
-  body: string;
-  attempts: number;
-  notBefore?: number; // deferred: not before this epoch ms
-  skipReason?: SkipReason;
-  providerId?: string; // sent
-  error?: string; // failed
-  retryable?: boolean; // failed
-}
-
-export type NotificationStatus = "in_progress" | "scheduled" | "delivered" | "failed" | "suppressed";
-
-export interface NotificationRecord {
-  id: string;
-  idempotencyKey: string;
-  typeId: string;
-  userId: string;
-  category: Category;
-  mode: DeliveryMode;
-  createdAt: number;
-  deliveries: Delivery[];
-}
+export {
+  notificationStatus,
+  type Delivery,
+  type NotificationRecord,
+  type NotificationStatus,
+  type NotifyRequest,
+} from "./record.js";
 
 export interface NotifierOptions {
   catalog: NotificationCatalog;
@@ -77,49 +54,8 @@ interface KeyEntry {
   done: Promise<void>;
 }
 
-const MAX_KEY_LENGTH = 255;
-
-// in_progress > scheduled > delivered > failed > suppressed
-export function notificationStatus(record: NotificationRecord): NotificationStatus {
-  const statuses = record.deliveries.map((d) => d.status);
-  if (statuses.some((s) => s === "pending" || s === "sending")) return "in_progress";
-  if (statuses.includes("deferred")) return "scheduled";
-  if (statuses.includes("sent")) return "delivered";
-  if (statuses.includes("failed")) return "failed";
-  return "suppressed";
-}
-
-// Key order must not matter: {a:1,b:2} and {b:2,a:1} are the same request.
-function stableStringify(value: unknown): string {
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(",")}]`;
-  if (value !== null && typeof value === "object") {
-    const entries = Object.keys(value)
-      .sort()
-      .map((k) => `${JSON.stringify(k)}:${stableStringify((value as Record<string, unknown>)[k])}`);
-    return `{${entries.join(",")}}`;
-  }
-  return JSON.stringify(value) ?? "undefined";
-}
-
-function isPlainObject(value: unknown): value is Record<string, unknown> {
-  if (value === null || typeof value !== "object" || Array.isArray(value)) return false;
-  const proto = Object.getPrototypeOf(value);
-  return proto === Object.prototype || proto === null;
-}
-
-function isSendResult(value: unknown): value is SendResult {
-  if (value === null || typeof value !== "object") return false;
-  const r = value as Record<string, unknown>;
-  if (r.status === "sent") return typeof r.providerId === "string";
-  if (r.status === "failed") return typeof r.retryable === "boolean" && typeof r.reason === "string";
-  return false;
-}
-
 export class Notifier {
-  private readonly catalog: NotificationCatalog;
-  private readonly users: UserDirectory;
-  private readonly preferences: PreferenceStore;
-  private readonly senders = new Map<Channel, ChannelSender>();
+  private readonly deps: PlannerDeps;
   private readonly clock: Clock;
   private readonly newId: () => string;
   private readonly records = new Map<string, NotificationRecord>();
@@ -127,17 +63,14 @@ export class Notifier {
   private readonly running = new Set<string>(); // record ids with sends in progress
 
   constructor(options: NotifierOptions) {
-    this.catalog = options.catalog;
-    this.users = options.users;
-    this.preferences = options.preferences;
+    this.deps = {
+      catalog: options.catalog,
+      users: options.users,
+      preferences: options.preferences,
+      senders: sendersByChannel(options.senders),
+    };
     this.clock = options.clock ?? systemClock;
     this.newId = options.newId ?? (() => randomUUID());
-    for (const sender of options.senders) {
-      if (this.senders.has(sender.channel)) {
-        throw new NotificationError("INVALID_REQUEST", `two senders for channel ${sender.channel}`);
-      }
-      this.senders.set(sender.channel, sender);
-    }
   }
 
   // Resolves when this request's immediate sends are done (deferred deliveries wait for flushDue). A duplicate of an
@@ -149,12 +82,7 @@ export class Notifier {
   }
 
   private accept(request: NotifyRequest): KeyEntry {
-    const key = request?.idempotencyKey;
-    if (typeof key !== "string" || key.trim() === "" || key.length > MAX_KEY_LENGTH) {
-      throw new NotificationError("INVALID_REQUEST", `idempotencyKey must be a non-empty string of at most ${MAX_KEY_LENGTH} characters`);
-    }
-    if (!isPlainObject(request.data)) throw new NotificationError("INVALID_REQUEST", "data must be a plain object");
-    const fingerprint = stableStringify({ typeId: request.typeId, userId: request.userId, data: request.data });
+    const { key, fingerprint } = checkRequest(request);
     const existing = this.keys.get(key);
     if (existing) {
       if (existing.fingerprint !== fingerprint) {
@@ -162,39 +90,8 @@ export class Notifier {
       }
       return existing;
     }
-
-    const type = this.catalog.get(request.typeId);
-    if (!type) throw new NotificationError("UNKNOWN_TYPE", `no notification type ${String(request.typeId)}`);
-    const recipient = this.users.get(request.userId);
-    if (!recipient) throw new NotificationError("UNKNOWN_USER", `no user ${String(request.userId)}`);
-    const prefs = this.preferences.get(request.userId);
-    const now = this.clock.now();
-
-    // Every channel of the type is rendered and must have a sender, even one this user will skip: whether a request
-    // is valid must not depend on who the user is or what time it is.
-    const deliveries: Delivery[] = type.channels.map((channel) => {
-      if (!this.senders.has(channel)) throw new NotificationError("NO_SENDER", `no sender for channel ${channel}`);
-      const rendered = renderTemplate(type.templates[channel]!, request.data, channel === "email");
-      const plan = planChannel(type.category, channel, recipient, prefs, now);
-      const delivery: Delivery = { channel, status: plan.status, body: rendered.body, attempts: 0 };
-      if (rendered.subject !== undefined) delivery.subject = rendered.subject;
-      if (plan.status === "skipped") delivery.skipReason = plan.reason;
-      else delivery.to = plan.to;
-      if (plan.status === "deferred") delivery.notBefore = plan.notBefore;
-      return delivery;
-    });
-
+    const record = buildRecord(this.deps, request, key, this.newId(), this.clock.now());
     // Nothing above changed any state. From here on, nothing throws.
-    const record: NotificationRecord = {
-      id: this.newId(),
-      idempotencyKey: key,
-      typeId: type.id,
-      userId: request.userId,
-      category: type.category,
-      mode: type.mode,
-      createdAt: now,
-      deliveries,
-    };
     this.records.set(record.id, record);
     const entry: KeyEntry = { fingerprint, recordId: record.id, done: Promise.resolve() };
     this.keys.set(key, entry);
@@ -215,23 +112,10 @@ export class Notifier {
     const runs: Promise<number>[] = [];
     for (const record of this.records.values()) {
       if (this.running.has(record.id) || !record.deliveries.some(due)) continue;
-      const recipient = this.users.get(record.userId);
-      const prefs = this.preferences.get(record.userId);
       const ready = new Set<Delivery>();
       for (const delivery of record.deliveries.filter(due)) {
-        const plan = recipient
-          ? planChannel(record.category, delivery.channel, recipient, prefs, now)
-          : ({ status: "skipped", reason: "no_address" } as const); // the user is gone
-        if (plan.status === "skipped") {
-          delivery.status = "skipped";
-          delivery.skipReason = plan.reason;
-          delete delivery.notBefore;
-          delete delivery.to;
-        } else {
-          delivery.to = plan.to; // the CURRENT address
-          if (plan.status === "deferred") delivery.notBefore = plan.notBefore;
-          else ready.add(delivery);
-        }
+        applyPlan(delivery, replan(this.deps, record, delivery, now));
+        if (delivery.status === "pending") ready.add(delivery);
       }
       if (ready.size > 0) runs.push(this.run(record, (d) => ready.has(d)));
     }
@@ -267,14 +151,7 @@ export class Notifier {
       for (const delivery of chosen) {
         attempted += 1;
         if (await this.attempt(record, delivery)) {
-          // Delivered: every channel still waiting is no longer needed.
-          for (const other of record.deliveries) {
-            if (other.status === "pending" || other.status === "deferred") {
-              other.status = "skipped";
-              other.skipReason = "not_needed";
-              delete other.notBefore;
-            }
-          }
+          markRestNotNeeded(record);
           return attempted;
         }
       }
@@ -285,34 +162,12 @@ export class Notifier {
   }
 
   private async attempt(record: NotificationRecord, delivery: Delivery): Promise<boolean> {
-    const sender = this.senders.get(delivery.channel)!;
+    const sender = this.deps.senders.get(delivery.channel)!;
     delivery.status = "sending";
     delivery.attempts += 1;
     delete delivery.notBefore;
-    const message: OutboundMessage = {
-      notificationId: record.id,
-      channel: delivery.channel,
-      to: delivery.to!,
-      body: delivery.body,
-      ...(delivery.subject !== undefined ? { subject: delivery.subject } : {}),
-    };
-    let result: SendResult;
-    try {
-      const answer: unknown = await sender.send(message);
-      result = isSendResult(answer)
-        ? answer
-        : { status: "failed", retryable: true, reason: "sender returned an invalid result" };
-    } catch (error) {
-      result = { status: "failed", retryable: true, reason: `sender threw: ${(error as Error)?.message ?? String(error)}` };
-    }
-    if (result.status === "sent") {
-      delivery.status = "sent";
-      delivery.providerId = result.providerId;
-      return true;
-    }
-    delivery.status = "failed";
-    delivery.error = result.reason;
-    delivery.retryable = result.retryable;
-    return false;
+    const result = await sendOnce(sender, outboundMessage(record, delivery));
+    recordResult(delivery, result);
+    return result.status === "sent";
   }
 }

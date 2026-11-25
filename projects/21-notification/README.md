@@ -1,16 +1,23 @@
 # B19 Notification System (low-level design)
 
-A TypeScript library (no runtime dependencies, in memory) for the core of a notification system: notification
-types with templates per channel, user preferences and quiet hours, channel fallback, and idempotent requests.
-Providers are fakes: nothing in this project sends a real email, SMS or push.
+A TypeScript library (in memory) for the core of a notification system: notification types with templates per
+channel, user preferences and quiet hours, channel fallback and idempotent requests (stage 1); a job queue with
+leases and priorities, workers, retries with backoff, a circuit breaker and a timeout per channel, frequency caps and
+bounded idempotency keys (stage 2). Providers are fakes: nothing in this project sends a real email, SMS or push.
 
-Status (2026-11-23): stage 1 DONE -- 81 tests, 43 deliberate code breaks all caught (see "Mutation checks").
-Stages 2 and 3 are planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-25): stages 1 and 2 DONE -- 126 tests; mutation checks in "Mutation checks" (stage 1) and
+"Stage 2: mutation checks". Stage 3 is planned in [PLAN.md](PLAN.md), not built.
+
+Stage 2 uses three libraries from this repo as `file:` dependencies on their built `dist/`:
+[resilience-kit](../18-resilience) (backoff, timeout, circuit breaker), [ratelimit-kit](../19-rate-limit)
+(frequency caps) and [cache-kit](../20-cache) (idempotency keys). Build them once before installing:
 
 ```
+npm run build:deps    # npm ci + npm run build in 18-resilience, 19-rate-limit and 20-cache
 npm ci
-npm test        # 81 tests
-npm run demo    # OTP with fallback, a retried request, marketing deferred by quiet hours
+npm test              # 126 tests
+npm run demo          # stage 1: OTP with fallback, a retried request, marketing deferred by quiet hours
+npm run demo:queue    # stage 2: a retry with backoff, a dead push provider (breaker open, OTP fails over), a cap
 ```
 
 ## Usage
@@ -112,6 +119,8 @@ channel check -- the test's type was also invalid for another reason).
 
 ## Known and NOT handled (stage 1)
 
+(Stage 2 changes some of these: see "Stage 2: known and NOT handled".)
+
 - **Everything is in memory.** A restart loses records, keys and deferred deliveries. Stage 2 moves sends onto a
   queue; a real system stores records in a database.
 - **No retries.** A retryable failure is final in stage 1 (in `first` mode the next channel is tried). Stage 2.
@@ -121,6 +130,101 @@ channel check -- the test's type was also invalid for another reason).
 - **`flushDue()` is polled.** How late a deferred message goes out depends on how often it is called; a window with
   only a short gap (say quiet 00:15-00:00) needs flushes at least that often or the gap is missed and the message
   waits another day (the randomized test showed this with hourly flushes).
-- **One address per channel** (one push token per user); multiple devices and removing dead tokens are stage 2.
+- **One address per channel** (one push token per user); multiple devices and removing dead tokens are stage 3.
 - **Marketing defaults to allowed** (opt-out model). Some jurisdictions require opt-in for marketing SMS / email; that
   is a policy change in one function, not built.
+
+## Stage 2: the queued notifier
+
+```ts
+const queue = new InMemoryJobQueue();
+const notifier = new QueuedNotifier({
+  catalog, users, preferences, senders: [pushSender, smsSender, emailSender], queue,
+  retry: { maxAttempts: 3, backoff: exponentialBackoff({ initialMs: 1_000, maxMs: 300_000 }) },
+  sendTimeoutMs: 10_000,                       // per provider call (resilience-kit TimeoutPolicy)
+  leaseMs: 60_000,                             // must be > sendTimeoutMs
+  breaker: { windowSize: 20, minimumCalls: 5, failureRateThreshold: 0.5, openMs: 30_000 }, // one per channel
+  frequencyCap: new RateLimiter({ algorithm: slidingWindow({ limit: 3, windowMs: 86_400_000 }), store }),
+  idempotency: { ttlMs: 86_400_000, maxEntries: 100_000 },
+});
+const record = notifier.notify(request); // synchronous: validates, stores, queues; an HTTP layer answers 202
+new Worker(notifier, { concurrency: 4 }).start(); // run as many as you like against the same queue
+```
+
+`notify()` no longer sends. It validates, stores the record and queues one job per delivery (`all`) or one for the
+first channel (`first`), and returns. Workers claim jobs and send. What one job does is described at the top of
+[src/queued-notifier.ts](src/queued-notifier.ts); the rules:
+
+| Situation | What happens |
+|---|---|
+| Retryable failure, timeout, sender throws | back in the queue at `now + backoff(attempt)`; attempts used up -> `failed` (`first`: next channel) |
+| Permanent failure | `failed` at once, not retried, not counted by the breaker (`first`: next channel) |
+| Channel's circuit open | no provider call. `first`: fail over to the next channel now. `all`: back in the queue for when the breaker allows a probe, no attempt used |
+| Deferred by quiet hours | a delayed job at `notBefore`; planned again when it runs (may defer again, skip or send) |
+| Marketing over the user's cap for that channel | `skipped (capped)`, not delayed; checked on the first try only (a retry of an admitted delivery is not counted again) |
+| The cap's store is down | the job waits and tries again later: no send without the cap, no drop either |
+| Worker dies or stalls holding a job | the lease runs out, another worker gets the job; the old worker's result is dropped |
+| Job for a delivery that already finished (crash before `complete`) | dropped, nothing sent |
+| Same idempotency key within 24 h | the same record, nothing queued; a different payload is `IDEMPOTENCY_CONFLICT` |
+
+- **Priorities.** Transactional jobs (0) are claimed before marketing jobs (1), then by `runAt`, then first in first
+  out. An OTP queued after any number of promotions is claimed first.
+- **At-least-once.** A worker that sent and then stalled past its lease loses the job to another worker, which sends
+  again. Every send carries the same provider idempotency key `<notificationId>:<channel>` on every attempt, so a
+  provider that supports keys drops the duplicate. The fakes here do not dedupe; the tests check the key, not a
+  provider.
+- **Leases are checked before every write.** A worker writes a result, reschedules or completes only while its lease
+  token is current and has not run out.
+
+### Stage 2: tests
+
+| File | Tests | What |
+|---|---|---|
+| test/queue.test.ts | 5 | claim order (priority, runAt, FIFO), delayed jobs wait, `max`, lease tokens (stale holder refused, expired lease lost), reschedule releases |
+| test/queued.test.ts | 29 | notify queues and returns; `all` in one batch; priorities; errors leave nothing; retries and backoff timing; attempts used up in both modes; permanent failure; timeout aborts the sender's signal; breaker (`first` fails over, `all` waits without an attempt, permanent failures not counted); leases (dead worker, stalled worker's late result dropped, redelivered finished job, unexpected error); quiet hours as delayed jobs; caps (incl. the 36 h case below, transactional never capped, store down, store failing after the lease was lost); a skipped retry drops `nextAttemptAt`; key TTL and LRU eviction |
+| test/worker.test.ts | 5 | real timers: start / stop, `start()` twice is one loop, stop waits for the job in progress, several workers never process one job twice |
+| test/queued-invariants.test.ts | 6 | randomized, 6 seeds x 250 requests, 3 workers, random provider answers, client retries, workers that die holding jobs, the clock jumping around quiet windows: the rules are checked at every provider call (re-computed in the test), and at the end every job is gone, every record is finished, `first` sent at most one channel, attempts <= 3, a failure has a reason, each sent delivery was sent once |
+
+The 81 stage 1 tests are unchanged and still pass against the shared `planner.ts`.
+
+### Stage 2: mutation checks
+
+The stage 1 breaks were moved to their new places in `planner.ts` and run again (all 43 caught), plus 34 new ones,
+each applied alone with the suite run against it, the file restored byte for byte. All 77 are caught. Three survived
+the first run and were test gaps, now closed:
+
+- **S22**: the lease check after the cap store fails. With it gone, a worker that stalled past its lease while
+  waiting on a failing cap store wrote `pending` over a delivery the new owner had already SENT. Test added.
+- **S24**: a delivery waiting for a retry that is skipped when the retry runs (its address was removed) kept its
+  `nextAttemptAt`. Test added.
+- **W2**: the `start()`-twice guard. The old test called `start()` twice but could not see a second loop; the new one
+  uses concurrency 1 and checks that a second job waits.
+
+J6 and S6 are caught by a hang, not by a failing assertion: with the `runAt` check gone (J6) or a deferral
+rescheduled for `now` (S6), a job is claimed again at once, over and over, and the suite never finishes; the runner
+stops it after 180 s and counts it as caught.
+
+| Area | Breaks |
+|---|---|
+| queue | J1 priority ignored, J2 expired leases never reclaimed, J3 any token accepted, J4 expired lease still owns, J5 reschedule keeps the lease, J6 delayed jobs claimable early |
+| queued notifier | S1 one priority for all, S2 `first` picks a deferred channel before a pending one, S3 next channel not queued after a finish, S4 finished delivery processed again, S5 no planning again in the job, S6 deferral rescheduled for now, S7 transactional capped, S8 a retry counted by the cap again, S9 attempts not counted, S10 permanent failures counted by the breaker, S11 no failover on an open circuit, S12 requeue ignores the breaker's reopen time, S13 no lease check after the send, S14 one attempt too many, S15 permanent failures retried, S16 backoff does not grow, S17 `first` sends past a success, S18 conflict not detected, S19 `leaseMs <= sendTimeoutMs` accepted, S20 no timeout, S21 deferred job queued for now, S22 no lease check after the cap store fails, S23 key not stored, S24 `nextAttemptAt` kept on a skip, S25 provider key changes per attempt |
+| worker | W1 stop does not wait, W2 `start()` twice runs two loops, W3 drain stops after one round |
+
+### Stage 2: known and NOT handled
+
+- **Still in memory, one process.** The queue, records and keys live in the process. The queue's interface (claim
+  with a lease, complete / reschedule with the token) is the shape of SQS, BullMQ or a Postgres table claimed with
+  `FOR UPDATE SKIP LOCKED`; none of those is built. `claim()` scans every job (O(n)).
+- **Records are never removed.** Keys are bounded (TTL and `maxEntries`); records are not. A real system keeps them
+  in a database with a retention period.
+- **A key is forgotten after 24 h or when evicted.** The same key then makes a NEW notification. That is the price
+  of bounded memory (Stripe's keys expire after 24 h too).
+- **Marketing can starve.** Priorities are strict: under constant transactional load, marketing jobs wait. Aging
+  (raising a job's priority as it waits) is not built.
+- **A cap of 1 per day can block for 36 h.** ratelimit-kit's sliding window counter weights the previous
+  day-aligned window, so with a limit of 1 a send at 12:00 blocks until 00:00 UTC two days later. Pinned in a test.
+  A small cap that must be exactly "24 h since the last one" needs a sliding log, not a counter.
+- **The worker runs in batches.** It claims `concurrency` jobs and waits for the slowest before claiming again; a
+  pool that refills each slot as it frees is not built.
+- **Using the libraries found a gap in them.** All three built without type declarations, so this TypeScript
+  consumer got no types. Fixed with `"declaration": true` in each library's `tsconfig.build.json`.

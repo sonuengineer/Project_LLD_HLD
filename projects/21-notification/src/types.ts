@@ -22,6 +22,7 @@ export interface OutboundMessage {
   notificationId: string;
   channel: Channel;
   to: string; // email address, phone number or push token
+  idempotencyKey: string; // "<notificationId>:<channel>", the same on every attempt: lets a provider drop a duplicate
   subject?: string; // email only
   body: string;
 }
@@ -32,7 +33,8 @@ export type SendResult =
 
 export type DeliveryStatus = "pending" | "sending" | "sent" | "failed" | "skipped" | "deferred";
 
-export type SkipReason = "no_address" | "opted_out" | "not_needed";
+// capped: stage 2's per-user frequency cap for marketing was reached.
+export type SkipReason = "no_address" | "opted_out" | "not_needed" | "capped";
 
 export function isChannel(value: unknown): value is Channel {
   return typeof value === "string" && (CHANNELS as readonly string[]).includes(value);

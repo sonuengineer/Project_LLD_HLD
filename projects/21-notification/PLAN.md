@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-23): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again; 81 tests; 43 mutation checks, all caught).
+Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys). 126 tests; 77 mutation checks, all caught (README). Stage 3 not started.
 
 ## Why this project
 
@@ -44,13 +44,45 @@ test. Stage 2 adds the HLD half (queue, workers, retries, caps) using the librar
 - **Patterns NOT used, on purpose:** no Singleton notifier (tests create many), no class per notification type (a type
   is data, not behaviour), no State pattern for a delivery (a status field with guarded transitions is enough).
 
+## Stage 2 decisions (one recommendation each)
+
+- **A second notifier, not a flag on the first.** `QueuedNotifier` queues the sends and returns at once; the stage 1
+  `Notifier` stays as the in-process version. Both share `planner.ts` (validate, render, plan, build the record, send
+  once), extracted from stage 1 with its tests unchanged as the regression guard.
+- **The queue has leases (visibility timeout).** A claimed job is invisible for `leaseMs`; a dead worker's job comes
+  back. Delivery is therefore at-least-once, so every send carries a provider idempotency key
+  `<notificationId>:<channel>` that is the same on every attempt. Only the current lease holder may write a result
+  or complete the job. `leaseMs` must be greater than the send timeout, so a healthy worker always finishes inside its
+  lease. Recommended over a "processing" flag (a crash leaves it set forever) and over exactly-once claims (needs a
+  transaction spanning the provider call, which does not exist).
+- **Retries are jobs back in the queue (`runAt = now + backoff`), not sleeps in the worker.** Recommended over
+  resilience-kit's RetryPolicy here: an in-process retry holds a worker slot while it waits and is lost with the
+  process; a queued retry costs nothing while waiting and survives a crash. The library still supplies the backoff
+  (`exponentialBackoff`), a `TimeoutPolicy` per send and a `CircuitBreaker` per channel.
+- **Only retryable failures count against the breaker.** A permanent failure (bad number) is the provider working.
+- **Circuit open: "first" fails over now, "all" waits for the probe without using an attempt.** "first" exists to
+  route around a channel (an OTP should not wait 30 s); "all" must reach every channel, and burning attempts while no
+  call is even made would fail it without a single real try.
+- **Priority: transactional before marketing.** Two levels, strict. Starvation of marketing under constant
+  transactional load is possible and documented (aging not built).
+- **Deferred deliveries are delayed jobs** (`runAt = notBefore`), so there is no `flushDue` poll; the job plans the
+  channel again when it runs (stage 1's lesson).
+- **Frequency caps (ratelimit-kit), marketing only, on the first try only.** Over the cap -> skipped `capped`, not
+  deferred (a backlog of old promotions is worse than none). A retry of an admitted delivery does not count again.
+  The cap's store failing -> the job waits (neither uncapped sends nor drops).
+- **Idempotency keys in a cache-kit `LruCache`: 24 h TTL, `maxEntries` bound.** After the TTL or an LRU eviction the
+  same key creates a new notification (as with Stripe's 24 h keys); the bound is the price of not growing forever.
+- **The libraries are `file:` dependencies on their built `dist/`.** Using them from another project found a real
+  gap: all three built without type declarations, so a TypeScript consumer got no types. Fixed with
+  `"declaration": true` in each library's build config.
+
 ## Stages
 
 | Stage | What | Status |
 |---|---|---|
 | 1 | Catalog (types, categories, channels, modes, templates), template rendering, preferences (opt-out, quiet hours with deferral), fake channel senders, notifier (`all` / `first` with fallback, idempotency incl. concurrent duplicates, check-then-change), `flushDue`; randomized invariant test; mutation checks | DONE 2026-11-23 |
-| 2 | Queue + workers (priority: transactional before marketing), retries with backoff for retryable failures (resilience-kit), per-user frequency caps (ratelimit-kit), bounded idempotency store, provider delivery receipts | not started |
-| 3 | HTTP API (Express), in-app inbox, interview bank, portfolio page | not started |
+| 2 | Queue with leases and priorities, workers, retries as delayed jobs with backoff, timeout and circuit breaker per channel (resilience-kit), per-user frequency caps (ratelimit-kit), bounded idempotency keys (cache-kit), deferred deliveries as delayed jobs; randomized test with dying workers; mutation checks | DONE 2026-11-25 |
+| 3 | HTTP API (Express), in-app inbox, several push tokens per user (dead tokens removed), provider delivery receipts, interview bank, portfolio page | not started |
 
 ## Not in scope
 
