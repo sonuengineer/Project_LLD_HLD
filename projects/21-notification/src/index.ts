@@ -12,7 +12,8 @@ export {
 } from "./notifier.js";
 export { planChannel, WAKES_USER, type ChannelPlan } from "./policy.js";
 export { InMemoryJobQueue, type ClaimedJob, type Job, type JobQueue } from "./queue.js";
-export { PRIORITY, QueuedNotifier, type QueuedNotifierOptions } from "./queued-notifier.js";
+export { PRIORITY, QueuedNotifier, type QueuedNotifierOptions, type ReceiptOutcome } from "./queued-notifier.js";
+export { mergeReceipt, RECEIPT_EVENTS, signWebhook, verifyWebhook, type Receipt, type ReceiptEvent } from "./receipts.js";
 export { Worker, type WorkerOptions } from "./worker.js";
 export { PreferenceStore, quietUntil, type Preferences, type QuietHours } from "./preferences.js";
 export { FakeSender, type ChannelSender, type FakeOutcome } from "./senders.js";

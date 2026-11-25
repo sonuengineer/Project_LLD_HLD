@@ -41,6 +41,7 @@ import {
 } from "./planner.js";
 import type { PreferenceStore } from "./preferences.js";
 import type { ClaimedJob, JobQueue } from "./queue.js";
+import { mergeReceipt, type Receipt } from "./receipts.js";
 import { markRestNotNeeded, type Delivery, type NotificationRecord, type NotifyRequest } from "./record.js";
 import type { ChannelSender } from "./senders.js";
 import type { Channel, SendResult } from "./types.js";
@@ -64,7 +65,11 @@ export interface QueuedNotifierOptions {
   // Marketing only, keyed "<userId>:<channel>". A RateLimiter from ratelimit-kit (memory or Redis store).
   frequencyCap?: { consume(key: string): Promise<Decision> };
   idempotency?: { ttlMs?: number; maxEntries?: number }; // default 24 h, 100_000 keys
+  // Stage 3: receipts that arrive before the send is recorded are parked this long (default 1 h, 10_000 entries).
+  receipts?: { parkTtlMs?: number; parkMaxEntries?: number };
 }
+
+export type ReceiptOutcome = "applied" | "unchanged" | "parked";
 
 interface KeyEntry {
   fingerprint: string;
@@ -94,7 +99,9 @@ export class QueuedNotifier {
   private readonly records = new Map<string, NotificationRecord>();
   private readonly keys: LruCache<string, KeyEntry>;
   private readonly admitted = new Set<string>(); // "<recordId>:<channel>" that passed the frequency cap
-  readonly stats = { sent: 0, failed: 0, retried: 0, capped: 0, failedOver: 0, leaseLost: 0, duplicateJobs: 0, unexpectedErrors: 0 };
+  private readonly sentBy = new Map<string, string>(); // "<channel>:<providerId>" -> record id (grows like records)
+  private readonly parked: LruCache<string, Receipt>; // "<channel>:<providerId>" -> merged receipt, send not seen yet
+  readonly stats = { sent: 0, failed: 0, retried: 0, capped: 0, failedOver: 0, leaseLost: 0, duplicateJobs: 0, unexpectedErrors: 0, receiptsApplied: 0, receiptsUnchanged: 0, receiptsParked: 0 };
 
   constructor(options: QueuedNotifierOptions) {
     this.deps = {
@@ -129,6 +136,35 @@ export class QueuedNotifier {
       ttlMs: options.idempotency?.ttlMs ?? 24 * 60 * 60 * 1000,
       now: () => this.clock.now(),
     });
+    this.parked = new LruCache<string, Receipt>({
+      maxEntries: options.receipts?.parkMaxEntries ?? 10_000,
+      ttlMs: options.receipts?.parkTtlMs ?? 60 * 60 * 1000,
+      now: () => this.clock.now(),
+    });
+  }
+
+  // A provider's report on a message it accepted. Synchronous, like notify(). Provider ids are only unique per
+  // provider, so the channel is part of the key.
+  //   applied   -- the delivery's receipt changed
+  //   unchanged -- a duplicate, or outranked by what is already there (out of order): nothing to do, still a success
+  //   parked    -- no send with this id yet (the webhook beat the send result): kept, applied when the send is recorded
+  applyReceipt(channel: Channel, providerId: string, receipt: Receipt): ReceiptOutcome {
+    const key = `${channel}:${providerId}`;
+    const recordId = this.sentBy.get(key);
+    const delivery = recordId === undefined ? undefined : this.records.get(recordId)?.deliveries.find((d) => d.channel === channel);
+    if (!delivery) {
+      this.parked.set(key, mergeReceipt(this.parked.get(key), receipt));
+      this.stats.receiptsParked++;
+      return "parked";
+    }
+    const merged = mergeReceipt(delivery.receipt, receipt);
+    if (merged === delivery.receipt) {
+      this.stats.receiptsUnchanged++;
+      return "unchanged";
+    }
+    delivery.receipt = merged;
+    this.stats.receiptsApplied++;
+    return "applied";
   }
 
   // Synchronous: validates, stores the record, queues the jobs, returns the record (status in_progress / scheduled /
@@ -294,6 +330,14 @@ export class QueuedNotifier {
     if (result.status === "sent") {
       recordResult(delivery, result);
       this.stats.sent++;
+      const key = `${delivery.channel}:${result.providerId}`;
+      this.sentBy.set(key, record.id);
+      const early = this.parked.get(key);
+      if (early) {
+        delivery.receipt = mergeReceipt(delivery.receipt, early);
+        this.parked.delete(key);
+        this.stats.receiptsApplied++;
+      }
       if (record.mode === "first") markRestNotNeeded(record);
       this.finish(job, record, now);
       return;

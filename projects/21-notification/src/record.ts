@@ -1,5 +1,6 @@
 // The notification record and its deliveries: shared by the in-process Notifier (stage 1) and the QueuedNotifier
 // (stage 2).
+import type { Receipt } from "./receipts.js";
 import type { Category, Channel, DeliveryMode, DeliveryStatus, SkipReason } from "./types.js";
 
 export interface NotifyRequest {
@@ -22,6 +23,7 @@ export interface Delivery {
   providerId?: string; // sent
   error?: string; // failed, or the last failure of a delivery waiting for a retry
   retryable?: boolean; // failed
+  receipt?: Receipt; // stage 3: what the provider reported after accepting it (sent deliveries only)
 }
 
 export type NotificationStatus = "in_progress" | "scheduled" | "delivered" | "failed" | "suppressed";
@@ -37,9 +39,9 @@ export interface NotificationRecord {
   deliveries: Delivery[];
 }
 
-// in_progress > scheduled > delivered > failed > suppressed
+// in_progress > scheduled > delivered > failed > suppressed. A sent delivery that BOUNCED counts as failed (stage 3).
 export function notificationStatus(record: NotificationRecord): NotificationStatus {
-  const statuses = record.deliveries.map((d) => d.status);
+  const statuses = record.deliveries.map((d) => (d.status === "sent" && d.receipt?.event === "bounced" ? "failed" : d.status));
   if (statuses.some((s) => s === "pending" || s === "sending")) return "in_progress";
   if (statuses.includes("deferred")) return "scheduled";
   if (statuses.includes("sent")) return "delivered";

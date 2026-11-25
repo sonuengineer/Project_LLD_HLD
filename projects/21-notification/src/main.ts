@@ -2,11 +2,12 @@
 //   NOTIFY_API_KEY  required, at least 16 characters (never in the code or the repo)
 //   PORT            default 3000
 //   HOST            default 127.0.0.1 (this process only; nothing is exposed to the network unless you change it)
+//   NOTIFY_WEBHOOK_SECRET_PUSH / _SMS / _EMAIL   optional, one per provider; enables POST /webhooks/<channel>
 // Fake senders only: nothing leaves the process. Ctrl+C shuts down cleanly.
 import { exponentialBackoff } from "resilience-kit";
 import { createApp, MIN_API_KEY_LENGTH } from "./http/app.js";
 import { startServer } from "./http/server.js";
-import { FakeSender, InMemoryJobQueue, InMemoryUsers, NotificationCatalog, PreferenceStore, QueuedNotifier, Worker } from "./index.js";
+import { CHANNELS, FakeSender, InMemoryJobQueue, InMemoryUsers, NotificationCatalog, PreferenceStore, QueuedNotifier, Worker } from "./index.js";
 
 const apiKey = process.env.NOTIFY_API_KEY;
 if (!apiKey || apiKey.length < MIN_API_KEY_LENGTH) {
@@ -15,6 +16,12 @@ if (!apiKey || apiKey.length < MIN_API_KEY_LENGTH) {
 }
 const port = Number(process.env.PORT ?? 3000);
 const host = process.env.HOST ?? "127.0.0.1";
+const webhookSecrets = Object.fromEntries(
+  CHANNELS.flatMap((c) => {
+    const secret = process.env[`NOTIFY_WEBHOOK_SECRET_${c.toUpperCase()}`];
+    return secret ? [[c, secret]] : [];
+  }),
+);
 
 const catalog = new NotificationCatalog();
 catalog.register({
@@ -44,8 +51,9 @@ const notifier = new QueuedNotifier({
   retry: { maxAttempts: 3, backoff: exponentialBackoff({ initialMs: 1_000, maxMs: 60_000 }) },
 });
 
-const running = await startServer(createApp({ notifier, users, preferences, apiKey }), new Worker(notifier), { port, host });
+const running = await startServer(createApp({ notifier, users, preferences, apiKey, webhookSecrets }), new Worker(notifier), { port, host });
 console.log(`notification API on ${running.url} (fake senders; types: ${catalog.ids().join(", ")}; user: u1)`);
+console.log(`webhooks: ${Object.keys(webhookSecrets).join(", ") || "none (no NOTIFY_WEBHOOK_SECRET_* set)"}`);
 
 let stopping = false;
 for (const signal of ["SIGINT", "SIGTERM"] as const) {

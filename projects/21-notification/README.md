@@ -5,8 +5,8 @@ channel, user preferences and quiet hours, channel fallback and idempotent reque
 leases and priorities, workers, retries with backoff, a circuit breaker and a timeout per channel, frequency caps and
 bounded idempotency keys (stage 2). Providers are fakes: nothing in this project sends a real email, SMS or push.
 
-Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API done) -- 144 tests; mutation checks in "Mutation checks" (stage 1) and
-"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (receipts, several push devices, inbox) is
+Status (2026-11-25): stages 1 and 2 DONE, stage 3 in progress (HTTP API and delivery receipts done) -- 161 tests; mutation checks in "Mutation checks" (stage 1) and
+"Stage 2: mutation checks" and "Stage 3: HTTP API". The rest of stage 3 (several push devices, inbox) is
 planned in [PLAN.md](PLAN.md), not built.
 
 Stage 2 uses three libraries from this repo as `file:` dependencies on their built `dist/`:
@@ -16,7 +16,7 @@ Stage 2 uses three libraries from this repo as `file:` dependencies on their bui
 ```
 npm run build:deps    # npm ci + npm run build in 18-resilience, 19-rate-limit and 20-cache
 npm ci
-npm test              # 144 tests
+npm test              # 161 tests
 npm run demo          # stage 1: OTP with fallback, a retried request, marketing deferred by quiet hours
 npm run demo:queue    # stage 2: a retry with backoff, a dead push provider (breaker open, OTP fails over), a cap
 ```
@@ -276,3 +276,50 @@ hidden, body-parser errors not mapped, JSON content type not required (POST and 
 PUT), no 404 fallback, no overall `status`, `startServer` not waiting for the worker / closing twice / not
 rejecting on a port in use. One survived the first run: H15, a PUT for an unknown user was stored -- no test sent
 one; added.
+
+## Stage 3: delivery receipts
+
+"Sent" only means the provider accepted the message. Later the provider calls a webhook with what happened:
+
+```
+POST /webhooks/push                         (no API key: the provider signs instead)
+Content-Type: application/json
+Notify-Signature: t=1795603753,v1=<hex HMAC-SHA256(NOTIFY_WEBHOOK_SECRET_PUSH, "1795603753." + raw body)>
+
+{"providerId":"push-1","event":"bounced","occurredAt":1795603753000}
+-> 200 {"result":"applied"} | 200 {"result":"unchanged"} | 202 {"result":"parked"}
+```
+
+The receipt appears on the delivery (`"receipt": { "event": "bounced", "at": ... }`) in `GET /notifications/:id`.
+`signWebhook(secret, rawBody, nowMs)` is exported, for a fake provider or a test to act as the real one.
+
+- **Signature:** one secret per channel's provider (`NOTIFY_WEBHOOK_SECRET_PUSH` / `_SMS` / `_EMAIL`; a channel
+  without one has no webhook, 404). The HMAC covers the timestamp and the raw bytes, so any change to either is
+  401, and a request more than 5 minutes old (or ahead) is 401 too: a captured request cannot be replayed later.
+  The signature is checked before the body is parsed; the API key is not accepted instead.
+- **Out of order and duplicates cannot matter.** A receipt only moves up: `delivered` < `bounced` (an email can be
+  accepted and bounce later; a late `delivered` never undoes a bounce); between two of the same event the earlier
+  time is kept. The result is the maximum of everything received, whatever the order or number of copies
+  (randomized test: 300 event lists, each shuffled with duplicates 5 times). So no store of seen event ids.
+- **A receipt can beat the send result** (the provider calls the webhook before our worker has written the answer).
+  It is parked for up to 1 h (cache-kit LRU, 10 000 entries), merged like any receipt, and applied when the send is
+  recorded; unknown ids just expire. Provider ids are unique per provider only, so the key is channel + id.
+- **A bounced delivery counts as failed** in the notification's status (another channel that did not bounce still
+  makes it delivered).
+
+Not built: falling back to the next channel after a bounce, a suppression list (stop sending to an address that
+bounced), `opened` / `clicked` events, the provider-index (`sentBy`) is never trimmed (it grows like the records).
+
+| File | Tests | What |
+|---|---|---|
+| test/receipts.test.ts | 10 | merge rule (rank, tie, unchanged is the same object) and the randomized order / duplicates check; signatures (wrong secret, changed body, changed time, tolerance both ways at the exact edge, 8 malformed headers); applied / unchanged / late delivered after a bounce; bounce -> failed only if no other channel delivered; channel is part of the key; parked then applied at send, parked receipts merge; parked TTL |
+| test/http.test.ts | +7 | webhook: signed receipt applied without the API key and visible in GET, unchanged on repeat; raw-bytes signature with the provider's own spacing and key order; 5 ways to be 401 (none, wrong, another channel's secret, replayed after 5 min, the API key); 404 and 415; 6 signed-but-malformed bodies are 400 and unsigned garbage is 401; parked -> 202; weak or misnamed secrets refused at startup |
+
+24 mutation checks on receipts, each applied alone, all caught on the first run: ranking reversed, tie keeps the
+later time, last event wins, unchanged not detected (a copy instead of the same object), future timestamps
+accepted, no tolerance, timestamp not signed, header regex not anchored, signature not compared, parked receipts
+not applied at send / overwritten instead of merged, provider id without the channel, a bounce not counted as
+failed, signature not checked, parked answered 200, each receipt field check removed, weak or unknown-channel
+secrets accepted, a non-JSON body reaching the verifier, the system clock instead of the injected one, a default
+secret for channels without one. One test was tightened before the run: the parked-merge test sent delivered then
+bounced, which "last one wins" would also pass; it now sends bounced first.

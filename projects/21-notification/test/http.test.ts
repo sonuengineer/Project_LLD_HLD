@@ -4,11 +4,14 @@ import type { AddressInfo } from "node:net";
 import type express from "express";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApp, type AppOptions } from "../src/http/app.js";
+import { signWebhook } from "../src/receipts.js";
 import { InMemoryJobQueue } from "../src/queue.js";
 import { QueuedNotifier } from "../src/queued-notifier.js";
-import { setupQueued } from "./queued-helpers.js";
+import { orderReq, setupQueued } from "./queued-helpers.js";
 
 const KEY = "test-key-0123456789abcdef";
+const PUSH_SECRET = "whsec-push-0123456789";
+const EMAIL_SECRET = "whsec-email-0123456789";
 const servers: Server[] = [];
 
 async function listen(app: express.Express): Promise<string> {
@@ -29,7 +32,16 @@ async function start(overrides: Partial<AppOptions> = {}) {
   const s = setupQueued();
   const logged: unknown[] = [];
   const base = await listen(
-    createApp({ notifier: s.notifier, users: s.users, preferences: s.preferences, apiKey: KEY, log: (_m, e) => logged.push(e), ...overrides }),
+    createApp({
+      notifier: s.notifier,
+      users: s.users,
+      preferences: s.preferences,
+      apiKey: KEY,
+      log: (_m, e) => logged.push(e),
+      clock: s.clock,
+      webhookSecrets: { push: PUSH_SECRET, email: EMAIL_SECRET },
+      ...overrides,
+    }),
   );
   const call = (method: string, path: string, init: { body?: unknown; raw?: string; headers?: Record<string, string> } = {}) =>
     fetch(base + path, {
@@ -253,5 +265,97 @@ describe("HTTP API: reads and preferences", () => {
     const text = await call("PUT", "/users/u1/preferences", { raw: "x", headers: { "content-type": "text/plain" } });
     expect(text.status).toBe(415);
     expect(await (await call("GET", "/users/u1/preferences")).json()).toEqual({ mutedMarketing: ["sms"] });
+  });
+});
+
+describe("HTTP API: POST /webhooks/:channel (delivery receipts)", () => {
+  async function withSentOrder() {
+    const t = await start();
+    const r = t.notifier.notify(orderReq());
+    await t.worker.drain();
+    const [push, email] = t.notifier.get(r.id)!.deliveries;
+    const hook = (channel: string, raw: string, signature?: string, contentType = "application/json") =>
+      fetch(`${t.base}/webhooks/${channel}`, {
+        method: "POST",
+        headers: { "content-type": contentType, ...(signature !== undefined ? { "notify-signature": signature } : {}) },
+        body: raw,
+      });
+    const signed = (channel: string, secret: string, raw: string) => hook(channel, raw, signWebhook(secret, raw, t.clock.now()));
+    return { ...t, id: r.id, pushId: push!.providerId!, emailId: email!.providerId!, hook, signed };
+  }
+  const receipt = (providerId: string, event: string, occurredAt = 1) => JSON.stringify({ providerId, event, occurredAt });
+
+  it("a signed receipt is applied without the API key; the record shows it; the same again is unchanged", async () => {
+    const { signed, call, id, pushId } = await withSentOrder();
+    const res = await signed("push", PUSH_SECRET, receipt(pushId, "delivered", 7));
+    expect([res.status, await res.json()]).toEqual([200, { result: "applied" }]);
+    expect((await (await call("GET", `/notifications/${id}`)).json()).deliveries[0].receipt).toEqual({ event: "delivered", at: 7 });
+    const again = await signed("push", PUSH_SECRET, receipt(pushId, "delivered", 7));
+    expect([again.status, await again.json()]).toEqual([200, { result: "unchanged" }]);
+  });
+
+  it("the signature is over the raw bytes: spacing and key order the provider chose are fine", async () => {
+    const { signed, pushId } = await withSentOrder();
+    const raw = `{ "occurredAt": 3,
+  "event": "bounced", "providerId": "${pushId}" }`;
+    const res = await signed("push", PUSH_SECRET, raw);
+    expect([res.status, await res.json()]).toEqual([200, { result: "applied" }]);
+  });
+
+  it("no signature, a wrong one, another channel's secret, an expired one or the API key -> 401, nothing applied", async () => {
+    const { hook, signed, notifier, id, pushId, clock, base } = await withSentOrder();
+    const raw = receipt(pushId, "bounced");
+    const old = signWebhook(PUSH_SECRET, raw, clock.now());
+    clock.advance(5 * 60_000 + 1_000);
+    const attempts = [
+      hook("push", raw),
+      hook("push", raw, signWebhook("whsec-wrong-0123456789", raw, clock.now())),
+      signed("push", EMAIL_SECRET, raw),
+      hook("push", raw, old), // a captured request replayed after 5 minutes
+      fetch(`${base}/webhooks/push`, { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${KEY}` }, body: raw }),
+    ];
+    for (const pending of attempts) {
+      const res = await pending;
+      expect([res.status, (await res.json()).error.code]).toEqual([401, "INVALID_SIGNATURE"]);
+    }
+    expect(notifier.get(id)!.deliveries[0]).not.toHaveProperty("receipt");
+  });
+
+  it("a channel without a secret, or not a channel -> 404; not JSON -> 415", async () => {
+    const { hook, signed } = await withSentOrder();
+    expect((await signed("sms", PUSH_SECRET, receipt("x", "delivered"))).status).toBe(404);
+    expect((await signed("fax", PUSH_SECRET, receipt("x", "delivered"))).status).toBe(404);
+    expect((await hook("push", "x", "t=1,v1=00", "text/plain")).status).toBe(415);
+  });
+
+  it("signed but malformed -> 400 (the signature is checked BEFORE the body is parsed)", async () => {
+    const { signed, hook } = await withSentOrder();
+    const cases: [string, string][] = [
+      ["{", "INVALID_JSON"],
+      ["[]", "INVALID_RECEIPT"],
+      [receipt("", "delivered"), "INVALID_RECEIPT"],
+      [receipt("p".repeat(256), "delivered"), "INVALID_RECEIPT"],
+      [receipt("p1", "opened"), "INVALID_RECEIPT"],
+      [JSON.stringify({ providerId: "p1", event: "delivered", occurredAt: "yesterday" }), "INVALID_RECEIPT"],
+    ];
+    for (const [raw, code] of cases) {
+      const res = await signed("push", PUSH_SECRET, raw);
+      expect([res.status, (await res.json()).error.code]).toEqual([400, code]);
+    }
+    expect((await hook("push", "{")).status).toBe(401); // unsigned garbage is never parsed
+  });
+
+  it("a receipt for a send not recorded yet -> 202 parked", async () => {
+    const { signed } = await withSentOrder();
+    const res = await signed("email", EMAIL_SECRET, receipt("not-yet", "delivered"));
+    expect([res.status, await res.json()]).toEqual([202, { result: "parked" }]);
+  });
+
+  it("refuses weak or misnamed webhook secrets at startup", () => {
+    const s = setupQueued();
+    const base = { notifier: s.notifier, users: s.users, preferences: s.preferences, apiKey: KEY };
+    expect(() => createApp({ ...base, webhookSecrets: { push: "short" } })).toThrow(RangeError);
+    expect(() => createApp({ ...base, webhookSecrets: { fax: PUSH_SECRET } as never })).toThrow(RangeError);
+    expect(() => createApp({ ...base, webhookSecrets: { push: "x".repeat(16) } })).not.toThrow();
   });
 });

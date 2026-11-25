@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API done (25 mutation checks, all caught). 144 tests.
+Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API and delivery receipts done. 161 tests; mutation checks in the README.
 
 ## Why this project
 
@@ -103,6 +103,22 @@ user, the in-app inbox, the interview bank, the portfolio page.
 - **One process runs the API and a worker** (`startServer`). `close()` stops accepting connections, finishes the
   requests in progress, then waits for the worker's sends in progress. Queued jobs stay queued (lost with an
   in-memory queue).
+
+- **Delivery receipts: a webhook per channel, signed, not API-keyed.** `POST /webhooks/:channel` with
+  `Notify-Signature: t=<unix s>,v1=<hex HMAC-SHA256(secret, "t.rawBody")>` (the Stripe scheme), one secret per
+  provider from the environment. Signed over the RAW body (the route reads bytes, not parsed JSON), verified before
+  the body is parsed, timestamps more than 5 minutes off refused (a captured request cannot be replayed later).
+  Registered before the API-key check: providers do not have our key, and our key does not sign receipts.
+- **Order and duplicates handled by the data, not by a store of seen event ids.** A receipt only moves up a ranking
+  (delivered < bounced; an email can be accepted and bounce later), ties keep the earlier time. The final state is
+  the maximum of all events received, the same in any order and with any number of duplicates (randomized test).
+  Recommended over deduplicating event ids: no extra store, and it also handles events that are distinct but
+  arrive out of order, which deduplication does not.
+- **A receipt that beats the send result is parked**, in a cache-kit LRU (1 h TTL, 10 000 entries) keyed by channel
+  and provider id, merged like any receipt, and applied when the send is recorded. Answered 202. Recommended over
+  404-and-hope-the-provider-retries: not every provider retries a 4xx.
+- **A bounce makes that delivery count as failed** in the overall status. No fallback to the next channel after a
+  bounce and no suppression list of bounced addresses (both documented, not built).
 
 ## Stages
 
