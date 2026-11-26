@@ -5,16 +5,17 @@ unlocks storage for a user's OTHER credentials, encrypted at rest with AES-256-G
 an entry goes through a `VaultStore`, which stage 2 makes a real async call (modeling a disk/network write),
 but the only implementation here is in memory. Stage 3 adds breach checking against a fake (but
 protocol-real) k-anonymity provider, guarded by a timeout and circuit breaker so that service can never block
-a save.
+a save. Stage 4 adds sharing a single entry between two INDEPENDENT vaults, via hybrid/envelope encryption
+(RSA-OAEP + AES-256-GCM) -- neither vault ever sees the other's master password or vault key.
 
 Status (2026-11-26): stage 1 DONE -- 48 tests, 30 mutation checks, all caught. Stage 2 DONE -- 63 tests, 46
-mutation checks, all caught. Stage 3 DONE -- 90 tests, 17 new mutation checks, all caught (see "Mutation
-checks"). Details in [PLAN.md](PLAN.md).
+mutation checks, all caught. Stage 3 DONE -- 90 tests, 17 new mutation checks, all caught. Stage 4 DONE --
+106 tests, 13 new mutation checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 90 tests
-npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking
+npm test        # 106 tests
+npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking, sharing an entry between two vaults
 ```
 
 ## Usage
@@ -44,6 +45,15 @@ const fresh = manager.unlock("alice", "a-new-master-password");
 const weak = await manager.addEntry(fresh.sessionId, { title: "Old site", username: "alice", password: "qwerty123" });
 weak.breached; // true
 await manager.checkBreach("qwerty123"); // true -- also usable standalone, like generatePassword()
+
+// Sharing one entry with a completely independent vault -- neither side ever sees the other's master
+// password, vault key, or private key:
+manager.createVault("dave", "daves-master-password-123");
+const dave = manager.unlock("dave", "daves-master-password-123");
+const davePublicKey = await manager.getSharingPublicKey(dave.sessionId); // dave hands this to alice, out of band
+const token = manager.shareEntry(fresh.sessionId, weak.id, davePublicKey); // alice seals it for dave; pure, synchronous crypto
+const redeemed = await manager.redeemShare(dave.sessionId, token); // dave unwraps it with his OWN private key
+manager.getEntry(dave.sessionId, redeemed.id); // dave's own, independent copy of alice's entry
 ```
 
 ## The rules
@@ -93,6 +103,18 @@ await manager.checkBreach("qwerty123"); // true -- also usable standalone, like 
   attempt records itself (that count is the point of lockout), `VAULT_BUSY`/`ENTRY_CONFLICT` exist
   specifically to tell a caller "someone else got there first" instead of silently losing their change, and a
   breach-check failure is the one case where a would-be error is deliberately swallowed instead of surfaced.
+- **One entry can be shared with a completely independent vault via hybrid (envelope) encryption.** Each
+  vault lazily generates its own RSA keypair (`getSharingPublicKey`, only on first use -- a 2048-bit keypair
+  costs about 200ms to generate). `shareEntry` decrypts with the sender's own key and re-encrypts under a
+  fresh one-time AES key wrapped for the recipient's public key, producing a self-contained token; it needs
+  no commit, since nothing about the sender's vault changes. `redeemShare` unwraps that token with the
+  recipient's own private key and adds the result through the recipient's ordinary `addEntry` -- so a shared
+  credential gets the exact same claim/commit exclusion and the exact same breach check (against the
+  RECIPIENT's own configuration) as any other entry, automatically.
+- **The sharing keypair's private key is re-wrapped on every `changeMasterPassword`, exactly like every
+  entry.** Skipping this would silently and permanently brick sharing the moment the vault's owner changes
+  their password -- the private key would still be "encrypted," just under a key the vault's canary no
+  longer matches.
 
 ## Design choices
 
@@ -116,6 +138,14 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
   resilience-themed projects -- every project here is its own standalone package, and the breaker needed for
   breach-checking is small enough that writing it directly (same spirit as `timeout.ts`) beats wiring up a
   cross-project dependency.
+- RSA-OAEP (hybrid/envelope encryption) over hand-rolling an ECIES-style scheme on an elliptic curve: Node
+  supports `publicEncrypt`/`privateDecrypt` directly, with no extra key-derivation logic to get right, at the
+  cost of a slower (but one-time, lazy) keypair generation -- a reasonable trade for a project optimizing for
+  a correct, well-understood implementation over raw key-generation speed.
+- `redeemShare` reuses `addEntry` wholesale instead of writing its own insertion logic -- a shared credential
+  is, from the recipient's point of view, just a new entry whose plaintext happened to come from an envelope
+  instead of a form field; duplicating `addEntry`'s claim/commit/breach-check logic for this one caller would
+  be the same bug risk twice, for no benefit.
 
 ## Tests
 
@@ -133,14 +163,16 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 | test/circuit-breaker.test.ts | 6 | starts closed, opens after the failure threshold (and never even calls `fn()` while open), fewer-than-threshold failures never open it, a success resets the failure counter, a half-open trial after the cooldown closes on success and re-opens (with a fresh cooldown) on failure |
 | test/breach-checker.test.ts | 5 | true/false for the real k-anonymity call, a throwing provider and a provider that never responds both degrade to `null` instead of throwing or hanging, defaults to `DEFAULT_BREACH_CHECK_TIMEOUT_MS` when none is given, the circuit opening makes later checks fail fast without even calling the provider again |
 | test/breach-integration.test.ts | 10 | the manager's own zero-config defaults correctly detect a known-breached password end to end, `addEntry`/`updateEntry` set `breached` and only re-check when the password field actually changes, `listEntries` surfaces it without a `getEntry` call, a broken provider never blocks a save, `checkBreach` as a standalone utility (including its own input validation), the `breached` flag never appears in the clear in `exportVault`'s output |
+| test/sharing.test.ts | 7 | `generateSharingKeyPair` produces valid, non-colliding PEM keys, `sealForRecipient`/`openAsRecipient` round-trip the exact plaintext, a different recipient's private key cannot open it, a tampered blob or wrappedKey fails, an invalid public key is rejected up front, the same plaintext sealed twice never produces the same token |
+| test/sharing-integration.test.ts | 9 | `getSharingPublicKey` lazily generates once and is idempotent on repeat calls, excluded by an in-progress rotation, a full share/redeem round trip between two independent vaults (including deleting the recipient's copy not touching the sender's), the token never contains the plaintext in the clear, breach status is re-checked against the RECIPIENT's own config, redeeming without a keypair throws `NO_SHARING_KEY`, a token meant for someone else throws `DECRYPTION_FAILED`, sharing still works after the sender rotates their master password, and the re-wrapped private key (not the old one) is what actually gets persisted |
 
 ## Mutation checks
 
-93 deliberate breaks total across all three stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
-`src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`), each applied alone with
-the suite run against it, the file restored byte for byte. 93 of 93 caught. Stage 1's check found one
-unreachable dead-code guard, removed rather than tested (see stage 1 notes below). Stage 2's check found
-three real, genuine gaps, each closed with a new test rather than dismissed:
+106 deliberate breaks total across all four stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
+`src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`, `src/sharing.ts`), each
+applied alone with the suite run against it, the file restored byte for byte. 106 of 106 caught. Stage 1's
+check found one unreachable dead-code guard, removed rather than tested (see stage 1 notes below). Stage 2's
+check found three real, genuine gaps, each closed with a new test rather than dismissed:
 
 - **A double-delete race** (`S16`): the re-check after a delete's commit, for whether the entry was already
   removed by a concurrent delete, was never exercised by any existing test -- every prior delete test had
@@ -168,6 +200,10 @@ Stage 3's check found two more genuine gaps:
   explicit `timeoutMs`. Closed with a fake-timers test that confirms a call is still pending just under
   `DEFAULT_BREACH_CHECK_TIMEOUT_MS` and settles once that deadline passes.
 
+Stage 4's check (13 breaks across the new sharing wiring) found no survivors on the first run -- the
+dedicated round-trip tests (both vaults' crypto, and the end-to-end share/redeem path) already happened to
+cover every one of them.
+
 | Area | Breaks |
 |---|---|
 | createVault / requireVault / requireSession | V1 duplicate-vault check removed, S1 unknown-owner check removed, S2 unknown-session check removed, S3 session-generation mismatch never detected, S4 lock() on an already-closed session never throws, S5 isSessionActive() ignores generation |
@@ -186,6 +222,8 @@ Stage 3's check found two more genuine gaps:
 | breach.ts | BR1 the wrong hash algorithm, BR2 a 6-character prefix sent instead of 5, BR3 the breached/clean comparison inverted, BR4 the already-aborted-signal check removed |
 | circuit-breaker.ts | CB1 the opening condition removed, CB2 a success never resets the failure counter, CB3 the cooldown-elapsed comparison inverted, CB4 `fn()` still gets called while open, CB5 `openedAt` never actually recorded (circuit never reaches half-open) |
 | breach-checker.ts | BK1 the catch-and-degrade-to-null removed, BK2 the default provider never falls back, BK3 the default breaker never falls back, BK4 the default timeout never falls back |
+| manager.ts sharing wiring | SH1 the idempotency check removed (re-generates a keypair every call), SH2/SH3 the new public/private key is never actually applied after a successful commit, SH4 the NO_SHARING_KEY check removed, SH5 shareEntry seals an empty body instead of the real one, SH6 redeemShare swaps username and password, SH7 the private key is never re-wrapped during a rotation, SH8 the re-wrapped key is never actually applied, SH9/SH10 the sharing-key fields are dropped from the persisted snapshot / `exportVault` |
+| sharing.ts | SG2 the one-time AES key is the wrong length for AES-256, SG3 an invalid recipient key is never translated into `INVALID_REQUEST`, SG4 a failed unwrap is never translated into `DECRYPTION_FAILED` |
 
 ### Stage 1 notes (kept for history)
 
@@ -194,12 +232,17 @@ the generator was unreachable dead code, since there are at most 4 character cla
 `MIN_GENERATED_LENGTH` is already 4 -- `length` can never be smaller than the number of enabled classes. The
 guard was removed rather than writing a test for a path that cannot occur.
 
-## Known and NOT handled (stage 3)
+## Known and NOT handled (stage 4)
 
 - **Everything is in memory, one process.** The `VaultStore` abstraction exists so a real disk/network
   backend could be dropped in, but no such backend is implemented here; nothing survives a restart.
-- **No ownership or multi-user sharing of a vault.** One vault per ownerId; there is no way to give another
-  user access to it, and no cross-device conflict resolution beyond the per-entry version check.
+- **No ownership or multi-user sharing of a VAULT itself.** One vault per ownerId; sharing is per-entry, via
+  an explicit token, not "give someone access to my whole vault."
+- **No directory service for exchanging public keys.** Callers are responsible for getting the recipient's
+  public key to the sender out of band; this project does not model how that handoff happens.
+- **No revocation.** Once a share token is redeemed, the recipient's copy is theirs -- there is no way to
+  revoke it or make it expire. The two copies are independent from that point on; the sender can still update
+  or delete their own entry without affecting the recipient's copy, and vice versa.
 - **`lock()`'s "discard the key" is best-effort.** JavaScript has no way to reliably zero out a `Buffer`'s
   backing memory or guarantee it is not still sitting in some other retained reference.
 - **No automatic retry on `VAULT_BUSY`/`ENTRY_CONFLICT`.** The caller is told someone else got there first and

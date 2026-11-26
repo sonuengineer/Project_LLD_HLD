@@ -18,6 +18,7 @@ import { Clock, systemClock } from "./clock.js";
 import { InMemoryVaultStore, type PersistedVault, type VaultStore } from "./store.js";
 import { withTimeout } from "./timeout.js";
 import { BreachChecker, type BreachCheckerOptions } from "./breach-checker.js";
+import { generateSharingKeyPair, openAsRecipient, sealForRecipient, type ShareToken } from "./sharing.js";
 import type { DecryptedEntryBody, EntryDetail, EntryInput, EntrySummary, UnlockResult, VaultExport, VaultSummary } from "./types.js";
 
 export const MIN_MASTER_PASSWORD_LENGTH = 8;
@@ -54,6 +55,8 @@ interface VaultRecord {
   generation: number; // bumped on every successful changeMasterPassword; invalidates other sessions
   rotating: boolean; // true while a changeMasterPassword commit is in flight -- excludes entry ops
   pendingEntryOps: number; // count of in-flight add/update/delete commits -- excludes rotation
+  sharingPublicKey: string | null; // PEM; not secret; lazily generated on first use
+  wrappedPrivateKey: EncryptedBlob | null; // the matching private key, encrypted under this vault's own key
 }
 
 interface Session {
@@ -132,6 +135,8 @@ export class PasswordManager {
       generation: 0,
       rotating: false,
       pendingEntryOps: 0,
+      sharingPublicKey: null,
+      wrappedPrivateKey: null,
     };
     this.vaults.set(ownerId, record);
     return this.toSummary(record);
@@ -196,7 +201,13 @@ export class PasswordManager {
         lastUsedAt: null,
         version: 1,
       };
-      await this.commit(record, [...record.entries.values(), stored]);
+      await this.commit(record, {
+        salt: record.salt,
+        canary: record.canary,
+        entries: [...record.entries.values(), stored],
+        sharingPublicKey: record.sharingPublicKey,
+        wrappedPrivateKey: record.wrappedPrivateKey,
+      });
       record.entries.set(stored.id, stored); // only applied after the store confirms it
       return this.toSummaryEntry(stored, body);
     } finally {
@@ -242,7 +253,13 @@ export class PasswordManager {
       const newBlob = encrypt(session.key, Buffer.from(JSON.stringify(merged), "utf8"));
       const updated: StoredEntry = { ...stored, blob: newBlob, updatedAt: this.clock.now(), version: expectedVersion + 1 };
 
-      await this.commit(record, [...record.entries.values()].map((e) => (e.id === entryId ? updated : e)));
+      await this.commit(record, {
+        salt: record.salt,
+        canary: record.canary,
+        entries: [...record.entries.values()].map((e) => (e.id === entryId ? updated : e)),
+        sharingPublicKey: record.sharingPublicKey,
+        wrappedPrivateKey: record.wrappedPrivateKey,
+      });
 
       // Re-check AFTER the await: another update or delete may have landed on this same entry while this one
       // was in flight. If so, this one lost the race -- its (already-persisted) write is discarded, not
@@ -266,7 +283,13 @@ export class PasswordManager {
     this.claimEntryOp(record);
     try {
       this.requireEntry(record, entryId);
-      await this.commit(record, [...record.entries.values()].filter((e) => e.id !== entryId));
+      await this.commit(record, {
+        salt: record.salt,
+        canary: record.canary,
+        entries: [...record.entries.values()].filter((e) => e.id !== entryId),
+        sharingPublicKey: record.sharingPublicKey,
+        wrappedPrivateKey: record.wrappedPrivateKey,
+      });
       if (!record.entries.has(entryId)) {
         throw new PasswordManagerError("UNKNOWN_ENTRY", `no entry ${entryId} in vault for ${record.ownerId}`);
       }
@@ -274,6 +297,65 @@ export class PasswordManager {
     } finally {
       record.pendingEntryOps--;
     }
+  }
+
+  // Lazily generates (on first use) and returns this vault's sharing public key -- safe to hand to anyone,
+  // out of band; this project does not model a directory service. The matching private key is stored only
+  // encrypted under this vault's own key, same as any entry's secret content.
+  async getSharingPublicKey(sessionId: string): Promise<string> {
+    const session = this.requireSession(sessionId);
+    const record = this.requireVault(session.ownerId);
+    if (record.sharingPublicKey) return record.sharingPublicKey;
+
+    this.claimEntryOp(record); // mutates vault state via a commit, so it excludes (and is excluded by) a rotation
+    try {
+      const { publicKey, privateKey } = generateSharingKeyPair();
+      const wrappedPrivateKey = encrypt(session.key, Buffer.from(privateKey, "utf8"));
+      await this.commit(record, {
+        salt: record.salt,
+        canary: record.canary,
+        entries: [...record.entries.values()],
+        sharingPublicKey: publicKey,
+        wrappedPrivateKey,
+      });
+      record.sharingPublicKey = publicKey;
+      record.wrappedPrivateKey = wrappedPrivateKey;
+      return publicKey;
+    } finally {
+      record.pendingEntryOps--;
+    }
+  }
+
+  // A pure, synchronous read: decrypts the entry with THIS vault's key, then re-encrypts it under a fresh
+  // one-time key wrapped for the recipient (hybrid/envelope encryption -- see src/sharing.ts). Nothing about
+  // this vault changes, so there is no commit and no claim.
+  shareEntry(sessionId: string, entryId: string, recipientPublicKey: string): ShareToken {
+    const session = this.requireSession(sessionId);
+    const record = this.requireVault(session.ownerId);
+    const stored = this.requireEntry(record, entryId);
+    requireString(recipientPublicKey, "recipientPublicKey", 10_000);
+    const body = this.decryptBody(session.key, stored.blob);
+    return sealForRecipient(recipientPublicKey, Buffer.from(JSON.stringify(body), "utf8"));
+  }
+
+  // Unwraps a token with THIS vault's own private key, then adds the result as a brand-new entry through
+  // the ordinary addEntry() path -- so it gets the exact same claim/commit exclusion and the exact same
+  // breach check (against this vault's own breach-check configuration, not the sender's) as any other add.
+  async redeemShare(sessionId: string, token: ShareToken): Promise<EntrySummary> {
+    const session = this.requireSession(sessionId);
+    const record = this.requireVault(session.ownerId);
+    if (!record.wrappedPrivateKey) {
+      throw new PasswordManagerError("NO_SHARING_KEY", "call getSharingPublicKey first to generate a keypair for this vault");
+    }
+    const privateKeyPem = decrypt(session.key, record.wrappedPrivateKey).toString("utf8");
+    const plaintext = openAsRecipient(privateKeyPem, token);
+    const sharedBody = JSON.parse(plaintext.toString("utf8")) as DecryptedEntryBody;
+    return this.addEntry(sessionId, {
+      title: sharedBody.title,
+      username: sharedBody.username,
+      password: sharedBody.password,
+      notes: sharedBody.notes,
+    });
   }
 
   // Re-encrypts every entry under a new key, all at once, as one store commit. Nothing about the vault is
@@ -296,12 +378,25 @@ export class PasswordManager {
         const body = this.decryptBody(oldKey, stored.blob);
         reEncrypted.set(stored.id, { ...stored, blob: encrypt(newKey, Buffer.from(JSON.stringify(body), "utf8")) });
       }
+      // The sharing keypair's private key is just another secret encrypted under this vault's key -- it
+      // must be re-wrapped here too, or it would silently become permanently unreadable after this rotation
+      // (still "encrypted," just under a key the vault's canary no longer matches).
+      const rewrappedPrivateKey = record.wrappedPrivateKey
+        ? encrypt(newKey, decrypt(oldKey, record.wrappedPrivateKey))
+        : null;
 
-      await this.commit({ ...record, salt: newSaltBuf, canary: newCanary }, [...reEncrypted.values()]);
+      await this.commit(record, {
+        salt: newSaltBuf,
+        canary: newCanary,
+        entries: [...reEncrypted.values()],
+        sharingPublicKey: record.sharingPublicKey,
+        wrappedPrivateKey: rewrappedPrivateKey,
+      });
 
       record.salt = newSaltBuf;
       record.canary = newCanary;
       record.entries = reEncrypted;
+      record.wrappedPrivateKey = rewrappedPrivateKey;
       record.generation++; // every other session's captured generation is now stale -- SESSION_INVALIDATED
     } finally {
       record.rotating = false;
@@ -324,6 +419,8 @@ export class PasswordManager {
         updatedAt: e.updatedAt,
         lastUsedAt: e.lastUsedAt,
       })),
+      sharingPublicKey: record.sharingPublicKey,
+      wrappedPrivateKey: record.wrappedPrivateKey ? { ...record.wrappedPrivateKey } : null,
     };
   }
 
@@ -335,13 +432,32 @@ export class PasswordManager {
     record.pendingEntryOps++;
   }
 
-  private async commit(record: VaultRecord, entries: StoredEntry[]): Promise<void> {
+  // Every field that can change is passed explicitly -- never read implicitly off `record` -- so a commit
+  // can never accidentally persist a stale salt/canary/key alongside a fresh set of entries, or vice versa.
+  private async commit(
+    record: VaultRecord,
+    fields: {
+      salt: Buffer;
+      canary: EncryptedBlob;
+      entries: StoredEntry[];
+      sharingPublicKey: string | null;
+      wrappedPrivateKey: EncryptedBlob | null;
+    },
+  ): Promise<void> {
     const snapshot: PersistedVault = {
       ownerId: record.ownerId,
       createdAt: record.createdAt,
-      salt: record.salt.toString("base64"),
-      canary: record.canary,
-      entries: entries.map((e) => ({ id: e.id, blob: e.blob, createdAt: e.createdAt, updatedAt: e.updatedAt, lastUsedAt: e.lastUsedAt })),
+      salt: fields.salt.toString("base64"),
+      canary: fields.canary,
+      entries: fields.entries.map((e) => ({
+        id: e.id,
+        blob: e.blob,
+        createdAt: e.createdAt,
+        updatedAt: e.updatedAt,
+        lastUsedAt: e.lastUsedAt,
+      })),
+      sharingPublicKey: fields.sharingPublicKey,
+      wrappedPrivateKey: fields.wrappedPrivateKey,
     };
     await withTimeout((signal) => this.store.persist(snapshot, signal), this.commitTimeoutMs);
   }

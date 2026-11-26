@@ -51,6 +51,8 @@ export interface VaultExport {
     updatedAt: number;
     lastUsedAt: number | null;
   }>;
+  sharingPublicKey: string | null;
+  wrappedPrivateKey: EncryptedBlob | null;
 }
 
 // Internal entry shape, decrypted into this before being trimmed down to EntrySummary/EntryDetail.

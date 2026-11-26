@@ -17,6 +17,8 @@ export interface PersistedVault {
   salt: string; // base64
   canary: EncryptedBlob;
   entries: PersistedEntry[];
+  sharingPublicKey: string | null; // PEM -- not secret, stored in the clear like the rest of this snapshot
+  wrappedPrivateKey: EncryptedBlob | null;
 }
 
 export interface VaultStore {

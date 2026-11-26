@@ -1,7 +1,8 @@
 # B5 Password Storage System (low-level design): plan
 
 Status (2026-11-26): stage 1 DONE (48 tests, 30 mutation checks, all caught). Stage 2 DONE (63 tests, 46
-mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught).
+mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught). Stage 4 DONE (106
+tests, 13 new mutation checks, all caught).
 
 ## Why this project
 
@@ -105,6 +106,33 @@ ever storing it, and what happens the moment someone starts guessing.
   completely intact -- the only new constraint stage 3 added to that machinery was making sure it still
   holds with one more async step in the mix.
 
+### Stage 4 decisions
+
+- **Shared entries between two INDEPENDENT vaults, via hybrid (envelope) encryption** -- the same pattern TLS
+  and PGP use: RSA-OAEP is slow and can only encrypt a small payload, so it wraps only a fresh one-time AES
+  key; the entry's actual content is encrypted with that AES key through the same AEAD as everywhere else in
+  this project (`src/sharing.ts`). This lets one vault hand a credential to another without either side ever
+  seeing the other's master password, vault key, or private key.
+- **Each vault lazily generates its own RSA keypair, only on first use.** A 2048-bit keypair takes roughly
+  200ms to generate synchronously -- fine once per vault that ever shares something, wasteful to pay on
+  every `createVault` for vaults that never do. `getSharingPublicKey` is the one entry point: it returns the
+  existing public key if there is one, or generates, persists, and returns a new one.
+- **The private key is stored only encrypted under the vault's own key, exactly like any entry's secret
+  content** -- never in the clear, even inside the vault's own storage. `changeMasterPassword` must re-wrap
+  it on every rotation, the same way it re-encrypts every entry; missing this would silently and permanently
+  brick sharing after the very first password change (the key would still be "encrypted," just under a key
+  the vault's canary no longer matches -- the identical class of bug stage 2 fixed for entries, now
+  reappearing for this new piece of state).
+- **A share token is a self-contained, portable artifact -- not a live call between two vaults.** `shareEntry`
+  is a pure, synchronous read (decrypt with the sender's key, re-encrypt for the recipient); it needs no
+  commit and no claim, because nothing about the sender's vault changes. `redeemShare` unwraps the token with
+  the recipient's own private key and then calls the recipient's OWN `addEntry` -- so the shared credential
+  automatically gets the exact same claim/commit exclusion (stage 2) and the exact same breach check, against
+  the RECIPIENT's own configuration, not the sender's (stage 3), with no duplicated logic anywhere.
+- **`getSharingPublicKey` goes through the same `claimEntryOp`/commit machinery as `addEntry`,** because it
+  mutates persisted vault state (the new keypair) the same way adding an entry does -- it must be excluded by
+  (and exclude) an in-flight rotation for exactly the reason stage 2 established.
+
 ## Stages
 
 | Stage | What | Status |
@@ -112,11 +140,13 @@ ever storing it, and what happens the moment someone starts guessing.
 | 1 | Vault lifecycle (create/unlock/lock), lockout after repeated wrong attempts, encrypted entry CRUD, atomic master-password change, encrypted export, a secure password generator; randomized invariant test; mutation checks | DONE 2026-11-26 |
 | 2 | Multiple devices/sessions per vault, saving an entry as a real async store call, the add-vs-rotation and update-vs-update/delete races reproduced and fixed, session invalidation on password change, store timeout + AbortSignal; mutation checks | DONE 2026-11-26 |
 | 3 | Breach-check integration via k-anonymity, a circuit breaker + timeout so a flaky breach-check service can never block a save; mutation checks | DONE 2026-11-26 |
-| 4 | Not decided yet; proposed once stage 3's follow-ups are picked (candidates: shared/team entries, session auto-lock on a timer, an HTTP API layer) | not started |
+| 4 | Shared entries between two independent vaults via hybrid/envelope encryption (RSA-OAEP + AES-256-GCM), a lazily-generated per-vault keypair whose private key is re-wrapped on every master-password rotation; mutation checks | DONE 2026-11-26 |
+| 5 | Not decided yet; proposed once stage 4's follow-ups are picked (candidates: session auto-lock on a timer, an HTTP API layer, revoking a share) | not started |
 
 ## Not in scope
 
 A real transport or storage backend (the `VaultStore` here is in memory), a real breach-check network call
-(`FakeBreachProvider` is a fixed in-memory dataset), a UI, browser extension autofill, 2FA on unlock, sharing
-an entry between users, password-strength scoring beyond the generator's own charset rules, import from
-another password manager's export format, actually persisting across a restart.
+(`FakeBreachProvider` is a fixed in-memory dataset), a UI, browser extension autofill, 2FA on unlock, revoking
+or expiring an already-redeemed share, a directory service for exchanging public keys (callers exchange them
+out of band), password-strength scoring beyond the generator's own charset rules, import from another
+password manager's export format, actually persisting across a restart.

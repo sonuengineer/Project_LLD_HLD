@@ -12,6 +12,7 @@ export {
   type CircuitState,
 } from "./circuit-breaker.js";
 export { BreachChecker, DEFAULT_BREACH_CHECK_TIMEOUT_MS, type BreachCheckerOptions } from "./breach-checker.js";
+export { generateSharingKeyPair, openAsRecipient, sealForRecipient, type ShareToken, type SharingKeyPair } from "./sharing.js";
 export {
   DEFAULT_GENERATED_LENGTH,
   MAX_GENERATED_LENGTH,
