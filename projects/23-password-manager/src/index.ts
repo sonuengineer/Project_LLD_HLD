@@ -1,6 +1,8 @@
 export { ManualClock, systemClock, type Clock } from "./clock.js";
 export { PasswordManagerError, type PasswordManagerErrorCode } from "./errors.js";
 export { decrypt, deriveKey, encrypt, newSalt, KEY_LENGTH, SALT_LENGTH, type EncryptedBlob } from "./crypto.js";
+export { InMemoryVaultStore, type PersistedEntry, type PersistedVault, type VaultStore } from "./store.js";
+export { withTimeout } from "./timeout.js";
 export {
   DEFAULT_GENERATED_LENGTH,
   MAX_GENERATED_LENGTH,
@@ -9,6 +11,7 @@ export {
   type GeneratePasswordOptions,
 } from "./generator.js";
 export {
+  DEFAULT_COMMIT_TIMEOUT_MS,
   LOCKOUT_MS,
   MAX_FAILED_ATTEMPTS,
   MAX_MASTER_PASSWORD_LENGTH,

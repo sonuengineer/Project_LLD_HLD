@@ -2,12 +2,12 @@ import { describe, expect, it } from "vitest";
 import { setup } from "./helpers.js";
 
 describe("exportVault", () => {
-  it("works without unlocking, and contains only ciphertext -- never the plaintext password, title or username", () => {
+  it("works without any active session, and contains only ciphertext -- never the plaintext password, title or username", async () => {
     const { manager } = setup();
     manager.createVault("alice", "correct-horse-battery");
-    manager.unlock("alice", "correct-horse-battery");
-    manager.addEntry("alice", { title: "super-secret-site", username: "alice@example.com", password: "p@ssw0rd-plaintext", notes: "n" });
-    manager.lock("alice");
+    const { sessionId } = manager.unlock("alice", "correct-horse-battery");
+    await manager.addEntry(sessionId, { title: "super-secret-site", username: "alice@example.com", password: "p@ssw0rd-plaintext", notes: "n" });
+    manager.lock(sessionId);
 
     const dump = JSON.stringify(manager.exportVault("alice"));
     expect(dump).not.toContain("p@ssw0rd-plaintext");
@@ -16,11 +16,11 @@ describe("exportVault", () => {
     expect(dump).not.toContain("correct-horse-battery");
   });
 
-  it("includes exactly the entries that exist, as base64 ciphertext with an id and timestamps", () => {
+  it("includes exactly the entries that exist, as base64 ciphertext with an id and timestamps", async () => {
     const { manager } = setup();
     manager.createVault("alice", "correct-horse-battery");
-    manager.unlock("alice", "correct-horse-battery");
-    const summary = manager.addEntry("alice", { title: "t", username: "u", password: "p" });
+    const { sessionId } = manager.unlock("alice", "correct-horse-battery");
+    const summary = await manager.addEntry(sessionId, { title: "t", username: "u", password: "p" });
 
     const dump = manager.exportVault("alice");
     expect(dump.entries).toHaveLength(1);

@@ -3,8 +3,12 @@ import type { EncryptedBlob } from "./crypto.js";
 export interface VaultSummary {
   ownerId: string;
   createdAt: number;
-  unlocked: boolean;
+  activeSessions: number; // how many devices currently hold a valid, unlocked session
   entryCount: number;
+}
+
+export interface UnlockResult extends VaultSummary {
+  sessionId: string;
 }
 
 export interface EntryInput {

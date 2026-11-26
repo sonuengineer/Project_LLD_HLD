@@ -8,9 +8,13 @@ export type PasswordManagerErrorCode =
   | "VAULT_ALREADY_EXISTS"
   | "INVALID_MASTER_PASSWORD"
   | "LOCKED_OUT" // too many wrong attempts; cooldown has not elapsed yet
-  | "VAULT_LOCKED" // the vault exists and the password was never wrong, but it is not unlocked right now
   | "UNKNOWN_ENTRY"
-  | "DECRYPTION_FAILED"; // ciphertext failed AEAD authentication: wrong key or tampered data
+  | "DECRYPTION_FAILED" // ciphertext failed AEAD authentication: wrong key or tampered data
+  | "UNKNOWN_SESSION" // this sessionId was never issued, or was lock()ed
+  | "SESSION_INVALIDATED" // the master password changed since this session unlocked; unlock again
+  | "VAULT_BUSY" // an entry operation and a master-password rotation are claiming the same vault right now
+  | "ENTRY_CONFLICT" // another operation changed this entry first; this one's work was discarded
+  | "STORE_TIMEOUT"; // the vault store did not respond in time
 
 export class PasswordManagerError extends Error {
   constructor(
