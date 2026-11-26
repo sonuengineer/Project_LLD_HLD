@@ -1,4 +1,4 @@
-import { BreachChecker, FakeBreachProvider, PasswordManager, generatePassword } from "./index.js";
+import { BreachChecker, FakeBreachProvider, ManualClock, PasswordManager, generatePassword } from "./index.js";
 
 const manager = new PasswordManager();
 
@@ -82,4 +82,19 @@ try {
   await manager.redeemShare(dave.sessionId, secondToken);
 } catch (err) {
   console.log(`redeeming a revoked share: ${(err as Error).message}`);
+}
+
+console.log("\n-- sessions auto-lock after a period of inactivity --");
+const idleClock = new ManualClock(Date.now());
+const idleManager = new PasswordManager({ clock: idleClock, sessionIdleTimeoutMs: 5 * 60 * 1000 }); // 5 minutes, for this demo
+idleManager.createVault("erin", "erins-master-password-123");
+const erin = idleManager.unlock("erin", "erins-master-password-123");
+console.log("erin's session active right after unlocking?", idleManager.isSessionActive(erin.sessionId));
+
+idleClock.advance(5 * 60 * 1000 + 1); // 5 minutes and 1ms of inactivity pass
+console.log("erin's session active after 5+ idle minutes?", idleManager.isSessionActive(erin.sessionId));
+try {
+  idleManager.listEntries(erin.sessionId);
+} catch (err) {
+  console.log(`using the idle session: ${(err as Error).message}`);
 }

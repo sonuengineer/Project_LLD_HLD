@@ -18,7 +18,8 @@ export type PasswordManagerErrorCode =
   | "NO_SHARING_KEY" // redeemShare called before this vault ever generated a sharing keypair
   | "UNKNOWN_SHARE" // this shareId was never issued, or the caller is not the vault that issued it
   | "SHARE_REVOKED" // the issuer revoked this share before it was redeemed
-  | "SHARE_ALREADY_REDEEMED"; // this share was already redeemed once; shares are single-use
+  | "SHARE_ALREADY_REDEEMED" // this share was already redeemed once; shares are single-use
+  | "SESSION_IDLE_TIMEOUT"; // this session was not used for longer than the idle timeout; unlock again
 
 export class PasswordManagerError extends Error {
   constructor(

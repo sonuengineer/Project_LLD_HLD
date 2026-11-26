@@ -3,6 +3,7 @@
 Status (2026-11-26): stage 1 DONE (48 tests, 30 mutation checks, all caught). Stage 2 DONE (63 tests, 46
 mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught). Stage 4 DONE (106
 tests, 13 new mutation checks, all caught). Stage 5 DONE (113 tests, 8 new mutation checks, all caught).
+Stage 6 DONE (122 tests, 7 new mutation checks, all caught).
 
 ## Why this project
 
@@ -153,6 +154,21 @@ ever storing it, and what happens the moment someone starts guessing.
   don't-leak-existence instinct used elsewhere (a wrong password and an unknown account should look the same
   to an attacker). Revoking an already-revoked or already-redeemed share is a harmless no-op, not an error.
 
+### Stage 6 decisions
+
+- **Sessions auto-lock after a period of inactivity, via LAZY expiry -- never a background timer.** The same
+  idiom this project already uses for the lockout cooldown and `SESSION_INVALIDATED`: checked on next use,
+  not on a schedule. `requireSession` is the single choke point every session-based call already goes
+  through, so it is the one place that both checks the idle deadline and, on success, resets it -- no other
+  call site needs to remember to do either.
+  `isSessionActive` is a pure read -- it reports the timeout accurately but never itself resets the idle
+  clock, because a status check that could un-expire a session by being polled would defeat the whole point
+  of the feature.
+- **Each session has its own independent idle clock**, stored on the `Session` record itself
+  (`lastActivityAt`), not on the vault. Two devices sharing one vault (stage 2) can have wildly different
+  activity patterns -- one idling out while the other stays in active use -- and neither should affect the
+  other's timer.
+
 ## Stages
 
 | Stage | What | Status |
@@ -162,7 +178,8 @@ ever storing it, and what happens the moment someone starts guessing.
 | 3 | Breach-check integration via k-anonymity, a circuit breaker + timeout so a flaky breach-check service can never block a save; mutation checks | DONE 2026-11-26 |
 | 4 | Shared entries between two independent vaults via hybrid/envelope encryption (RSA-OAEP + AES-256-GCM), a lazily-generated per-vault keypair whose private key is re-wrapped on every master-password rotation; mutation checks | DONE 2026-11-26 |
 | 5 | Share revocation and single-use redemption: a manager-wide grant registry, claim-before-await for single-use (same shape as `claimEntryOp`), don't-leak-existence authorization on revoke; mutation checks | DONE 2026-11-26 |
-| 6 | Not decided yet; proposed once stage 5's follow-ups are picked (candidates: session auto-lock on a timer, an HTTP API layer) | not started |
+| 6 | Session auto-lock on an idle timeout, via lazy expiry at `requireSession` (never a background timer), independent per-session idle clocks; mutation checks | DONE 2026-11-26 |
+| 7 | Not decided yet; proposed once stage 6's follow-ups are picked (candidates: an HTTP API layer, finishing toward an interview bank + portfolio entry) | not started |
 
 ## Not in scope
 
@@ -171,4 +188,5 @@ A real transport or storage backend (the `VaultStore` here is in memory), a real
 a share after a time limit (only explicit revocation or single-use redemption end it), a directory service
 for exchanging public keys (callers exchange them out of band), password-strength scoring beyond the
 generator's own charset rules, import from another password manager's export format, actually persisting
-across a restart.
+across a restart, a background sweep that proactively evicts idle sessions (idle sessions are only ever
+noticed lazily, on their next use).

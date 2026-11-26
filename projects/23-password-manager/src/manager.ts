@@ -41,6 +41,7 @@ export const MAX_NOTES_LENGTH = 4096;
 export const MAX_FAILED_ATTEMPTS = 5;
 export const LOCKOUT_MS = 30_000;
 export const DEFAULT_COMMIT_TIMEOUT_MS = 5_000;
+export const DEFAULT_SESSION_IDLE_TIMEOUT_MS = 15 * 60 * 1000;
 
 const CANARY_PLAINTEXT = Buffer.from("password-manager-canary-v1", "utf8");
 
@@ -74,6 +75,7 @@ interface Session {
   ownerId: string;
   key: Buffer;
   generation: number; // the vault's generation at the moment this session unlocked
+  lastActivityAt: number; // bumped by requireSession() on every successful use; drives idle auto-lock
 }
 
 // Tracking for an issued share -- manager-level bookkeeping, like Session, not vault content: it never goes
@@ -91,6 +93,7 @@ export interface PasswordManagerOptions {
   commitTimeoutMs?: number;
   breachChecker?: BreachChecker;
   breachCheckerOptions?: BreachCheckerOptions;
+  sessionIdleTimeoutMs?: number;
 }
 
 function requireString(value: unknown, field: string, max: number, allowEmpty = false): string {
@@ -118,6 +121,7 @@ export class PasswordManager {
   private readonly store: VaultStore;
   private readonly commitTimeoutMs: number;
   private readonly breachChecker: BreachChecker;
+  private readonly sessionIdleTimeoutMs: number;
   private nextSessionSeq = 1;
 
   constructor(options: PasswordManagerOptions = {}) {
@@ -125,6 +129,7 @@ export class PasswordManager {
     this.store = options.store ?? new InMemoryVaultStore();
     this.commitTimeoutMs = options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS;
     this.breachChecker = options.breachChecker ?? new BreachChecker(options.breachCheckerOptions);
+    this.sessionIdleTimeoutMs = options.sessionIdleTimeoutMs ?? DEFAULT_SESSION_IDLE_TIMEOUT_MS;
   }
 
   // A standalone utility, like generatePassword(): no vault or session needed. Never throws -- see
@@ -168,7 +173,7 @@ export class PasswordManager {
     const record = this.requireVault(ownerId);
     const key = this.verifyMasterPassword(record, masterPassword);
     const sessionId = `sess${this.nextSessionSeq++}`;
-    this.sessions.set(sessionId, { sessionId, ownerId, key, generation: record.generation });
+    this.sessions.set(sessionId, { sessionId, ownerId, key, generation: record.generation, lastActivityAt: this.clock.now() });
     return { sessionId, ...this.toSummary(record) };
   }
 
@@ -178,13 +183,14 @@ export class PasswordManager {
     }
   }
 
-  // Alive AND still current -- a session whose vault has since changed its master password is not active,
-  // even though lock() was never called on it.
+  // Alive, still current, AND not idle -- a pure read: unlike requireSession(), this never bumps
+  // lastActivityAt, because a status check must not be able to un-expire a session by itself.
   isSessionActive(sessionId: string): boolean {
     const session = this.sessions.get(sessionId);
     if (!session) return false;
     const record = this.vaults.get(session.ownerId);
-    return !!record && record.generation === session.generation;
+    if (!record || record.generation !== session.generation) return false;
+    return this.clock.now() - session.lastActivityAt <= this.sessionIdleTimeoutMs;
   }
 
   getVault(ownerId: string): VaultSummary {
@@ -552,6 +558,9 @@ export class PasswordManager {
     return record;
   }
 
+  // The single choke point every session-based call goes through -- which is also why idle auto-lock lives
+  // here and nowhere else: this is the one place that can both check it and, on success, reset it, with no
+  // other call site needing to remember to do either.
   private requireSession(sessionId: string): Session {
     const session = this.sessions.get(sessionId);
     if (!session) throw new PasswordManagerError("UNKNOWN_SESSION", `no active session ${sessionId}`);
@@ -560,6 +569,11 @@ export class PasswordManager {
       this.sessions.delete(sessionId); // lazy cleanup: this session can never become valid again
       throw new PasswordManagerError("SESSION_INVALIDATED", "the master password changed since this session unlocked; unlock again");
     }
+    if (this.clock.now() - session.lastActivityAt > this.sessionIdleTimeoutMs) {
+      this.sessions.delete(sessionId); // lazy cleanup, same as SESSION_INVALIDATED above -- no background sweep
+      throw new PasswordManagerError("SESSION_IDLE_TIMEOUT", `session ${sessionId} was idle for longer than ${this.sessionIdleTimeoutMs}ms`);
+    }
+    session.lastActivityAt = this.clock.now(); // using the session is what keeps it alive
     return session;
   }
 
