@@ -1,25 +1,31 @@
 # B5 Password Storage System (low-level design)
 
-A TypeScript library (no runtime dependencies, in memory) for a password manager's vault: a master password
-unlocks storage for a user's OTHER credentials, encrypted at rest with AES-256-GCM. There is no UI -- saving
-an entry goes through a `VaultStore`, which stage 2 makes a real async call (modeling a disk/network write),
-but the only implementation here is in memory. Stage 3 adds breach checking against a fake (but
-protocol-real) k-anonymity provider, guarded by a timeout and circuit breaker so that service can never block
-a save. Stage 4 adds sharing a single entry between two INDEPENDENT vaults, via hybrid/envelope encryption
-(RSA-OAEP + AES-256-GCM) -- neither vault ever sees the other's master password or vault key. Stage 5 makes
-a share revocable by its issuer and single-use, so it cannot be redeemed twice. Stage 6 makes a session
-auto-lock after a period of inactivity.
+A TypeScript library (in memory) for a password manager's vault: a master password unlocks storage for a
+user's OTHER credentials, encrypted at rest with AES-256-GCM. The library itself (`src/manager.ts` and
+everything it imports) has zero runtime dependencies; the optional HTTP layer added in stage 7 is the one
+place this project depends on anything external (Express). There is no UI -- saving an entry goes through a
+`VaultStore`, which stage 2 makes a real async call (modeling a disk/network write), but the only
+implementation here is in memory. Stage 3 adds breach checking against a fake (but protocol-real)
+k-anonymity provider, guarded by a timeout and circuit breaker so that service can never block a save. Stage
+4 adds sharing a single entry between two INDEPENDENT vaults, via hybrid/envelope encryption (RSA-OAEP +
+AES-256-GCM) -- neither vault ever sees the other's master password or vault key. Stage 5 makes a share
+revocable by its issuer and single-use, so it cannot be redeemed twice. Stage 6 makes a session auto-lock
+after a period of inactivity. Stage 7 adds an HTTP API in front of the whole library.
 
 Status (2026-11-26): stage 1 DONE -- 48 tests, 30 mutation checks, all caught. Stage 2 DONE -- 63 tests, 46
 mutation checks, all caught. Stage 3 DONE -- 90 tests, 17 new mutation checks, all caught. Stage 4 DONE --
 106 tests, 13 new mutation checks, all caught. Stage 5 DONE -- 113 tests, 8 new mutation checks, all caught.
-Stage 6 DONE -- 122 tests, 7 new mutation checks, all caught (see "Mutation checks"). Details in
-[PLAN.md](PLAN.md).
+Stage 6 DONE -- 122 tests, 7 new mutation checks, all caught. Stage 7 DONE -- 140 tests, 7 new mutation
+checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
+
+Seven substantial, distinct stages are now done -- the natural next step for this project is an interview
+question bank and a portfolio entry, not an eighth feature stage.
 
 ```
 npm ci
-npm test        # 122 tests
+npm test        # 140 tests
 npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking, sharing an entry between two vaults, revoking a share, idle auto-lock
+npm start       # the HTTP API on http://127.0.0.1:3000 (needs PASSWORD_MANAGER_API_KEY in the environment)
 ```
 
 ## Usage
@@ -70,6 +76,26 @@ const idleManager = new PasswordManager({ sessionIdleTimeoutMs: 5 * 60 * 1000 })
 // ... after 5+ minutes of no activity on a session ...
 idleManager.isSessionActive(someSessionId); // false
 idleManager.listEntries(someSessionId); // throws SESSION_IDLE_TIMEOUT
+```
+
+### Over HTTP
+
+```
+POST /vaults                                      { ownerId, masterPassword }   -> 201 VaultSummary
+POST /vaults/:ownerId/unlock                       { masterPassword }           -> 200 UnlockResult
+POST /sessions/:sessionId/entries                  EntryInput                   -> 201 EntrySummary
+GET  /sessions/:sessionId/entries/:entryId                                      -> 200 EntryDetail
+POST /sessions/:sessionId/entries/:entryId/share   { recipientPublicKey }       -> 201 SharedEntryToken
+POST /sessions/:sessionId/shares/redeem            SharedEntryToken             -> 201 EntrySummary
+```
+
+Every route (full list in `src/http/app.ts`) needs `Authorization: Bearer <PASSWORD_MANAGER_API_KEY>`; every
+error comes back as `{ "error": { "code", "message" } }` with the status from the table in "The rules" below.
+
+```bash
+PASSWORD_MANAGER_API_KEY=a-long-random-string npm start
+curl -X POST localhost:3000/vaults -H "Authorization: Bearer a-long-random-string" \
+  -H "Content-Type: application/json" -d '{"ownerId":"alice","masterPassword":"correct-horse-battery"}'
 ```
 
 ## The rules
@@ -146,6 +172,22 @@ idleManager.listEntries(someSessionId); // throws SESSION_IDLE_TIMEOUT
   is a pure read and never resets the clock itself, since a status check that could keep a session alive by
   being polled would defeat the whole point. Each session has its own independent idle clock, so one idle
   device does not affect another device's active session on the same vault.
+- **The HTTP API authenticates SERVICES, not end users, with one bearer API key** -- the same scope
+  `21-notification`'s API has. Every `PasswordManagerErrorCode` maps to a specific HTTP status (table
+  below); none of them maps to `500` -- every one is an expected, documented outcome, and `500` is reserved
+  for a genuine bug (logged server-side, never echoed to the caller).
+
+| Code | Status | | Code | Status |
+|---|---|---|---|---|
+| `INVALID_REQUEST` | 400 | | `VAULT_BUSY` | 409 |
+| `UNKNOWN_OWNER` | 404 | | `ENTRY_CONFLICT` | 409 |
+| `VAULT_ALREADY_EXISTS` | 409 | | `STORE_TIMEOUT` | 503 |
+| `INVALID_MASTER_PASSWORD` | 401 | | `NO_SHARING_KEY` | 409 |
+| `LOCKED_OUT` | 423 | | `UNKNOWN_SHARE` | 404 |
+| `UNKNOWN_ENTRY` | 404 | | `SHARE_REVOKED` | 410 |
+| `DECRYPTION_FAILED` | 400 | | `SHARE_ALREADY_REDEEMED` | 409 |
+| `UNKNOWN_SESSION` | 401 | | `SESSION_IDLE_TIMEOUT` | 401 |
+| `SESSION_INVALIDATED` | 401 | | | |
 
 ## Design choices
 
@@ -184,6 +226,14 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
   other time-based check in this project (the lockout cooldown, `SESSION_INVALIDATED`); a background job
   that proactively walks every session would be more code for a guarantee nothing here actually needs
   (nobody is harmed by an idle session sitting unnoticed until its next use attempt).
+- Express 4, matched exactly to `21-notification`'s pinned version, over Express 5 or a different framework
+  -- consistency across this repo's HTTP layers matters more than any one project picking its own stack, and
+  it is also WHY `asyncRoute()` exists here at all: Express 5 routes a rejected promise to the error handler
+  automatically, Express 4 does not.
+- No field-level validation duplicated between the HTTP layer and the library -- a body field is read and
+  handed straight to the matching `PasswordManager` method, which already validates its own inputs. The one
+  deliberate exception is `POST .../shares/redeem`'s body shape, which the library has no equivalent check
+  for (it only ever receives a token already structurally valid, from `shareEntry`'s own return value).
 
 ## Tests
 
@@ -205,16 +255,17 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 | test/sharing-integration.test.ts | 9 | `getSharingPublicKey` lazily generates once and is idempotent on repeat calls, excluded by an in-progress rotation, a full share/redeem round trip between two independent vaults (including deleting the recipient's copy not touching the sender's), the token never contains the plaintext in the clear, breach status is re-checked against the RECIPIENT's own config, `NO_SHARING_KEY` is checked before the one-time claim (repeating the attempt proves it was not consumed), a token meant for someone else throws `DECRYPTION_FAILED` and does NOT consume the share (the real recipient can still redeem it afterward), sharing still works after the sender rotates their master password, and the re-wrapped private key (not the old one) is what actually gets persisted |
 | test/share-revocation.test.ts | 7 | a revoked share can no longer be redeemed, an unknown shareId and someone else's shareId both throw `UNKNOWN_SHARE` (and a failed revoke attempt does not revoke it), revoking twice (or revoking an already-redeemed share) is a harmless no-op, a forged shareId throws `UNKNOWN_SHARE`, a share is single-use (`SHARE_ALREADY_REDEEMED` on the second attempt, no duplicate entry), two concurrent redemptions of the same token: exactly one succeeds |
 | test/session-idle-timeout.test.ts | 9 | idle longer than the timeout throws `SESSION_IDLE_TIMEOUT`, right-at-the-boundary usage stays active, using a session repeatedly resets its idle clock indefinitely, `isSessionActive` reports it without a throwing call first, polling `isSessionActive` does NOT itself reset the clock, two sessions on one vault have independent idle clocks, a freshly unlocked session's clock starts at unlock time (not some earlier moment), defaults to `DEFAULT_SESSION_IDLE_TIMEOUT_MS` when none is given, a timed-out session is cleaned up and reports `UNKNOWN_SESSION` (not another timeout) on a second touch |
+| test/http.test.ts | 18 | auth (missing/wrong API key, too-short apiKey rejected at startup), full vault lifecycle over HTTP (create/read/409 on duplicate/404 on unknown/unlock/wrong-password 401/lockout 423/rotate/export with no plaintext leak), full entry CRUD over HTTP, lock + session status, a complete share/redeem/revoke flow between two sessions, a malformed redeem body is 400 not a crash, breach-check, idle timeout reported and enforced over HTTP, an unknown route (404), wrong Content-Type (415), malformed JSON (400), an oversized body (413), an unexpected library-independent error maps to 500 and is logged rather than leaked to the caller |
 
 ## Mutation checks
 
-121 deliberate breaks total across all six stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
-`src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`, `src/sharing.ts`), each
-applied alone with the suite run against it, the file restored byte for byte. 121 of 121 caught (one more
-attempted break, on the revocation wiring, turned out to be malformed rather than a real mutation -- see the
-stage 5 note below -- and was discarded rather than counted). Stage 1's check found one unreachable dead-code
-guard, removed rather than tested (see stage 1 notes below). Stage 2's check found three real, genuine gaps,
-each closed with a new test rather than dismissed:
+128 deliberate breaks total across all seven stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
+`src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`, `src/sharing.ts`,
+`src/http/app.ts`), each applied alone with the suite run against it, the file restored byte for byte. 128 of
+128 caught (one more attempted break, on the revocation wiring, turned out to be malformed rather than a
+real mutation -- see the stage 5 note below -- and was discarded rather than counted). Stage 1's check found
+one unreachable dead-code guard, removed rather than tested (see stage 1 notes below). Stage 2's check found
+three real, genuine gaps, each closed with a new test rather than dismissed:
 
 - **A double-delete race** (`S16`): the re-check after a delete's commit, for whether the entry was already
   removed by a concurrent delete, was never exercised by any existing test -- every prior delete test had
@@ -257,6 +308,8 @@ Stage 6's check (the idle-timeout wiring, 7 breaks) found no survivors on the fi
 boundary tests (exactly-at-the-deadline, repeated activity resetting the clock, polling never resetting it)
 already happened to cover every one of them.
 
+Stage 7's check (`src/http/app.ts`, 7 breaks) also found no survivors on the first run.
+
 | Area | Breaks |
 |---|---|
 | createVault / requireVault / requireSession | V1 duplicate-vault check removed, S1 unknown-owner check removed, S2 unknown-session check removed, S3 session-generation mismatch never detected, S4 lock() on an already-closed session never throws, S5 isSessionActive() ignores generation |
@@ -279,6 +332,7 @@ already happened to cover every one of them.
 | sharing.ts | SG2 the one-time AES key is the wrong length for AES-256, SG3 an invalid recipient key is never translated into `INVALID_REQUEST`, SG4 a failed unwrap is never translated into `DECRYPTION_FAILED` |
 | manager.ts revocation/single-use wiring | RV1 shareEntry never registers the grant, RV2 revokeShare's ownership check removed, RV3 revoking never actually sets revoked, RV4 redeemShare's unknown-share check removed, RV5 the revoked check removed, RV6 the already-redeemed check removed, RV8 the claim is never set (no single-use at all), RV9 a failed redemption never releases its claim |
 | manager.ts idle-timeout wiring | IT1 a new session's idle clock starts at an arbitrary fixed time instead of now, IT2/IT7 `isSessionActive`'s idle check removed or off-by-one, IT3 the idle-expiry check in `requireSession` removed, IT4 using a session never resets its idle clock, IT5 off-by-one on the idle deadline (exact-boundary usage incorrectly rejected), IT6 the default idle timeout never falls back |
+| http/app.ts | H1 the API-key check removed, H2 the key comparison accepts ANY Bearer value, H3 the Content-Type check removed, H4 the redeem-body shape check removed, H5 a status-code mapping entry wrong, H6 the catch-all 404 route returns 200 instead, H7 `asyncRoute`'s `.catch(next)` removed (an async route's error would hang instead of responding) |
 
 ### Stage 1 notes (kept for history)
 
@@ -287,7 +341,7 @@ the generator was unreachable dead code, since there are at most 4 character cla
 `MIN_GENERATED_LENGTH` is already 4 -- `length` can never be smaller than the number of enabled classes. The
 guard was removed rather than writing a test for a path that cannot occur.
 
-## Known and NOT handled (stage 6)
+## Known and NOT handled (stage 7)
 
 - **Everything is in memory, one process.** The `VaultStore` abstraction exists so a real disk/network
   backend could be dropped in, but no such backend is implemented here; nothing survives a restart --
@@ -313,3 +367,9 @@ guard was removed rather than writing a test for a path that cannot occur.
 - **No rate limiting independent of the vault** (a single very persistent attacker making requests for many
   different ownerIds is not covered -- that is a transport/API-layer concern, same note as the other projects
   here that assume a single caller's behavior, not a whole fleet of them).
+- **The HTTP API has no CORS, no per-end-user session/cookie layer, and no rate limiting of its own.** It
+  authenticates services with one API key, the same scope `21-notification`'s API has; a real deployment
+  would put this behind its own backend, not expose it straight to a browser.
+- **No URL-encoding beyond what Express's own router handles** for ids placed in a `Location` header; an id
+  containing characters that need escaping (none of this project's own generated ids ever do) is not
+  specifically tested at the HTTP layer.

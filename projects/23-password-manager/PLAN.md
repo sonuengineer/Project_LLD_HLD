@@ -3,7 +3,8 @@
 Status (2026-11-26): stage 1 DONE (48 tests, 30 mutation checks, all caught). Stage 2 DONE (63 tests, 46
 mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught). Stage 4 DONE (106
 tests, 13 new mutation checks, all caught). Stage 5 DONE (113 tests, 8 new mutation checks, all caught).
-Stage 6 DONE (122 tests, 7 new mutation checks, all caught).
+Stage 6 DONE (122 tests, 7 new mutation checks, all caught). Stage 7 DONE (140 tests, 7 new mutation checks,
+all caught).
 
 ## Why this project
 
@@ -169,6 +170,32 @@ ever storing it, and what happens the moment someone starts guessing.
   activity patterns -- one idling out while the other stays in active use -- and neither should affect the
   other's timer.
 
+### Stage 7 decisions
+
+- **An Express HTTP API in front of `PasswordManager`, matching `21-notification`'s pattern** (same Express
+  version, same constant-time bearer-API-key auth, same `{ error: { code, message } }` shape, same
+  `asyncRoute` wrapper for the methods that are genuinely async). For OTHER SERVICES, not browsers: one API
+  key, no CORS, no per-user login layered on top -- the library's own security model (a sessionId proves
+  which vault a call acts on; a master password proves you know it) already does that job, and the HTTP
+  layer adds only "are you a legitimate caller of this API at all."
+- **Every `PasswordManagerErrorCode` maps to a specific HTTP status**, not a blanket 400 or 500: `404` for
+  "no such resource," `409` for a conflicting operation or state, `410` specifically for a revoked share
+  (it existed, it is just gone now), `423` for a locked-out vault, `503` for a store that did not respond in
+  time. None of the library's own error codes map to `500` -- every one of them is an expected, documented
+  outcome, not a server bug; `500` is reserved for truly unexpected errors (and is logged server-side, never
+  echoed to the caller).
+- **`asyncRoute()` wraps every route that calls an async `PasswordManager` method.** Express 4 does not route
+  a rejected promise to its error-handling middleware on its own (unlike Express 5) -- a route that forgot
+  this wrapper would silently hang instead of returning an error. Routes calling a SYNCHRONOUS method
+  (`createVault`, `unlock`, `shareEntry`, `revokeShare`, ...) do not need it, since Express 4 already routes a
+  synchronous throw correctly.
+- **No field-level validation is duplicated in the HTTP layer.** A body field is read and handed straight to
+  the matching `PasswordManager` method, which already validates its own inputs and throws `INVALID_REQUEST`
+  (mapped to 400) for a wrong type or shape. The one exception is `POST .../shares/redeem`: its body is a
+  whole `SharedEntryToken` structure, and a malformed one would otherwise reach `openAsRecipient` as a raw
+  `TypeError` (e.g. `Buffer.from(undefined)`) rather than a clean 400 -- so its shape IS checked at the HTTP
+  boundary, the one place in this layer where the library has no equivalent check of its own to defer to.
+
 ## Stages
 
 | Stage | What | Status |
@@ -179,7 +206,11 @@ ever storing it, and what happens the moment someone starts guessing.
 | 4 | Shared entries between two independent vaults via hybrid/envelope encryption (RSA-OAEP + AES-256-GCM), a lazily-generated per-vault keypair whose private key is re-wrapped on every master-password rotation; mutation checks | DONE 2026-11-26 |
 | 5 | Share revocation and single-use redemption: a manager-wide grant registry, claim-before-await for single-use (same shape as `claimEntryOp`), don't-leak-existence authorization on revoke; mutation checks | DONE 2026-11-26 |
 | 6 | Session auto-lock on an idle timeout, via lazy expiry at `requireSession` (never a background timer), independent per-session idle clocks; mutation checks | DONE 2026-11-26 |
-| 7 | Not decided yet; proposed once stage 6's follow-ups are picked (candidates: an HTTP API layer, finishing toward an interview bank + portfolio entry) | not started |
+| 7 | An Express HTTP API exposing the full library surface, every error code mapped to a specific HTTP status, `asyncRoute` for Express 4's lack of automatic rejected-promise routing; mutation checks | DONE 2026-11-26 |
+
+Seven substantial, distinct stages are now done. The next natural step for this project is an interview
+question bank and a portfolio entry, the same finishing move `17-parking-lot` and `21-notification` took
+once their own LLD stages were complete -- not an eighth feature stage.
 
 ## Not in scope
 
@@ -189,4 +220,6 @@ a share after a time limit (only explicit revocation or single-use redemption en
 for exchanging public keys (callers exchange them out of band), password-strength scoring beyond the
 generator's own charset rules, import from another password manager's export format, actually persisting
 across a restart, a background sweep that proactively evicts idle sessions (idle sessions are only ever
-noticed lazily, on their next use).
+noticed lazily, on their next use), CORS or a browser-facing session/cookie layer on top of the HTTP API
+(this API authenticates SERVICES with one API key, the same way `21-notification`'s does), rate limiting at
+the HTTP layer independent of the library's own lockout.
