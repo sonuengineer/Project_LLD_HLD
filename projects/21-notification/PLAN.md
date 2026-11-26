@@ -1,6 +1,6 @@
 # B19 Notification System (low-level design): plan
 
-Status (2026-11-25): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 in progress: HTTP API, delivery receipts, several push devices and the in-app inbox done. 192 tests; mutation checks in the README.
+Status (2026-11-26): stage 1 DONE (catalog, templates, preferences and quiet hours, fake senders, notifier with `all` / `first` modes, idempotency, flushDue that plans a due delivery again). Stage 2 DONE (queue with leases and priorities, workers, retries as delayed jobs, per-channel timeout and circuit breaker, frequency caps, bounded idempotency keys; 77 mutation checks, all caught). Stage 3 DONE (HTTP API, delivery receipts, several push devices, in-app inbox, 105-question interview bank, portfolio page). 192 tests; mutation checks in the README.
 
 ## Why this project
 
@@ -158,7 +158,7 @@ user, the in-app inbox, the interview bank, the portfolio page.
 |---|---|---|
 | 1 | Catalog (types, categories, channels, modes, templates), template rendering, preferences (opt-out, quiet hours with deferral), fake channel senders, notifier (`all` / `first` with fallback, idempotency incl. concurrent duplicates, check-then-change), `flushDue`; randomized invariant test; mutation checks | DONE 2026-11-23 |
 | 2 | Queue with leases and priorities, workers, retries as delayed jobs with backoff, timeout and circuit breaker per channel (resilience-kit), per-user frequency caps (ratelimit-kit), bounded idempotency keys (cache-kit), deferred deliveries as delayed jobs; randomized test with dying workers; mutation checks | DONE 2026-11-25 |
-| 3 | HTTP API (Express), in-app inbox, several push tokens per user (dead tokens removed), provider delivery receipts, interview bank, portfolio page | not started |
+| 3 | HTTP API (Express), in-app inbox, several push tokens per user (dead tokens removed), provider delivery receipts, interview bank, portfolio page | DONE 2026-11-26 |
 
 ## Not in scope
 

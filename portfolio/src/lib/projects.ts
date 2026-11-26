@@ -528,6 +528,25 @@ export const PROJECTS: ProjectInfo[] = [
       },
     ],
   },
+  {
+    num: 20, slug: "p21-notification", dir: "projects/21-notification", name: "Notification System",
+    tagline: "Email, SMS, push and an in-app inbox behind one API: templates, user preferences and quiet hours, a queue with workers, retries and circuit breakers, signed delivery receipts -- with fake providers, nothing is really sent.",
+    stack: ["TypeScript", "Node.js", "Express 4", "resilience-kit, ratelimit-kit, cache-kit (projects 17-19)", "Vitest"],
+    features: [
+      "Notification types as data: ordered channels, 'all' or 'first' (an OTP by push, else SMS, else email), a template per channel checked at registration, HTML escaping for email only",
+      "Preferences and quiet hours in the user's local time: marketing is muted or deferred, transactional never; a deferred message is planned again when it runs (the randomized test caught a late flush sending inside the next night's quiet hours)",
+      "Idempotent requests: the key is registered before the first await, so 20 concurrent duplicates make one record and one send; the same key with a different body is a conflict",
+      "A job queue with leases (at-least-once, a provider idempotency key per address), priorities, retries as delayed jobs with backoff, a timeout and a circuit breaker per channel, per-user frequency caps -- built on the three libraries of projects 17-19",
+      "HTTP API with a required API key (constant-time compare): 202 + Location, replays answered 200, a different body 409",
+      "Signed delivery-receipt webhooks (HMAC over the timestamp and the raw body, 5 minute replay window); receipts only move up a ranking, so order and duplicates cannot matter; a receipt that beats the send result is parked",
+      "Several push devices per user: one delivery fanned out at send time, dead tokens removed; an in-app inbox with cursor paging and an unread counter that a randomized test recounts after every step",
+      "Built in three stages; 167 distinct deliberate code breaks, all caught -- the survivors of the first runs were real test gaps, each closed with a test",
+    ],
+    tests: "192 passing, incl. real Express servers on random ports and randomized invariant tests with dying workers",
+    run: "cd projects/21-notification && npm run build:deps && npm ci && npm test && npm run demo:queue",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);

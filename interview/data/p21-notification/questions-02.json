@@ -1,0 +1,1294 @@
+[
+  {
+    "id": "NTF-027",
+    "project_slug": "p21-notification",
+    "category": "Fundamentals",
+    "difficulty": "Beginner",
+    "question": "Why does notify() in stage 2 queue the sends and return at once instead of calling the providers directly?",
+    "answer_hinglish": "Seedha jawab: kyunki provider call slow aur unreliable hai, aur caller ko uska wait nahi karna chahiye. Stage 1 ka `Notifier.notify()` async tha -- woh push, SMS, email provider ko call karta aur jab tak answer na aaye, caller (maan lo login API) ruka rehta. Push provider 10 second hang ho gaya toh login request bhi 10 second hang.\n\nStage 2 ka `QueuedNotifier.notify()` SYNCHRONOUS hai. Woh teen kaam karta hai: request validate karta hai (unknown type, user, missing template variable -- sab yahin throw), record store karta hai, aur har delivery ke liye queue mein ek job daal deta hai (`all` mode mein har channel ka ek job, `first` mode mein sirf pehle channel ka). Phir record return -- status `in_progress`. HTTP layer isliye 202 Accepted deta hai, 200 nahi: 'maine le liya, bheja abhi nahi'.\n\nActual sending `Worker` karta hai jo jobs claim karke `process()` chalata hai. Isse teen cheezein milti hain: caller ki latency provider se decouple ho jaati hai, retries aur backoff caller ke bina ho sakte hain, aur traffic spike par jobs queue mein jama hote hain -- providers par ek saath load nahi aata. Interview mein main yeh bolunga: request accept karna aur kaam karna do alag responsibilities hain, queue unhe alag karta hai.",
+    "why_needed": "Provider ka slow ya down hona caller ki problem nahi banni chahiye. OTP API ko millisecond mein jawab dena hai, chahe SMS provider ko 5 second lagein.",
+    "real_world_analogy": "Restaurant mein waiter order le ke turant token de deta hai, khana kitchen banata hai. Waiter chef ke saath khada nahi rehta.",
+    "how_it_works": "notify(): checkRequest -> idempotency lookup -> buildRecord (sab throw yahin) -> records.set + keys.set -> enqueue jobs -> structuredClone(record) return. Worker baad mein claim + process karta hai.",
+    "in_this_project": "`src/queued-notifier.ts` mein `notify(request: NotifyRequest): NotificationRecord` koi await nahi karta. Comment: 'Nothing above changed any state. From here on, nothing throws.' Test `test/queued.test.ts` 'notify returns at once (in_progress), nothing is sent until a worker runs': notify ke baad `push.attempts` 0 aur `queue.size` 1; `worker.drain()` ke baad push sent, sms aur email `skipped(not_needed)`.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/src/queued-notifier.ts::notify",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/src/worker.ts::Worker"
+    ],
+    "code_example": "// real, test/queued.test.ts\nconst { notifier, worker, push, queue } = setupQueued();\nconst r = notifier.notify(otpReq());\nexpect(notificationStatus(r)).toBe(\"in_progress\");\nexpect(push.attempts).toHaveLength(0);\nexpect(queue.size).toBe(1); // \"first\": one job at a time\nexpect(await worker.drain()).toBe(1);",
+    "code_language": "typescript",
+    "advantages": [
+      "Caller ki latency provider se independent",
+      "Retries caller ke bina",
+      "Spike ko queue absorb karta hai",
+      "Validation errors abhi bhi turant milte hain"
+    ],
+    "disadvantages": [
+      "Caller ko final result turant nahi milta (status poll ya receipt chahiye)",
+      "Ek aur moving part: queue aur workers chalane padte hain",
+      "In-memory queue restart par jobs kho deta hai"
+    ],
+    "common_mistakes": [
+      "202 ki jagah 200 dena jaise message bhej diya ho",
+      "Validation ko worker tak taal dena (phir caller ko error kabhi nahi milta)",
+      "notify ko async rakhna aur andar send await karna"
+    ],
+    "follow_up_questions": [
+      "How does the caller learn whether the message was actually delivered?",
+      "What happens to queued jobs if the process restarts?",
+      "Why does a validation error still throw synchronously?"
+    ],
+    "concepts": [
+      "async-processing",
+      "job-queue",
+      "202-accepted",
+      "decoupling"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-028",
+    "project_slug": "p21-notification",
+    "category": "Fundamentals",
+    "difficulty": "Beginner",
+    "question": "How are transactional jobs prioritized over marketing jobs, and what is the starvation risk?",
+    "answer_hinglish": "Har job par ek `priority` number hai: `PRIORITY = { transactional: 0, marketing: 1 }`, lower pehle. `InMemoryJobQueue.claim()` ready jobs ko teen keys se sort karta hai: pehle priority, phir `runAt`, phir `seq` (FIFO). Matlab ek OTP jo 10,000 promotions ke BAAD queue hua, woh bhi agle claim mein sabse pehle jaata hai. Yahi chahiye: login OTP ka wait 'sale 20% off' ke peeche lagna galat hai.\n\nTest `transactional jobs are claimed before marketing jobs queued earlier`: concurrency 1 wala worker, 5 sale requests pehle, phir ek OTP -- ek `runOnce()` ke baad push ka pehla aur akela attempt `Code 123456` hai.\n\nPar priorities STRICT hain, aur isliye starvation possible hai. Agar transactional load kabhi khatam hi na ho (har claim mein utne OTP ready hon jitna `max`), toh marketing jobs kabhi claim nahi honge. README 'Stage 2: known and NOT handled' mein yeh likha hai: 'Marketing can starve... Aging (raising a job's priority as it waits) is not built.' Interview mein bolna: do levels strict rakhe kyunki simple aur predictable hain; production mein ya toh aging, ya alag queues with weighted consumption (jaise 9 transactional : 1 marketing), ya marketing ke liye alag worker pool.",
+    "why_needed": "Notification system mein urgency bahut alag hoti hai: OTP seconds mein chahiye, promotion ghante late bhi chalega. Ek FIFO queue mein promo blast OTP ko block kar deta.",
+    "real_world_analogy": "Hospital emergency: critical patient pehle, chahe line mein baad mein aaya. Par agar critical patient aate hi rahein, normal checkup wala din bhar baitha rahega -- wahi starvation hai.",
+    "how_it_works": "claim(now, max, leaseMs): filter(runAt <= now aur lease free ya expired) -> sort(priority, runAt, seq) -> slice(0, max) -> har ek par naya leaseToken aur leaseUntil.",
+    "in_this_project": "`src/queued-notifier.ts` mein `PRIORITY` constant aur private `enqueue()` jo `priority: PRIORITY[record.category]` set karta hai. `src/queue.ts` ka sort: `a.job.priority - b.job.priority || a.job.runAt - b.job.runAt || a.seq - b.seq`. `test/queue.test.ts` pehla test order `[\"t1\", \"t-late\", \"m1\", \"m2\"]` check karta hai. Mutation J1 (priority ignored) aur S1 (one priority for all) dono pakde gaye.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::PRIORITY",
+      "projects/21-notification/src/queue.ts::claim",
+      "projects/21-notification/test/queue.test.ts",
+      "projects/21-notification/test/queued.test.ts"
+    ],
+    "code_example": "// real, src/queue.ts (claim, trimmed)\nconst ready = [...this.entries.values()]\n  .filter((e) => e.job.runAt <= now && (e.leaseUntil === undefined || e.leaseUntil <= now))\n  .sort((a, b) => a.job.priority - b.job.priority || a.job.runAt - b.job.runAt || a.seq - b.seq)\n  .slice(0, max);",
+    "code_language": "typescript",
+    "advantages": [
+      "OTP kabhi promotions ke peeche nahi atakta",
+      "Simple: ek number, ek sort",
+      "Tested order with tie-breakers"
+    ],
+    "disadvantages": [
+      "Strict priority se marketing starve ho sakta hai",
+      "Sirf do levels"
+    ],
+    "common_mistakes": [
+      "Priority ko queue ke bahar worker mein decide karna",
+      "Tie-breaker na dena (same priority mein order random)",
+      "Starvation ko ignore karna aur document na karna"
+    ],
+    "follow_up_questions": [
+      "How would you add aging so marketing jobs eventually run?",
+      "Would you use separate queues per priority in SQS?",
+      "What does runAt do in the sort order?"
+    ],
+    "concepts": [
+      "priority-queue",
+      "starvation",
+      "aging",
+      "fifo"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-029",
+    "project_slug": "p21-notification",
+    "category": "Core Concepts",
+    "difficulty": "Beginner",
+    "question": "What is a lease (visibility timeout) on a job, and why is it better than a 'processing' flag?",
+    "answer_hinglish": "Lease ka matlab: jab worker job claim karta hai, toh job usko ek limited time (`leaseMs`, default 60 s) ke liye milta hai. Us dauraan doosre workers ko woh job dikhta hi nahi. Worker ne kaam khatam karke `complete()` kiya toh job delete. Worker mar gaya ya atak gaya toh lease khud expire ho jaati hai aur job dobara visible -- koi aur worker utha leta hai. SQS isko 'visibility timeout' kehta hai, BullMQ 'lock'.\n\n'processing = true' flag ka problem: worker crash ho gaya toh flag kabhi reset nahi hota, job hamesha ke liye 'processing' mein atka rehta hai -- ek lost OTP. Uske liye phir koi cleanup cron chahiye jo andaza lagaye ki kaunsa flag purana hai -- jo asal mein ek lease hi hai, bas buri tarah se banayi hui. PLAN.md exactly yahi kehta hai: lease recommended over a 'processing' flag (a crash leaves it set forever).\n\nLease ke saath ek token bhi aata hai. Har claim par `leaseToken` naya number hota hai. `owns(id, token, now)` tabhi true jab token current ho AUR `leaseUntil > now`. Isse purana worker jo late jaaga, woh naye owner ka job complete ya reschedule nahi kar sakta. Boundary bhi exact hai: lease `leaseUntil` PAR khatam hoti hai, uske baad nahi.",
+    "why_needed": "Worker processes marte hain (deploy, OOM, crash). Bina lease ke unke haath ke jobs kho jaate hain; lease guarantee deta hai ki job kabhi lost nahi hota.",
+    "real_world_analogy": "Library se kitaab 14 din ke liye issue hoti hai. Tum gayab ho gaye toh 14 din baad woh kitaab dobara 'available' ho jaati hai. Permanently 'issued' flag hota toh kitaab hamesha ke liye gayi.",
+    "how_it_works": "claim: `leaseToken = ++tokens`, `leaseUntil = now + leaseMs`. Ready filter mein `leaseUntil <= now` wale jobs bhi aate hain (expired lease). complete / reschedule pehle `owns()` check karte hain, warna `refuse()` (stats.refused++).",
+    "in_this_project": "`src/queue.ts` ka `InMemoryJobQueue`. `test/queue.test.ts` 'only the current lease holder may complete or reschedule; an expired lease is lost': lease 100 ms, `owns(..., 99)` true, `owns(..., 100)` false; doosra claim `claims: 2` deta hai; purane token se `complete` aur `reschedule` dono false; stats `{ claimed: 2, reclaimed: 1, completed: 1, refused: 2 }`. Mutations J2, J3, J4 pakde gaye.",
+    "implementation_files": [
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/21-notification/src/queue.ts::owns",
+      "projects/21-notification/test/queue.test.ts",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// real, test/queue.test.ts (trimmed)\nconst id = q.enqueue(job(\"r\", 0, 0));\nconst [a] = q.claim(0, 1, 100);\nexpect(q.owns(id, a!.leaseToken, 99)).toBe(true);\nexpect(q.owns(id, a!.leaseToken, 100)).toBe(false); // the lease ends AT leaseUntil\nconst [b] = q.claim(100, 1, 100); // visible again: another worker takes it\nexpect(b!.claims).toBe(2);\nexpect(q.complete(id, a!.leaseToken, 101)).toBe(false); // the old worker is refused",
+    "code_language": "typescript",
+    "advantages": [
+      "Crash par job kabhi lost nahi",
+      "Koi cleanup cron nahi chahiye",
+      "Token se stale worker ke writes refuse"
+    ],
+    "disadvantages": [
+      "At-least-once: job do baar process ho sakta hai",
+      "leaseMs sahi chunna padta hai (chhota = duplicate, bada = slow recovery)"
+    ],
+    "common_mistakes": [
+      "Lease ke bina 'processing' flag",
+      "Token check na karna, sirf id se complete karna",
+      "Lease expiry boundary ko test na karna"
+    ],
+    "follow_up_questions": [
+      "What happens if the lease is shorter than the work?",
+      "Why is delivery only at-least-once with leases?",
+      "How does SQS implement the same idea?"
+    ],
+    "concepts": [
+      "lease",
+      "visibility-timeout",
+      "fencing-token",
+      "at-least-once"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-030",
+    "project_slug": "p21-notification",
+    "category": "Core Concepts",
+    "difficulty": "Intermediate",
+    "question": "Why is delivery at-least-once, and how does the provider idempotency key protect the user from a duplicate message?",
+    "answer_hinglish": "Lease wale queue mein exactly-once possible nahi hai. Scenario: worker A ne push provider ko call kiya, provider ne message bhej diya, aur phir A atak gaya (GC pause, network) aur uski lease khatam. Job worker B ko milta hai, B bhi send karta hai. Provider ke paas do calls. Hum isse rok nahi sakte kyunki 'provider call' aur 'job complete' ek transaction mein nahi aa sakte -- provider hamare database ka hissa nahi hai. PLAN.md yahi bolta hai: exactly-once claims ko provider call tak phaila hua transaction chahiye, jo exist hi nahi karta.\n\nIsliye design ka jawab: at-least-once accept karo, aur duplicate ko provider side par khatam karo. Har send ke saath `OutboundMessage.idempotencyKey` jaata hai, jo har attempt par SAME hai: `<notificationId>:<channel>`, aur push ke liye per device `<notificationId>:push:<token>`. Jo provider idempotency keys support karta hai, woh doosri call ko duplicate maan ke drop kar deta hai.\n\nHonest point: is project ke fake senders dedupe NAHI karte. Tests key check karte hain, provider ka behaviour nahi. Test 'a worker that stalls past its lease' mein push ko do baar call hota hai, dono par key `n1:push:tok-1`. Mutation S25 (provider key changes per attempt) pakda gaya. Production mein provider docs check karne padte hain ki key kitni der yaad rakhta hai.",
+    "why_needed": "Duplicate OTP ya do baar 'payment received' SMS user ka trust todta hai aur SMS ka paisa bhi lagta hai. At-least-once ke saath dedupe kahin na kahin karna hi padega.",
+    "real_world_analogy": "Courier ko parcel do baar de diya galti se, par parcel par same tracking number hai -- courier office dekh ke doosra wapas kar deta hai.",
+    "how_it_works": "outboundMessage() key banata hai record.id aur channel (aur push ke liye token) se -- attempt number ya job id se nahi. Retry, redelivery, lease loss: sab mein same key.",
+    "in_this_project": "`src/planner.ts` ka `outboundMessage()`: `idempotencyKey: delivery.channel === \"push\" ? `${record.id}:push:${to}` : `${record.id}:${delivery.channel}``. `test/queued.test.ts` 'a retryable failure goes back in the queue after the backoff' teen attempts par teen baar same key check karta hai. Randomized test `test/queued-invariants.test.ts` har provider call par key verify karta hai.",
+    "implementation_files": [
+      "projects/21-notification/src/planner.ts::outboundMessage",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/test/queued-invariants.test.ts",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// real, src/planner.ts (outboundMessage, trimmed)\nidempotencyKey: delivery.channel === \"push\" ? `${record.id}:push:${to}` : `${record.id}:${delivery.channel}`,",
+    "code_language": "typescript",
+    "advantages": [
+      "Koi distributed transaction nahi chahiye",
+      "Har retry path par same key, ek rule",
+      "Push par device add hone se bhi key stable"
+    ],
+    "disadvantages": [
+      "Provider ke support par depend (sab support nahi karte)",
+      "Fake providers yahan dedupe nahi karte -- sirf key test hoti hai",
+      "Provider key ko limited time yaad rakhta hai"
+    ],
+    "common_mistakes": [
+      "Attempt number ko key mein daalna (har retry nayi key, dedupe khatam)",
+      "Exactly-once ka claim karna",
+      "Job id ko key banana (redelivered ya re-queued job par badal sakta hai)"
+    ],
+    "follow_up_questions": [
+      "What if the provider does not support idempotency keys?",
+      "Why is the push key per device token?",
+      "Can a transactional outbox give exactly-once here?"
+    ],
+    "concepts": [
+      "at-least-once",
+      "idempotency-key",
+      "exactly-once",
+      "deduplication"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-031",
+    "project_slug": "p21-notification",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "How does the stage 2 randomized test with dying workers prove the queued notifier is correct, and what exactly does it check?",
+    "answer_hinglish": "Unit tests woh scenarios check karte hain jo humne socha. Randomized test woh pakadta hai jo nahi socha -- stage 1 mein isi ne late flushDue wala bug pakda tha. Stage 2 ka `test/queued-invariants.test.ts` 6 seeds (11 se 16) par chalta hai, har seed 250 requests.\n\nSetup: 10 random users (random offsets -300/0/330/600, random addresses, mutes, quiet windows), 3 workers (concurrency 1, 2, 4) ek hi queue par, provider answers random -- 70% sent, 20% retryable, 5% permanent, 5% throw. Beech beech mein 10% client retries same key se, aur 8% chance par `notifier.claim(...)` call karke jobs pakad ke chhod diye jaate hain -- yeh ek worker hai jo jobs haath mein le ke mar gaya. Clock random advance hota hai, aur end mein 3 din tak har 15 minute drain.\n\nDo tarah ke checks. (1) Har provider call ke MOMENT par: sahi address, sahi provider key, marketing muted channel par nahi gaya, push/SMS quiet hours mein nahi gaya -- aur quiet hours test mein `Date` arithmetic se dobara compute hote hain, `policy.ts` se nahi. 'first' mode mein success ke baad koi send nahi. (2) End state: queue khaali, records ki count expected (24 h TTL ke baad retry naya record), har record finished, 'first' ne max ek channel bheja, attempts <= 3, failed ka ek reason hai, har sent delivery exactly ek baar successfully bheji gayi, aur total provider calls = recorded attempts. Seed fixed hai toh failure reproducible hai.",
+    "why_needed": "Leases, retries, quiet hours, dying workers -- inke combinations hazaaron hain. Hand-written tests saare nahi cover kar sakte; invariants plus random inputs kar sakte hain.",
+    "real_world_analogy": "Car ka crash test sirf ek angle se nahi, random angles aur speeds se -- aur har baar same checklist: airbag khula, door lock nahi hua.",
+    "how_it_works": "Seeded PRNG (mulberry32 jaisa) sab randomness deta hai, backoff jitter bhi (`random: rand`). Sender `willAnswer` mein 3000 outcome functions, har ek invariants check karke random answer deta hai.",
+    "in_this_project": "`test/queued-invariants.test.ts`: `for (const seed of [11, 12, 13, 14, 15, 16])`, `leaseMs: 60_000`, backoff `initialMs: 30_000, maxMs: 600_000, jitter: \"full\"`. Dead workers: `if (action < 0.08) dropped += s.notifier.claim(...)`. End mein `expect(s.queue.stats.reclaimed).toBeGreaterThanOrEqual(dropped)` aur `expect([...successes.values()].every((n) => n === 1)).toBe(true)`. Test independent oracle use karta hai (`inQuiet`), implementation se copy nahi.",
+    "implementation_files": [
+      "projects/21-notification/test/queued-invariants.test.ts",
+      "projects/21-notification/test/queued-helpers.ts::setupQueued",
+      "projects/21-notification/src/worker.ts::Worker",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// real, test/queued-invariants.test.ts (trimmed)\nconst action = rand();\nif (action < 0.08) dropped += s.notifier.claim(1 + Math.floor(rand() * 3)).length; // a worker dies holding these\nelse if (action < 0.7) await pick(workers).runOnce();\n// ... at the end\nexpect(violations).toEqual([]);\nexpect(s.queue.size).toBe(0);\nif (dropped > 0) expect(s.queue.stats.reclaimed).toBeGreaterThanOrEqual(dropped);",
+    "code_language": "typescript",
+    "advantages": [
+      "Unsoche combinations pakadta hai",
+      "Seed se reproducible",
+      "Oracle independent hai, implementation ka copy nahi",
+      "Dying workers simulate bina processes maare"
+    ],
+    "disadvantages": [
+      "Ek hi process: real network partitions ya do machines simulate nahi",
+      "Fake clock: real timer races cover nahi (uske liye worker.test.ts)",
+      "Random coverage ki guarantee nahi"
+    ],
+    "common_mistakes": [
+      "Oracle mein implementation ka hi function call karna (bug dono mein same)",
+      "Seed fix na karna (failure reproduce nahi hota)",
+      "Sirf end state check karna, send ke moment par nahi"
+    ],
+    "follow_up_questions": [
+      "Why recompute quiet hours in the test instead of calling policy.ts?",
+      "How do you simulate a worker that dies without killing a process?",
+      "What would a property-based testing library add here?"
+    ],
+    "concepts": [
+      "randomized-testing",
+      "invariants",
+      "property-based-testing",
+      "test-oracle"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Random test slow hota hai (6 seeds x 250 requests x 3 din drain) par mutation checks ke saath milke yeh sabse strong guard hai. Trade-off: debug karna mushkil, isliye seeds fixed aur violations ek list mein message ke saath.",
+      "failure_scenarios": "Agar provider key galat hoti, ya ek dead worker ka job kabhi reclaim na hota (J2), toh `queue.size` 0 nahi hota ya violations list bharti. Jo cheez yeh nahi pakadta: do processes, real Redis cap store, real time.",
+      "alternatives": "fast-check jaisi property-based library shrinking deti hai (failing case ko chhota karna). Model-based testing ek reference model ke against compare karta. Jepsen-style tests real distributed failures ke liye.",
+      "scale_10x_100x": "10x requests par test time badhta hai; seeds ki sankhya CI mein kam aur nightly mein zyada rakh sakte hain. Logic same rehta hai.",
+      "production_improvements": "Nightly job mein random seeds (aur failing seed log karna), real Redis store ke saath ek variant, aur shrinking ke liye fast-check."
+    }
+  },
+  {
+    "id": "NTF-032",
+    "project_slug": "p21-notification",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "Walk through InMemoryJobQueue: enqueue, claim, owns, complete and reschedule.",
+    "answer_hinglish": "`InMemoryJobQueue` ek `Map<string, Entry>` hai jisme har entry ke paas `job`, ek `seq` (FIFO ke liye), optional `leaseToken` / `leaseUntil`, aur `claims` count hai. Paanch methods `JobQueue` interface banate hain -- notifier sirf interface par depend karta hai.\n\n`enqueue(job)`: id `job-N` banata hai, entry store, `stats.enqueued++`. `claim(now, max, leaseMs)`: pehle arguments validate (`max` integer >= 1, `leaseMs > 0`, warna RangeError). Phir ready jobs: `runAt <= now` aur lease nahi ya expire ho chuki. Sort priority, runAt, seq; `max` tak. Har ek par `claims++` (pehle se claimed tha toh `reclaimed++`), naya `leaseToken`, `leaseUntil = now + leaseMs`. Return copy, entry nahi.\n\n`owns(id, token, now)`: entry hai, token match, aur `leaseUntil > now`. `complete()`: own karta hai toh delete, warna `refuse()` false return. `reschedule(id, token, runAt, now)`: own karta hai toh `runAt` badlo aur lease HATA do -- isse job future time par dobara claimable. Retry aur 'deferred again' dono isi se hote hain.\n\nKoi alag 'delayed queue' nahi: delay sirf `runAt` hai jo claim ka filter dekhta hai. README honestly kehta hai: claim har job scan karta hai, O(n) -- in-memory ke liye theek, production ke liye nahi.",
+    "why_needed": "Queue ki semantics (lease, delay, priority) correct ho toh notifier simple reh sakta hai. Interface chhota hai taaki baad mein SQS ya Postgres implementation lagayi ja sake.",
+    "real_world_analogy": "Token system wala counter: token lo (claim), kaam karo, counter par token wapas do (complete). 'Kal aana' bola toh naya time likh ke token wapas line mein (reschedule).",
+    "how_it_works": "Job states implicit hain: ready (runAt aaya, lease nahi), delayed (runAt future), leased (leaseUntil > now), gone (complete). Koi status field nahi, sab fields se derive.",
+    "in_this_project": "`src/queue.ts`: `JobQueue` interface, `InMemoryJobQueue` with `stats = { enqueued, claimed, reclaimed, completed, rescheduled, refused }` aur test ke liye `jobs()` snapshot. `test/queue.test.ts` 'reschedule releases the lease and sets the new time': reschedule to 300, `claim(299)` empty, `claim(300)` ek job, snapshot `{ runAt: 300, claims: 2, leaseUntil: 400 }`. Mutations J5 (reschedule keeps the lease) aur J6 (delayed jobs claimable early) pakde gaye; J6 hang se pakda gaya.",
+    "implementation_files": [
+      "projects/21-notification/src/queue.ts::JobQueue",
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/21-notification/src/queue.ts::reschedule",
+      "projects/21-notification/test/queue.test.ts"
+    ],
+    "code_example": "// real, src/queue.ts\nreschedule(id: string, leaseToken: number, runAt: number, now: number): boolean {\n  if (!this.owns(id, leaseToken, now)) return this.refuse();\n  const e = this.entries.get(id)!;\n  e.job.runAt = runAt;\n  delete e.leaseToken;\n  delete e.leaseUntil;\n  this.stats.rescheduled++;\n  return true;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Chhota interface, multiple backends possible",
+      "Delay aur retry ek hi mechanism (runAt)",
+      "Stats se reclaim aur refuse observable"
+    ],
+    "disadvantages": [
+      "claim O(n) scan",
+      "In memory, ek process",
+      "Koi dead-letter queue nahi"
+    ],
+    "common_mistakes": [
+      "Reschedule mein lease release bhool jaana (job leaseMs tak atka)",
+      "Claim mein entry ka reference return karna, copy nahi",
+      "Delay ke liye setTimeout lagana"
+    ],
+    "follow_up_questions": [
+      "Why does reschedule release the lease instead of extending it?",
+      "How would you make claim faster than O(n)?",
+      "What would a dead-letter queue add?"
+    ],
+    "concepts": [
+      "job-queue",
+      "lease",
+      "delayed-jobs",
+      "interface-design"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-033",
+    "project_slug": "p21-notification",
+    "category": "Internal Implementation",
+    "difficulty": "Advanced",
+    "question": "What does QueuedNotifier.process() do with one claimed job, step by step?",
+    "answer_hinglish": "`process(job)` ek wrapper hai jo kabhi throw nahi karta: andar `processJob()`, aur unexpected error par sirf `stats.unexpectedErrors++`. Job leased reh jaata hai aur lease khatam hone par koi aur worker uthata hai -- crashed worker wala hi path.\n\n`processJob` ke steps: (1) Record aur delivery dhundo. Delivery already finished (`sent`, `failed`, `skipped`) hai toh yeh redelivered job hai (worker result likh ke complete se pehle mara) -- `duplicateJobs++`, complete, kuch send nahi. (2) `replan()` -- channel ka rule DOBARA lagao kyunki time, preferences, address badal gaye ho sakte hain. Skipped toh finish; deferred toh `reschedule` to `notBefore`; pending toh aage. (3) Marketing ka first try: frequency cap `consume(\"<userId>:<channel>\")`. Store fail toh owns check, phir `retryLater` bina attempt ke. Over cap toh `skipped (capped)`. Allowed toh `admitted` set mein. (4) Status `sending`, phir `sendToAddresses` ke through har address ke liye `call()`: breaker -> timeout -> `sendOnce`. Retryable failure `ProviderFailure` throw hoti hai taaki breaker count kare. (5) Send ke baad `owns()` check -- lease gayi toh `lostLease()`, kuch nahi likha. Phir result: circuit-open (first: fail over, all: wait), sent (first mode mein baaki `not_needed`), retryable with attempts left (backoff), warna failed. `finish()` complete karta hai aur 'first' mode mein agla channel queue karta hai -- sirf agar complete true aaya.",
+    "why_needed": "Ek job ke andar har branch ek alag failure mode handle karti hai. Order matter karta hai: replan cap se pehle, owns check har write se pehle.",
+    "real_world_analogy": "Delivery boy ka checklist: parcel already deliver ho chuka? address abhi bhi sahi? customer ne mana toh nahi kiya? phir ghanti bajao; koi jawab nahi toh baad mein dobara.",
+    "how_it_works": "Har await ke baad `now = this.clock.now()` aur `this.queue.owns(...)`. Writes (delivery fields, reschedule, complete) sirf lease ke andar. 'first' mode mein ek record ka ek hi job ek time par.",
+    "in_this_project": "`src/queued-notifier.ts` file ke top comment mein steps 1-5 likhe hain. `finish()`: `if (this.queue.complete(job.id, job.leaseToken, now)) this.queueNextCandidate(record, now);`. Tests: 'a job redelivered after its delivery finished (crash before complete) sends nothing' (ek `ForgetfulQueue` jo pehla complete bhool jaata hai), 'an unexpected error inside a job does not escape' (users.get throw karta hai, `unexpectedErrors` 2, lease ke baad send). Mutations S3, S4, S5, S13 pakde gaye.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::process",
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/src/queued-notifier.ts::finish",
+      "projects/21-notification/src/planner.ts::replan",
+      "projects/21-notification/test/queued.test.ts"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (processJob, trimmed)\nconst plan = replan(this.deps, record, delivery, now);\nif (plan.status !== \"pending\") {\n  applyPlan(delivery, plan);\n  if (plan.status === \"deferred\") this.queue.reschedule(job.id, job.leaseToken, plan.notBefore, now);\n  else this.finish(job, record, now);\n  return;\n}\n// ... cap, send through breaker + timeout ...\nnow = this.clock.now();\nif (!this.queue.owns(job.id, job.leaseToken, now)) return this.lostLease();",
+    "code_language": "typescript",
+    "advantages": [
+      "Har failure mode ki ek clear branch",
+      "Worker loop kabhi crash nahi hota",
+      "Redelivered job safely drop"
+    ],
+    "disadvantages": [
+      "Ek lambi function, dhyaan se padhni padti hai",
+      "In-memory record par direct mutation (database mein transaction chahiye hoga)"
+    ],
+    "common_mistakes": [
+      "Await ke baad lease check bhoolna",
+      "finish mein complete ka result ignore karke agla channel queue karna (stale worker do channels bhej dega)",
+      "Replan skip karna aur purana plan use karna"
+    ],
+    "follow_up_questions": [
+      "Why is replan done before the frequency cap?",
+      "What happens if the worker dies between recordResult and complete?",
+      "Why does process() swallow errors instead of rethrowing?"
+    ],
+    "concepts": [
+      "job-processing",
+      "lease-check",
+      "state-machine",
+      "redelivery"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Ek function mein saari branches rakhi taaki order explicit rahe; alternative ek pipeline of middlewares hota, par order bugs chhup jaate. Records memory mein mutate hote hain -- simple, par database ke saath har write conditional update banana padega.",
+      "failure_scenarios": "Worker result likh ke complete se pehle mara: job dobara aata hai, step 1 use drop karta hai. Unexpected error: job leased rehta hai, lease ke baad retry. Stalled worker: owns false, result drop.",
+      "alternatives": "Har branch ko alag job type bana sakte the (cap-check job, send job) -- zyada queue round trips. Ya ek workflow engine (Temporal) jahan steps durable hote hain.",
+      "scale_10x_100x": "10x par processJob same rehta hai; badalta hai records store (database) aur queue backend. Har owns check database ka round trip ban sakta hai -- token ko conditional UPDATE mein fold karna better.",
+      "production_improvements": "Records ko database mein `UPDATE ... WHERE lease_token = $1` jaise conditional writes, structured logs har branch par (job id, claims, outcome), aur unexpectedErrors par alert."
+    }
+  },
+  {
+    "id": "NTF-034",
+    "project_slug": "p21-notification",
+    "category": "Internal Implementation",
+    "difficulty": "Intermediate",
+    "question": "How does the Worker work (runOnce, drain, start/stop), and why is it a batch loop rather than a pool?",
+    "answer_hinglish": "`Worker` chhota class hai. `runOnce()`: `notifier.claim(concurrency)` se jobs lo, `Promise.all` se sab parallel process karo, count return. Tests manual clock ke saath yahi chalate hain. `drain(maxRounds = 10_000)`: runOnce tab tak jab tak 0 na aaye -- matlab jo kaam ABHI due hai woh sab; 10,000 rounds ke baad bhi busy toh throw (infinite loop ka guard).\n\n`start()`: real process ka loop. `running = true`, aur ek async loop: runOnce, kuch na mila toh `pollMs` (default 250 ms) wait, mila toh turant phir. Timer `unref()` hai taaki idle worker process ko zinda na rakhe. `stop()`: `running = false`, timer clear, `wake()` se sleep todo, aur `await this.loop` -- matlab chal rahe jobs khatam hone ka wait, abandon nahi.\n\nBug W2: `start()` ka guard `if (this.running) return;`. Purana test start do baar call karta tha par doosra loop dikh hi nahi sakta tha -- mutation survive hua. Naya test concurrency 1 aur ek slow send leta hai, aur check karta hai ki doosra job wait karta hai.\n\nBatch vs pool: batch apne sabse slow job ka wait karta hai, phir claim. Ek 10 s timeout wala job baaki 3 slots ko khaali rakhta hai. Pool har slot free hote hi naya job claim karta. README: 'a pool that refills each slot as it frees is not built.'",
+    "why_needed": "Worker hi queue ko provider calls mein badalta hai. Tests ke liye deterministic `runOnce`, production ke liye loop jo shutdown par jobs na chhode.",
+    "real_world_analogy": "Batch: ek bus jo tab tak nahi chalti jab tak saare 4 passengers utar na jaayein. Pool: taxi stand jahan har taxi khaali hote hi agla passenger le leti hai.",
+    "how_it_works": "start loop: while running { n = await runOnce(); if n == 0 then sleep pollMs (wakeable) }. stop: running=false, wake, await loop.",
+    "in_this_project": "`src/worker.ts`. `test/worker.test.ts` real timers ke saath: 'start() picks up work that arrives later', 'start() twice runs ONE loop: with concurrency 1 a second job waits for the first' (W2), 'stop() waits for the job in progress instead of abandoning it' (W1), 'several workers on one queue never process the same job twice' (30 orders, 3 workers, 30 unique push keys). Mutation W3 (drain stops after one round) bhi pakda gaya.",
+    "implementation_files": [
+      "projects/21-notification/src/worker.ts::Worker",
+      "projects/21-notification/src/worker.ts::runOnce",
+      "projects/21-notification/src/worker.ts::drain",
+      "projects/21-notification/test/worker.test.ts"
+    ],
+    "code_example": "// real, src/worker.ts\nasync runOnce(): Promise<number> {\n  const jobs = this.notifier.claim(this.concurrency);\n  await Promise.all(jobs.map((job) => this.notifier.process(job)));\n  return jobs.length;\n}\n\nstart(): void {\n  if (this.running) return; // W2: a second start() must not start a second loop\n  this.running = true;\n  // ... loop ...\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Simple aur testable (runOnce manual clock ke saath)",
+      "Graceful stop: in-progress jobs khatam hote hain",
+      "Idle worker process ko zinda nahi rakhta (unref)"
+    ],
+    "disadvantages": [
+      "Batch: slowest job baaki slots ko idle rakhta hai",
+      "Polling (pollMs) se thodi latency jab queue khaali ho",
+      "stop ke waqt queued jobs memory ke saath kho jaate hain"
+    ],
+    "common_mistakes": [
+      "start do baar call par do loops (W2)",
+      "stop mein loop ka await na karna (jobs adhoore)",
+      "process ka throw worker loop ko maar de"
+    ],
+    "follow_up_questions": [
+      "How would you implement a slot-based pool?",
+      "How would you replace polling with a push notification from the broker?",
+      "What should a worker do on SIGTERM?"
+    ],
+    "concepts": [
+      "worker",
+      "graceful-shutdown",
+      "polling",
+      "concurrency"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-035",
+    "project_slug": "p21-notification",
+    "category": "Architecture & System Design",
+    "difficulty": "Beginner",
+    "question": "Why is QueuedNotifier a second class sharing planner.ts instead of a flag on the stage 1 Notifier?",
+    "answer_hinglish": "Stage 1 ka `Notifier` in-process hai: notify karta hai aur wahin send. Stage 2 ka `QueuedNotifier` queue karta hai aur workers bhejte hain. Inki zindagi bilkul alag hai -- ek async hai aur caller ka wait karwata hai, doosra synchronous hai aur leases, retries, breaker, caps rakhta hai. Ek class mein `if (queued)` flags daalte toh har method do raaston mein bant jaata aur dono ka testing mushkil.\n\nPar jo logic DONO ka same hai woh duplicate nahi hona chahiye. Isliye `src/planner.ts` nikala gaya: `checkRequest` (key aur fingerprint), `buildRecord` (type, user, templates, har channel ka plan -- sab throw yahin, koi state change nahi), `replan` (send time par rule dobara), `applyPlan`, `outboundMessage` (provider key), `sendOnce` (throw ya garbage result ko retryable failure banana), `recordResult` aur `sendToAddresses` (push fan-out).\n\nSabse achhi baat: planner stage 1 se nikala gaya aur stage 1 ke 81 tests BINA badle pass hue. Yahi regression guard tha. Stage 1 ke 43 mutation checks planner mein unki nayi jagah par dobara chalaye gaye, sab pakde gaye. Interview point: refactor ka saboot purane tests ka bina chhede pass hona hai.",
+    "why_needed": "Do notifiers ka rule ek hi hona chahiye (quiet hours, mutes, templates). Copy hota toh ek mein fix, doosre mein bug.",
+    "real_world_analogy": "Ek hi kitchen (planner) do counters ko khana deta hai: dine-in (Notifier) aur delivery (QueuedNotifier). Recipe ek, serve karne ka tareeka alag.",
+    "how_it_works": "Dono notifiers `PlannerDeps` (catalog, users, preferences, senders map) banate hain aur wahi functions call karte hain. Fark sirf notify ke baad: ek turant send, doosra enqueue.",
+    "in_this_project": "`src/planner.ts` ka header comment: 'The part of notify() that both notifiers share'. `src/queued-notifier.ts` imports `applyPlan, buildRecord, checkRequest, recordResult, replan, sendersByChannel, sendOnce, sendToAddresses`. README: 'The 81 stage 1 tests are unchanged and still pass against the shared planner.ts.' PLAN.md: 'A second notifier, not a flag on the first.'",
+    "implementation_files": [
+      "projects/21-notification/src/planner.ts::buildRecord",
+      "projects/21-notification/src/planner.ts::checkRequest",
+      "projects/21-notification/src/notifier.ts",
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (imports)\nimport {\n  applyPlan, buildRecord, checkRequest, recordResult, replan,\n  sendersByChannel, sendOnce, sendToAddresses,\n  type CallResult, type PlannerDeps,\n} from \"./planner.js\";",
+    "code_language": "typescript",
+    "advantages": [
+      "Har class ki ek responsibility",
+      "Rules ek jagah, dono notifiers mein same",
+      "Stage 1 tests ne refactor ko guard kiya"
+    ],
+    "disadvantages": [
+      "Do public classes maintain karni padti hain",
+      "Planner functions ko dono ki zarurat ke hisaab se general rakhna padta hai"
+    ],
+    "common_mistakes": [
+      "Boolean flag se do behaviours ek class mein",
+      "Logic copy-paste karna",
+      "Refactor ke saath purane tests bhi badal dena (phir guard khatam)"
+    ],
+    "follow_up_questions": [
+      "Which parts of planner.ts must never change state, and why?",
+      "How did you prove the refactor did not change stage 1 behaviour?",
+      "When would you delete the stage 1 Notifier?"
+    ],
+    "concepts": [
+      "refactoring",
+      "single-responsibility",
+      "shared-module",
+      "regression-tests"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-036",
+    "project_slug": "p21-notification",
+    "category": "Architecture & System Design",
+    "difficulty": "Senior/System Design",
+    "question": "How would the JobQueue interface map onto SQS, BullMQ or a Postgres table with FOR UPDATE SKIP LOCKED in production?",
+    "answer_hinglish": "Pehle honest baat: inme se kuch bhi is project mein built nahi hai. Queue in-memory hai, ek process mein. Par interface jaan-boojh kar inhi systems ki shape mein banaya: `claim` with a lease, `complete` / `reschedule` sirf token ke saath, `runAt` se delay.\n\nSQS: `ReceiveMessage` claim hai, `VisibilityTimeout` lease hai, `ReceiptHandle` hamara `leaseToken` hai (har receive par naya, aur purane handle se delete fail/no-op). `DeleteMessage` complete, `ChangeMessageVisibility` reschedule jaisa (retry delay ke liye), `DelaySeconds` sirf 15 minute tak -- isliye quiet hours ke 9 ghante ke deferral ke liye scheduler ya database chahiye. Priority SQS mein nahi: do queues (transactional, marketing) aur consumer pehle transactional poll kare. Standard queue khud at-least-once hai.\n\nBullMQ (Redis): job lock = lease, lock token, `moveToDelayed` = reschedule, priorities built-in, stalled job checker = hamara lease expiry. Postgres: `jobs` table, claim = `SELECT ... WHERE run_at <= now() AND (lease_until IS NULL OR lease_until <= now()) ORDER BY priority, run_at, id FOR UPDATE SKIP LOCKED LIMIT n` plus `UPDATE lease_token = lease_token + 1, lease_until = now() + interval`. SKIP LOCKED se do workers ek row par wait nahi karte. Mera recommendation: records already Postgres mein hon toh Postgres queue (ek transaction mein record aur job dono), throughput bahut badhe tab SQS/Kafka.",
+    "why_needed": "Interview mein 'in-memory queue' ka next question hamesha hota hai: production mein kya? Interface ka mapping dikhata hai ki design portable hai.",
+    "real_world_analogy": "Ek hi 'token counter' ka rule teen alag offices mein: sarkari (SQS), private (BullMQ), apna register (Postgres). Rule same: token lo, time limit, token se hi kaam band karo.",
+    "how_it_works": "Teeno mein mapping: claim -> receive / lock / SELECT FOR UPDATE SKIP LOCKED; leaseToken -> receipt handle / lock token / column; complete -> delete; reschedule -> change visibility / moveToDelayed / UPDATE run_at.",
+    "in_this_project": "`src/queue.ts` ka header comment: 'the shape of SQS (visibility timeout), BullMQ (lock) or a Postgres table claimed with FOR UPDATE SKIP LOCKED'. README 'Stage 2: known and NOT handled': 'none of those is built. claim() scans every job (O(n)).' `QueuedNotifier` sirf `JobQueue` interface leta hai (`queue: JobQueue` option), toh naya backend ek naya class hai.",
+    "implementation_files": [
+      "projects/21-notification/src/queue.ts::JobQueue",
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifierOptions",
+      "projects/21-notification/README.md",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "-- illustrative, NOT in the repo: claim with SKIP LOCKED\nWITH picked AS (\n  SELECT id FROM jobs\n  WHERE run_at <= now() AND (lease_until IS NULL OR lease_until <= now())\n  ORDER BY priority, run_at, id\n  FOR UPDATE SKIP LOCKED\n  LIMIT $1\n)\nUPDATE jobs j\nSET lease_token = j.lease_token + 1, lease_until = now() + $2::interval, claims = j.claims + 1\nFROM picked WHERE j.id = picked.id\nRETURNING j.*;",
+    "code_language": "sql",
+    "advantages": [
+      "Interface backend-agnostic hai",
+      "Lease + token har backend mein exist karta hai",
+      "Postgres mein record aur job ek transaction mein"
+    ],
+    "disadvantages": [
+      "SQS mein priority aur lambe delays native nahi",
+      "Postgres queue high throughput par vacuum/bloat issues",
+      "Redis (BullMQ) durability config par depend"
+    ],
+    "common_mistakes": [
+      "SQS ka 15 min delay limit bhool jaana",
+      "Postgres claim mein SKIP LOCKED ke bina (workers ek doosre par block)",
+      "Receipt handle ko permanent id samajhna"
+    ],
+    "follow_up_questions": [
+      "How would you implement priorities on SQS?",
+      "Why does SKIP LOCKED matter for many workers?",
+      "How do you enqueue the job atomically with the record (transactional outbox)?"
+    ],
+    "concepts": [
+      "sqs",
+      "bullmq",
+      "skip-locked",
+      "visibility-timeout",
+      "system-design"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Postgres: ek database, transactional enqueue, par lakhon jobs/min par table hot ho jaati hai. SQS: managed, infinite scale, par priority, lamba delay aur ordering nahi. BullMQ: priorities aur delays achhe, par Redis ko durable chalana padta hai.",
+      "failure_scenarios": "SQS mein consumer crash -> visibility timeout ke baad message wapas (same as yahan). Postgres mein worker ka connection gaya toh row lock chhoot jaata hai, lease_until ke baad dobara claim. Redis failover par BullMQ jobs kho sakte hain agar AOF/replication weak ho.",
+      "alternatives": "Kafka (partition per user se ordering, par per-message retry/delay mushkil), RabbitMQ (priority queues, TTL + dead-letter se delay), Temporal (durable timers, workflows).",
+      "scale_10x_100x": "10x par Postgres partial index `(priority, run_at) WHERE lease_until IS NULL` aur batching. 100x par SQS/Kafka, aur deferred jobs ke liye alag scheduler (database se due jobs ko queue mein daalna).",
+      "production_improvements": "Transactional outbox (record + outbox row ek transaction, relay queue mein daale), dead-letter queue, queue depth aur oldest-job-age par alerts, per priority alag queues."
+    }
+  },
+  {
+    "id": "NTF-037",
+    "project_slug": "p21-notification",
+    "category": "Database Design",
+    "difficulty": "Senior/System Design",
+    "question": "Design the tables you would need to move the stage 2 records, jobs and idempotency keys into Postgres.",
+    "answer_hinglish": "Is project mein koi database nahi hai -- records, jobs, keys sab process memory mein hain aur restart par kho jaate hain (README 'Still in memory, one process'). Main yeh design karunga.\n\n`notifications`: id, idempotency_key, type_id, user_id, category, mode, created_at. Idempotency ke liye `UNIQUE (idempotency_key)` -- par 24 h TTL chahiye, toh ek alag table `idempotency_keys (key PK, fingerprint, notification_id, expires_at)`, insert `ON CONFLICT DO NOTHING` aur fir select: conflict hua aur fingerprint alag toh 409. Expired keys ek cleanup job delete kare. Yahi cache-kit LRU ka database version hai, par bina LRU eviction ke (database mein memory ka dabav nahi, sirf retention).\n\n`deliveries`: (notification_id, channel) primary key, status, attempts, next_attempt_at, not_before, error, retryable, provider_id, skip_reason. `jobs`: id, notification_id, channel, priority, run_at, lease_token, lease_until, claims. Index `(priority, run_at) WHERE lease_until IS NULL` claim ke liye.\n\nSabse important: `notify()` mein notification + deliveries + jobs ek transaction mein insert -- abhi bhi 'error matlab kuch nahi hua'. Aur har worker write conditional: `UPDATE deliveries ... WHERE ...` ke saath `jobs.lease_token = $token AND lease_until > now()` check usi transaction mein, warna lease-lost. Admitted (cap) set ko delivery par ek boolean column `cap_admitted` bana dunga. Records ke liye retention period (README: 'Records are never removed').",
+    "why_needed": "In-memory state restart par khatam. Production mein OTP queue mein tha aur deploy hua toh woh gaya. Durable storage ke saath bhi wahi guarantees (atomic notify, lease-checked writes) rehni chahiye.",
+    "real_world_analogy": "Ek register jisme har order ka panna (notifications), har dish ki line (deliveries), aur kitchen ki token slip (jobs). Slip par likha hai kis cook ke paas kab tak hai.",
+    "how_it_works": "notify: BEGIN; insert key (ON CONFLICT); insert notification, deliveries, jobs; COMMIT. Worker: claim with SKIP LOCKED; send; BEGIN; UPDATE delivery + jobs WHERE lease_token matches; COMMIT.",
+    "in_this_project": "Code mein yeh maps hain: `QueuedNotifier.records` (Map), `keys` (cache-kit `LruCache<string, KeyEntry>` with fingerprint + recordId), `admitted` (Set of `<recordId>:<channel>`), aur `InMemoryJobQueue.entries`. `Delivery` ke fields `src/record.ts` mein hain (status, attempts, nextAttemptAt, notBefore, error, retryable, providerId, skipReason). Yeh tables unhi ka direct translation hain.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/src/record.ts",
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "-- illustrative, NOT in the repo\nCREATE TABLE idempotency_keys (\n  key text PRIMARY KEY,\n  fingerprint text NOT NULL,\n  notification_id uuid NOT NULL,\n  expires_at timestamptz NOT NULL\n);\nCREATE TABLE jobs (\n  id bigserial PRIMARY KEY,\n  notification_id uuid NOT NULL,\n  channel text NOT NULL,\n  priority smallint NOT NULL,\n  run_at timestamptz NOT NULL,\n  lease_token bigint NOT NULL DEFAULT 0,\n  lease_until timestamptz,\n  claims int NOT NULL DEFAULT 0\n);\nCREATE INDEX jobs_ready ON jobs (priority, run_at) WHERE lease_until IS NULL;",
+    "code_language": "sql",
+    "advantages": [
+      "Restart-safe",
+      "notify atomic rehta hai (ek transaction)",
+      "Lease check conditional UPDATE mein, race-free"
+    ],
+    "disadvantages": [
+      "Har job par kai database round trips",
+      "Queue table high churn: vacuum tune karna padta hai",
+      "Partial index lease_until expired rows nahi pakadta (unke liye alag scan)"
+    ],
+    "common_mistakes": [
+      "Job ko transaction ke bahar enqueue karna (record hai, job nahi, ya ulta)",
+      "Idempotency ko sirf unique constraint se karna bina fingerprint ke (conflict detect nahi)",
+      "Lease check aur write alag statements mein"
+    ],
+    "follow_up_questions": [
+      "How do you expire idempotency keys in Postgres?",
+      "Why must the lease check and the result write be in one statement or transaction?",
+      "How would you partition the deliveries table at 100x?"
+    ],
+    "concepts": [
+      "schema-design",
+      "transactional-enqueue",
+      "idempotency",
+      "postgres"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Ek database mein sab: simple consistency, par queue aur records ek hi bottleneck. Alag queue (SQS) se scale milta hai par outbox pattern chahiye. Keys table vs Redis: database durable, Redis tez aur TTL native.",
+      "failure_scenarios": "Worker ka transaction commit se pehle mara: delivery update rollback, job lease ke baad wapas -- provider key duplicate rokti hai. Cleanup job ruk gaya toh keys table badhti hai, correctness nahi bigadti (expires_at check select mein bhi).",
+      "alternatives": "Records ke liye DynamoDB (key-value access, TTL attribute native), keys Redis mein `SET NX EX 86400`, jobs SQS mein.",
+      "scale_10x_100x": "10x: deliveries ko created_at se partition, purane partitions drop (retention). 100x: user_id se shard, jobs alag store mein, hot rows (popular users) ke liye kuch nahi badalta kyunki notification per user kam hain.",
+      "production_improvements": "Retention policy (90 din), keys cleanup cron, `jobs` par monitoring (oldest ready job age), aur migrations ke liye expand-contract."
+    }
+  },
+  {
+    "id": "NTF-038",
+    "project_slug": "p21-notification",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "A worker stalls past its lease while its provider call is still running. Walk through what happens and why the late result is dropped.",
+    "answer_hinglish": "Test 'a worker that stalls past its lease' exactly yahi karta hai. Worker A OTP ka job claim karta hai (lease 30 s) aur push call karta hai jo hang hai (gate promise). Clock 30 s aage -- A ki lease khatam. Ab job ready dikhta hai, worker B claim karta hai (`claims: 2`, naya token), B ka push call turant sent deta hai (`push-1`), B result likhta hai aur complete karta hai.\n\nAb A ka call bhi wapas aata hai, 'late-A' ke saath. `processJob` mein send ke baad: `now = this.clock.now(); if (!this.queue.owns(job.id, job.leaseToken, now)) return this.lostLease();`. A ka token purana hai (aur job delete bhi ho chuka), toh owns false. A kuch nahi likhta: providerId B ka hi `push-1` rehta hai, `stats.leaseLost` 1. Agar yeh check na hota (mutation S13), toh A B ka result overwrite karta, aur 'first' mode mein `finish` se agla channel bhi queue ho sakta tha.\n\nYeh fencing token ka idea hai: write ke saath token, aur storage purana token refuse kare. Provider ko do calls gayi -- yeh rok nahi sakte, at-least-once hai. Dono calls par same key `n1:push:tok-1` gayi, toh dedupe karne wala provider ek drop karega. Rule: 'Leases are checked before every write' -- send ke baad, cap store ke baad, aur complete/reschedule ke andar bhi.",
+    "why_needed": "Distributed system mein 'main abhi bhi owner hoon' ka assumption galat ho sakta hai -- GC pause, network, slow provider. Har write se pehle ownership verify karna hi safe hai.",
+    "real_world_analogy": "Tumne hotel room checkout time ke baad tak rakha, reception ne room naye guest ko de diya. Tumhara purana card ab door nahi kholta -- card (token) purana hai.",
+    "how_it_works": "Lease expiry -> job visible -> naya claim naya token -> purane worker ke owns/complete/reschedule false -> uske writes skip.",
+    "in_this_project": "`test/queued.test.ts` 'a worker that stalls past its lease: the job goes to another worker; the late result is dropped': `expect(d.providerId).toBe(\"push-1\")`, `expect(notifier.stats.leaseLost).toBe(1)`, aur `push.attempts` ki keys `[`${r.id}:push:tok-1`, `${r.id}:push:tok-1`]`. Code: `src/queued-notifier.ts` processJob ka post-send owns check aur `lostLease()`.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/src/queued-notifier.ts::lostLease",
+      "projects/21-notification/src/queue.ts::owns",
+      "projects/21-notification/test/queued.test.ts"
+    ],
+    "code_example": "// real, test/queued.test.ts (trimmed)\nconst [jobA] = notifier.claim(1);\nconst a = notifier.process(jobA!);\nclock.advance(30_000); // A's lease runs out\nconst [jobB] = notifier.claim(1);\nexpect(jobB!.claims).toBe(2);\nawait notifier.process(jobB!); // B sends (default answer)\nslow.resolve({ status: \"sent\", providerId: \"late-A\" });\nawait a;\nexpect(notifier.get(r.id)!.deliveries[0]!.providerId).toBe(\"push-1\"); // B's result, not A's",
+    "code_language": "typescript",
+    "advantages": [
+      "Stale worker naye owner ka state nahi bigadta",
+      "Fencing token simple counter hai",
+      "Test deterministic hai (gate + manual clock)"
+    ],
+    "disadvantages": [
+      "Provider ko duplicate call jaati hai",
+      "In-memory mein owns check aur write ke beech koi await nahi -- database mein yeh ek atomic statement banana padega"
+    ],
+    "common_mistakes": [
+      "Sirf send se pehle lease check karna, baad mein nahi",
+      "Lease ko wall-clock par trust karna bina token ke",
+      "Late result ko 'zyada naya' samajh ke likh dena"
+    ],
+    "follow_up_questions": [
+      "What is a fencing token and where else is it used (e.g. distributed locks)?",
+      "Can the stalled worker still cause harm even with the check?",
+      "How would you do this check atomically in Postgres?"
+    ],
+    "concepts": [
+      "fencing-token",
+      "lease",
+      "stale-writes",
+      "at-least-once"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Owns check + write in-memory mein atomic hai kyunki JS single-threaded hai aur beech mein await nahi. Database mein yeh conditional UPDATE banana padega. Trade-off: har write ek check, par correctness ka yahi sasta raasta hai.",
+      "failure_scenarios": "Check ke bina: A B ka providerId overwrite karta, receipts galat delivery par map hote, 'first' mode do channels bhejta. Cap store ke failure path mein yeh check bhool gaye the -- wahi S22 bug.",
+      "alternatives": "Lease heartbeat (worker lease extend karta rahe jab tak kaam chal raha) -- stall ko kam karta hai par khatam nahi. Distributed lock with fencing (Redlock ke saath token). Single-owner partitioning (Kafka partition per worker).",
+      "scale_10x_100x": "Zyada workers aur zyada GC pauses par lease loss badhta hai; `leaseLost` aur `reclaimed` metrics dekh ke leaseMs tune karna. Logic same.",
+      "production_improvements": "leaseLost par metric aur warning log (job id, claims), lease heartbeat lambe sends ke liye, aur provider-side dedupe ka verification (staging mein duplicate key bhej ke dekhna)."
+    }
+  },
+  {
+    "id": "NTF-039",
+    "project_slug": "p21-notification",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "Why must leaseMs be greater than sendTimeoutMs, and how does the TimeoutPolicy abort a hanging provider call?",
+    "answer_hinglish": "Constructor mein check hai: `if (!(this.leaseMs > sendTimeoutMs)) throw new NotificationError(\"INVALID_REQUEST\", \"leaseMs must be greater than sendTimeoutMs\")`. Defaults: send timeout 10 s, lease 60 s. Wajah: lease woh time hai jitne mein worker ko kaam khatam karna hai. Agar ek healthy par slow provider call timeout ke andar 25 s le, aur lease 20 s ho, toh job doosre worker ko chala jaata -- ek bilkul healthy worker ki wajah se duplicate send. Timeout lease se chhota hai toh har send lease ke andar ya toh khatam hota hai ya time out hota hai. Mutation S19 (`leaseMs <= sendTimeoutMs` accepted) pakda gaya; boundary equal par bhi refuse (`30_000, 30_000`).\n\nTimeout resilience-kit ka `TimeoutPolicy({ ms: sendTimeoutMs })` hai. `execute(async (signal) => ...)` operation ko ek AbortSignal deta hai. Time khatam hone par woh signal abort karta hai (reason ek `TimeoutError`) aur promise reject. Notifier `TimeoutError` pakad ke retryable failure banata hai: reason `timed out after 30 ms`. Signal `sendOnce(sender, message, signal)` se sender tak jaata hai, toh achha sender (fetch) apni HTTP request bhi cancel kar deta hai -- sirf hum wait chhodte hain itna nahi.\n\nHonest caveat: lease > timeout ek NECESSARY condition hai, sufficient nahi. Ek push delivery mein kai devices parallel jaate hain (timeout har call par), aur cap store ka await timeout ke bahar hai -- isliye cap ke baad bhi owns check hai.",
+    "why_needed": "Bina timeout ke ek hung provider worker slot ko hamesha ke liye pakad leta. Bina 'lease > timeout' ke healthy sends bhi duplicate hote.",
+    "real_world_analogy": "Parking ka 1 ghante ka ticket aur tumhara meeting 2 ghante ka -- tow ho jaogi. Ticket (lease) hamesha meeting ki max length (timeout) se lamba lo.",
+    "how_it_works": "breaker.execute(() => timeout.execute(async (signal) => sendOnce(sender, message, signal))). Timeout: setTimeout -> controller.abort(new TimeoutError(ms)); race reject. Notifier catch: TimeoutError -> { status: failed, retryable: true }.",
+    "in_this_project": "`src/queued-notifier.ts` constructor check aur `call` closure. `test/queued.test.ts` 'a hanging provider times out: retryable failure, the signal given to the sender is aborted': `sendTimeoutMs: 30, leaseMs: 1_000`, sender kabhi answer nahi karta, result `{ status: \"pending\", attempts: 1, error: \"timed out after 30 ms\" }` aur `seen?.aborted` true. 'rejects leaseMs <= sendTimeoutMs and a bad maxAttempts' boundary test. Mutation S20 (no timeout) pakda gaya.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/src/planner.ts::sendOnce",
+      "projects/18-resilience/src/timeout.ts::TimeoutPolicy",
+      "projects/21-notification/test/queued.test.ts"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (constructor, trimmed)\nconst sendTimeoutMs = options.sendTimeoutMs ?? 10_000;\nthis.leaseMs = options.leaseMs ?? 60_000;\n// A worker must finish (or time out) well inside its lease, or a healthy but slow send would be handed to a\n// second worker and sent twice.\nif (!(this.leaseMs > sendTimeoutMs)) {\n  throw new NotificationError(\"INVALID_REQUEST\", \"leaseMs must be greater than sendTimeoutMs\");\n}\nthis.timeout = new TimeoutPolicy({ ms: sendTimeoutMs });",
+    "code_language": "typescript",
+    "advantages": [
+      "Config ki galti startup par pakdi jaati hai",
+      "Hung provider worker ko nahi pakadta",
+      "Abort signal se real request bhi cancel"
+    ],
+    "disadvantages": [
+      "Timeout ke bahar ke awaits (cap store) lease ko kha sakte hain",
+      "Sender signal ignore kare toh request background mein chalti rehti hai",
+      "Sirf '>' check, koi margin nahi (60 vs 10 default mein bada margin hai)"
+    ],
+    "common_mistakes": [
+      "Timeout ke baad sender ko signal na dena",
+      "Lease ko timeout ke barabar rakhna",
+      "TimeoutError ko permanent failure maanna"
+    ],
+    "follow_up_questions": [
+      "What if the cap store call hangs longer than the lease?",
+      "Would you require a margin, like leaseMs >= 2 x sendTimeoutMs?",
+      "What does a lease heartbeat change?"
+    ],
+    "concepts": [
+      "timeout",
+      "abort-signal",
+      "lease",
+      "configuration-validation"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Lease lamba: crash recovery slow (OTP 60 s tak atka). Lease chhota: duplicate sends. Timeout chhota: slow-but-ok providers fail. Isliye default 10 s / 60 s aur constructor check.",
+      "failure_scenarios": "Cap store (Redis) hang: timeout policy usko cover nahi karti, lease nikal sakti hai -- isiliye cap ke baad owns check hai (S22 ka sabak). Sender jo signal ignore kare: worker aage badh jaata hai par socket khula rehta hai.",
+      "alternatives": "Lease heartbeat / extend (SQS ChangeMessageVisibility, BullMQ lock extend) lambe kaam ke liye. Har await (cap store bhi) ko apna timeout dena.",
+      "scale_10x_100x": "Zyada devices per push par ek round ka total time badhta hai (parallel, toh max ke barabar). Bahut lambe jobs ke liye heartbeat zaroori ho jaata hai.",
+      "production_improvements": "Cap store call par bhi timeout, margin ka rule (lease >= timeout + buffer), aur metrics: timeouts per channel, leaseLost count."
+    }
+  },
+  {
+    "id": "NTF-040",
+    "project_slug": "p21-notification",
+    "category": "Performance & Scalability",
+    "difficulty": "Senior/System Design",
+    "question": "What limits the throughput of the stage 2 design, and what would you change to handle millions of notifications a day?",
+    "answer_hinglish": "Pehle sach: is project mein koi benchmark ya latency number nahi hai, toh main design se baat karunga, measured numbers se nahi.\n\nBottlenecks jo code mein dikhte hain: (1) `InMemoryJobQueue.claim()` har baar saari entries ka array banata hai, filter aur sort karta hai -- O(n log n) per claim. Lakhon delayed jobs (quiet hours ke) padhe hon toh har claim un sab ko scan karega. (2) Worker batch mein chalta hai: `concurrency` jobs claim, `Promise.all`, sabse slow ka wait. Ek 10 s timeout wala job baaki slots idle rakhta hai. (3) Ek process: queue, records, keys, breakers sab memory mein; horizontally scale karne ke liye shared queue chahiye. (4) Records kabhi delete nahi hote -- memory badhti rehti hai. (5) Breaker per process hai; 50 processes mein har ek ko apne aap provider ki maut seekhni padegi.\n\nMillions/day ke liye: queue ko broker (SQS ya Postgres SKIP LOCKED with index) par le jaao; delayed jobs ko ready jobs se alag (ek sorted set / scheduler jo due jobs ko ready queue mein move kare); worker ko pool banao jo slot free hote hi claim kare; records database mein retention ke saath; provider ke batch APIs (FCM multicast -- built nahi) use karo. Providers khud rate limit karte hain (SMS provider per second), toh per-provider outbound rate limiter bhi chahiye -- yeh bhi built nahi. Typically bottleneck provider ka rate limit hi banta hai, hamara CPU nahi.",
+    "why_needed": "Notification systems spiky hain: ek marketing blast lakhon jobs ek saath. Design ko pata hona chahiye kahan tootega.",
+    "real_world_analogy": "Ek counter wala post office: har customer ke aane par poori line dobara arrange (O(n) claim). Bheed badhe toh token machine (index) aur kai counters (workers pool) chahiye.",
+    "how_it_works": "Throughput = workers x concurrency / average send time, jab tak provider rate limit ya queue claim cost aage na aaye. Batch mode mein average ki jagah per-batch max time lagta hai.",
+    "in_this_project": "`src/queue.ts` comment: 'In memory, one process; claim() scans every job (O(n))'. `src/worker.ts` comment: 'A batch waits for its slowest job before the next claim (simple; a slot-based pool would keep all slots busy -- not built)'. README 'Stage 2: known and NOT handled': records never removed, 'The worker runs in batches'. Breakers `QueuedNotifier.breakers` Map mein, per instance.",
+    "implementation_files": [
+      "projects/21-notification/src/queue.ts::claim",
+      "projects/21-notification/src/worker.ts::runOnce",
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// illustrative, NOT in the repo: a slot-based pool instead of batches\nasync function pool(notifier: QueuedNotifier, slots: number, running: () => boolean) {\n  const loop = async () => {\n    while (running()) {\n      const [job] = notifier.claim(1);\n      if (!job) { await new Promise((r) => setTimeout(r, 250)); continue; }\n      await notifier.process(job); // never throws\n    }\n  };\n  await Promise.all(Array.from({ length: slots }, loop));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Bottlenecks known aur documented",
+      "Interface backend badalne deta hai",
+      "Process() pool ya batch dono mein same"
+    ],
+    "disadvantages": [
+      "O(n) claim",
+      "Batch idle slots",
+      "Per-process breaker aur records memory"
+    ],
+    "common_mistakes": [
+      "Bina measure kiye numbers bolna",
+      "Sirf workers badhana jab bottleneck provider rate limit ho",
+      "Delayed jobs ko ready jobs ke saath scan karna"
+    ],
+    "follow_up_questions": [
+      "How would you share circuit breaker state across 50 workers?",
+      "How do you respect a provider's rate limit across many workers?",
+      "Where would you separate delayed and ready jobs?"
+    ],
+    "concepts": [
+      "scalability",
+      "throughput",
+      "worker-pool",
+      "bottlenecks"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Pool: better utilisation par thoda complex shutdown. Shared breaker (Redis): jaldi sab ko pata chalta hai, par ek aur dependency jo khud fail ho sakti hai. Per-process breaker simple aur failure-isolated.",
+      "failure_scenarios": "Marketing blast: queue depth badhti hai, transactional priority ki wajah se OTP chalte rehte hain par marketing starve. Provider rate limit hit: retryable failures badhti hain, breaker khul sakta hai -- outbound limiter better.",
+      "alternatives": "Kafka partitioned by user, provider-specific consumer groups, FCM/SES batch APIs, managed services (SNS, Pinpoint) jo khud fan-out karte hain.",
+      "scale_10x_100x": "10x: indexed queue + pool + database records. 100x: alag ingest service aur sender service, per-channel queues, per-provider rate-limited senders, delayed jobs ka scheduler service.",
+      "production_improvements": "Load test aur measured numbers, queue depth / oldest job age / send latency per channel metrics, autoscaling on queue depth, outbound rate limiter per provider account."
+    }
+  },
+  {
+    "id": "NTF-041",
+    "project_slug": "p21-notification",
+    "category": "Security",
+    "difficulty": "Advanced",
+    "question": "What abuse and resource-exhaustion risks do the bounded idempotency keys and frequency caps address, and what risks remain?",
+    "answer_hinglish": "Do alag cheezein protect hoti hain: hamari memory, aur user ka phone.\n\nIdempotency keys: stage 1 mein keys hamesha ke liye yaad rehti thi -- matlab har request ek entry, memory sirf badhti. Koi caller (ya bug) unique keys ki baarish kare toh process OOM. Stage 2 mein keys cache-kit `LruCache` mein hain: `maxEntries` default 100,000 aur `ttlMs` 24 h. Memory bounded. Price: LRU eviction ya TTL ke baad same key ek NAYI notification banati hai. Iska security angle: ek flood 100,000 nayi keys bhej ke ek legit client ki key evict kar sakta hai, aur phir uska retry duplicate OTP bhejega. Iska bachaav key store nahi, upar ka auth aur per-caller rate limit hai.\n\nKey length bhi bounded hai: `MAX_KEY_LENGTH = 255`, blank key reject (`checkRequest`). Fingerprint check (same key, alag payload -> `IDEMPOTENCY_CONFLICT`) ek key ko doosre request ke liye reuse hone se rokta hai.\n\nFrequency caps marketing spam se user ko bachate hain: per user per channel, ratelimit-kit se. Transactional kabhi capped nahi -- warna OTP lock-out. Jo risk BAAKI hai: OTP flooding (attacker kisi ke number par OTP request kare -- SMS pumping fraud). Yeh is layer par nahi rukta kyunki transactional uncapped hai; uska jawab upstream hai -- login endpoint par per-phone aur per-IP rate limit. `records` aur `sentBy` bhi unbounded hain (README documented).",
+    "why_needed": "Notification system ek paisa kharch karne wali machine hai (SMS) jo logon ke phone tak pahunchti hai. Memory DoS aur spam dono real threats hain.",
+    "real_world_analogy": "Building ka visitor register: register ke pages limited hain (purane phat jaate hain). Koi 1000 fake entries karde toh asli entry ka record bhi chala jaata hai -- isliye gate par guard (auth, rate limit) zaroori hai.",
+    "how_it_works": "notify: checkRequest (length, blank) -> keys.get(key) (LRU, TTL) -> fingerprint compare. Worker: marketing aur first try par frequencyCap.consume(`userId:channel`).",
+    "in_this_project": "`src/queued-notifier.ts`: `this.keys = new LruCache<string, KeyEntry>({ maxEntries: options.idempotency?.maxEntries ?? 100_000, ttlMs: ... ?? 24 * 60 * 60 * 1000, now: () => this.clock.now() })`. `test/queued.test.ts` 'maxEntries bounds memory: the least recently used key is evicted first' (maxEntries 2, k3 k1 ko evict karta hai, k1 phir naya record). `src/planner.ts` `MAX_KEY_LENGTH = 255`. Stage 3 ka HTTP API key auth karta hai (doosri file ka topic).",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifier",
+      "projects/21-notification/src/planner.ts::MAX_KEY_LENGTH",
+      "projects/21-notification/src/planner.ts::checkRequest",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/20-cache/src/cache.ts::LruCache"
+    ],
+    "code_example": "// real, test/queued.test.ts\nconst { notifier } = setupQueued({ idempotency: { maxEntries: 2 } });\nconst a = notifier.notify(otpReq(\"k1\"));\nnotifier.notify(otpReq(\"k2\"));\nnotifier.notify(otpReq(\"k3\")); // evicts k1\nexpect(notifier.getByKey(\"k1\")).toBeUndefined();\nexpect(notifier.notify(otpReq(\"k1\")).id).not.toBe(a.id);",
+    "code_language": "typescript",
+    "advantages": [
+      "Memory bounded, OOM se bachaav",
+      "Key reuse for different payload detect",
+      "Marketing spam per user capped"
+    ],
+    "disadvantages": [
+      "Eviction flood se legit key gayab -> duplicate",
+      "OTP flooding is layer par nahi rukta",
+      "Records aur sentBy unbounded"
+    ],
+    "common_mistakes": [
+      "Transactional ko bhi cap karna (OTP lock-out)",
+      "Unbounded key map ko 'kaafi hai' samajhna",
+      "Idempotency ko security control samajhna (yeh correctness control hai)"
+    ],
+    "follow_up_questions": [
+      "How would you stop SMS pumping on the OTP endpoint?",
+      "Why not cap transactional messages at all?",
+      "How would per-caller key namespaces help?"
+    ],
+    "concepts": [
+      "resource-exhaustion",
+      "idempotency",
+      "rate-limiting",
+      "abuse-prevention"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "LRU bound vs durable store: memory safe par eviction correctness ko todta hai. Per-caller namespace (key = callerId + key) ek caller ko doosre ki keys evict karne se rokega nahi (shared LRU), par conflict collisions rokega.",
+      "failure_scenarios": "Key flood: legit retry naya record -> double OTP. Cap store down: marketing rukta hai (waits), spam nahi hota -- fail closed for marketing. OTP pumping: SMS bill.",
+      "alternatives": "Keys Redis mein TTL ke saath (eviction policy noeviction + memory alerts), per-caller quotas, CAPTCHA / proof-of-work OTP request par, SMS provider ki fraud protection.",
+      "scale_10x_100x": "100x traffic par 100,000 keys 24 h ke liye kam pad sakti hain -- tab LRU 24 h se pehle hi evict karega aur duplicates badhenge. Size = peak requests per TTL window se calculate karo, ya durable store.",
+      "production_improvements": "Eviction metric (evict reason size) par alert -- matlab bound chhota hai, per-phone OTP rate limit upstream, records retention, aur audit log of who sent what."
+    }
+  },
+  {
+    "id": "NTF-042",
+    "project_slug": "p21-notification",
+    "category": "Failure Scenarios",
+    "difficulty": "Advanced",
+    "question": "The push provider goes completely down. What happens to an OTP ('first' mode) and to an order update ('all' mode)?",
+    "answer_hinglish": "Shuru mein push calls retryable failures dete hain (503). Har failure `ProviderFailure` ke roop mein breaker ke andar throw hoti hai, toh `CircuitBreaker` unhe count karta hai. Window mein failure rate threshold cross (test mein windowSize 4, minimumCalls 2, threshold 0.5) -> breaker `open` for `openMs` (30 s).\n\nAb OTP aata hai ('first': push, sms, email). Worker push job uthata hai, breaker call refuse karta hai (`BrokenCircuitError`), provider ko call JAATI HI NAHI. `call()` 'circuit-open' return karta hai, `called` false toh `attempts` nahi badhta. 'first' mode mein: `failedOver++`, push delivery `failed` with error `circuit open`, `finish()` -> SMS ka job turant queue aur bheja. User ko OTP SMS se seconds mein, 30 s wait nahi.\n\nOrder update ('all': push aur email) ke liye: email apna kaam karta hai. Push ka job `retryLater` se `now + max(reopenInMs, 1)` par wapas -- `retryAfterMs` breaker deta hai, yaani jab half-open probe allowed ho. Attempt use NAHI hota, kyunki koi call nahi hui. Test: `{ status: \"pending\", attempts: 0, error: \"circuit open\", nextAttemptAt: T0 + 30_000 }`, phir 30 s baad probe jaata hai, sent, breaker `closed`. Agar provider abhi bhi down: probe fail, breaker phir open, job phir wait. 'all' ka matlab hi hai har channel tak pahunchna -- bina call ke attempts jalana usse bina ek real try ke fail kar deta. `npm run demo:queue` ka section 2 yahi dikhata hai.",
+    "why_needed": "Provider outages real hain. System ko down provider ko hammer nahi karna chahiye, aur urgent messages ko doosre raaste se nikalna chahiye.",
+    "real_world_analogy": "Highway band hai (circuit open): ambulance (OTP) turant doosra raasta leti hai; courier truck (order update) jisko wahi address chahiye, woh road khulne ka wait karta hai, aur wait ko 'delivery attempt' nahi ginta.",
+    "how_it_works": "breaker.execute -> open state mein BrokenCircuitError(retryAfterMs). first: recordResult failed 'circuit open' + finish (next channel). all: status pending, retryLater(now + reopenInMs).",
+    "in_this_project": "`src/queued-notifier.ts` processJob ka `if (result === \"circuit-open\")` block. Tests `test/queued.test.ts` describe 'circuit breaker per channel': '\"first\": circuit open -> no provider call, fail over to sms immediately' (`attempts: 0`, `failedOver` 1) aur '\"all\": circuit open -> requeued for when a probe is allowed, no attempt used; then sent'. Mutations S11 (no failover) aur S12 (requeue ignores reopen time) pakde gaye. `src/demo-queue.ts` section 2.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/src/demo-queue.ts",
+      "projects/18-resilience/src/breaker.ts::CircuitBreaker"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (processJob, trimmed)\nif (result === \"circuit-open\") {\n  if (record.mode === \"first\") {\n    this.stats.failedOver++;\n    recordResult(delivery, { status: \"failed\", retryable: true, reason: \"circuit open\" });\n    this.finish(job, record, now);\n  } else {\n    delivery.status = \"pending\";\n    delivery.error = \"circuit open\";\n    this.retryLater(job, delivery, now + Math.max(reopenInMs, 1), now);\n  }\n  return;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Down provider par calls band (no hammering)",
+      "OTP turant fallback",
+      "'all' ke attempts bina call ke nahi jalte"
+    ],
+    "disadvantages": [
+      "Breaker per process: har process ko alag se seekhna",
+      "'all' ka job provider ke wapas aane tak indefinitely wait kar sakta hai (koi max wait nahi)",
+      "Failover ke baad push kabhi nahi bhejta (first mode)"
+    ],
+    "common_mistakes": [
+      "Breaker open par attempts count karna",
+      "Permanent failures ko breaker mein ginna",
+      "Requeue ko 'now' par karna (tight loop jab tak breaker band)"
+    ],
+    "follow_up_questions": [
+      "Should an 'all' delivery give up after the provider has been down for a day?",
+      "Why does the breaker not count permanent failures?",
+      "How would you share breaker state across processes?"
+    ],
+    "concepts": [
+      "circuit-breaker",
+      "failover",
+      "graceful-degradation",
+      "retries"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "'first' ke liye fail over: speed > channel preference. 'all' ke liye wait: completeness > speed. Ek global policy dono ko galat karti. Cost: 'all' ka push indefinitely pending reh sakta hai.",
+      "failure_scenarios": "Provider flapping: breaker open/half-open/closed jhoolta hai, 'all' jobs probe ke saath aate hain. Saare channels down: 'first' last channel par circuit open -> failed. Breaker probe fail -> job phir reopen time par.",
+      "alternatives": "Hedging (do providers parallel), multiple providers per channel (Twilio + backup SMS provider) with failover inside the channel, health-check based routing.",
+      "scale_10x_100x": "Bahut workers par har process ka breaker alag open hota hai -- total probe traffic = processes ki sankhya. Shared breaker ya provider health service consider.",
+      "production_improvements": "Max wait for 'all' (jaise 24 h, phir failed), breaker state changes par alert, backup provider per channel, dashboard: failedOver count per channel."
+    }
+  },
+  {
+    "id": "NTF-043",
+    "project_slug": "p21-notification",
+    "category": "Failure Scenarios",
+    "difficulty": "Intermediate",
+    "question": "A worker dies right after claiming a job, or right after writing the result but before completing it. What happens in each case?",
+    "answer_hinglish": "Do alag crash points, do alag raaste -- aur dono mein koi OTP lost nahi hota aur koi extra send nahi hota (provider key ke alawa).\n\nCase 1, claim ke turant baad mara: job leased hai, kisi ko dikhta nahi. Lease (test mein 30 s) khatam hote hi job ready, doosra worker claim karta hai aur bhejta hai. Test 'a worker that dies holding a job': `notifier.claim(10)` 2 jobs le ke chhod deta hai; `worker.drain()` 0 (leased); clock 30 s aage; drain 2 process karta hai; push ek baar sent, `queue.stats.reclaimed` 2. Cost: OTP 30 s (production default 60 s) late. Yahi lease chhota rakhne ka reason hai.\n\nCase 2, result likha (delivery `sent`) par `complete()` se pehle mara. Lease khatam, job phir aata hai. Agar worker bina soche dobara bhejta toh duplicate SMS. Isliye `processJob` ka pehla step: delivery already finished (sent/failed/skipped) hai toh `duplicateJobs++`, complete, kuch send nahi. Test isko ek `ForgetfulQueue` se simulate karta hai jo pehla `complete` 'bhool' jaata hai: doosre drain mein 1 job process hota hai par `push.attempts` 1 hi rehta hai, `duplicateJobs` 1, queue khaali. Mutation S4 (finished delivery processed again) pakda gaya.\n\nCase 3 bhi hai: send hua par result likhne se pehle mara. Yahan record mein sent nahi, toh doosra worker phir bhejega -- isi ke liye provider idempotency key hai.",
+    "why_needed": "Crash kabhi bhi ho sakta hai. Har crash point par system ka behaviour pata hona chahiye: lost, duplicate, ya theek.",
+    "real_world_analogy": "Courier ne parcel deliver kiya, app mein 'delivered' daba diya, par office ko call karne se pehle phone mar gaya. Office doosra courier bhejta hai -- woh app dekh ke 'already delivered' padh ke wapas aa jaata hai.",
+    "how_it_works": "Lease expiry har crash point ko cover karta hai. Record status check (step 1) 'result likha, ack nahi' ko cover karta hai. Provider key 'sent, result nahi likha' ko.",
+    "in_this_project": "`src/queued-notifier.ts` processJob step 1 (`stats.duplicateJobs++`). `test/queued.test.ts` describe 'leases: at-least-once, never a lost job': 'a worker that dies holding a job: after the lease the job is claimed again and sent' aur 'a job redelivered after its delivery finished (crash before complete) sends nothing'. README table: 'Job for a delivery that already finished (crash before complete) -> dropped, nothing sent'.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/src/queue.ts::claim",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// real, test/queued.test.ts (trimmed)\nclass ForgetfulQueue extends InMemoryJobQueue {\n  forget = 1;\n  override complete(id: string, token: number, now: number): boolean {\n    if (this.forget-- > 0) return true; // the worker died between writing the result and acknowledging\n    return super.complete(id, token, now);\n  }\n}\n// ... drain, advance 30 s, drain again\nexpect(push.attempts).toHaveLength(1);\nexpect(notifier.stats.duplicateJobs).toBe(1);",
+    "code_language": "typescript",
+    "advantages": [
+      "Koi job lost nahi",
+      "Redelivered finished job sasta drop",
+      "Har crash point tested"
+    ],
+    "disadvantages": [
+      "Crash recovery lease jitna slow",
+      "'Sent par result nahi likha' case provider par depend"
+    ],
+    "common_mistakes": [
+      "Job ke delivery state ko check kiye bina dobara bhejna",
+      "Crash ke baad 'processing' rows ko manually clean karna",
+      "Lease ko itna lamba rakhna ki OTP minutes late ho"
+    ],
+    "follow_up_questions": [
+      "Which crash point can still produce a duplicate message, and what limits it?",
+      "How would a transactional outbox change case 2?",
+      "How do you choose leaseMs for OTPs?"
+    ],
+    "concepts": [
+      "crash-recovery",
+      "at-least-once",
+      "redelivery",
+      "lease"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-044",
+    "project_slug": "p21-notification",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Advanced",
+    "question": "Mutation S22 survived at first: a delivery that was already SENT showed up as 'pending' with 'frequency cap unavailable'. How would you investigate it, and what was the fix?",
+    "answer_hinglish": "Symptom: record mein delivery `pending`, error `frequency cap unavailable`, `nextAttemptAt` set -- par provider logs mein woh message already bheja gaya hai, aur doosra worker ne usse `sent` likha tha. Matlab koi likha hua 'sent' baad mein overwrite hua.\n\nInvestigate: (1) `stats.leaseLost` aur queue ke `reclaimed` dekho -- job do workers ke paas gaya tha? (2) Kis code path ne `frequency cap unavailable` likha? Sirf ek jagah: cap store ka catch block. (3) Timeline: worker A ne marketing job claim kiya, `frequencyCap.consume()` await kiya -- Redis slow tha, hang. Lease (30 s) nikal gayi. Worker B ne job claim kiya, cap mila, bhej diya, `sent`. Phir A ka Redis call reject hua ('redis down'), aur catch block ne seedha delivery par error likha aur `retryLater` kiya. Reschedule toh refuse hua (purana token), par delivery fields mutate ho chuke the.\n\nCause: lease check send ke baad tha, par cap store ke failure path mein nahi. Har await ke baad lease kho sakti hai, sirf send ke baad nahi. Fix: catch mein pehle `now = this.clock.now(); if (!this.queue.owns(job.id, job.leaseToken, now)) return this.lostLease();`, uske baad hi likho. Yeh mutation check se mila: check hataya, suite green raha -- test gap. Naya test 'cap store fails AFTER the worker lost its lease' ek promise se exact timeline banata hai aur check karta hai ki delivery `sent` rehti hai aur `error` property nahi hai. Sabak: 'leases are checked before every write', literally har write.",
+    "why_needed": "Stale writes chupke se hote hain -- koi exception nahi, bas galat state. Mutation testing hi aise gaps pakadta hai jahan code sahi lagta hai par test us branch ko dekhta nahi.",
+    "real_world_analogy": "Purana chowkidar shift khatam hone ke baad bhi register mein 'gate band' likh gaya, jabki naye ne gate khola tha. Rule: register mein likhne se pehle check karo ki shift abhi tumhari hai.",
+    "how_it_works": "Har await ke baad ownership dobara verify. Write sirf `owns()` true hone par. Reschedule/complete khud bhi check karte hain, par delivery fields ka mutation unse pehle hota hai -- isliye explicit check.",
+    "in_this_project": "`src/queued-notifier.ts` processJob ke cap catch block mein owns check. Test `test/queued.test.ts` 'cap store fails AFTER the worker lost its lease: the late error is not written over the new owner's send': `consume` pehli call par ek pending promise deta hai, `clock.advance(30_000)`, `worker.drain()` bhejta hai, phir `failFirst(new Error(\"redis down\"))`; expect `status: \"sent\"`, no `error`, `leaseLost` 1, `push.sent` 1. README 'Stage 2: mutation checks' mein S22.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (processJob, the cap store path)\ntry {\n  decision = await this.frequencyCap.consume(`${record.userId}:${delivery.channel}`);\n} catch {\n  // The cap's store is down: neither send uncapped nor drop -- try again later, no attempt used.\n  now = this.clock.now();\n  if (!this.queue.owns(job.id, job.leaseToken, now)) return this.lostLease(); // S22\n  delivery.error = \"frequency cap unavailable\";\n  this.retryLater(job, delivery, now + this.backoff.delayMs(1, this.random), now);\n  return;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Test exact timeline reproduce karta hai (promise + manual clock)",
+      "Fix ek line, rule general",
+      "Mutation testing ne test gap pakda"
+    ],
+    "disadvantages": [
+      "Har naya await ek naya jagah jahan check bhoolna possible",
+      "In-memory mutation: database mein yeh conditional UPDATE hota toh khud safe hota"
+    ],
+    "common_mistakes": [
+      "Sirf happy path (send ke baad) lease check",
+      "Yeh maan lena ki reschedule refuse ho gaya toh sab theek (fields pehle hi badal gaye)",
+      "Line coverage ko kaafi maanna -- branch covered thi, assertion nahi"
+    ],
+    "follow_up_questions": [
+      "How could you make it impossible to forget the check, e.g. a helper that writes only under the lease?",
+      "Why did line coverage not reveal this gap?",
+      "Where else in processJob is there an await before a write?"
+    ],
+    "concepts": [
+      "mutation-testing",
+      "stale-writes",
+      "lease",
+      "debugging"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Explicit check har await ke baad vs ek wrapper `writeIfOwned(fn)`: wrapper bhoolna mushkil banata hai par code indirect. Database mein conditional UPDATE natural solution hai.",
+      "failure_scenarios": "Bina fix: sent delivery pending dikhti, phir retry job (agar reschedule chal jaata) dobara bhejta. Yahan reschedule refuse hua, toh delivery hamesha 'pending' atki rehti -- record kabhi finish nahi hota.",
+      "alternatives": "Lease heartbeat (Redis slow ho toh bhi lease badhti rahe), cap store call par timeout (lease ke andar), ya cap check ko job claim se pehle alag step.",
+      "scale_10x_100x": "Zyada load par Redis latency spikes common hain, toh yeh race production mein real hota. Monitoring: leaseLost by code path.",
+      "production_improvements": "Har await ke baad check ka lint/review rule, `writeIfOwned` helper, cap store timeout, aur leaseLost metric with reason label."
+    }
+  },
+  {
+    "id": "NTF-045",
+    "project_slug": "p21-notification",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Intermediate",
+    "question": "Product says the cap is '1 promotional push per day', but a user who got one at noon gets nothing for 36 hours. How do you debug this?",
+    "answer_hinglish": "Symptom: cap `slidingWindow({ limit: 1, windowMs: 86_400_000 })`, user ko day N 12:00 par sale push mila. Day N+1 12:00 (poore 24 h baad) wala promo `skipped (capped)`. Day N+2 00:00 UTC par hi agla jaata hai. 36 ghante.\n\nInvestigate: (1) Delivery ka `skipReason` dekho -- `capped`, toh cap ne roka, quiet hours ya mute nahi. (2) `stats.capped` badh raha hai. (3) Algorithm padho: ratelimit-kit ka sliding window COUNTER hai, sliding log nahi. Woh day-aligned windows rakhta hai (`curStart = now - (now % window)`, UTC midnight se) aur estimate karta hai `cur + prev * weight`, jahan weight = previous window ka jitna hissa abhi bhi sliding day mein hai. (4) Hisaab: day N+1 12:00 par cur = 0, prev = 1 (day N ka send), weight = 0.5. Estimate 0.5, plus cost 1 = 1.5 > 1 -> capped. Day N+2 00:00 par day N previous bhi nahi raha -> free.\n\nCause: bug nahi, algorithm ka approximation. Bade limits (1000/min) par yeh error chhota hai, par limit 1 par weighted 0.5 bhi poora slot kha leta hai. Fix options: chhote caps ke liye sliding LOG (har send ka timestamp, exactly 24 h); ya product ko bata do ki behaviour aisa hai. Is project ne behaviour ko test mein PIN kiya aur README mein document kiya -- 'surprise' ko chhupaya nahi.",
+    "why_needed": "Rate limiting algorithms approximations hain. Product ki language ('24 h since last') aur algorithm ki guarantee alag ho sakti hai -- yeh mismatch bug report jaisa dikhta hai.",
+    "real_world_analogy": "Gym ka rule '1 visit per day' par counter din ke hisaab se purane din ki aadhi visit bhi gin leta hai -- toh kal dopahar aaye, aaj dopahar ko 'aadha' visit baaki hai aur aap andar nahi ja sakte.",
+    "how_it_works": "estimated = cur + prev * (window - elapsed) / window; if estimated + cost > limit -> denied. Limit 1 par koi bhi prev > 0 aur weight > 0 deny karta hai.",
+    "in_this_project": "`test/queued.test.ts` 'cap of 1/day with the sliding window counter: still capped 24 h later, free at the second midnight': T0 = 2026-11-23 12:00 UTC, s2 capped, +24 h s3 capped, `clock.set(Date.UTC(2026, 10, 25, 0, 0))` par s4 jaata hai, `push.sent` 2. `projects/19-rate-limit/src/algorithms.ts` ka `slidingWindow`. README: 'A small cap that must be exactly \"24 h since the last one\" needs a sliding log, not a counter.'",
+    "implementation_files": [
+      "projects/21-notification/test/queued.test.ts",
+      "projects/19-rate-limit/src/algorithms.ts::slidingWindow",
+      "projects/21-notification/README.md",
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifierOptions"
+    ],
+    "code_example": "// real, test/queued.test.ts (trimmed)\nnotifier.notify(saleReq(\"s1\")); // day N 12:00\nconst second = notifier.notify(saleReq(\"s2\"));\nawait worker.drain();\nexpect(notifier.get(second.id)!.deliveries[0]!.skipReason).toBe(\"capped\");\nclock.advance(24 * 3_600_000); // day N+1 12:00: previous day weighted 0.5 -> 0.5 + 1 > 1\nconst third = notifier.notify(saleReq(\"s3\"));\nawait worker.drain();\nexpect(notifier.get(third.id)!.deliveries[0]!.skipReason).toBe(\"capped\");\nclock.set(Date.UTC(2026, 10, 25, 0, 0)); // day N+2 00:00: day N is out of the sliding window",
+    "code_language": "typescript",
+    "advantages": [
+      "Behaviour test mein pinned, regression nahi hoga",
+      "Document kiya, chhupaya nahi",
+      "Root cause algorithm ka maths, code bug nahi"
+    ],
+    "disadvantages": [
+      "Small limits par counter ka error bada",
+      "Windows UTC midnight se aligned, user ke timezone se nahi"
+    ],
+    "common_mistakes": [
+      "Sliding window counter ko exact maan lena",
+      "Bug report par seedha limit 2 kar dena bina samjhe",
+      "Cap ko timezone-aware samajhna"
+    ],
+    "follow_up_questions": [
+      "When is a sliding log worth its memory cost?",
+      "How would a token bucket behave for 1 per day?",
+      "Should marketing caps follow the user's local day?"
+    ],
+    "concepts": [
+      "sliding-window-counter",
+      "rate-limiting",
+      "approximation",
+      "debugging"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-046",
+    "project_slug": "p21-notification",
+    "category": "Debugging & Troubleshooting",
+    "difficulty": "Intermediate",
+    "question": "A dashboard shows a skipped push delivery that still has a nextAttemptAt in the future (S24). What happened, and how was it fixed?",
+    "answer_hinglish": "Symptom: delivery `skipped (no_address)` hai, par uspe `nextAttemptAt` bhi hai -- dashboard 'retry in 1 s' dikha raha hai ek aisi delivery ke liye jo khatam ho chuki. Koi job queue mein nahi.\n\nTimeline: OTP push ko retryable failure mila. `retryLater` ne `status: pending` aur `nextAttemptAt: now + 1_000` set kiya. Beech mein user ne app uninstall kiya / push token hata (`users.upsert({ ...FULL_USER, pushTokens: undefined })`). Retry job chala, `replan()` ne bola `skipped (no_address)`, aur `applyPlan` ne status aur skipReason set kiya -- par purana `nextAttemptAt` hataya nahi. Field reh gaya.\n\nInvestigate kaise: record ka JSON dekho -- `status` aur `nextAttemptAt` ek doosre ke against hain. Phir dekho kaun `nextAttemptAt` set aur delete karta hai: set `retryLater` mein, delete `recordResult` mein (sent/failed). Skip path `recordResult` se nahi jaata, `applyPlan` se jaata hai -- wahan delete missing.\n\nFix `applyPlan` mein: `if (plan.status !== \"pending\") delete delivery.nextAttemptAt;`. Yeh mutation check S24 se mila: line hatao, sab tests pass -- kisi test ne retry ke baad skip combination check hi nahi kiya tha. Naya test 'a retry that is skipped when it runs (address removed meanwhile) keeps no nextAttemptAt' check karta hai ki push skipped no_address hai, `nextAttemptAt` property nahi hai, aur 'first' mode mein SMS gaya. Sabak: state change par saare related fields ek saath sambhalo.",
+    "why_needed": "Stale fields API consumers ko jhooth bolte hain (dashboard, support team). Status aur uske dependent fields consistent hone chahiye.",
+    "real_world_analogy": "Train cancel ho gayi par station board par abhi bhi 'next departure 10:15' likha hai -- board update karna bhool gaye.",
+    "how_it_works": "Delivery ke dependent fields: notBefore (sirf deferred), nextAttemptAt (sirf pending retry), skipReason (sirf skipped), to (skipped mein nahi). applyPlan har plan par inhe reset karta hai.",
+    "in_this_project": "`src/planner.ts` `applyPlan()`: `delete delivery.notBefore; if (plan.status !== \"pending\") delete delivery.nextAttemptAt;`. `test/queued.test.ts` retries describe ka pehla test. README 'Stage 2: mutation checks' -- S24: 'a delivery waiting for a retry that is skipped when the retry runs (its address was removed) kept its nextAttemptAt'.",
+    "implementation_files": [
+      "projects/21-notification/src/planner.ts::applyPlan",
+      "projects/21-notification/src/queued-notifier.ts::retryLater",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// real, src/planner.ts\nexport function applyPlan(delivery: Delivery, plan: ChannelPlan): void {\n  delivery.status = plan.status;\n  delete delivery.notBefore;\n  if (plan.status !== \"pending\") delete delivery.nextAttemptAt; // S24\n  if (plan.status === \"skipped\") {\n    delivery.skipReason = plan.reason;\n    delete delivery.to;\n  } else {\n    delivery.to = plan.to; // the CURRENT address\n    if (plan.status === \"deferred\") delivery.notBefore = plan.notBefore;\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek function saare dependent fields reset karta hai",
+      "Test exact combination pin karta hai"
+    ],
+    "disadvantages": [
+      "Optional fields ka model: har naye field ke saath reset bhoolna possible",
+      "Discriminated union type hota toh compiler pakadta"
+    ],
+    "common_mistakes": [
+      "Status badalna par related fields nahi",
+      "Sirf main path (sent/failed) ka cleanup",
+      "Mutation testing ke bina coverage par bharosa"
+    ],
+    "follow_up_questions": [
+      "How would a discriminated union type for Delivery prevent this class of bug?",
+      "Why does a retry re-run the planner at all?",
+      "What other field combinations should be invariants?"
+    ],
+    "concepts": [
+      "state-consistency",
+      "mutation-testing",
+      "debugging",
+      "data-model"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-047",
+    "project_slug": "p21-notification",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "Why are retries delayed jobs in the queue (runAt = now + backoff) instead of resilience-kit's in-process RetryPolicy with sleeps?",
+    "answer_hinglish": "resilience-kit mein ek achha `RetryPolicy` already tha, par yahan jaan-boojh kar use nahi kiya. PLAN.md: 'Retries are jobs back in the queue, not sleeps in the worker.'\n\nDo reasons. Pehla, in-process retry worker slot pakad ke rakhta hai. Backoff 1 s, 2 s, 4 s, ... 5 min tak (`maxMs: 300_000`). Sleep ke dauraan woh worker slot kuch nahi karta. Provider down hai toh saare slots sleeping retries se bhar jaate hain aur naye OTP claim hi nahi hote. Queued retry ka wait cost zero hai -- job queue mein `runAt` ke saath pada hai, worker doosre jobs karta hai.\n\nDoosra, in-process retry process ke saath marta hai. Deploy ya crash hua toh 'teesra attempt 2 minute baad' gayab. Queued retry (durable queue ke saath) crash survive karta hai -- worker kaun hai farak nahi padta. Bonus: retry naye worker par chal sakta hai, aur priority bhi lagti hai (retry wala marketing job naye OTP ke peeche).\n\nLibrary phir bhi kaam aayi: `exponentialBackoff` delay deta hai, `TimeoutPolicy` har send par, `CircuitBreaker` per channel. Flow: retryable failure aur `attempts < maxAttempts` -> `retryLater(job, delivery, now + backoff.delayMs(delivery.attempts, random))` -> `queue.reschedule`. Cost: har retry ek queue round trip aur thodi latency (poll interval).",
+    "why_needed": "Retries notification system ka core hain. Galat jagah karne se worker capacity aur crash safety dono jaate hain.",
+    "real_world_analogy": "Doctor ka appointment: report 2 din mein aayegi toh tum clinic mein 2 din baithte nahi -- naya appointment le ke ghar jaate ho, aur doctor doosre patients dekhta hai.",
+    "how_it_works": "Retryable failure -> delivery.status pending, nextAttemptAt = runAt -> queue.reschedule(id, token, runAt) (lease release). claim filter runAt <= now tak job ko chhupata hai.",
+    "in_this_project": "`src/queued-notifier.ts` `retryLater()` aur default `exponentialBackoff({ initialMs: 1_000, maxMs: 300_000 })` (full jitter). `test/queued.test.ts` 'a retryable failure goes back in the queue after the backoff (1 s, 2 s), not before': `clock.advance(999)` par drain 0, 1 ms aur par chalta hai, phir `nextAttemptAt: T0 + 1_000 + 2_000`. Mutations S9, S14, S15, S16 pakde gaye.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::retryLater",
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/18-resilience/src/backoff.ts::exponentialBackoff",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// real, src/queued-notifier.ts\nif (result.retryable && delivery.attempts < this.maxAttempts) {\n  delivery.status = \"pending\";\n  delivery.error = result.reason;\n  this.stats.retried++;\n  this.retryLater(job, delivery, now + this.backoff.delayMs(delivery.attempts, this.random), now);\n  return;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Wait ke dauraan worker free",
+      "Crash ke baad bhi retry (durable queue ho toh)",
+      "Priority retries par bhi"
+    ],
+    "disadvantages": [
+      "Har retry ek queue round trip",
+      "Poll interval jitni extra latency",
+      "In-memory queue mein crash-survive ka faayda abhi nahi milta"
+    ],
+    "common_mistakes": [
+      "Worker mein sleep loop",
+      "Bina jitter ke backoff (thundering herd)",
+      "Attempts ko job par rakhna aur delivery par nahi (redelivery par reset)"
+    ],
+    "follow_up_questions": [
+      "When would an in-process retry still be the right choice?",
+      "Why is the attempt count stored on the delivery, not on the job?",
+      "Why full jitter by default?"
+    ],
+    "concepts": [
+      "retries",
+      "exponential-backoff",
+      "jitter",
+      "delayed-jobs"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-048",
+    "project_slug": "p21-notification",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Senior/System Design",
+    "question": "Why is there one circuit breaker per channel, why are only retryable failures counted, and why do 'first' and 'all' react differently to an open circuit?",
+    "answer_hinglish": "Teen decisions, ek hi soch: breaker ko sirf 'provider bimaar hai' ka signal hona chahiye.\n\nPer channel: har channel ka provider alag hai (FCM, Twilio, SES). SMS provider down hai toh email ko kyun roka jaaye? Constructor har sender ke channel ke liye ek `CircuitBreaker` banata hai, same options ke saath, clock injected (`now: () => this.clock.now()`) taaki tests open/half-open time control kar sakein.\n\nSirf retryable: 'invalid phone number' ya 'token unregistered' ek PERMANENT failure hai -- provider ne kaam sahi kiya, input galat tha. Agar inhe count karte toh ek bad-data batch (purane numbers wala marketing list) breaker khol deta aur sabke OTP rok deta. Implementation: retryable failure ko `ProviderFailure` bana ke breaker ke andar throw (breaker count karta hai); permanent ko return (breaker ke liye success). Test: 4 permanent failures ke baad breaker `closed`. Mutation S10 pakda gaya.\n\nOpen circuit par: 'first' ka matlab hai 'pehla channel jo user tak pahunche' -- OTP ko dead push provider ke liye 30 s wait nahi karna chahiye, toh fail over now. 'all' ka matlab hai 'har channel' -- push chhod nahi sakte, toh wait for probe. Aur attempt nahi jalta kyunki provider ko call hi nahi hui; warna 3 'attempts' bina ek bhi real try ke failed. Ek global rule dono mein se ek ko galat karta.",
+    "why_needed": "Breaker galat signal par khule toh woh khud outage ban jaata hai. Aur ek hi reaction har delivery mode ke liye sahi nahi.",
+    "real_world_analogy": "Bijli ka fuse har kamre ka alag (per channel). Fuse sirf short circuit par udta hai, bulb fuse hone par nahi (permanent failure provider ki galti nahi).",
+    "how_it_works": "breaker.execute(fn): fn throw -> failure count; return -> success. Open -> BrokenCircuitError with retryAfterMs. Notifier: first -> failed + next channel; all -> pending at now + retryAfterMs, attempts unchanged.",
+    "in_this_project": "`src/queued-notifier.ts`: `class ProviderFailure extends Error` with comment 'A permanent one ... is the provider working correctly: returned, not counted'. Constructor loop `for (const channel of this.deps.senders.keys()) this.breakers.set(channel, new CircuitBreaker({ ...options.breaker, now: ... }))`. `if (called) delivery.attempts += 1;`. Tests: 'a permanent failure does not count against the breaker (the provider is working)', aur dono circuit-open tests.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::ProviderFailure",
+      "projects/21-notification/src/queued-notifier.ts::breakerState",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/18-resilience/src/breaker.ts::CircuitBreaker",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (the call closure, trimmed)\nreturn await breaker.execute(() =>\n  this.timeout.execute(async (signal) => {\n    const answer = await sendOnce(sender, message, signal);\n    if (answer.status === \"failed\" && answer.retryable) throw new ProviderFailure(answer); // counted\n    return answer; // sent or permanent: not a failure for the breaker\n  }),\n);",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek channel ka outage doosre ko nahi rokta",
+      "Bad data breaker nahi kholta",
+      "Har mode ki semantics ke hisaab se reaction"
+    ],
+    "disadvantages": [
+      "Per process breaker: har instance alag se seekhta hai",
+      "Timeouts bhi count hote hain (slow-but-alive provider par breaker khul sakta hai)",
+      "'all' ka indefinite wait"
+    ],
+    "common_mistakes": [
+      "Ek global breaker saare providers ke liye",
+      "4xx ko 5xx jaisa count karna",
+      "Open circuit ko normal retry ki tarah attempt ginna"
+    ],
+    "follow_up_questions": [
+      "What if a provider returns a permanent error for every request because of an outage on their side?",
+      "How would you configure a breaker per provider account rather than per channel?",
+      "Should timeouts count the same as 5xx errors?"
+    ],
+    "concepts": [
+      "circuit-breaker",
+      "failure-classification",
+      "failover",
+      "design-decisions"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Per-channel vs per-provider: agar ek channel ke do providers hon (primary + backup SMS), toh breaker per provider chahiye. Retryable-only counting: provider ke galat classification (outage ko 400 bolna) par breaker nahi khulega -- us case ko permanent failure rate alert se pakdo.",
+      "failure_scenarios": "Breaker half-open probe fail -> phir open, 'all' jobs phir wait. Clock skew: breaker injected clock use karta hai, tests mein deterministic. Process restart: breaker state reset, provider ko phir hammer (minimumCalls tak).",
+      "alternatives": "Adaptive concurrency (provider latency se limit), bulkhead per channel (resilience-kit mein Bulkhead hai, yahan use nahi), shared breaker state Redis mein.",
+      "scale_10x_100x": "Bahut processes par probe traffic = processes x halfOpenMaxCalls. 100x par shared health signal ya service mesh ka outlier detection.",
+      "production_improvements": "Breaker state change events ko metrics/alerts mein (resilience-kit onEvent deta hai -- yahan wire nahi), 'all' ke liye max wait, per-provider breakers jab backup providers aayein."
+    }
+  },
+  {
+    "id": "NTF-049",
+    "project_slug": "p21-notification",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "Explain the frequency-cap rules: marketing only, first try only, skipped not deferred, and the job waits when the cap store is down.",
+    "answer_hinglish": "Frequency cap ka matlab: ek user ko ek channel par itne se zyada marketing messages nahi (jaise 3 per day). Implementation ratelimit-kit ka koi bhi object jiska `consume(key)` ek `Decision` deta hai -- key `<userId>:<channel>`. Chaar rules, har ek ki wajah.\n\nMarketing only: transactional (OTP, receipt) ko cap karna user ko lock out karna hai. Test: cap 2 ke baad bhi 3 OTP sab gaye (`push.sent` 5).\n\nFirst try only: ek delivery cap se admit hui, phir provider ne 503 diya aur retry hua. Retry ko phir cap se guzaara toh ek message do slots kha leta (aur cap 1 par retry khud ko block kar deta). Isliye `admitted` set (`<recordId>:<channel>`); test 'a retry of an admitted delivery does not use the cap again' (cap 1, retry ke baad sent, attempts 2). Mutation S8.\n\nSkipped, not deferred: over cap toh `skipped (capped)`. Defer karte toh promotions ka backlog banta aur kal user ko kal ke saath aaj ke purane promos bhi milte. 'Flash sale' 2 din baad bekaar hai.\n\nStore down: Redis gaya toh do bure options -- bina cap ke bhejo (spam) ya drop karo (business loss). Dono nahi: job `retryLater` se backoff ke baad wapas, attempt use nahi, error `frequency cap unavailable`. Test 'cap store unavailable: the job waits (no send, no attempt used), then goes through'. Iska failure path hi S22 bug tha.",
+    "why_needed": "Marketing fatigue se users app uninstall karte hain aur unsubscribe karte hain. Cap zaroori hai, par galat jagah lagaya toh OTP ya revenue dono ka nuksaan.",
+    "real_world_analogy": "Ek dost jo din mein 3 se zyada forward nahi bhejta. Kal ke bache forwards aaj nahi bhejta (skip, not defer). Aur agar usko yaad nahi ki aaj kitne bheje (store down), toh woh ruk jaata hai, bina gine nahi bhejta.",
+    "how_it_works": "Order in processJob: replan pehle (muted/quiet/no address wale cap ka slot nahi khaate), phir cap, phir send. admitted set first try ke baad cap skip karta hai.",
+    "in_this_project": "`src/queued-notifier.ts`: `frequencyCap?: { consume(key: string): Promise<Decision> }` option, `admitted = new Set<string>()`, cap block processJob mein. README table rows 'Marketing over the user's cap' aur 'The cap's store is down'. Tests 'quiet hours and caps in the queue' describe mein. Mutations S7 (transactional capped), S8.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::QueuedNotifierOptions",
+      "projects/21-notification/src/queued-notifier.ts::processJob",
+      "projects/21-notification/test/queued.test.ts",
+      "projects/19-rate-limit/src/limiter.ts",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// real, src/queued-notifier.ts (processJob, trimmed)\nconst admitKey = `${record.id}:${delivery.channel}`;\nif (record.category === \"marketing\" && this.frequencyCap && !this.admitted.has(admitKey)) {\n  // ... consume, store-down path ...\n  if (!decision.allowed) {\n    delivery.status = \"skipped\";\n    delivery.skipReason = \"capped\";\n    this.stats.capped++;\n    this.finish(job, record, now);\n    return;\n  }\n  this.admitted.add(admitKey);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "OTP kabhi capped nahi",
+      "Retry double count nahi",
+      "Store down par na spam na drop"
+    ],
+    "disadvantages": [
+      "admitted set unbounded (records ki tarah)",
+      "Store down lamba chale toh marketing ruki rehti hai",
+      "Sliding counter ka 36 h surprise chhote caps par"
+    ],
+    "common_mistakes": [
+      "Cap ko replan se pehle lagana (muted channel bhi slot kha le)",
+      "Har retry par cap consume",
+      "Store error par fail-open (bina cap bheja)"
+    ],
+    "follow_up_questions": [
+      "Why fail closed (wait) for caps but never cap transactional?",
+      "Should a capped message fall back to email in 'first' mode?",
+      "How would you make the admitted set survive a restart?"
+    ],
+    "concepts": [
+      "frequency-cap",
+      "rate-limiting",
+      "fail-closed",
+      "marketing"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-050",
+    "project_slug": "p21-notification",
+    "category": "Production Scenarios",
+    "difficulty": "Beginner",
+    "question": "When the notification project first consumed resilience-kit, ratelimit-kit and cache-kit, what gap did it find in them, and how is the dependency set up?",
+    "answer_hinglish": "Teeno libraries (projects 18, 19, 20) is repo mein pehle ban chuki thi, apne tests ke saath. Par kisi doosre project ne unhe USE nahi kiya tha. Notification project pehla consumer tha -- aur turant ek real gap mila: teeno `npm run build` se JavaScript to bana rahi thi, par `.d.ts` type declarations nahi. Matlab TypeScript consumer ko `import { CircuitBreaker } from \"resilience-kit\"` par koi types nahi milte -- `any` ya compile error. Library ke apne tests source se chalte the, toh unhe kabhi pata hi nahi chala.\n\nFix: har library ke `tsconfig.build.json` mein `\"declaration\": true`. Ab `dist/` mein `.d.ts` files bhi banti hain. Sabak interview ke liye: library ka asli test uska consumer hai -- 'mere tests pass' aur 'koi use kar sakta hai' alag cheezein hain. Isi tarah npm packages ke liye `npm pack` karke ek sample project mein install karna achhi practice hai.\n\nSetup: `package.json` mein `\"resilience-kit\": \"file:../18-resilience\"` jaise file: dependencies, jo unke built `dist/` ko point karti hain. `dist/` commit nahi hota, isliye fresh clone par `npm run build:deps` chalana padta hai -- `scripts/build-deps.mjs` teeno folders mein `npm ci` aur `npm run build` karta hai -- phir `npm ci`. Koi npm publish nahi.",
+    "why_needed": "Shared internal libraries tabhi kaam ki hain jab doosre projects unhe asaani se use kar sakein. Pehla consumer hamesha integration gaps pakadta hai.",
+    "real_world_analogy": "Ek naya charger banaya, khud ke phone par test kiya, chal gaya. Dost ke phone mein lagaya toh pata chala cable ka connector hi alag hai.",
+    "how_it_works": "file: dependency node_modules mein library folder ko link/copy karti hai; package.json ke main/types fields dist ko point karte hain; tsc declaration: true se .d.ts likhta hai.",
+    "in_this_project": "`projects/21-notification/package.json` dependencies: `cache-kit: file:../20-cache`, `ratelimit-kit: file:../19-rate-limit`, `resilience-kit: file:../18-resilience`; script `build:deps`. `projects/18-resilience/tsconfig.build.json` mein `\"declaration\": true` (19 aur 20 mein bhi). README 'Stage 2: known and NOT handled' ka last point. Notification ka apna `tsconfig.build.json` declaration false rakhta hai -- woh library nahi, app hai.",
+    "implementation_files": [
+      "projects/21-notification/package.json",
+      "projects/21-notification/scripts/build-deps.mjs",
+      "projects/18-resilience/tsconfig.build.json",
+      "projects/19-rate-limit/tsconfig.build.json",
+      "projects/20-cache/tsconfig.build.json"
+    ],
+    "code_example": "// real, projects/18-resilience/tsconfig.build.json\n{\n  \"extends\": \"./tsconfig.json\",\n  \"compilerOptions\": { \"rootDir\": \"src\", \"outDir\": \"dist\", \"declaration\": true, \"sourceMap\": true },\n  \"include\": [\"src\"]\n}",
+    "code_language": "json",
+    "advantages": [
+      "Real consumer ne real gap pakda",
+      "Ek line ka fix",
+      "Bina publish ke libraries reuse"
+    ],
+    "disadvantages": [
+      "file: deps ke liye pehle build zaroori (fresh clone par ek extra step)",
+      "Versioning nahi: library badli toh consumer turant affected"
+    ],
+    "common_mistakes": [
+      "Library ko sirf apne tests se 'done' maanna",
+      "dist/ commit karna ya build step bhool jaana",
+      "Consumer mein types ke liye `any` cast karke chhod dena"
+    ],
+    "follow_up_questions": [
+      "How would you catch this gap in the library's own CI?",
+      "file: dependency vs npm workspaces vs a private registry?",
+      "What does `npm pack` let you verify?"
+    ],
+    "concepts": [
+      "library-packaging",
+      "type-declarations",
+      "dependency-management",
+      "integration-testing"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-051",
+    "project_slug": "p21-notification",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "How does a marketing push deferred by quiet hours become a delayed job, and what happens if the workers run it late, inside the next night?",
+    "answer_hinglish": "Stage 1 mein deferred deliveries ke liye `flushDue()` poll tha. Stage 2 mein koi poll nahi: deferred delivery ek DELAYED JOB hai jiska `runAt = notBefore` (quiet window ka end). `notify()` mein 'all' mode ke liye: `if (d.status === \"deferred\") this.enqueue(record, d, d.notBefore!)`. Queue ka claim filter `runAt <= now` usse tab tak chhupata hai.\n\nJab job chalta hai, `processJob` pehle `replan()` karta hai -- yeh stage 1 ka sabak hai (late flushDue ne agli raat ki quiet hours mein push bhej diya tha). Teen nateeje: pending (ab bhejo), skipped (user ne beech mein mute kiya, address hata), ya deferred dobara -- tab `queue.reschedule(job.id, job.leaseToken, plan.notBefore, now)` naye window end par.\n\nTest 'a deferred delivery is a delayed job; a late run inside the next window defers it again': 23:00 UTC par sale (quiet 22:00-07:00, user UTC), job ka `runAt` agle din 07:00. Phir clock 24 Nov 23:30 par set -- 'workers din bhar down the, phir raat ho gayi'. Drain 1 job process karta hai par push ko 0 calls; delivery `deferred`, `notBefore` 25 Nov 07:00. 07:00 par push jaata hai.\n\n'first' mode alag: `queueNextCandidate` pehle koi pending channel dhoondta hai (email abhi ja sakta hai), deferred sirf tab. Toh raat ko 'first' marketing turant email se jaata hai aur push/sms `not_needed`. Mutations S5, S6 (deferral now par reschedule -- hang), S21.",
+    "why_needed": "Quiet hours user ki neend bachate hain. Delayed job bina polling ke sahi time par uthta hai, aur replan late run ko bhi safe banata hai.",
+    "real_world_analogy": "Alarm subah 7 baje ka. Agar tum alarm miss karke raat 11:30 ko uthe, toh tum phir bhi us waqt dost ko call nahi karte -- agle din subah 7 ka naya alarm lagate ho.",
+    "how_it_works": "notify: deferred -> enqueue(runAt = notBefore). process: replan -> deferred -> applyPlan + reschedule(notBefore). Pending -> cap -> send.",
+    "in_this_project": "`src/queued-notifier.ts` `notify()` ka 'all' loop, `queueNextCandidate()`, aur processJob ka replan block. `src/planner.ts` `replan()` jo users aur preferences dobara padhta hai. Tests `test/queued.test.ts` describe 'quiet hours and caps in the queue' ke pehle do tests.",
+    "implementation_files": [
+      "projects/21-notification/src/queued-notifier.ts::notify",
+      "projects/21-notification/src/queued-notifier.ts::queueNextCandidate",
+      "projects/21-notification/src/planner.ts::replan",
+      "projects/21-notification/test/queued.test.ts"
+    ],
+    "code_example": "// real, test/queued.test.ts (trimmed)\nconst night = Date.UTC(2026, 10, 23, 23, 0);\nconst { notifier, worker, clock, preferences, push, queue } = setupQueued({ now: night });\npreferences.set(\"u1\", { mutedMarketing: [\"sms\", \"email\"], quietHours: NIGHT });\nconst r = notifier.notify(saleReq());\nexpect(queue.jobs()[0]!.runAt).toBe(Date.UTC(2026, 10, 24, 7, 0));\nclock.set(Date.UTC(2026, 10, 24, 23, 30)); // the workers were down all day; it is night again\nexpect(await worker.drain()).toBe(1);\nexpect(push.attempts).toHaveLength(0);\nexpect(notifier.get(r.id)!.deliveries[0]).toMatchObject({ status: \"deferred\", notBefore: Date.UTC(2026, 10, 25, 7, 0) });",
+    "code_language": "typescript",
+    "advantages": [
+      "Koi flushDue poll nahi",
+      "Late run bhi rule todta nahi",
+      "Preference changes waiting jobs par apply"
+    ],
+    "disadvantages": [
+      "Lakhon deferred jobs claim scan ko slow karte hain (O(n))",
+      "Saare users ka window end ek time par -> 07:00 par spike",
+      "DST handle nahi (fixed offset)"
+    ],
+    "common_mistakes": [
+      "Deferred job ko 'now' par reschedule karna (tight loop, S6)",
+      "Job chalne par purana plan use karna",
+      "Quiet window end par sab ek saath bhejna bina spread ke"
+    ],
+    "follow_up_questions": [
+      "How would you avoid a send spike when every user's quiet hours end at 07:00?",
+      "Why does 'first' mode prefer a pending channel over a deferred one?",
+      "What changes with IANA time zones and DST?"
+    ],
+    "concepts": [
+      "delayed-jobs",
+      "quiet-hours",
+      "replanning",
+      "scheduling"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "NTF-052",
+    "project_slug": "p21-notification",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Add aging to InMemoryJobQueue.claim so a marketing job that has waited long enough competes with transactional jobs, and write a test for it.",
+    "answer_hinglish": "README khud kehta hai: 'Marketing can starve... Aging is not built.' Exercise: claim ke sort mein 'effective priority' use karo jo waiting time ke saath ghatti hai.\n\nDesign: constructor option `agingMs` (optional; na diya toh behaviour bilkul purana, taaki 5 existing queue tests na badlein). Effective priority = `priority - floor(waited / agingMs)`, jahan `waited = now - runAt` (runAt se, enqueue se nahi -- ek delayed job ka wait tab shuru hota hai jab woh ready hota hai). Ek floor lagao: effective priority 0 se neeche nahi, warna ek bahut purana marketing job naye OTP se AAGE nikal jaayega -- hum starvation hatana chahte hain, OTP ko peeche nahi karna. 0 par tie hone par runAt pehle, toh purana marketing job fresh OTP ke saath barabari se compete karta hai.\n\nTest teen cheezein pin kare. (a) agingMs 60_000, marketing job runAt 0, OTP runAt 59_000: `claim(59_000)` par marketing 59 s ruka -> effective abhi 1, OTP pehle. (b) Same setup `claim(60_000)` par: marketing effective 0, tie par runAt 0 < 59_000 -> marketing pehle. (c) Floor: agingMs 1, OTP aur ek bahut purana marketing job same runAt ke saath, OTP pehle enqueue -- floor ke saath dono 0, seq tie-break se OTP pehle; floor hatao toh marketing ka effective negative aur woh aage -- yahi test us mutation ko pakadta hai. Aur purane 5 queue tests bina agingMs ke bina badle pass hone chahiye.",
+    "why_needed": "Strict priority starvation laati hai. Aging sabse sasta fix hai jo design ko nahi badalta -- sirf sort key.",
+    "real_world_analogy": "Hospital line mein normal patient ka token har ghante ek level upar chadhta hai. Kabhi na kabhi uski baari aati hai, par woh emergency se aage kabhi nahi jaata.",
+    "how_it_works": "sort key: (effectivePriority, runAt, seq). effectivePriority(e) = max(0, priority - floor((now - runAt) / agingMs)) jab agingMs diya ho, warna priority.",
+    "in_this_project": "Is project mein aging NAHI hai -- yeh exercise hai. Change sirf `src/queue.ts` ke `InMemoryJobQueue.claim()` ke sort mein aur constructor mein. Notifier ko kuch nahi pata chalega kyunki woh sirf `JobQueue` interface use karta hai. Existing test `test/queue.test.ts` ka pehla test (`[\"t1\", \"t-late\", \"m1\", \"m2\"]`) bina agingMs ke same rehna chahiye.",
+    "implementation_files": [
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/21-notification/src/queue.ts::claim",
+      "projects/21-notification/test/queue.test.ts",
+      "projects/21-notification/README.md"
+    ],
+    "code_example": "// illustrative solution, NOT in the repo\n// src/queue.ts\nexport class InMemoryJobQueue implements JobQueue {\n  constructor(private readonly options: { agingMs?: number } = {}) {\n    const a = options.agingMs;\n    if (a !== undefined && !(Number.isFinite(a) && a > 0)) throw new RangeError(\"agingMs must be > 0\");\n  }\n  private effective(e: Entry, now: number): number {\n    const a = this.options.agingMs;\n    if (a === undefined) return e.job.priority;\n    return Math.max(0, e.job.priority - Math.floor((now - e.job.runAt) / a));\n  }\n  // in claim():\n  //   .sort((x, y) => this.effective(x, now) - this.effective(y, now) || x.job.runAt - y.job.runAt || x.seq - y.seq)\n}\n\n// test/queue.test.ts\nit(\"aging: a marketing job that waited agingMs competes with transactional ones, never ahead of priority 0\", () => {\n  const make = () => {\n    const q = new InMemoryJobQueue({ agingMs: 60_000 });\n    q.enqueue(job(\"m-old\", 1, 0));\n    q.enqueue(job(\"otp\", 0, 59_000));\n    return q;\n  };\n  expect(make().claim(59_000, 1, 1_000)[0]!.recordId).toBe(\"otp\");   // waited 59 s: still priority 1\n  expect(make().claim(60_000, 1, 1_000)[0]!.recordId).toBe(\"m-old\"); // aged to 0, earlier runAt wins\n  const q = new InMemoryJobQueue({ agingMs: 1 });\n  q.enqueue(job(\"otp\", 0, 1_000));\n  q.enqueue(job(\"m-ancient\", 1, 1_000));\n  expect(q.claim(1_000_000, 1, 1_000)[0]!.recordId).toBe(\"otp\"); // floor at 0: FIFO tie, not ahead\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Starvation khatam, ek sort key ka change",
+      "Opt-in: purana behaviour default",
+      "Interface same, notifier untouched"
+    ],
+    "disadvantages": [
+      "OTP latency thodi badh sakti hai heavy load par",
+      "Sort comparator mein har baar calculation (O(n log n) already)",
+      "agingMs tune karna padta hai"
+    ],
+    "common_mistakes": [
+      "Effective priority ka floor na lagana (purana promo OTP se aage)",
+      "Enqueue time se wait ginna (delayed jobs galat age)",
+      "Default behaviour badal dena aur purane tests 'fix' karna"
+    ],
+    "follow_up_questions": [
+      "How would you implement aging in Postgres or with two SQS queues?",
+      "What metric tells you aging is needed?",
+      "Would weighted fair queuing be better than aging here?"
+    ],
+    "concepts": [
+      "aging",
+      "starvation",
+      "priority-queue",
+      "coding-exercise"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Aging vs weighted fair queuing vs alag worker pools: aging sabse kam code, par OTP latency par asar load par depend. Weighted (9:1) predictable throughput deta hai. Alag pools isolation dete hain par capacity waste.",
+      "failure_scenarios": "agingMs bahut chhota: marketing har time transactional ke barabar, OTP latency badhti. Bahut bada: starvation practically wahi. Clock jump (manual clock) par sab jobs ek saath age ho jaate hain.",
+      "alternatives": "Do queues aur consumer ka ratio, priority lanes with reserved capacity, deadline-based scheduling (har job ka deadline, earliest deadline first).",
+      "scale_10x_100x": "Lakhon jobs par sort mein har comparison par effective priority -- precompute karke ya database mein `priority - (now - run_at)/aging` wala expression index nahi ho sakta (now badalta hai); tab periodic 'promote' job jo purane marketing jobs ki priority column update kare.",
+      "production_improvements": "Oldest marketing job age ka metric, agingMs config with alert, aur OTP p99 claim latency ka guard taaki aging transactional ko nuksaan na de."
+    }
+  }
+]
