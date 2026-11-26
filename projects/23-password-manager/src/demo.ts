@@ -69,3 +69,17 @@ console.log("share token contains the plaintext password?", JSON.stringify(token
 
 const redeemed = await manager.redeemShare(dave.sessionId, token); // dave unwraps it with his OWN private key
 console.log("dave's copy:", await manager.getEntry(dave.sessionId, redeemed.id));
+
+console.log("\n-- shares are single-use, and revocable by their issuer --");
+try {
+  await manager.redeemShare(dave.sessionId, token); // the same token again
+} catch (err) {
+  console.log(`redeeming the same token twice: ${(err as Error).message}`);
+}
+const secondToken = manager.shareEntry(aliceNow.sessionId, githubEntry.id, davePublicKey);
+manager.revokeShare(aliceNow.sessionId, secondToken.shareId); // alice changes her mind before dave redeems it
+try {
+  await manager.redeemShare(dave.sessionId, secondToken);
+} catch (err) {
+  console.log(`redeeming a revoked share: ${(err as Error).message}`);
+}

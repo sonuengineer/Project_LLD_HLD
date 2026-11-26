@@ -6,16 +6,18 @@ an entry goes through a `VaultStore`, which stage 2 makes a real async call (mod
 but the only implementation here is in memory. Stage 3 adds breach checking against a fake (but
 protocol-real) k-anonymity provider, guarded by a timeout and circuit breaker so that service can never block
 a save. Stage 4 adds sharing a single entry between two INDEPENDENT vaults, via hybrid/envelope encryption
-(RSA-OAEP + AES-256-GCM) -- neither vault ever sees the other's master password or vault key.
+(RSA-OAEP + AES-256-GCM) -- neither vault ever sees the other's master password or vault key. Stage 5 makes
+a share revocable by its issuer and single-use, so it cannot be redeemed twice.
 
 Status (2026-11-26): stage 1 DONE -- 48 tests, 30 mutation checks, all caught. Stage 2 DONE -- 63 tests, 46
 mutation checks, all caught. Stage 3 DONE -- 90 tests, 17 new mutation checks, all caught. Stage 4 DONE --
-106 tests, 13 new mutation checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
+106 tests, 13 new mutation checks, all caught. Stage 5 DONE -- 113 tests, 8 new mutation checks, all caught
+(see "Mutation checks"). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 106 tests
-npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking, sharing an entry between two vaults
+npm test        # 113 tests
+npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking, sharing an entry between two vaults, revoking a share
 ```
 
 ## Usage
@@ -54,6 +56,12 @@ const davePublicKey = await manager.getSharingPublicKey(dave.sessionId); // dave
 const token = manager.shareEntry(fresh.sessionId, weak.id, davePublicKey); // alice seals it for dave; pure, synchronous crypto
 const redeemed = await manager.redeemShare(dave.sessionId, token); // dave unwraps it with his OWN private key
 manager.getEntry(dave.sessionId, redeemed.id); // dave's own, independent copy of alice's entry
+
+// Shares are single-use and revocable:
+await manager.redeemShare(dave.sessionId, token); // throws SHARE_ALREADY_REDEEMED -- already used once
+const another = manager.shareEntry(fresh.sessionId, weak.id, davePublicKey);
+manager.revokeShare(fresh.sessionId, another.shareId); // alice changes her mind before dave redeems it
+await manager.redeemShare(dave.sessionId, another); // throws SHARE_REVOKED
 ```
 
 ## The rules
@@ -115,6 +123,15 @@ manager.getEntry(dave.sessionId, redeemed.id); // dave's own, independent copy o
   entry.** Skipping this would silently and permanently brick sharing the moment the vault's owner changes
   their password -- the private key would still be "encrypted," just under a key the vault's canary no
   longer matches.
+- **A share is single-use and revocable.** Every `shareEntry` registers a grant, tracked manager-wide (like
+  `sessions`, not inside any vault's own storage). `redeemShare` claims it SYNCHRONOUSLY, before any `await`
+  -- the identical claim-before-await shape `claimEntryOp` uses for entries, now protecting a different
+  resource -- so two concurrent redemptions of the same token can never both succeed. A precondition failure
+  (`NO_SHARING_KEY`) is checked and thrown BEFORE that claim, since it is not a real attempt; a genuine
+  failure AFTER claiming (a wrong-recipient token, or the recipient's own `VAULT_BUSY`) releases it, so a
+  real retry still gets its one legitimate shot. `revokeShare` reports an unknown shareId and someone else's
+  shareId identically (`UNKNOWN_SHARE`) -- the same don't-leak-existence instinct as not telling a failed
+  login which part was wrong.
 
 ## Design choices
 
@@ -146,6 +163,9 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
   is, from the recipient's point of view, just a new entry whose plaintext happened to come from an envelope
   instead of a form field; duplicating `addEntry`'s claim/commit/breach-check logic for this one caller would
   be the same bug risk twice, for no benefit.
+- Share grants live in a manager-wide map, not inside any `VaultRecord` -- they are metadata ABOUT a
+  transaction between two vaults, not content belonging to either one, the same reasoning that already put
+  `sessions` at the manager level instead of per-vault.
 
 ## Tests
 
@@ -164,15 +184,18 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 | test/breach-checker.test.ts | 5 | true/false for the real k-anonymity call, a throwing provider and a provider that never responds both degrade to `null` instead of throwing or hanging, defaults to `DEFAULT_BREACH_CHECK_TIMEOUT_MS` when none is given, the circuit opening makes later checks fail fast without even calling the provider again |
 | test/breach-integration.test.ts | 10 | the manager's own zero-config defaults correctly detect a known-breached password end to end, `addEntry`/`updateEntry` set `breached` and only re-check when the password field actually changes, `listEntries` surfaces it without a `getEntry` call, a broken provider never blocks a save, `checkBreach` as a standalone utility (including its own input validation), the `breached` flag never appears in the clear in `exportVault`'s output |
 | test/sharing.test.ts | 7 | `generateSharingKeyPair` produces valid, non-colliding PEM keys, `sealForRecipient`/`openAsRecipient` round-trip the exact plaintext, a different recipient's private key cannot open it, a tampered blob or wrappedKey fails, an invalid public key is rejected up front, the same plaintext sealed twice never produces the same token |
-| test/sharing-integration.test.ts | 9 | `getSharingPublicKey` lazily generates once and is idempotent on repeat calls, excluded by an in-progress rotation, a full share/redeem round trip between two independent vaults (including deleting the recipient's copy not touching the sender's), the token never contains the plaintext in the clear, breach status is re-checked against the RECIPIENT's own config, redeeming without a keypair throws `NO_SHARING_KEY`, a token meant for someone else throws `DECRYPTION_FAILED`, sharing still works after the sender rotates their master password, and the re-wrapped private key (not the old one) is what actually gets persisted |
+| test/sharing-integration.test.ts | 9 | `getSharingPublicKey` lazily generates once and is idempotent on repeat calls, excluded by an in-progress rotation, a full share/redeem round trip between two independent vaults (including deleting the recipient's copy not touching the sender's), the token never contains the plaintext in the clear, breach status is re-checked against the RECIPIENT's own config, `NO_SHARING_KEY` is checked before the one-time claim (repeating the attempt proves it was not consumed), a token meant for someone else throws `DECRYPTION_FAILED` and does NOT consume the share (the real recipient can still redeem it afterward), sharing still works after the sender rotates their master password, and the re-wrapped private key (not the old one) is what actually gets persisted |
+| test/share-revocation.test.ts | 7 | a revoked share can no longer be redeemed, an unknown shareId and someone else's shareId both throw `UNKNOWN_SHARE` (and a failed revoke attempt does not revoke it), revoking twice (or revoking an already-redeemed share) is a harmless no-op, a forged shareId throws `UNKNOWN_SHARE`, a share is single-use (`SHARE_ALREADY_REDEEMED` on the second attempt, no duplicate entry), two concurrent redemptions of the same token: exactly one succeeds |
 
 ## Mutation checks
 
-106 deliberate breaks total across all four stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
+114 deliberate breaks total across all five stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
 `src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`, `src/sharing.ts`), each
-applied alone with the suite run against it, the file restored byte for byte. 106 of 106 caught. Stage 1's
-check found one unreachable dead-code guard, removed rather than tested (see stage 1 notes below). Stage 2's
-check found three real, genuine gaps, each closed with a new test rather than dismissed:
+applied alone with the suite run against it, the file restored byte for byte. 114 of 114 caught (one more
+attempted break, on the revocation wiring, turned out to be malformed rather than a real mutation -- see the
+stage 5 note below -- and was discarded rather than counted). Stage 1's check found one unreachable dead-code
+guard, removed rather than tested (see stage 1 notes below). Stage 2's check found three real, genuine gaps,
+each closed with a new test rather than dismissed:
 
 - **A double-delete race** (`S16`): the re-check after a delete's commit, for whether the entry was already
   removed by a concurrent delete, was never exercised by any existing test -- every prior delete test had
@@ -204,6 +227,13 @@ Stage 4's check (13 breaks across the new sharing wiring) found no survivors on 
 dedicated round-trip tests (both vaults' crypto, and the end-to-end share/redeem path) already happened to
 cover every one of them.
 
+Stage 5's check (the revocation/single-use wiring) attempted 9 breaks; 8 were caught, and the 9th (reordering
+the `NO_SHARING_KEY` check relative to the claim) was discovered to be a malformed mutation, not a real gap:
+the existing, unrelated `NO_SHARING_KEY` check a few lines earlier already made the moved copy unreachable --
+nothing in `record.wrappedPrivateKey` can change between the two checks, so no test could ever observe a
+difference. It was discarded rather than given a test for a code path that provably cannot differ, the same
+principle as the stage-1 dead-code guard.
+
 | Area | Breaks |
 |---|---|
 | createVault / requireVault / requireSession | V1 duplicate-vault check removed, S1 unknown-owner check removed, S2 unknown-session check removed, S3 session-generation mismatch never detected, S4 lock() on an already-closed session never throws, S5 isSessionActive() ignores generation |
@@ -224,6 +254,7 @@ cover every one of them.
 | breach-checker.ts | BK1 the catch-and-degrade-to-null removed, BK2 the default provider never falls back, BK3 the default breaker never falls back, BK4 the default timeout never falls back |
 | manager.ts sharing wiring | SH1 the idempotency check removed (re-generates a keypair every call), SH2/SH3 the new public/private key is never actually applied after a successful commit, SH4 the NO_SHARING_KEY check removed, SH5 shareEntry seals an empty body instead of the real one, SH6 redeemShare swaps username and password, SH7 the private key is never re-wrapped during a rotation, SH8 the re-wrapped key is never actually applied, SH9/SH10 the sharing-key fields are dropped from the persisted snapshot / `exportVault` |
 | sharing.ts | SG2 the one-time AES key is the wrong length for AES-256, SG3 an invalid recipient key is never translated into `INVALID_REQUEST`, SG4 a failed unwrap is never translated into `DECRYPTION_FAILED` |
+| manager.ts revocation/single-use wiring | RV1 shareEntry never registers the grant, RV2 revokeShare's ownership check removed, RV3 revoking never actually sets revoked, RV4 redeemShare's unknown-share check removed, RV5 the revoked check removed, RV6 the already-redeemed check removed, RV8 the claim is never set (no single-use at all), RV9 a failed redemption never releases its claim |
 
 ### Stage 1 notes (kept for history)
 
@@ -232,17 +263,18 @@ the generator was unreachable dead code, since there are at most 4 character cla
 `MIN_GENERATED_LENGTH` is already 4 -- `length` can never be smaller than the number of enabled classes. The
 guard was removed rather than writing a test for a path that cannot occur.
 
-## Known and NOT handled (stage 4)
+## Known and NOT handled (stage 5)
 
 - **Everything is in memory, one process.** The `VaultStore` abstraction exists so a real disk/network
-  backend could be dropped in, but no such backend is implemented here; nothing survives a restart.
+  backend could be dropped in, but no such backend is implemented here; nothing survives a restart --
+  including the `shares` grant registry, same as `sessions`.
 - **No ownership or multi-user sharing of a VAULT itself.** One vault per ownerId; sharing is per-entry, via
   an explicit token, not "give someone access to my whole vault."
 - **No directory service for exchanging public keys.** Callers are responsible for getting the recipient's
   public key to the sender out of band; this project does not model how that handoff happens.
-- **No revocation.** Once a share token is redeemed, the recipient's copy is theirs -- there is no way to
-  revoke it or make it expire. The two copies are independent from that point on; the sender can still update
-  or delete their own entry without affecting the recipient's copy, and vice versa.
+- **Revocation and single-use only stop a share BEFORE it is redeemed.** Once `redeemShare` succeeds, the
+  recipient's copy is theirs permanently and independently -- there is no way to reach into their vault and
+  take it back, and no expiry on time, only on first use or explicit revocation.
 - **`lock()`'s "discard the key" is best-effort.** JavaScript has no way to reliably zero out a `Buffer`'s
   backing memory or guarantee it is not still sitting in some other retained reference.
 - **No automatic retry on `VAULT_BUSY`/`ENTRY_CONFLICT`.** The caller is told someone else got there first and

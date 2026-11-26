@@ -15,7 +15,10 @@ export type PasswordManagerErrorCode =
   | "VAULT_BUSY" // an entry operation and a master-password rotation are claiming the same vault right now
   | "ENTRY_CONFLICT" // another operation changed this entry first; this one's work was discarded
   | "STORE_TIMEOUT" // the vault store did not respond in time
-  | "NO_SHARING_KEY"; // redeemShare called before this vault ever generated a sharing keypair
+  | "NO_SHARING_KEY" // redeemShare called before this vault ever generated a sharing keypair
+  | "UNKNOWN_SHARE" // this shareId was never issued, or the caller is not the vault that issued it
+  | "SHARE_REVOKED" // the issuer revoked this share before it was redeemed
+  | "SHARE_ALREADY_REDEEMED"; // this share was already redeemed once; shares are single-use
 
 export class PasswordManagerError extends Error {
   constructor(

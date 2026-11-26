@@ -18,8 +18,18 @@ import { Clock, systemClock } from "./clock.js";
 import { InMemoryVaultStore, type PersistedVault, type VaultStore } from "./store.js";
 import { withTimeout } from "./timeout.js";
 import { BreachChecker, type BreachCheckerOptions } from "./breach-checker.js";
-import { generateSharingKeyPair, openAsRecipient, sealForRecipient, type ShareToken } from "./sharing.js";
-import type { DecryptedEntryBody, EntryDetail, EntryInput, EntrySummary, UnlockResult, VaultExport, VaultSummary } from "./types.js";
+import { generateSharingKeyPair, openAsRecipient, sealForRecipient } from "./sharing.js";
+import { randomBytes } from "node:crypto";
+import type {
+  DecryptedEntryBody,
+  EntryDetail,
+  EntryInput,
+  EntrySummary,
+  SharedEntryToken,
+  UnlockResult,
+  VaultExport,
+  VaultSummary,
+} from "./types.js";
 
 export const MIN_MASTER_PASSWORD_LENGTH = 8;
 export const MAX_MASTER_PASSWORD_LENGTH = 256;
@@ -66,6 +76,15 @@ interface Session {
   generation: number; // the vault's generation at the moment this session unlocked
 }
 
+// Tracking for an issued share -- manager-level bookkeeping, like Session, not vault content: it never goes
+// through VaultStore, and does not survive a restart (same documented limitation as sessions).
+interface ShareGrant {
+  shareId: string;
+  ownerId: string; // only this vault may revoke it
+  revoked: boolean;
+  redeemedAt: number | null; // non-null once claimed; shares are single-use
+}
+
 export interface PasswordManagerOptions {
   clock?: Clock;
   store?: VaultStore;
@@ -94,6 +113,7 @@ function requireMasterPassword(value: unknown): string {
 export class PasswordManager {
   private readonly vaults = new Map<string, VaultRecord>();
   private readonly sessions = new Map<string, Session>();
+  private readonly shares = new Map<string, ShareGrant>();
   private readonly clock: Clock;
   private readonly store: VaultStore;
   private readonly commitTimeoutMs: number;
@@ -328,34 +348,71 @@ export class PasswordManager {
 
   // A pure, synchronous read: decrypts the entry with THIS vault's key, then re-encrypts it under a fresh
   // one-time key wrapped for the recipient (hybrid/envelope encryption -- see src/sharing.ts). Nothing about
-  // this vault changes, so there is no commit and no claim.
-  shareEntry(sessionId: string, entryId: string, recipientPublicKey: string): ShareToken {
+  // this vault changes beyond registering the grant, so there is no commit and no vault-entry claim.
+  // shareId is an opaque tracking reference, not a secret -- it only lets revokeShare()/single-use
+  // redemption find this grant, never anything that could open the entry on its own.
+  shareEntry(sessionId: string, entryId: string, recipientPublicKey: string): SharedEntryToken {
     const session = this.requireSession(sessionId);
     const record = this.requireVault(session.ownerId);
     const stored = this.requireEntry(record, entryId);
     requireString(recipientPublicKey, "recipientPublicKey", 10_000);
     const body = this.decryptBody(session.key, stored.blob);
-    return sealForRecipient(recipientPublicKey, Buffer.from(JSON.stringify(body), "utf8"));
+    const sealed = sealForRecipient(recipientPublicKey, Buffer.from(JSON.stringify(body), "utf8"));
+    const shareId = randomBytes(16).toString("hex");
+    this.shares.set(shareId, { shareId, ownerId: session.ownerId, revoked: false, redeemedAt: null });
+    return { shareId, ...sealed };
+  }
+
+  // Only the vault that issued a share may revoke it. An unknown shareId and someone else's shareId report
+  // the SAME error -- never letting a caller distinguish "does not exist" from "exists but is not yours" is
+  // the same don't-leak-existence instinct as not telling a login attempt which part was wrong. Revoking an
+  // already-revoked (or already-redeemed) share is a harmless no-op, not an error.
+  revokeShare(sessionId: string, shareId: string): void {
+    const session = this.requireSession(sessionId);
+    const share = this.shares.get(shareId);
+    if (!share || share.ownerId !== session.ownerId) {
+      throw new PasswordManagerError("UNKNOWN_SHARE", `no share ${shareId} issued by ${session.ownerId}`);
+    }
+    share.revoked = true;
   }
 
   // Unwraps a token with THIS vault's own private key, then adds the result as a brand-new entry through
   // the ordinary addEntry() path -- so it gets the exact same claim/commit exclusion and the exact same
   // breach check (against this vault's own breach-check configuration, not the sender's) as any other add.
-  async redeemShare(sessionId: string, token: ShareToken): Promise<EntrySummary> {
+  //
+  // Single-use: the grant is claimed (redeemedAt set) SYNCHRONOUSLY, before any await -- the same
+  // claim-before-await shape as every other race-prone operation in this project -- so two concurrent
+  // redemptions of the same token can never both succeed. NO_SHARING_KEY is checked and thrown BEFORE that
+  // claim, on purpose: a recipient who has not generated a keypair yet has not actually attempted a
+  // redemption, so that precondition failure must not burn the one-time use. A genuine failure AFTER
+  // claiming (a tampered/wrong-recipient token, or the recipient's own addEntry hitting VAULT_BUSY) releases
+  // the claim, so a real retry still has its one legitimate shot.
+  async redeemShare(sessionId: string, token: SharedEntryToken): Promise<EntrySummary> {
     const session = this.requireSession(sessionId);
     const record = this.requireVault(session.ownerId);
+    const share = this.shares.get(token.shareId);
+    if (!share) throw new PasswordManagerError("UNKNOWN_SHARE", `no share ${token.shareId}`);
+    if (share.revoked) throw new PasswordManagerError("SHARE_REVOKED", `share ${token.shareId} was revoked by its issuer`);
+    if (share.redeemedAt !== null) throw new PasswordManagerError("SHARE_ALREADY_REDEEMED", `share ${token.shareId} was already redeemed`);
     if (!record.wrappedPrivateKey) {
       throw new PasswordManagerError("NO_SHARING_KEY", "call getSharingPublicKey first to generate a keypair for this vault");
     }
-    const privateKeyPem = decrypt(session.key, record.wrappedPrivateKey).toString("utf8");
-    const plaintext = openAsRecipient(privateKeyPem, token);
-    const sharedBody = JSON.parse(plaintext.toString("utf8")) as DecryptedEntryBody;
-    return this.addEntry(sessionId, {
-      title: sharedBody.title,
-      username: sharedBody.username,
-      password: sharedBody.password,
-      notes: sharedBody.notes,
-    });
+
+    share.redeemedAt = this.clock.now(); // the claim
+    try {
+      const privateKeyPem = decrypt(session.key, record.wrappedPrivateKey).toString("utf8");
+      const plaintext = openAsRecipient(privateKeyPem, token);
+      const sharedBody = JSON.parse(plaintext.toString("utf8")) as DecryptedEntryBody;
+      return await this.addEntry(sessionId, {
+        title: sharedBody.title,
+        username: sharedBody.username,
+        password: sharedBody.password,
+        notes: sharedBody.notes,
+      });
+    } catch (err) {
+      share.redeemedAt = null; // this attempt did not actually succeed -- release the one-time use
+      throw err;
+    }
   }
 
   // Re-encrypts every entry under a new key, all at once, as one store commit. Nothing about the vault is

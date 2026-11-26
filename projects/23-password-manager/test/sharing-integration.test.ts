@@ -80,16 +80,18 @@ describe("shareEntry / redeemShare: end to end between two different vaults", ()
     expect(redeemed.breached).toBe(true); // re-checked, not blindly copied from alice's entry
   });
 
-  it("redeemShare on a vault that never generated a keypair throws NO_SHARING_KEY", async () => {
+  it("redeemShare on a vault that never generated a keypair throws NO_SHARING_KEY, checked BEFORE the one-time claim", async () => {
     const { manager, alice, bob } = twoVaults();
     const entry = await manager.addEntry(alice.sessionId, { title: "x", username: "a", password: "p" });
-    const bobPublicKey = await manager.getSharingPublicKey(bob.sessionId);
-    const token = manager.shareEntry(alice.sessionId, entry.id, bobPublicKey);
+    // Sealed for SOME public key -- whose does not matter, since NO_SHARING_KEY must fire before this
+    // vault's own wrappedPrivateKey is even looked at, let alone before any decryption is attempted.
+    const someonesPublicKey = await manager.getSharingPublicKey(alice.sessionId);
+    const token = manager.shareEntry(alice.sessionId, entry.id, someonesPublicKey);
 
-    const { manager: freshManager } = setup();
-    freshManager.createVault("carol", "carol-master-password");
-    const carol = freshManager.unlock("carol", "carol-master-password");
-    expect(await asyncErrorCode(() => freshManager.redeemShare(carol.sessionId, token))).toBe("NO_SHARING_KEY");
+    // bob never called getSharingPublicKey -- repeating the attempt proves the first failure did not
+    // silently consume the one-time use (it would read SHARE_ALREADY_REDEEMED on the second try otherwise).
+    expect(await asyncErrorCode(() => manager.redeemShare(bob.sessionId, token))).toBe("NO_SHARING_KEY");
+    expect(await asyncErrorCode(() => manager.redeemShare(bob.sessionId, token))).toBe("NO_SHARING_KEY");
   });
 
   it("a token meant for a DIFFERENT recipient cannot be redeemed -- DECRYPTION_FAILED, not a silent wrong read", async () => {
@@ -103,6 +105,11 @@ describe("shareEntry / redeemShare: end to end between two different vaults", ()
     const tokenForBob = manager.shareEntry(alice.sessionId, entry.id, bobPublicKey);
 
     expect(await asyncErrorCode(() => manager.redeemShare(carol.sessionId, tokenForBob))).toBe("DECRYPTION_FAILED");
+
+    // carol's failed attempt did not consume the share's one-time use -- the ACTUAL intended recipient can
+    // still redeem it: the claim is released on a genuine failure, not just on success.
+    const redeemed = await manager.redeemShare(bob.sessionId, tokenForBob);
+    expect(redeemed.title).toBe("x");
   });
 
   it("sharing still works after the owner rotates their master password -- the private key is re-wrapped, not lost", async () => {

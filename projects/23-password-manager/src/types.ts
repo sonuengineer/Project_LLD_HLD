@@ -1,4 +1,13 @@
 import type { EncryptedBlob } from "./crypto.js";
+import type { ShareToken } from "./sharing.js";
+
+// The manager-level envelope around sharing.ts's pure crypto ShareToken: shareId is an opaque tracking
+// reference (not a secret -- knowing it alone cannot open the entry, only a matching private key can) that
+// lets revokeShare() and single-use redemption find the right grant. sharing.ts itself knows nothing about
+// vaults, sessions, or revocation -- it only ever produces/consumes the crypto envelope.
+export interface SharedEntryToken extends ShareToken {
+  shareId: string;
+}
 
 export interface VaultSummary {
   ownerId: string;

@@ -2,7 +2,7 @@
 
 Status (2026-11-26): stage 1 DONE (48 tests, 30 mutation checks, all caught). Stage 2 DONE (63 tests, 46
 mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught). Stage 4 DONE (106
-tests, 13 new mutation checks, all caught).
+tests, 13 new mutation checks, all caught). Stage 5 DONE (113 tests, 8 new mutation checks, all caught).
 
 ## Why this project
 
@@ -133,6 +133,26 @@ ever storing it, and what happens the moment someone starts guessing.
   mutates persisted vault state (the new keypair) the same way adding an entry does -- it must be excluded by
   (and exclude) an in-flight rotation for exactly the reason stage 2 established.
 
+### Stage 5 decisions
+
+- **Every `shareEntry` call now registers a lightweight grant, tracked manager-wide, not per-vault.** A
+  `shares: Map<shareId, {ownerId, revoked, redeemedAt}>` sits alongside the existing `sessions` map, for the
+  same reason: this is bookkeeping ABOUT a grant, not vault content, so it never goes through `VaultStore` and
+  does not survive a restart (the same already-documented limitation as sessions).
+- **Shares are single-use.** `redeemShare` claims the grant (`redeemedAt = now()`) SYNCHRONOUSLY, before any
+  `await` -- the identical claim-before-await shape as `claimEntryOp`, now applied to a completely different
+  resource. Two concurrent redemptions of the same token can therefore never both succeed, by the same
+  construction argument as every other race in this project, not by a lock.
+- **A genuine failure after claiming releases it; a precondition failure before claiming never reaches it.**
+  `NO_SHARING_KEY` (the recipient never generated a keypair) is checked and thrown BEFORE the claim, because
+  it is not an actual redemption attempt and must not burn the one-time use. A tampered/wrong-recipient token,
+  or the recipient's own `addEntry` hitting `VAULT_BUSY`, fails AFTER claiming and releases it in a `catch`,
+  so a legitimate retry still gets its one real shot.
+- **`revokeShare` reports an unknown shareId and someone-else's shareId identically (`UNKNOWN_SHARE`).** Never
+  letting a caller distinguish "does not exist" from "exists but is not yours" is the same
+  don't-leak-existence instinct used elsewhere (a wrong password and an unknown account should look the same
+  to an attacker). Revoking an already-revoked or already-redeemed share is a harmless no-op, not an error.
+
 ## Stages
 
 | Stage | What | Status |
@@ -141,12 +161,14 @@ ever storing it, and what happens the moment someone starts guessing.
 | 2 | Multiple devices/sessions per vault, saving an entry as a real async store call, the add-vs-rotation and update-vs-update/delete races reproduced and fixed, session invalidation on password change, store timeout + AbortSignal; mutation checks | DONE 2026-11-26 |
 | 3 | Breach-check integration via k-anonymity, a circuit breaker + timeout so a flaky breach-check service can never block a save; mutation checks | DONE 2026-11-26 |
 | 4 | Shared entries between two independent vaults via hybrid/envelope encryption (RSA-OAEP + AES-256-GCM), a lazily-generated per-vault keypair whose private key is re-wrapped on every master-password rotation; mutation checks | DONE 2026-11-26 |
-| 5 | Not decided yet; proposed once stage 4's follow-ups are picked (candidates: session auto-lock on a timer, an HTTP API layer, revoking a share) | not started |
+| 5 | Share revocation and single-use redemption: a manager-wide grant registry, claim-before-await for single-use (same shape as `claimEntryOp`), don't-leak-existence authorization on revoke; mutation checks | DONE 2026-11-26 |
+| 6 | Not decided yet; proposed once stage 5's follow-ups are picked (candidates: session auto-lock on a timer, an HTTP API layer) | not started |
 
 ## Not in scope
 
 A real transport or storage backend (the `VaultStore` here is in memory), a real breach-check network call
-(`FakeBreachProvider` is a fixed in-memory dataset), a UI, browser extension autofill, 2FA on unlock, revoking
-or expiring an already-redeemed share, a directory service for exchanging public keys (callers exchange them
-out of band), password-strength scoring beyond the generator's own charset rules, import from another
-password manager's export format, actually persisting across a restart.
+(`FakeBreachProvider` is a fixed in-memory dataset), a UI, browser extension autofill, 2FA on unlock, expiring
+a share after a time limit (only explicit revocation or single-use redemption end it), a directory service
+for exchanging public keys (callers exchange them out of band), password-strength scoring beyond the
+generator's own charset rules, import from another password manager's export format, actually persisting
+across a restart.
