@@ -3,15 +3,18 @@
 A TypeScript library (no runtime dependencies, in memory) for a password manager's vault: a master password
 unlocks storage for a user's OTHER credentials, encrypted at rest with AES-256-GCM. There is no UI -- saving
 an entry goes through a `VaultStore`, which stage 2 makes a real async call (modeling a disk/network write),
-but the only implementation here is in memory.
+but the only implementation here is in memory. Stage 3 adds breach checking against a fake (but
+protocol-real) k-anonymity provider, guarded by a timeout and circuit breaker so that service can never block
+a save.
 
 Status (2026-11-26): stage 1 DONE -- 48 tests, 30 mutation checks, all caught. Stage 2 DONE -- 63 tests, 46
-mutation checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
+mutation checks, all caught. Stage 3 DONE -- 90 tests, 17 new mutation checks, all caught (see "Mutation
+checks"). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 63 tests
-npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation
+npm test        # 90 tests
+npm run demo    # two devices sharing a vault, a lost session after a password change, an add raced against a rotation, breach checking
 ```
 
 ## Usage
@@ -35,6 +38,12 @@ manager.getEntry(laptop.sessionId, entry.id).password; // the one call that retu
 
 await manager.changeMasterPassword("alice", "correct-horse-battery-staple", "a-new-master-password");
 manager.isSessionActive(laptop.sessionId); // false -- every OTHER session is invalidated by a rotation
+
+// Every add/update is checked against a (fake, in-memory) breach-check provider automatically:
+const fresh = manager.unlock("alice", "a-new-master-password");
+const weak = await manager.addEntry(fresh.sessionId, { title: "Old site", username: "alice", password: "qwerty123" });
+weak.breached; // true
+await manager.checkBreach("qwerty123"); // true -- also usable standalone, like generatePassword()
 ```
 
 ## The rules
@@ -72,9 +81,18 @@ manager.isSessionActive(laptop.sessionId); // false -- every OTHER session is in
   itself require the master password; this call never decrypts anything.
 - **`listEntries` never returns a password; `getEntry` does, and marks that entry as used.** Listing is meant
   to be cheap and safe to show on screen; reading one entry's password is the one call that actually reveals it.
+- **Every saved or changed password is checked against a breach-check provider using k-anonymity**: only the
+  first 5 hex characters of its SHA-1 hash ever leave the vault (`isPasswordBreached`/`FakeBreachProvider` in
+  `src/breach.ts`) -- the same protocol Have I Been Pwned's real password API uses, even though the provider
+  here is a small, fixed, explicitly-fake in-memory dataset, not a real network call.
+- **A breach check can NEVER block a save -- the opposite instinct from "an error means nothing happened,"
+  deliberately.** `BreachChecker.check()` never throws: a provider error, a timeout, or an open circuit
+  breaker all degrade to `breached: null` ("unknown"), and the entry is saved regardless. A non-critical
+  dependency must never be able to stop someone from saving a password.
 - **An error means nothing happened**, with deliberate exceptions: a WRONG unlock/`changeMasterPassword`
-  attempt records itself (that count is the point of lockout), and `VAULT_BUSY`/`ENTRY_CONFLICT` exist
-  specifically to tell a caller "someone else got there first" instead of silently losing their change.
+  attempt records itself (that count is the point of lockout), `VAULT_BUSY`/`ENTRY_CONFLICT` exist
+  specifically to tell a caller "someone else got there first" instead of silently losing their change, and a
+  breach-check failure is the one case where a would-be error is deliberately swallowed instead of surfaced.
 
 ## Design choices
 
@@ -94,6 +112,10 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
   not two secrets to keep in sync), `Math.random()` anywhere near a secret, deleting entries on a failed
   `changeMasterPassword` before re-encryption is known to have fully succeeded, eagerly walking and revoking
   every session on a rotation (the lazy `generation` check does the same job without that walk).
+- A self-contained circuit breaker (`src/circuit-breaker.ts`) instead of importing one from this repo's other
+  resilience-themed projects -- every project here is its own standalone package, and the breaker needed for
+  breach-checking is small enough that writing it directly (same spirit as `timeout.ts`) beats wiring up a
+  cross-project dependency.
 
 ## Tests
 
@@ -107,13 +129,18 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 | test/generator.test.ts | 7 | default/explicit length bounds, disabling a class excludes it, enabling one guarantees at least one instance of it, disabling every class throws, the guaranteed characters are not pinned to fixed positions (the result is shuffled) |
 | test/invariants.test.ts | 4 | randomized, 4 seeds x 150 SEQUENTIAL operations (add/update/delete/get/lock/unlock-correct/unlock-wrong/change-password/advance-clock) against a shadow model that independently re-derives the lockout gate; checked at every step: entry count, session validity, and that no secret ever used so far appears in the raw export |
 | test/concurrency.test.ts | 11 | the actual races: two devices adding at once (nothing lost), add-vs-rotation and rotation-vs-add both reject with `VAULT_BUSY` and neither side loses data, two concurrent rotations (`VAULT_BUSY`), two devices editing the SAME entry (`ENTRY_CONFLICT` for the loser), update-vs-delete and delete-vs-delete on the same entry (`UNKNOWN_ENTRY` for the loser), a hung store times out (custom and default timeout) and releases its claim, a successful commit clears its timeout timer, and a standalone illustration of the un-guarded version of the bug |
+| test/breach.test.ts | 6 | `sha1Hex` matches a well-known public value and is deterministic, `FakeBreachProvider` returns the right suffix (and nothing for an unrelated prefix, and throws on an already-aborted signal), `isPasswordBreached` is true/false correctly and -- via a spy provider -- never sends more than a 5-character prefix, never the password or the full hash |
+| test/circuit-breaker.test.ts | 6 | starts closed, opens after the failure threshold (and never even calls `fn()` while open), fewer-than-threshold failures never open it, a success resets the failure counter, a half-open trial after the cooldown closes on success and re-opens (with a fresh cooldown) on failure |
+| test/breach-checker.test.ts | 5 | true/false for the real k-anonymity call, a throwing provider and a provider that never responds both degrade to `null` instead of throwing or hanging, defaults to `DEFAULT_BREACH_CHECK_TIMEOUT_MS` when none is given, the circuit opening makes later checks fail fast without even calling the provider again |
+| test/breach-integration.test.ts | 10 | the manager's own zero-config defaults correctly detect a known-breached password end to end, `addEntry`/`updateEntry` set `breached` and only re-check when the password field actually changes, `listEntries` surfaces it without a `getEntry` call, a broken provider never blocks a save, `checkBreach` as a standalone utility (including its own input validation), the `breached` flag never appears in the clear in `exportVault`'s output |
 
 ## Mutation checks
 
-76 deliberate breaks total across both stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
-`src/timeout.ts`), each applied alone with the suite run against it, the file restored byte for byte. 76 of 76
-caught. Stage 1's check found one unreachable dead-code guard, removed rather than tested (see stage 1 notes
-below). Stage 2's check found three real, genuine gaps, each closed with a new test rather than dismissed:
+93 deliberate breaks total across all three stages (`src/manager.ts`, `src/crypto.ts`, `src/generator.ts`,
+`src/timeout.ts`, `src/breach.ts`, `src/circuit-breaker.ts`, `src/breach-checker.ts`), each applied alone with
+the suite run against it, the file restored byte for byte. 93 of 93 caught. Stage 1's check found one
+unreachable dead-code guard, removed rather than tested (see stage 1 notes below). Stage 2's check found
+three real, genuine gaps, each closed with a new test rather than dismissed:
 
 - **A double-delete race** (`S16`): the re-check after a delete's commit, for whether the entry was already
   removed by a concurrent delete, was never exercised by any existing test -- every prior delete test had
@@ -129,6 +156,18 @@ below). Stage 2's check found three real, genuine gaps, each closed with a new t
   `withTimeout`'s `finally`. No existing test asserted anything about timer cleanup. Closed with a
   `vi.getTimerCount()` check after a successful commit under fake timers.
 
+Stage 3's check found two more genuine gaps:
+
+- **A success never reset the circuit breaker's failure counter** (`CB2`): every existing test's failure
+  count either stayed well under the threshold or was pushed straight through it, so nothing distinguished
+  "the counter resets on success" from "it just happens to not have reached the threshold yet." Closed with a
+  test that runs two failures, one success, then one more failure, and checks the circuit is still closed
+  (it would read as 3 failures and open if the reset had not happened).
+- **The default breach-check timeout was never actually verified** (`BK4`): every existing test either used
+  a provider that resolved almost immediately (so any timeout value, including 0, would "work") or passed an
+  explicit `timeoutMs`. Closed with a fake-timers test that confirms a call is still pending just under
+  `DEFAULT_BREACH_CHECK_TIMEOUT_MS` and settles once that deadline passes.
+
 | Area | Breaks |
 |---|---|
 | createVault / requireVault / requireSession | V1 duplicate-vault check removed, S1 unknown-owner check removed, S2 unknown-session check removed, S3 session-generation mismatch never detected, S4 lock() on an already-closed session never throws, S5 isSessionActive() ignores generation |
@@ -143,6 +182,10 @@ below). Stage 2's check found three real, genuine gaps, each closed with a new t
 | timeout.ts | W1 a timeout is never distinguished from any other failure, W2 the store call is never actually aborted, W3 a successful commit leaks its timer |
 | crypto.ts (carried over) | K1 deriveKey ignores the salt, K2 encrypt reuses a fixed IV, K3 decrypt never checks the auth tag |
 | generator.ts (carried over) | G1 off-by-one on the max generated length, G2 the empty-charset check removed, G4 the guaranteed-one-per-class draw pulls from the whole charset instead, G5 the output is never shuffled |
+| manager.ts breach wiring | B1 checkBreach's own input validation removed, B2 updateEntry's re-check-only-if-password-changed condition inverted, B3 `breached` is never surfaced in a summary, B4 addEntry never actually uses the computed breach result |
+| breach.ts | BR1 the wrong hash algorithm, BR2 a 6-character prefix sent instead of 5, BR3 the breached/clean comparison inverted, BR4 the already-aborted-signal check removed |
+| circuit-breaker.ts | CB1 the opening condition removed, CB2 a success never resets the failure counter, CB3 the cooldown-elapsed comparison inverted, CB4 `fn()` still gets called while open, CB5 `openedAt` never actually recorded (circuit never reaches half-open) |
+| breach-checker.ts | BK1 the catch-and-degrade-to-null removed, BK2 the default provider never falls back, BK3 the default breaker never falls back, BK4 the default timeout never falls back |
 
 ### Stage 1 notes (kept for history)
 
@@ -151,7 +194,7 @@ the generator was unreachable dead code, since there are at most 4 character cla
 `MIN_GENERATED_LENGTH` is already 4 -- `length` can never be smaller than the number of enabled classes. The
 guard was removed rather than writing a test for a path that cannot occur.
 
-## Known and NOT handled (stage 2)
+## Known and NOT handled (stage 3)
 
 - **Everything is in memory, one process.** The `VaultStore` abstraction exists so a real disk/network
   backend could be dropped in, but no such backend is implemented here; nothing survives a restart.
@@ -161,8 +204,10 @@ guard was removed rather than writing a test for a path that cannot occur.
   backing memory or guarantee it is not still sitting in some other retained reference.
 - **No automatic retry on `VAULT_BUSY`/`ENTRY_CONFLICT`.** The caller is told someone else got there first and
   must decide whether to retry; this project does not do that for them.
-- **No 2FA, no breach-database checking, no password-strength scoring beyond the generator's own charset
-  rules, no session expiry on a timer.**
+- **`FakeBreachProvider` is a small, fixed, explicitly-fake in-memory dataset -- not a real breach database,
+  and not a real network call.** The k-anonymity protocol it speaks is real; the data behind it is not.
+- **No 2FA, no password-strength scoring beyond the generator's own charset rules, no session expiry on a
+  timer.**
 - **No rate limiting independent of the vault** (a single very persistent attacker making requests for many
   different ownerIds is not covered -- that is a transport/API-layer concern, same note as the other projects
   here that assume a single caller's behavior, not a whole fleet of them).

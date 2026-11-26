@@ -19,6 +19,8 @@ export interface EntryInput {
 }
 
 // What listEntries() returns: enough to find and recognize an entry, never the secret itself.
+// breached: true = found in the breach-check provider, false = checked and clean, null = never checked or
+// the breach-check service could not be reached (unknown, NOT "assumed safe").
 export interface EntrySummary {
   id: string;
   title: string;
@@ -26,6 +28,7 @@ export interface EntrySummary {
   createdAt: number;
   updatedAt: number;
   lastUsedAt: number | null;
+  breached: boolean | null;
 }
 
 // What getEntry() returns: everything, including the one field listEntries() withholds.
@@ -56,4 +59,5 @@ export interface DecryptedEntryBody {
   username: string;
   password: string;
   notes: string;
+  breached: boolean | null;
 }

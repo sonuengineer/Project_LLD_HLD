@@ -64,6 +64,7 @@ describe("an entry operation racing a master-password rotation", () => {
     const rotation = manager.changeMasterPassword("alice", "correct-horse-battery", "a-new-master-password");
 
     await expect(rotation).rejects.toMatchObject({ code: "VAULT_BUSY" });
+    await flush(); // let addEntry's own breach-check step finish before it reaches its commit
     expect(store.pending).toHaveLength(1); // only addEntry's commit was ever attempted
     store.resolveNext();
     await add;
@@ -84,6 +85,7 @@ describe("two devices updating the SAME entry at the same time", () => {
     const phone = manager.unlock("alice", "correct-horse-battery");
     const laptop = manager.unlock("alice", "correct-horse-battery");
     const seedAdd = manager.addEntry(phone.sessionId, { title: "GitHub", username: "alice", password: "original" });
+    await flush(); // let the seed add's own breach-check step finish before it reaches its commit
     store.resolveNext();
     const entry = await seedAdd;
 
@@ -109,16 +111,20 @@ describe("an update racing a delete of the same entry", () => {
     const phone = manager.unlock("alice", "correct-horse-battery");
     const laptop = manager.unlock("alice", "correct-horse-battery");
     const seedAdd = manager.addEntry(phone.sessionId, { title: "GitHub", username: "alice", password: "original" });
+    await flush(); // let the seed add's own breach-check step finish before it reaches its commit
     store.resolveNext();
     const entry = await seedAdd;
 
     const update = manager.updateEntry(phone.sessionId, entry.id, { password: "from-phone" });
     const remove = manager.deleteEntry(laptop.sessionId, entry.id);
     await flush();
-    expect(store.pending).toHaveLength(2); // update was pushed at index 0, delete at index 1
+    // deleteEntry has no breach-check step, so it reaches its own commit (and is pushed into `pending`)
+    // before updateEntry's breach-check hop finishes -- delete lands at index 0 even though update was
+    // CALLED first.
+    expect(store.pending).toHaveLength(2);
 
-    store.resolveAt(1); // the delete's commit lands FIRST, removing the entry
-    store.resolveAt(0); // the update's commit lands second, onto an entry that is now gone
+    store.resolveAt(0); // the delete's commit lands FIRST, removing the entry
+    store.resolveAt(0); // the update's commit lands second, onto an entry that is now gone (index 0 again -- delete's call already left the queue)
 
     await expect(remove).resolves.toBeUndefined();
     await expect(update).rejects.toMatchObject({ code: "UNKNOWN_ENTRY" });
@@ -134,6 +140,7 @@ describe("two devices deleting the SAME entry at the same time", () => {
     const phone = manager.unlock("alice", "correct-horse-battery");
     const laptop = manager.unlock("alice", "correct-horse-battery");
     const seedAdd = manager.addEntry(phone.sessionId, { title: "GitHub", username: "alice", password: "original" });
+    await flush(); // let the seed add's own breach-check step finish before it reaches its commit
     store.resolveNext();
     const entry = await seedAdd;
 
@@ -198,6 +205,9 @@ describe("a store that never responds", () => {
     const session = manager.unlock("alice", "correct-horse-battery");
 
     const add = manager.addEntry(session.sessionId, { title: "GitHub", username: "alice", password: "p1" });
+    // Under fake timers, flush() (real setImmediate) cannot be relied on -- advance by 0ms instead, which
+    // still drains microtasks (including the breach-check step) before addEntry reaches its own commit.
+    await vi.advanceTimersByTimeAsync(0);
     store.resolveNext();
     await add;
 

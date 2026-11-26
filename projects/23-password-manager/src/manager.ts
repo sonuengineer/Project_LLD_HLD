@@ -17,6 +17,7 @@ import { PasswordManagerError } from "./errors.js";
 import { Clock, systemClock } from "./clock.js";
 import { InMemoryVaultStore, type PersistedVault, type VaultStore } from "./store.js";
 import { withTimeout } from "./timeout.js";
+import { BreachChecker, type BreachCheckerOptions } from "./breach-checker.js";
 import type { DecryptedEntryBody, EntryDetail, EntryInput, EntrySummary, UnlockResult, VaultExport, VaultSummary } from "./types.js";
 
 export const MIN_MASTER_PASSWORD_LENGTH = 8;
@@ -66,6 +67,8 @@ export interface PasswordManagerOptions {
   clock?: Clock;
   store?: VaultStore;
   commitTimeoutMs?: number;
+  breachChecker?: BreachChecker;
+  breachCheckerOptions?: BreachCheckerOptions;
 }
 
 function requireString(value: unknown, field: string, max: number, allowEmpty = false): string {
@@ -91,12 +94,21 @@ export class PasswordManager {
   private readonly clock: Clock;
   private readonly store: VaultStore;
   private readonly commitTimeoutMs: number;
+  private readonly breachChecker: BreachChecker;
   private nextSessionSeq = 1;
 
   constructor(options: PasswordManagerOptions = {}) {
     this.clock = options.clock ?? systemClock;
     this.store = options.store ?? new InMemoryVaultStore();
     this.commitTimeoutMs = options.commitTimeoutMs ?? DEFAULT_COMMIT_TIMEOUT_MS;
+    this.breachChecker = options.breachChecker ?? new BreachChecker(options.breachCheckerOptions);
+  }
+
+  // A standalone utility, like generatePassword(): no vault or session needed. Never throws -- see
+  // BreachChecker's own doc comment for why.
+  async checkBreach(password: string): Promise<boolean | null> {
+    requireString(password, "password", MAX_PASSWORD_LENGTH);
+    return this.breachChecker.check(password);
   }
 
   // Synchronous and store-free: nothing can race the creation of a vault that does not exist yet.
@@ -157,15 +169,23 @@ export class PasswordManager {
   async addEntry(sessionId: string, input: EntryInput): Promise<EntrySummary> {
     const session = this.requireSession(sessionId);
     const record = this.requireVault(session.ownerId);
-    const body: DecryptedEntryBody = {
+    const password = requireString(input.password, "password", MAX_PASSWORD_LENGTH);
+    // Kicked off now (its clock starts ticking during the rest of this function's validation) but not
+    // awaited yet -- claimEntryOp below must still run synchronously, with no await ahead of it, exactly
+    // like every other claim in this project.
+    const breachCheck = this.breachChecker.check(password);
+    const partialBody = {
       title: requireString(input.title, "title", MAX_TITLE_LENGTH),
       username: requireString(input.username, "username", MAX_USERNAME_LENGTH),
-      password: requireString(input.password, "password", MAX_PASSWORD_LENGTH),
+      password,
       notes: requireString(input.notes ?? "", "notes", MAX_NOTES_LENGTH, true),
     };
 
     this.claimEntryOp(record); // synchronous: fails fast if a rotation is in progress
     try {
+      // A flaky breach-check service never holds this claim open longer than its own timeout, and
+      // BreachChecker.check() never throws, so it cannot fail this save either way.
+      const body: DecryptedEntryBody = { ...partialBody, breached: await breachCheck };
       // The id is allocated now, synchronously, so two concurrent adds can never collide.
       const now = this.clock.now();
       const stored: StoredEntry = {
@@ -208,11 +228,16 @@ export class PasswordManager {
       const stored = this.requireEntry(record, entryId);
       const expectedVersion = stored.version;
       const existing = this.decryptBody(session.key, stored.blob);
+      const newPassword = requireString(patch.password ?? existing.password, "password", MAX_PASSWORD_LENGTH);
+      // Only re-check breach status when the password actually changed -- re-checking an unchanged password
+      // would just burn a call against the breach-check service for no new information.
+      const breached = patch.password !== undefined ? await this.breachChecker.check(newPassword) : existing.breached;
       const merged: DecryptedEntryBody = {
         title: requireString(patch.title ?? existing.title, "title", MAX_TITLE_LENGTH),
         username: requireString(patch.username ?? existing.username, "username", MAX_USERNAME_LENGTH),
-        password: requireString(patch.password ?? existing.password, "password", MAX_PASSWORD_LENGTH),
+        password: newPassword,
         notes: requireString(patch.notes ?? existing.notes, "notes", MAX_NOTES_LENGTH, true),
+        breached,
       };
       const newBlob = encrypt(session.key, Buffer.from(JSON.stringify(merged), "utf8"));
       const updated: StoredEntry = { ...stored, blob: newBlob, updatedAt: this.clock.now(), version: expectedVersion + 1 };
@@ -391,6 +416,7 @@ export class PasswordManager {
       createdAt: stored.createdAt,
       updatedAt: stored.updatedAt,
       lastUsedAt: stored.lastUsedAt,
+      breached: body.breached,
     };
   }
 }

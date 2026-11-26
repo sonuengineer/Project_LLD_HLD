@@ -1,4 +1,4 @@
-import { PasswordManager, generatePassword } from "./index.js";
+import { BreachChecker, FakeBreachProvider, PasswordManager, generatePassword } from "./index.js";
 
 const manager = new PasswordManager();
 
@@ -38,3 +38,21 @@ try {
   console.log(`add while rotating: ${(err as Error).message}`);
 }
 await rotation;
+
+console.log("\n-- breach checking: only a 5-character hash prefix ever leaves the vault --");
+const breachManager = new PasswordManager({ breachChecker: new BreachChecker({ provider: new FakeBreachProvider() }) });
+breachManager.createVault("bob", "correct-horse-battery-staple");
+const bob = breachManager.unlock("bob", "correct-horse-battery-staple");
+const weak = await breachManager.addEntry(bob.sessionId, { title: "Old site", username: "bob", password: "qwerty123" });
+const strong = await breachManager.addEntry(bob.sessionId, { title: "Bank", username: "bob", password: generatePassword({ length: 24 }) });
+console.log("a known-breached password:", weak.breached);
+console.log("a freshly generated password:", strong.breached);
+
+console.log("\n-- a broken breach-check service never blocks a save --");
+const brokenBreachManager = new PasswordManager({
+  breachChecker: new BreachChecker({ provider: { lookupPrefix: () => Promise.reject(new Error("service is down")) } }),
+});
+brokenBreachManager.createVault("carol", "correct-horse-battery-staple");
+const carol = brokenBreachManager.unlock("carol", "correct-horse-battery-staple");
+const savedAnyway = await brokenBreachManager.addEntry(carol.sessionId, { title: "GitHub", username: "carol", password: "x" });
+console.log("saved despite the breach-check service being down; breached status:", savedAnyway.breached);

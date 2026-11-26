@@ -1,7 +1,7 @@
 # B5 Password Storage System (low-level design): plan
 
 Status (2026-11-26): stage 1 DONE (48 tests, 30 mutation checks, all caught). Stage 2 DONE (63 tests, 46
-mutation checks, all caught).
+mutation checks, all caught). Stage 3 DONE (90 tests, 17 new mutation checks, all caught).
 
 ## Why this project
 
@@ -77,16 +77,46 @@ ever storing it, and what happens the moment someone starts guessing.
   claim it was holding is still released in a `finally`, so one hung commit cannot wedge the vault for every
   later operation.
 
+### Stage 3 decisions
+
+- **Breach-check integration via the real k-anonymity protocol** (the one Have I Been Pwned's password API
+  actually uses): only the first 5 hex characters of a password's SHA-1 hash ever leave `isPasswordBreached`;
+  the provider returns every breached hash sharing that prefix, and the comparison against the full hash
+  happens locally. `FakeBreachProvider` is a small, fixed, explicitly-fake in-memory dataset -- not a real
+  network call -- but it speaks the real protocol, which is the part worth testing (`test/breach.test.ts`
+  asserts, via a spy provider, that nothing longer than 5 characters -- and never the password itself -- is
+  ever sent out).
+- **A breach check can NEVER block a save -- the opposite instinct from this project's usual "an error means
+  nothing happened" rule, deliberately.** `BreachChecker.check()` never throws: a provider error, a timeout,
+  or an open circuit all degrade to `null` ("unknown"), and `addEntry`/`updateEntry` still succeed either way.
+  Breach-checking is a non-critical dependency; a flaky third-party service must not be able to stop someone
+  from saving a password.
+- **A small, self-contained circuit breaker** (closed -> open after `failureThreshold` consecutive failures
+  -> a single half-open trial after `cooldownMs`) protects the save path from a slow/down breach-check
+  service, on top of a per-call timeout. Not imported from this repo's other resilience-themed projects
+  (`18-resilience`, `19-rate-limit`) -- each project here is a standalone package, and the breaker needed here
+  is small enough that writing it directly (same pattern as `timeout.ts`/`withTimeout`) is simpler than wiring
+  up a cross-project dependency.
+- **`updateEntry` only re-checks breach status when the password field actually changes.** Re-checking an
+  unchanged password would just be an extra call against the breach-check service for no new information; a
+  patch that does not touch the password keeps the entry's existing `breached` value.
+- **The breach-check call starts (but is not awaited) before any claim, and is only awaited once the claim
+  already holds.** This keeps `claimEntryOp`'s "run synchronously, before any await" invariant from stage 2
+  completely intact -- the only new constraint stage 3 added to that machinery was making sure it still
+  holds with one more async step in the mix.
+
 ## Stages
 
 | Stage | What | Status |
 |---|---|---|
 | 1 | Vault lifecycle (create/unlock/lock), lockout after repeated wrong attempts, encrypted entry CRUD, atomic master-password change, encrypted export, a secure password generator; randomized invariant test; mutation checks | DONE 2026-11-26 |
 | 2 | Multiple devices/sessions per vault, saving an entry as a real async store call, the add-vs-rotation and update-vs-update/delete races reproduced and fixed, session invalidation on password change, store timeout + AbortSignal; mutation checks | DONE 2026-11-26 |
-| 3 | Not decided yet; proposed once stage 2's follow-ups are picked (candidates: breach-check integration, shared/team entries, session auto-lock on a timer) | not started |
+| 3 | Breach-check integration via k-anonymity, a circuit breaker + timeout so a flaky breach-check service can never block a save; mutation checks | DONE 2026-11-26 |
+| 4 | Not decided yet; proposed once stage 3's follow-ups are picked (candidates: shared/team entries, session auto-lock on a timer, an HTTP API layer) | not started |
 
 ## Not in scope
 
-A real transport or storage backend (the `VaultStore` here is in memory), a UI, browser extension autofill,
-2FA on unlock, sharing an entry between users, breach-database checking, import from another password
-manager's export format, actually persisting across a restart.
+A real transport or storage backend (the `VaultStore` here is in memory), a real breach-check network call
+(`FakeBreachProvider` is a fixed in-memory dataset), a UI, browser extension autofill, 2FA on unlock, sharing
+an entry between users, password-strength scoring beyond the generator's own charset rules, import from
+another password manager's export format, actually persisting across a restart.

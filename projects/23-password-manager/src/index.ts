@@ -3,6 +3,15 @@ export { PasswordManagerError, type PasswordManagerErrorCode } from "./errors.js
 export { decrypt, deriveKey, encrypt, newSalt, KEY_LENGTH, SALT_LENGTH, type EncryptedBlob } from "./crypto.js";
 export { InMemoryVaultStore, type PersistedEntry, type PersistedVault, type VaultStore } from "./store.js";
 export { withTimeout } from "./timeout.js";
+export { sha1Hex, isPasswordBreached, FakeBreachProvider, type BreachProvider } from "./breach.js";
+export {
+  CircuitBreaker,
+  DEFAULT_COOLDOWN_MS,
+  DEFAULT_FAILURE_THRESHOLD,
+  type CircuitBreakerOptions,
+  type CircuitState,
+} from "./circuit-breaker.js";
+export { BreachChecker, DEFAULT_BREACH_CHECK_TIMEOUT_MS, type BreachCheckerOptions } from "./breach-checker.js";
 export {
   DEFAULT_GENERATED_LENGTH,
   MAX_GENERATED_LENGTH,
