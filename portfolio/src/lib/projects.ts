@@ -547,6 +547,24 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 21, slug: "p23-password-manager", dir: "projects/23-password-manager", name: "Password Storage System (B5)",
+    tagline: "A master-password vault for other credentials: canary verification, multi-device concurrency, k-anonymity breach checks, envelope-encrypted sharing, idle auto-lock, and an HTTP API.",
+    stack: ["TypeScript", "Node.js (node:crypto only; Express is the one dependency, confined to the HTTP layer)", "Vitest"],
+    features: [
+      "Master password never stored, not even hashed -- a canary ciphertext decrypt is the entire verify step; lockout after 5 wrong attempts via an injectable Clock",
+      "Multi-device sessions on one vault; every mutation claims synchronously before its one await, so a password rotation can never race an in-flight add/update/delete (a real lost-update bug this fixes)",
+      "k-anonymity breach checking (only a 5-char SHA-1 prefix ever leaves the vault) behind a circuit breaker and timeout -- a broken provider can never block a save",
+      "Sharing one entry between two independent vaults via hybrid/envelope encryption (RSA-OAEP wraps a one-time AES key), with per-share revocation and single-use redemption",
+      "Sessions auto-lock after an idle timeout, checked lazily at the one place every session call already goes through -- never a background timer",
+      "An Express HTTP API in front of the library: one bearer API key, every error code mapped to a specific HTTP status, none to 500",
+      "128 deliberate code breaks across all seven stages, all caught (one more discovered to be malformed and discarded)",
+    ],
+    tests: "140 passing (incl. a randomized invariant test and a dedicated concurrency test file reproducing real races)",
+    run: "cd projects/23-password-manager && npm ci && npm test && npm run demo",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
