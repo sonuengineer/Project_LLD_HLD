@@ -39,7 +39,10 @@ export interface Message {
   seq: number; // assigned at send time; defines order. NEVER compare messages by createdAt.
   senderId: string;
   clientMessageId: string; // the sender's idempotency key for this message
-  body: string;
+  body: string; // "" once deletedAt is set -- delete-for-everyone removes the content, not just a UI flag
   createdAt: number; // display only
+  edited: boolean;
+  editedAt: number | null;
+  deletedAt: number | null; // set by deleteMessage; a delete in flight always wins over a racing edit
   receipts: Record<string, Receipt>; // userId -> receipt, one entry per OTHER member at send time
 }

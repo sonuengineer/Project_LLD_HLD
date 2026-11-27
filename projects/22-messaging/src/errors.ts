@@ -11,7 +11,12 @@ export type MessagingErrorCode =
   | "OWNER_REQUIRED" // only the owner may do this (add/remove members)
   | "CANNOT_REMOVE_OWNER"
   | "IDEMPOTENCY_CONFLICT" // the same clientMessageId was used before with a different body
-  | "INVALID_CURSOR"; // getMessages: a cursor this API did not return
+  | "INVALID_CURSOR" // getMessages: a cursor this API did not return
+  | "CONVERSATION_BUSY" // a membership change and a message op (or two membership changes) collided; retry
+  | "SEND_IN_FLIGHT" // a send with this exact clientMessageId is already being committed; retry once it settles
+  | "SENDER_REQUIRED" // only the original sender may edit or delete this message
+  | "MESSAGE_DELETED" // the message was deleted and cannot be edited
+  | "UNKNOWN_DEVICE"; // disconnectDevice: that device is not connected for that user
 
 export class MessagingError extends Error {
   constructor(

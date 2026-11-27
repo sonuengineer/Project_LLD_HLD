@@ -1,5 +1,7 @@
 // Randomized: random sends, deliveries, reads and membership changes across several conversations, checked at
-// every step against rules re-derived independently here, not taken from src/.
+// every step against rules re-derived independently here, not taken from src/. Every step is awaited in turn
+// (not fired concurrently), so this file proves the single-caller rules still hold under the async API; the
+// actual races are test/concurrency.test.ts's job, with a controllable store.
 import { describe, expect, it } from "vitest";
 import { overallStatus, type Conversation } from "../src/index.js";
 import { setup } from "./helpers.js";
@@ -16,7 +18,7 @@ function prng(seed: number) {
 }
 
 for (const seed of [1, 2, 3, 4, 5, 6]) {
-  it(`seed ${seed}: 400 random operations across several groups, the rules hold at every step`, () => {
+  it(`seed ${seed}: 400 random operations across several groups, the rules hold at every step`, async () => {
     const rand = prng(seed);
     const USERS = ["u1", "u2", "u3", "u4"];
     const { messenger } = setup(USERS);
@@ -49,24 +51,24 @@ for (const seed of [1, 2, 3, 4, 5, 6]) {
       if (action < 0.55) {
         // Send from a random current member.
         const sender = current.members[Math.floor(rand() * current.members.length)]!.userId;
-        const m = messenger.sendMessage(group.id, sender, `m${++clientSeq}`, `c${clientSeq}`);
+        const m = await messenger.sendMessage(group.id, sender, `m${++clientSeq}`, `c${clientSeq}`);
         const expectedSeq = (sentCount.get(group.id) ?? 0) + 1;
         expect(m.seq).toBe(expectedSeq);
         sentCount.set(group.id, expectedSeq);
         const expectedRecipients = current.members.filter((mem) => mem.userId !== sender).map((mem) => mem.userId);
         expect(Object.keys(m.receipts).sort()).toEqual(expectedRecipients.sort());
-        for (const r of Object.values(m.receipts)) expect(r.status).toBe("sent");
+        for (const r of Object.values(m.receipts)) expect(r.status).toBe("sent"); // nobody is online in this test
       } else if (action < 0.7 && current.kind === "group") {
         const candidate = USERS[Math.floor(rand() * USERS.length)]!;
         if (!current.members.some((m) => m.userId === candidate)) {
-          const after = messenger.addMember(group.id, "u1", candidate);
+          const after = await messenger.addMember(group.id, "u1", candidate);
           expect(after.members.find((m) => m.userId === candidate)!.joinedAtSeq).toBe(sentCount.get(group.id) ?? 0);
         }
       } else if (action < 0.8 && current.kind === "group") {
         const removable = current.members.filter((m) => m.role !== "owner");
         if (removable.length > 0) {
           const target = removable[Math.floor(rand() * removable.length)]!.userId;
-          const after = messenger.removeMember(group.id, "u1", target);
+          const after = await messenger.removeMember(group.id, "u1", target);
           expect(after.members.some((m) => m.userId === target)).toBe(false);
         }
       } else if (action < 0.9) {
@@ -77,7 +79,7 @@ for (const seed of [1, 2, 3, 4, 5, 6]) {
           const target = page.items[Math.floor(rand() * page.items.length)]!;
           if (target.receipts[member.userId]) {
             const before = target.receipts[member.userId]!.status;
-            const after = messenger.markDelivered(group.id, member.userId, target.id);
+            const after = await messenger.markDelivered(group.id, member.userId, target.id);
             if (before === "sent") expect(after.status).toBe("delivered");
             else expect(after.status).toBe(before); // never downgraded, never changed once past "sent"
           }
@@ -88,7 +90,7 @@ for (const seed of [1, 2, 3, 4, 5, 6]) {
           const page = messenger.getMessages(group.id, member.userId, { limit: 200 });
           if (page.items.length > 0) {
             const upto = page.items[Math.floor(rand() * page.items.length)]!.seq;
-            const { marked } = messenger.markReadUpTo(group.id, member.userId, upto);
+            const { marked } = await messenger.markReadUpTo(group.id, member.userId, upto);
             expect(marked).toBeGreaterThanOrEqual(0);
             // page.items is a snapshot taken BEFORE this call; re-fetch to see the effect, not the stale copy.
             for (const m of page.items.filter((x) => x.seq <= upto)) {

@@ -13,5 +13,6 @@ export {
   type MessagePage,
   type MessengerOptions,
 } from "./messenger.js";
+export { InMemoryConversationStore, type ConversationStore, type PersistedConversation } from "./store.js";
 export * from "./types.js";
 export { InMemoryUsers, type UserDirectory } from "./users.js";

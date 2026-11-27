@@ -4,13 +4,14 @@ A TypeScript library (no runtime dependencies, in memory) for the core of a mess
 style): direct and group conversations, ordering, and per-recipient delivery and read receipts. There is no real
 transport: nothing in this project sends anything over a network.
 
-Status (2026-11-26): stage 1 DONE -- 50 tests, 37 mutation checks, all caught (see "Mutation checks").
-Stage 2 is planned in [PLAN.md](PLAN.md), not built.
+Status (2026-11-27): stage 1 DONE -- 50 tests, 37 mutation checks, all caught. Stage 2 DONE -- 91 tests (41
+new), 20 new mutation checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 50 tests
-npm run demo    # direct chat, group chat, delivery/read receipts, a retried send, the join-time history cut
+npm test        # 91 tests
+npm run demo    # direct chat, group chat, receipts, a retried send, the join-time history cut, offline
+                # catch-up on reconnect, multiple devices, message edit/delete
 ```
 
 ## Usage
@@ -22,12 +23,16 @@ users.upsert({ userId: "u2", displayName: "Bilal" });
 
 const messenger = new Messenger({ users });
 const conv = messenger.createDirectConversation("u1", "u2");
-const message = messenger.sendMessage(conv.id, "u1", "hey, free for a call?", "client-generated-id-1");
-// message.seq === 1, message.receipts.u2 === { status: "sent", at: ... }
+const message = await messenger.sendMessage(conv.id, "u1", "hey, free for a call?", "client-generated-id-1");
+// message.seq === 1, message.receipts.u2 === { status: "sent", at: ... } (u2 is offline)
 
-messenger.markDelivered(conv.id, "u2", message.id); // u2's client acks arrival
-messenger.markReadUpTo(conv.id, "u2", message.seq); // u2 opens the chat
+await messenger.markDelivered(conv.id, "u2", message.id); // u2's client acks arrival
+await messenger.markReadUpTo(conv.id, "u2", message.seq); // u2 opens the chat
 overallStatus(messenger.getMessage(conv.id, message.id)!); // "read"
+
+await messenger.connectDevice("u2", "phone"); // u2 comes online; any OTHER pending receipts catch up right here
+await messenger.editMessage(conv.id, "u1", message.id, "hey, got a sec for a call?");
+await messenger.deleteMessage(conv.id, "u1", message.id); // delete-for-everyone: body is cleared, not just hidden
 ```
 
 ## The rules
@@ -56,6 +61,16 @@ overallStatus(messenger.getMessage(conv.id, message.id)!); // "read"
 - **An error means nothing happened.** Every validation (body/id length, unknown user, unknown conversation, not
   a member, duplicate membership) throws before any state changes; the only exception is a successful idempotent
   replay, which by definition changes nothing new.
+- **Every mutation is a real async round trip to a ConversationStore (stage 2).** Two operations on the SAME
+  conversation can genuinely interleave around that await. A SYNCHRONOUS claim before it and an apply after
+  (mirrors 23-password-manager's claimEntryOp/commit) keeps that safe: `pendingOps` (message ops: send, deliver,
+  read, edit, delete) and `revising` (membership changes) exclude each other, `CONVERSATION_BUSY` either way.
+- **Presence is ephemeral, never persisted.** Connecting a device is instant and in memory only (see `store.ts`).
+  A recipient already online is auto-delivered at send time; reconnecting after being offline catches up every
+  pending receipt across every conversation they belong to. Read receipts are keyed by user, not device, so
+  reading "on one device" is already visible from every other device of the same user -- nothing to implement.
+- **Message edit and delete-for-everyone are sender-only.** Receipts are untouched by either. A delete that lands
+  while an edit is in flight always wins: a deleted message can never be resurrected by a racing edit.
 
 ## Design choices
 
@@ -68,17 +83,27 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 - Not used on purpose: wall-clock ordering (races under clock skew), a single boolean "delivered" flag (cannot
   express partial delivery to a group), deleting history on membership changes (receipts of messages already
   seen are historical facts and are kept).
+- `removeMember`/`addMember` replace the WHOLE `members` array, not a keyed map, because membership is small and
+  rarely-changing; this is exactly why two of them racing without a guard can silently undo each other (see
+  "the lost-update bug" in `test/concurrency.test.ts`), and exactly why `revising` exists.
+- A membership change excludes every message op, not just other membership changes, so a send can never build
+  its receipts from a member list that is mid-replace underneath it.
+- Delete-for-everyone clears `body` outright rather than leaving a `deleted: true` flag next to the original
+  text: a reader must never be able to recover content the sender removed.
 
 ## Tests
 
 | File | Tests | What |
 |---|---|---|
 | test/conversations.test.ts | 12 | direct-pair uniqueness, group creation and validation, add/remove membership and authorization, `joinedAtSeq` assignment, copies returned by `get()` |
-| test/messages.test.ts | 11 | sequence numbers per conversation, body/id length boundaries (exact max and max+1), unknown conversation/non-member, per-recipient receipts at send time, idempotency (replay, conflict, scoping, replay after the sender left, 20 concurrent duplicates), copies returned by `sendMessage`/`getMessage` |
+| test/messages.test.ts | 11 | sequence numbers per conversation, body/id length boundaries (exact max and max+1), unknown conversation/non-member, per-recipient receipts at send time, idempotency (replay, conflict, scoping, replay after the sender left, 20 truly concurrent duplicates -- exactly one commits, the other 19 get `SEND_IN_FLIGHT`, a retry after settlement dedupes normally), copies returned by `sendMessage`/`getMessage` |
 | test/receipts.test.ts | 11 | `markDelivered` (idempotent, never downgrades, sender/unknown/non-member/joined-later all throw, cross-conversation message id), `markReadUpTo` (range, idempotent, excludes own messages and pre-join messages, does not retroactively mark later arrivals, validation), `overallStatus` (the tick rule end to end, the zero-recipient case) |
 | test/pagination.test.ts | 6 | newest-first paging with an exact-fit last page, arrivals between page loads do not shift the next page, the join-time cut applies while paging, limit bounds (exact 1 and 200), cursor forgery/corruption rejected |
 | test/users.test.ts | 5 | upsert validation (empty/whitespace userId or displayName), unknown user, upsert stores a copy (not aliasing the caller's object), `get()` returns a copy, re-upsert replaces |
-| test/invariants.test.ts | 6 | randomized, 6 seeds x 400 operations across two groups (send, add/remove member, deliver, read-up-to): sequence numbers assigned and checked live, receipt sets exactly match current membership, deliveries never downgrade, reads never retroactive, and at the end: the owner is never removed, sequence numbers are unique and strictly ordered, `overallStatus` matches an independently recomputed worst-of-receipts |
+| test/invariants.test.ts | 6 | randomized, 6 seeds x 400 operations across two groups (send, add/remove member, deliver, read-up-to), each one awaited in turn: sequence numbers assigned and checked live, receipt sets exactly match current membership, deliveries never downgrade, reads never retroactive, and at the end: the owner is never removed, sequence numbers are unique and strictly ordered, `overallStatus` matches an independently recomputed worst-of-receipts |
+| test/devices.test.ts | 16 | `connectDevice`/`disconnectDevice`/`isOnline` (several devices at once, unknown user/device), auto-delivery to an already-online recipient (per recipient, independently), offline catch-up on reconnect (spans every conversation, untouched if already delivered/read, only on the offline->online transition, `addMember`/`removeMember` keep `conversationsByUser` correct), multi-device read sync needs no per-device call |
+| test/edit-delete.test.ts | 13 | `editMessage` (sender-only, length validation, unknown conversation/message, cannot edit a deleted message, receipts untouched, returns a copy), `deleteMessage` (clears the body, idempotent and keeps the original `deletedAt`, sender-only, unknown conversation/message, cross-conversation scoping, receipts untouched) |
+| test/concurrency.test.ts | 12 | two sends never collide on sequence number regardless of resolve order; the lost-update bug `revising` prevents (illustrated unguarded, then shown fixed for `removeMember` vs `removeMember` and for a message op vs a membership change, both directions); concurrent reads never regress status or timestamp even out of order; an edit racing a delete always loses to the delete, either resolve order; idempotent calls commit nothing to the store; offline catch-up skips a conversation mid-revision without failing the whole reconnect |
 
 ## Mutation checks
 
@@ -109,18 +134,38 @@ real test gaps, now closed:
 | isolation | X1/X2 `get()`/`getMessage()` return the live object instead of a copy |
 | users | Y1 empty userId accepted, Y2 stored user is the caller's own object (not a copy) |
 
-## Known and NOT handled (stage 1)
+Stage 2: 20 deliberate breaks, each applied alone with the full suite run against it, the file restored byte for
+byte. Two survived the first run -- both real, though harmless to correctness, gaps: an idempotent `markDelivered`
+call and a catch-up with nothing pending both lacked a test proving they touch the store ZERO times (the final
+status was always correct either way, so no earlier test caught the wasted round trip). Closed with
+`test/concurrency.test.ts`'s "idempotent calls never touch the store" tests; all 20 are now caught.
 
-- **Everything is in memory, one process, fully synchronous.** No network, no database, no real concurrency: two
-  calls are never actually interleaved. Stage 2 adds the concurrency / offline side on top of this core.
+| Area | Breaks |
+|---|---|
+| claim guards | G1 `claimOp`'s revising check removed, G2 `claimRevision`'s pendingOps check removed, G3 `claimRevision`'s revising check removed |
+| sendMessage | S1 sequence claimed without incrementing, S2 idempotency pre-claim removed (truly concurrent duplicates would all slip through), S3 presence ignored at send time (always "sent") |
+| receipts | R1 `markDelivered`'s idempotent early return removed, R2 `markDelivered` applies unconditionally (could downgrade read), R3 `markReadUpTo`'s apply-time recheck removed (a stale timestamp could overwrite a newer read), R4 `uptoSeq` integer check removed |
+| edit / delete | E1 `MESSAGE_DELETED` precondition removed, E2 edit applies unconditionally over a racing delete, E3/E4 `SENDER_REQUIRED` removed (edit, delete), E5 delete's idempotent early return removed (re-deleting re-stamps `deletedAt`) |
+| presence | P1 `connectDevice` never catches up, P2 `disconnectDevice`'s `UNKNOWN_DEVICE` check removed, P3 catch-up's empty-pending skip removed |
+| membership bookkeeping | B1 `addMember` does not register the new member for future catch-up, B2 `removeMember` does not clean up a departed member's catch-up registration |
+
+## Known and NOT handled (stage 2)
+
 - **No ownership transfer and no self-leave.** The owner can never be removed or step down; a member who wants to
   leave needs the owner to remove them. A real version needs at least "the owner may transfer ownership" so the
   group survives the owner leaving.
 - **Leaving and rejoining loses access to everything before the most recent join**, including messages seen
   during an earlier membership. `joinedAtSeq` is overwritten on each join; it does not remember an earlier,
   wider window.
-- **No message editing or deletion.** Planned for stage 2.
-- **No multiple devices per user, no offline queueing, no push notifications.** (Push notifications are project 21
-  in this repo; this project could sit behind it as the `in_app`-style source of truth, but that integration is
-  not built.)
-- **No group size limit, no rate limiting, no media attachments, no search.**
+- **No real transport, no push notifications, no media attachments, no search, no group size limit, no rate
+  limiting.** (Push notifications are project 21 in this repo; this project could sit behind it as the
+  `in_app`-style source of truth, but that integration is not built.)
+- **Everything is in memory; nothing survives a restart,** including presence (deliberately -- see "The rules")
+  and the `ConversationStore`'s own snapshots (`InMemoryConversationStore` is in-memory only, same as
+  23-password-manager's `VaultStore`).
+- **Offline catch-up is best-effort per conversation, not retried automatically.** A conversation that happens to
+  be mid-revision at the exact moment a user reconnects is skipped for that reconnect; their next explicit ack, or
+  their next full reconnect, still catches it up (see `test/concurrency.test.ts`).
+- **No read receipt "undo".** Once read-up-to has been recorded there is no way to mark a message unread again,
+  mirroring real chat apps.
+- **No HTTP API.** Stage 3 is not decided yet (see PLAN.md).
