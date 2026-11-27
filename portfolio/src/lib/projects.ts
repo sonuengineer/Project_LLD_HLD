@@ -565,6 +565,25 @@ export const PROJECTS: ProjectInfo[] = [
     docs: ["README", "PLAN"],
     benches: [],
   },
+  {
+    num: 22, slug: "p22-messaging", dir: "projects/22-messaging", name: "Messaging System (B15)",
+    tagline: "WhatsApp/Slack-style direct and group conversations: per-recipient delivery and read receipts, idempotent sends, and a real async store with claim-before-await concurrency, presence and sender-only edit/delete.",
+    stack: ["TypeScript", "Node.js (no runtime dependencies)", "Vitest"],
+    features: [
+      "Order is a per-conversation sequence number, never a timestamp; delivery/read state is a receipts map keyed by recipient, not one enum -- overallStatus() is the WORST receipt among recipients (the single/double/blue-tick rule)",
+      "Idempotent sends via a caller-supplied clientMessageId; under real async code the key itself needs a synchronous claim, not just a lookup, or N concurrent identical sends all slip through before the first one commits",
+      "Every mutation is a real async round trip to a ConversationStore, guarded by claim-before-await (pendingOps/revising mutually exclude, mirrored from 23-password-manager) -- fixes a real lost-update bug where two concurrent membership changes replacing the whole members array could silently undo each other",
+      "Every receipt mutation rechecks LIVE status immediately before writing, so a slower call that started first can never downgrade a status or overwrite a newer timestamp",
+      "Presence (multiple devices per user) kept out of the durable store; an online recipient is auto-delivered at send time, reconnecting catches up every pending receipt across every conversation",
+      "Sender-only message edit and delete-for-everyone; delete clears the body outright and always wins over a racing edit",
+      "A new group member sees messages from their join point onward, enforced as a read-time filter, not a per-message access list",
+      "57 deliberate code breaks across both stages, all caught -- the survivors of the first runs were real test gaps, each closed with a test",
+    ],
+    tests: "91 passing (incl. a randomized invariant test and a dedicated concurrency test file reproducing real races)",
+    run: "cd projects/22-messaging && npm ci && npm test && npm run demo",
+    docs: ["README", "PLAN"],
+    benches: [],
+  },
 ];
 
 export const bySlug = (slug: string) => PROJECTS.find((p) => p.slug === slug);
