@@ -1,0 +1,1104 @@
+[
+  {
+    "id": "MSG-101",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Beginner",
+    "question": "You are migrating a messaging backend from stage 1's fully synchronous Messenger to stage 2's async-ConversationStore version. What is the single biggest NEW category of failure this migration introduces that simply could not happen before, and why?",
+    "answer_hinglish": "Sabse bada naya failure category hai: CONVERSATION_BUSY errors, jo stage 1 mein kabhi exist hi nahi karte the. Stage 1 fully synchronous tha -- har call ek CPU turn mein complete ya throw ho jaata tha, isliye do operations kabhi genuinely interleave nahi kar sakte the. Stage 2 mein har mutation ek real await hai ek ConversationStore ko, aur yahi woh jagah hai jahan do operations SAME conversation par genuinely race kar sakte hain.\n\nIsse bachane ke liye claim-before-await pattern hai (claimOp/claimRevision) -- yeh data corruption ko impossible banata hai, par iska side-effect yeh hai ki caller ko ab ek NAYA error code (CONVERSATION_BUSY) handle karna padega jo pehle kabhi nahi aata tha. Agar client code ne stage 1 ke against likha tha aur yeh naya error case handle nahi karta, toh production mein woh requests fail ho jaayengi jo pehle kabhi fail nahi hoti thi -- migration ka sabse common bug yeh hoga ki retry logic client side missing hai.",
+    "why_needed": "Interviewer check karna chahta hai ki candidate sync-to-async migration ka risk samajhta hai sirf 'bugs ho sakte hain' level par nahi, balki exact NAYE failure mode ke level par.",
+    "real_world_analogy": "Ek single cashier counter (sync) mein kabhi do log same transaction par clash nahi karte -- ek time par ek hi customer. Jaise hi tum multiple tellers add karte ho shared ledger ke saath (async), kabhi kabhi ek teller ko bolna padta hai 'ruko, ledger abhi busy hai' -- yeh wait pehle kabhi zaroori nahi thi.",
+    "how_it_works": "claimOp(record) synchronously record.revising check karta hai aur fail-fast CONVERSATION_BUSY throw karta hai agar membership change chal rahi ho; claimRevision(record) dono record.revising aur record.pendingOps check karta hai. Yeh checks koi await se pehle hote hain, isliye exclusion guaranteed hai.",
+    "in_this_project": "src/messenger.ts ke claimOp aur claimRevision private methods; PLAN.md ke 'Stage 2 decisions' section mein yeh exact trade-off likha hai -- CONVERSATION_BUSY dono directions mein, pendingOps/revising ek doosre ko exclude karte hain.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/PLAN.md"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nprivate claimOp(record: ConversationRecord): void {\n  if (record.revising) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} is being revised`);\n  record.pendingOps++;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Data corruption (lost membership updates) becomes impossible by construction",
+      "Fail-fast is explicit -- CONVERSATION_BUSY tells the caller exactly what happened",
+      "No lock library needed -- synchronous JS code already guarantees exclusion"
+    ],
+    "disadvantages": [
+      "Clients written against stage 1 may not have retry logic for this new error",
+      "A hot conversation can see a burst of CONVERSATION_BUSY under real concurrent traffic",
+      "Testing this properly needs a controllable fake store (FakeConversationStore), not just unit tests"
+    ],
+    "common_mistakes": [
+      "Deploying stage 2 without auditing every caller for CONVERSATION_BUSY handling",
+      "Assuming retries are automatically safe without checking idempotency (sendMessage is idempotent, but a blind retry on markReadUpTo after a partial failure needs care too)",
+      "Load-testing only single-conversation scenarios and never exercising the race path"
+    ],
+    "follow_up_questions": [
+      "How would you detect, before rollout, how often CONVERSATION_BUSY will actually fire in real traffic?",
+      "What retry strategy would you recommend to client code that now sees CONVERSATION_BUSY?",
+      "Why does a membership change exclude message ops too, not just other membership changes?"
+    ],
+    "concepts": ["migration", "claim-before-await", "concurrency-errors", "rollout-risk"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-102",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "What three metrics would you put on a dashboard for this Messenger in production, and what does each one tell you that the others cannot?",
+    "answer_hinglish": "Teen metrics: (1) store commit latency (ConversationStore.persist() ka P50/P99), (2) CONVERSATION_BUSY retry rate (claimOp/claimRevision kitni baar fail hote hain per conversation per minute), (3) catch-up backlog size (deliverPendingReceipts ek reconnect par kitne pending receipts process karta hai).\n\nCommit latency batata hai ki backing store healthy hai ya nahi -- agar yeh badh jaaye, toh pendingOps zyada time tak claimed rahenge, jisse CONVERSATION_BUSY rate khud-ba-khud badh jaayega (yeh do metrics correlated hain par alag root causes dikhate hain: slow store vs genuinely hot conversation).\n\nCONVERSATION_BUSY rate batata hai contention -- agar yeh ek specific conversationId ke liye consistently high hai, matlab woh conversation 'hot' hai (jaise ek bada broadcast group), store latency normal hone ke bawajood bhi.\n\nCatch-up backlog size batata hai presence/offline health -- agar ek user reconnect karte waqt 10,000 pending receipts leke aata hai, matlab woh LAMBE time se offline tha, ya koi upstream presence-tracking bug hai jo disconnect events miss kar raha hai. Teeno alag SIGNALS hain: store health, conversation-level contention, aur per-user offline duration -- ek bhi miss kiya toh root cause galat diagnose hoga.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate sirf 'latency, errors, throughput' generic answer na de, balki is SPECIFIC system ke concurrency model se related metrics identify kare jo ek doosre se independent signal dete hain.",
+    "real_world_analogy": "Ek restaurant mein teen alag dashboards: kitchen ki speed (commit latency), kitne customers waiting hain ek hi table ke liye (CONVERSATION_BUSY rate), aur kitna lamba order ek customer ne jo der se aaya hai diya (catch-up backlog) -- teeno alag problems point karte hain.",
+    "how_it_works": "commit() wraps store.persist(); claimOp/claimRevision throw CONVERSATION_BUSY synchronously before any await; deliverPendingReceipts filters liveMessages for receipts[userId]?.status === 'sent' per conversation on reconnect.",
+    "in_this_project": "src/messenger.ts ka private commit() method store.persist() ko await karta hai -- yahi latency measurement point hai. claimOp/claimRevision ke thrown MessagingError (code CONVERSATION_BUSY) ko catch karke count karna. deliverPendingReceipts mein 'pending' array ki length backlog size hai.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::commit",
+      "projects/22-messaging/src/messenger.ts::deliverPendingReceipts",
+      "projects/22-messaging/src/store.ts::ConversationStore"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Each metric isolates a different failure domain (store, contention, presence)",
+      "All three are directly measurable from existing code paths -- no new instrumentation plumbing needed",
+      "Correlating them narrows root cause faster than any single metric alone"
+    ],
+    "disadvantages": [
+      "This library has no built-in metrics hooks today -- all three would need to be added at the call sites",
+      "Per-conversation granularity for CONVERSATION_BUSY rate needs a conversationId label, which can create high-cardinality metrics at scale",
+      "Backlog size alone does not tell you WHY a user was offline that long"
+    ],
+    "common_mistakes": [
+      "Only monitoring error rate without distinguishing CONVERSATION_BUSY from real failures",
+      "Treating commit latency and CONVERSATION_BUSY rate as independent when a slow store directly drives busy-rate up",
+      "Ignoring catch-up backlog until a user complaint arrives"
+    ],
+    "follow_up_questions": [
+      "How would you add conversationId-labeled metrics without creating a cardinality explosion?",
+      "What alert threshold would you set on CONVERSATION_BUSY rate, and why not zero?",
+      "If commit latency spikes, what is your first investigation step?"
+    ],
+    "concepts": ["observability", "metrics", "concurrency-monitoring", "production-readiness"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-103",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "A user reports: 'my message shows as sent but never delivered.' Walk through exactly what you would check, in order, to find the cause.",
+    "answer_hinglish": "Pehla step: check karo recipient `isOnline(recipientId)` ki value kya hai. Agar woh offline hai, 'sent' hona EXPECTED hai -- koi bug nahi, matlab unhone abhi tak connectDevice call nahi kiya, ya unka client reconnect nahi hua.\n\nDoosra step: agar recipient ONLINE hai par phir bhi 'sent' dikh raha hai, yeh real bug hai. Check karo: sendMessage ke waqt kya woh really online tha -- `isOnline(member.userId) ? 'delivered' : 'sent'` check sirf SEND TIME par hota hai, agar recipient send ke THODI der baad online aaya, unka receipt auto-upgrade nahi hoga jab tak catch-up (deliverPendingReceipts) na chale, jo sirf offline->online transition par fire hota hai.\n\nTeesra step: check karo kya ek conversation mid-revision thi jab woh connect hua -- deliverPendingReceipts try/catch mein claimOp lekar skip karta hai agar CONVERSATION_BUSY aaye, aur silently continue karta hai next conversation ke liye. Agar is exact window mein connect hua ho, woh ek conversation ka catch-up miss ho sakta hai -- log/trace karo connectDevice calls ke around kya koi addMember/removeMember chal rahi thi.\n\nChautha: check karo recipient really ab bhi group ka member hai ya nahi (removeMember ke baad conversationsByUser se cleanup ho jaata hai, isliye removed member ka future catch-up kabhi nahi hoga -- yeh EXPECTED hai, bug nahi).",
+    "why_needed": "Interviewer debugging methodology dekhna chahta hai -- symptom se systematically investigate karna, expected vs actual behavior ka distinction samajhna.",
+    "real_world_analogy": "Courier company mein 'parcel delivered nahi hua' complaint ka investigation: pehle check karo customer ghar par tha ya nahi, phir check karo courier ne try kiya ya nahi, phir check karo koi route block tha ya nahi -- har step ek alag possible cause eliminate karta hai.",
+    "how_it_works": "isOnline(userId) checks onlineDevices.get(userId)?.size > 0. Auto-delivery only happens at sendMessage's exact moment via isOnline check. deliverPendingReceipts only fires on the false->true transition of isOnline, inside connectDevice, and skips a conversation (try/catch around claimOp) if it is mid-revision.",
+    "in_this_project": "src/messenger.ts ka sendMessage (receipts loop with isOnline check), connectDevice (wasOnline check before calling deliverPendingReceipts), deliverPendingReceipts (per-conversation try/catch skip). test/devices.test.ts has the exact scenarios this walkthrough covers.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/src/messenger.ts::connectDevice",
+      "projects/22-messaging/src/messenger.ts::deliverPendingReceipts",
+      "projects/22-messaging/test/devices.test.ts"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "A clear, ordered checklist turns a vague complaint into a concrete diagnosis fast",
+      "Distinguishing 'expected sent' from 'bug' avoids wasted investigation time",
+      "Each check maps directly to a real code path, not a guess"
+    ],
+    "disadvantages": [
+      "Requires access to internal state (isOnline, membership) that may not be exposed via a simple support tool today",
+      "The mid-revision skip window is narrow and hard to reproduce without logging connectDevice/addMember timing",
+      "No built-in audit log of catch-up attempts exists in this project -- would need to be added for real on-call use"
+    ],
+    "common_mistakes": [
+      "Assuming 'sent' always means a bug instead of checking presence first",
+      "Forgetting that catch-up only fires on offline->online transition, not on every connectDevice call",
+      "Not checking whether the user was removed from the conversation entirely"
+    ],
+    "follow_up_questions": [
+      "What log or metric would you add to make step 3 (mid-revision skip) debuggable without reading source code?",
+      "How would you confirm a missed catch-up actually happened versus the user just being offline the whole time?",
+      "What would you tell the user to do right now to unstick their message?"
+    ],
+    "concepts": ["debugging", "presence", "delivery-receipts", "on-call"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-104",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Advanced",
+    "question": "A group conversation has 500 active members and is extremely chatty (50 messages/second at peak). Given that pendingOps/revising serialize membership changes against ALL message ops on that one conversation, what capacity problem does this create, and how would you plan for it?",
+    "answer_hinglish": "pendingOps counter khud kabhi messages ko serialize NAHI karta -- multiple sendMessage/markDelivered/markReadUpTo calls ek saath chal sakte hain (`pendingOps++` sirf count hai, lock nahi). Real serialization POINT hai `revising`: jab tak koi addMember/removeMember chal rahi ho, HAR message op CONVERSATION_BUSY dekhta hai, aur jab tak koi message op chal rahi ho (pendingOps > 0), NAYI membership change bhi CONVERSATION_BUSY dekhti hai.\n\n500-member, 50 msg/sec conversation mein iska matlab: membership changes EXTREMELY rare honi chahiye, kyunki har ek ko wait karna padega jab tak saare in-flight message ops drain na ho jaayen (pendingOps === 0), aur jab tak woh revising true hai, 50 msg/sec ka burst poora CONVERSATION_BUSY dekhega. Yeh conversation effectively kabhi bhi 'good time' nahi dhoondh paayega membership change karne ke liye agar traffic continuous hai.\n\nCapacity planning: (1) membership changes ko ek low-traffic window mein schedule karo ya retry-with-backoff logic client side rakho specifically membership operations ke liye. (2) monitor karo kitni der revising=true rehta hai -- agar commit latency high hai, yeh window lamba ho jaata hai aur message throughput poora block ho jaata hai is ek conversation ke liye (dusre conversations affected nahi hote, kyunki har ConversationRecord apna independent revising/pendingOps rakhta hai). (3) is scale par, messages array ka wholesale array operations (members.filter/spread) bhi cost badhata hai -- 500 members ka array copy har membership change par trivial hai, par agar yeh 10,000+ ho jaaye, is design ko rethink karna padega (see MSG-118).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai pendingOps counter vs revising flag ka exact exclusion semantics, aur isse real capacity/throughput impact derive kar sakta hai, blind guess nahi.",
+    "real_world_analogy": "Ek busy highway (message traffic) jisme ek lane closure (membership change) poore highway ko ek taraf se temporarily block kar deta hai jab tak saari current cars (pendingOps) gaadi nikal na jayein -- agar highway kabhi empty hi nahi hota, lane closure kabhi start nahi ho sakta.",
+    "how_it_works": "claimOp(record): throws CONVERSATION_BUSY if record.revising is true, else record.pendingOps++ (a counter, not a lock -- many message ops can hold it at once). claimRevision(record): throws CONVERSATION_BUSY if record.revising is true OR if record.pendingOps > 0, else sets record.revising = true. Both checks run synchronously, before any await.",
+    "in_this_project": "src/messenger.ts ke claimOp/claimRevision -- claimRevision explicitly `record.pendingOps > 0` check karta hai, claimOp `record.revising` check karta hai. Har ConversationRecord apna alag revising/pendingOps rakhta hai (conversations Map mein), isliye blocking per-conversation hai, global nahi.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/22-messaging/src/messenger.ts::ConversationRecord"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nprivate claimRevision(record: ConversationRecord): void {\n  if (record.revising) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} is already being revised`);\n  if (record.pendingOps > 0) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} has a message operation in flight`);\n  record.revising = true;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Per-conversation isolation: a hot group never blocks any OTHER conversation's throughput",
+      "The exclusion is correctness-first -- it will never silently corrupt membership even under extreme load",
+      "Easy to reason about: one boolean + one counter, no distributed lock needed"
+    ],
+    "disadvantages": [
+      "A continuously busy conversation may never find a gap to apply a membership change without client-side retry",
+      "No queueing or fairness for revising -- it is pure fail-fast, so a determined retry storm can still never win",
+      "No visibility today into how long a conversation spends in 'revising' blocking message throughput"
+    ],
+    "common_mistakes": [
+      "Assuming pendingOps itself serializes message ops against each other (it does not -- only revising creates exclusion)",
+      "Not realizing blocking is per-conversation, and assuming a hot group affects system-wide throughput",
+      "Retrying a blocked membership change in a tight loop instead of backing off"
+    ],
+    "follow_up_questions": [
+      "How would you redesign addMember/removeMember to not need to exclude ALL message ops, only other membership changes?",
+      "What would a queued (rather than fail-fast) claimRevision look like, and what new risk would it introduce?",
+      "At what member count would you reconsider the whole-array members replace strategy?"
+    ],
+    "concepts": ["capacity-planning", "claim-before-await", "hot-conversation", "serialization"],
+    "advanced": {
+      "architecture_tradeoffs": "Fail-fast claimRevision vs a queued version: fail-fast keeps the code simple aur latency predictable (immediate CONVERSATION_BUSY ya immediate success), par ek genuinely busy conversation mein membership change starve ho sakti hai. Ek queue add karne se fairness milti hai par complexity aur latency variance badh jaati hai -- is project ne consciously simplicity choose ki hai kyunki membership changes rare events hain, messages frequent.",
+      "failure_scenarios": "Agar commit latency spike ho (slow store) exactly jab revising=true hai, poora conversation ka message throughput us duration tak zero ho jaata hai -- 50 msg/sec sab CONVERSATION_BUSY dekhenge. Client-side retry-without-backoff is scenario mein retry storm create kar sakta hai jo store par aur load daalta hai.",
+      "alternatives": "Ek lock-free CRDT-style membership structure (jahan add/remove commute kar sakein bina whole-array replace ke) message ops ko block hi nahi karegi. Ya membership changes ko ek alag, rate-limited admin path par rakhna jo deliberately sirf low-traffic windows mein chale.",
+      "scale_10x_100x": "10x (5000 members, 500 msg/sec) par yeh exclusion window problem bahut zyada visible ho jaata hai -- revising ka koi bhi window ek bade burst ko block karega. 100x par (50,000 msg/sec jaisa extreme broadcast case), single in-process ConversationRecord model hi ek bottleneck ban jaata hai -- ab per-shard ya per-partition conversation state chahiye hoga, jisse single revising flag ka blast radius bhi reduce ho.",
+      "production_improvements": "Membership-change rate limiting/scheduling add karna taaki woh low-traffic windows mein ho. Metrics: revising duration histogram per conversation. Explore a keyed (not whole-array) members structure for very large groups so a membership change does not need to exclude message ops at all, only other membership changes."
+    }
+  },
+  {
+    "id": "MSG-105",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Advanced",
+    "question": "The process hosting this Messenger restarts mid-deployment while 200 sendMessage calls are in flight with various clientMessageIds. What state is lost, what state is safe, and what does a client see?",
+    "answer_hinglish": "Sabse pehle: is project mein SABHI state in-memory hai -- InMemoryConversationStore khud bhi ek Map hai jo restart survive nahi karti (README ke 'Known and NOT handled' section mein explicitly likha hai). Toh 'commit ho gaya' aur 'commit durable hai' DO ALAG cheezein hain yahan -- real deployment mein VaultStore jaisa ek real backend hona chahiye.\n\n200 in-flight sendMessage calls mein se: jinka store.persist() await abhi resolve nahi hua tha, unka commit() call bhi crash ke saath gaya -- client ko ek rejected promise ya connection drop milega, koi response nahi. Idempotency map (`this.idempotency`) poori RAM mein thi, isliye woh bhi gayi -- jo clientMessageId claim ho chuka tha (messageId: null placeholder) uska koi record nahi bacha.\n\nClient agar retry karta hai SAME clientMessageId se NAYE process instance par: idempotency map empty hai (fresh process), toh yeh retry EK NAYA SEND treat hoga, naya sequence number consume karega. Yeh potentially DUPLICATE message create kar sakta hai agar original call ne actually store tak pahunch kar commit kiya tha par response client tak pahunchne se pehle crash ho gaya (classic 'did my write survive' ambiguity).\n\nReal production fix: VaultStore jaisa ek PERSISTED, idempotency-aware backend chahiye jahan clientMessageId ka record bhi durable ho, na ki sirf in-memory Map mein -- taaki restart ke baad bhi retry correctly dedupe ho sake.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate 'in-memory prototype' aur 'production-safe service' ke beech ka exact gap identify kare, specifically idempotency ka persistence angle.",
+    "real_world_analogy": "Ek bank teller apne pocket notebook mein customer ke transaction IDs likh raha tha duplicate-prevent karne ke liye -- agar teller ka shift khatam ho jaaye aur notebook kho jaaye, naya teller nahi jaanta ki kaunsa transaction ID pehle use ho chuka tha.",
+    "how_it_works": "this.idempotency is a plain in-memory Map inside the Messenger instance; this.conversations, this.messagesByConversation are also in-memory. A process restart creates a brand-new Messenger with empty maps -- there is no bootstrap/load path from any durable source today.",
+    "in_this_project": "src/messenger.ts constructor creates fresh Maps every time (conversations, messagesByConversation, idempotency, conversationsByUser). src/store.ts's InMemoryConversationStore is also just a Map -- README's 'Known and NOT handled' explicitly states nothing survives a restart.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/src/store.ts::InMemoryConversationStore",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "The idempotency design itself (clientMessageId scoped to conversation+sender) is correct and would work unchanged against a durable backend",
+      "The ConversationStore interface is already a clean seam for dependency injection -- swapping it is low-risk",
+      "sendMessage's try/catch release-on-error discipline is correct and durability-agnostic"
+    ],
+    "disadvantages": [
+      "No durability at all today -- a restart loses every conversation, message, and idempotency record",
+      "A naive client retry after a crash can create a genuine duplicate message if the original write actually landed",
+      "No write-ahead log or outbox pattern exists to make 'did my write survive' answerable"
+    ],
+    "common_mistakes": [
+      "Assuming the idempotency guarantee holds across a restart just because it held during normal operation",
+      "Retrying blindly without an exponential backoff or without checking for a prior successful response first",
+      "Conflating 'ConversationStore.persist() resolved' with 'durable on real infrastructure' when still using the in-memory store"
+    ],
+    "follow_up_questions": [
+      "What would a real ConversationStore implementation need to guarantee about idempotency across restarts?",
+      "How would you design a client-side retry policy that is safe even without knowing if the original write landed?",
+      "What is the smallest change that would make the idempotency map itself durable?"
+    ],
+    "concepts": ["durability", "idempotency", "restart-safety", "production-deployment"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping idempotency state purely in-memory keeps the library simple and dependency-free, but ties correctness of 'no duplicate message' guarantee to the process never restarting mid-flight -- an acceptable trade for a learning project, not for production.",
+      "failure_scenarios": "A crash between store.persist() resolving and the in-memory idempotency map being finalized (`messageId: message.id`) would, on a real durable store, leave an orphaned committed message with no idempotency record pointing to it -- a retry after restart would create a true duplicate, visible to the recipient as two copies of the same logical message.",
+      "alternatives": "Store the idempotency key AS PART OF the same durable commit (e.g. a unique constraint on (conversationId, senderId, clientMessageId) in a real database) instead of a separate in-memory map, so the dedupe check and the write are atomic and durable together.",
+      "scale_10x_100x": "At 10x traffic, in-memory-only idempotency already risks duplicates on any restart, regardless of scale. At 100x, with multiple process instances behind a load balancer, the problem compounds: each instance has its OWN idempotency map, so a retry landing on a different instance would never see the first instance's claim at all -- a shared, durable idempotency store becomes mandatory, not optional.",
+      "production_improvements": "Move idempotency tracking into the same durable transaction as the message write (unique constraint, not a separate map). Add a write-ahead log or outbox so in-flight writes at crash time can be reconciled on restart. Expose a way for clients to query 'did my clientMessageId already succeed' before blindly retrying."
+    }
+  },
+  {
+    "id": "MSG-106",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Senior/System Design",
+    "question": "Your ops team deploys two instances of this service behind a load balancer with no sticky sessions, each with its own in-memory Messenger. A user sends a message on instance A and immediately polls for delivery status, which lands on instance B. What do they see, and what operational symptom would this produce in practice?",
+    "answer_hinglish": "User ko ek message dikhega jo 'exist nahi karta' instance B ke point of view se -- `getMessage(conversationId, messageId)` undefined return karega, kyunki instance B ka `messageById` Map alag hai, instance A ke commit se koi connection nahi hai. Agar user ne poora conversation hi dekhna chaaha (`getMessages`), unhe woh conversation bhi 'empty' ya 'conversation not found' dikhega agar woh conversation kabhi B par create nahi hui.\n\nOperational symptom: users randomly complain 'mera message ghost ho gaya' ya 'mera chat khali dikh raha hai' -- aur yeh INTERMITTENT lagega (kabhi kaam karta hai, kabhi nahi) kyunki load balancer round-robin ya random routing use kar raha hai. On-call team confuse ho jaayegi kyunki REQUESTS individually success return karte hain (sendMessage A par successfully resolve hota hai) -- koi error log nahi milega, sirf 'data missing' symptom milega jab doosra request doosre instance par jaata hai.\n\nYeh is project ki fundamental limitation hai: Messenger apna poora state (conversations, messages, idempotency, presence) in-process memory mein rakhta hai, KOI shared state nahi hai instances ke beech. Production deployment ke liye yeh EITHER sticky sessions (same user hamesha same instance, jo horizontal scaling ko limit karta hai) OR ek shared backing store (real database ConversationStore ke peeche, plus shared session/presence store) chahiye -- stage 2 ka design hint deta hai ConversationStore interface already injectable hai, par Messenger ka in-memory state khud (conversations Map, messageById Map) bhi externalize karna padega, sirf store ko swap karna kaafi nahi hoga.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate single-instance-assumption ka real operational blast radius samajhta hai, aur symptom-to-root-cause mapping kar sakta hai bina code dekhe bhi.",
+    "real_world_analogy": "Do alag bank branches jinke apne-apne local ledgers hain, bina kisi central database ke -- ek customer branch A mein paisa deposit karta hai, phir branch B jaake balance poochta hai, wahan uska account hi nahi dikhta.",
+    "how_it_works": "Every piece of Messenger state (conversations, messagesByConversation, messageById, idempotency, conversationsByUser, onlineDevices) is a private in-memory Map on the class instance -- there is no shared backing store for any of it beyond the injected ConversationStore, which itself defaults to an in-memory implementation.",
+    "in_this_project": "src/messenger.ts constructor's private readonly Maps; src/store.ts's InMemoryConversationStore (also per-instance, non-shared). Nothing in this project's design assumes or supports multiple Messenger instances sharing state.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::Messenger",
+      "projects/22-messaging/src/store.ts::ConversationStore"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Single-instance in-memory design is simple, fast, and trivially testable -- ideal for this project's learning scope",
+      "The ConversationStore seam already exists, so SOME of the migration to multi-instance is a known, bounded piece of work",
+      "The symptom (intermittent 'missing data') is at least a recognizable pattern once you know to look for shared-state gaps"
+    ],
+    "disadvantages": [
+      "Zero built-in support for horizontal scaling today -- deploying more than one instance is actively incorrect",
+      "The failure mode is confusing operationally: no errors, just missing data, which delays diagnosis",
+      "Even swapping ConversationStore for a real database would not fix this alone -- presence, idempotency, and in-memory lookups all need their own shared backing"
+    ],
+    "common_mistakes": [
+      "Assuming a load balancer with multiple instances is safe because 'the database is shared' when here it is not (only the ConversationStore interface is swappable, and even that defaults to in-memory)",
+      "Diagnosing this as a data-loss bug instead of a routing/architecture gap",
+      "Fixing it with sticky sessions alone without addressing presence (a user's two devices could land on different instances and each think the other is offline)"
+    ],
+    "follow_up_questions": [
+      "If you added sticky sessions as a quick fix, what would still break (hint: presence, multi-device)?",
+      "What is the minimal set of state that needs to move to a shared backend for this to work with N instances?",
+      "How would you validate, before rollout, that a multi-instance deployment is actually safe?"
+    ],
+    "concepts": ["horizontal-scaling", "shared-state", "distributed-systems", "operational-symptoms"],
+    "advanced": {
+      "architecture_tradeoffs": "Sticky sessions would mask this cheaply, but caps scaling (a popular conversation could overload one instance with no way to shift load) and does nothing for multi-device presence correctness. A fully shared-state architecture (ConversationStore + Redis-backed presence + shared idempotency) fixes it properly but is a much larger change and introduces new consistency questions (network partitions between instance and shared store).",
+      "failure_scenarios": "Beyond the missing-message symptom: two instances could independently believe a user is online or offline (presence is per-instance onlineDevices), so delivery receipts become unreliable across devices connected to different instances; two instances could also independently accept the 'first' claim of the same clientMessageId since idempotency is per-instance, defeating the whole idempotent-send guarantee.",
+      "alternatives": "Option A: sticky routing by userId or conversationId hash (simple, limits elasticity). Option B: full externalization -- a real ConversationStore backend plus a shared presence service (Redis with TTL, matching PLAN.md's own stated intent for presence) plus a shared idempotency store. Option C: a single-writer-per-conversation design (consistent hashing to route all ops for a conversation to one instance) which keeps claim-before-await meaningful without a distributed lock.",
+      "scale_10x_100x": "At 10x traffic, sticky-by-conversationId routing could work reasonably if conversations are evenly distributed. At 100x, hot conversations (viral group chats) would overload a single sticky instance regardless -- true horizontal scaling needs the claim-before-await guard itself to become distributed (e.g. a Redis-based lock per conversationId) rather than relying on one process's in-memory boolean.",
+      "production_improvements": "Externalize ConversationStore to a real database first (lowest-risk, highest-value). Move presence to a shared TTL store. Replace idempotency's in-memory Map with a durable, shared uniqueness constraint. Only then consider removing sticky-session routing, once claimOp/claimRevision's exclusion has a distributed equivalent."
+    }
+  },
+  {
+    "id": "MSG-107",
+    "project_slug": "p22-messaging",
+    "category": "Production Scenarios",
+    "difficulty": "Senior/System Design",
+    "question": "Design the on-call alerting rules you would configure around CONVERSATION_BUSY rate and store commit latency for this system. What threshold logic avoids both alert fatigue and missed incidents?",
+    "answer_hinglish": "Naive approach 'alert on ANY CONVERSATION_BUSY' galat hai -- yeh EXPECTED hai, even working-as-designed cases mein (ek hot group ka occasional retry). Isliye threshold PER-CONVERSATION rate ya aggregate rate ka SUDDEN CHANGE hona chahiye, absolute count nahi.\n\nRule 1: alert agar aggregate CONVERSATION_BUSY rate (across all conversations) apne 7-din rolling baseline se 3x+ ho jaaye for 5+ minutes continuously -- yeh batata hai SYSTEM-WIDE kuch badal gaya hai (shayad store slow ho gaya), na ki ek normal hot conversation.\n\nRule 2 (separate, lower severity): alert agar EK SPECIFIC conversationId ka busy-rate threshold cross kare for a sustained period -- yeh 'hot conversation' case hai, jo capacity-planning follow-up chahiye, incident response nahi (page-worthy nahi, ticket-worthy hai).\n\nRule 3: commit latency (store.persist() P99) ek absolute SLO threshold cross kare (jaise > 500ms for 5 min) -- yeh direct store health signal hai, independent of busy-rate, aur page-worthy hai kyunki yeh poore system ko affect karta hai (slow store => sab conversations mein pendingOps zyada der tak claimed rahenge => busy-rate khud-ba-khud badhega, Rule 1 ko bhi trigger karega -- is CORRELATION ko dashboard par dikhana chahiye taaki on-call ko root cause jaldi mile, duplicate pages na milen).\n\nRule 4: catch-up backlog size ka alert sirf TREND par, not absolute -- agar average backlog size per reconnect steadily badh raha ho over days, yeh batata hai presence tracking kahin leak kar raha hai (disconnect events miss ho rahe hain).",
+    "why_needed": "Interviewer senior-level alerting design dekhna chahta hai -- threshold choice ka reasoning, alert fatigue avoidance, aur correlated-alert deduplication strategy.",
+    "real_world_analogy": "Ek hospital mein har patient ke heart-rate spike par alarm nahi bajta -- alarm sirf tab bajta hai jab baseline se bahut zyada deviation ho, ya sustained abnormal pattern ho; ek-off spike normal variation hai.",
+    "how_it_works": "CONVERSATION_BUSY is thrown synchronously by claimOp/claimRevision before any await -- counting it requires wrapping those call sites (or catching the error code at the Messenger boundary). Commit latency wraps the await on store.persist() inside commit().",
+    "in_this_project": "src/messenger.ts's claimOp/claimRevision throw MessagingError with code CONVERSATION_BUSY; commit() is the single chokepoint for every store.persist() call, making it the one place to instrument latency for every mutation type.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/src/messenger.ts::commit"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Relative/baseline thresholds avoid paging on normal, expected hot-conversation behavior",
+      "Separating per-conversation (ticket) from system-wide (page) alerts matches actual urgency",
+      "commit() being a single chokepoint makes latency instrumentation trivial to add correctly"
+    ],
+    "disadvantages": [
+      "Baseline-relative thresholds need historical data to be meaningful -- cold start has no baseline",
+      "Correlating busy-rate spikes with commit latency spikes requires dashboard/alert tooling beyond simple threshold rules",
+      "Per-conversation granularity risks high-cardinality metrics if not bucketed carefully"
+    ],
+    "common_mistakes": [
+      "Paging on every single CONVERSATION_BUSY occurrence (guaranteed alert fatigue)",
+      "Treating a hot-conversation ticket-worthy signal with the same urgency as a system-wide store outage",
+      "Not correlating busy-rate and commit latency, causing duplicate pages for the same root cause"
+    ],
+    "follow_up_questions": [
+      "How would you bucket conversationId to avoid a cardinality explosion in per-conversation metrics?",
+      "What would you do differently for alerting during a planned migration (like stage 1 to stage 2 rollout)?",
+      "How would you build a cold-start baseline before any alerting is meaningful?"
+    ],
+    "concepts": ["alerting", "slo", "on-call", "observability-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Relative/baseline-driven alerting is more accurate but more complex to implement and tune than fixed absolute thresholds; fixed thresholds are simpler to reason about but either too noisy (low threshold) or too slow to catch real incidents (high threshold) depending on traffic variance across conversations.",
+      "failure_scenarios": "A store outage would spike commit latency AND busy-rate together -- without correlation tooling, on-call could get paged twice for the same root cause and waste time investigating two 'separate' incidents. A slow memory leak in presence tracking (backlog size creeping up) would never trigger an acute alert at all without a trend-based rule.",
+      "alternatives": "A fixed-threshold-only system (simpler to build, noisier in practice); a fully anomaly-detection-based system (more accurate, needs ML infrastructure this project has no need for at its current scale); a manual dashboard with no automated alerting at all (cheapest, slowest to react).",
+      "scale_10x_100x": "At 10x traffic, per-conversation alerting granularity starts to matter more as more conversations become 'hot' simultaneously. At 100x, aggregate system-wide thresholds need re-baselining frequently, and the correlation between commit latency and busy-rate becomes the PRIMARY signal to watch, since individual conversation-level noise becomes impossible to triage manually.",
+      "production_improvements": "Build a correlation dashboard (commit latency vs busy-rate vs backlog size, same time axis) before building more alert rules. Auto-recompute the 7-day baseline on a rolling basis. Add conversationId-bucketed (not raw) labels to avoid cardinality blowup, e.g. grouping by kind (direct vs group) and size tier."
+    }
+  },
+  {
+    "id": "MSG-108",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "Looking at `claimOp` and `claimRevision` in src/messenger.ts, what exactly does each one check, in what order, and why does `claimRevision` check two things while `claimOp` only checks one?",
+    "answer_hinglish": "`claimOp(record)`: sirf EK check karta hai -- `if (record.revising) throw CONVERSATION_BUSY`. Agar pass ho jaaye, `record.pendingOps++` karta hai. Bas itna.\n\n`claimRevision(record)`: DO checks karta hai, IN ORDER -- pehla `if (record.revising) throw CONVERSATION_BUSY` ('already being revised'), doosra `if (record.pendingOps > 0) throw CONVERSATION_BUSY` ('has a message operation in flight'). Dono pass hone par `record.revising = true` set karta hai.\n\nYeh asymmetry EXACTLY matches is project ki exclusion design: ek membership change (claimRevision) ko DONO se bachna hai -- na koi doosri membership change chal rahi ho, na koi message op chal rahi ho (kyunki membership change WHOLE members array replace karti hai, aur agar ek message op us purani member list se abhi receipts bana raha ho, result corrupt ho sakta hai). Par ek message op (claimOp) ko sirf EK cheez se bachna hai -- koi membership change na chal rahi ho; multiple message ops EK DOOSRE ke saath fine hain chalna (woh ek doosre ki members array ko replace nahi karte, sirf read karte hain), isliye claimOp `pendingOps` ko kabhi check hi nahi karta, sirf increment karta hai.\n\nOrder bhi matter karta hai claimRevision mein: revising check pehle kyunki woh cheapest/most-common collision hai, phir pendingOps check -- dono SYNCHRONOUS hain, koi await beech mein nahi, isliye order sirf readability ke liye hai, correctness ke liye nahi (dono checks ek hi CPU turn mein hote hain).",
+    "why_needed": "Interviewer code-reading precision check karta hai -- exact check order aur WHY asymmetry exist karti hai, surface-level 'they guard concurrency' jawab kaafi nahi hai.",
+    "real_world_analogy": "Ek library mein kitaabein padhne wale (message ops) ek saath multiple log padh sakte hain, par jab koi shelf rearrange kar raha ho (membership change), tab na koi naya reader aa sakta hai na koi doosra rearranger -- par readers ek doosre ko kabhi block nahi karte.",
+    "how_it_works": "Both checks are purely synchronous property reads/writes on the in-memory ConversationRecord -- no await happens between the check and the mutation of revising/pendingOps, so there is no window for a race between the check and the flag-set itself.",
+    "in_this_project": "src/messenger.ts lines around claimOp/claimRevision; sendMessage/markDelivered/markReadUpTo/editMessage/deleteMessage all call claimOp, addMember/removeMember call claimRevision.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/22-messaging/src/messenger.ts::claimRevision"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nprivate claimOp(record: ConversationRecord): void {\n  if (record.revising) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} is being revised`);\n  record.pendingOps++;\n}\n\nprivate claimRevision(record: ConversationRecord): void {\n  if (record.revising) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} is already being revised`);\n  if (record.pendingOps > 0) throw new MessagingError(\"CONVERSATION_BUSY\", `conversation ${record.id} has a message operation in flight`);\n  record.revising = true;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Minimal checks -- claimOp does the least work needed, since message ops never conflict with each other",
+      "Both functions are trivially testable: pure synchronous logic, no async mocking needed",
+      "The asymmetry directly encodes the actual safety invariant instead of over-guarding"
+    ],
+    "disadvantages": [
+      "Two near-identical functions with subtly different checks is an easy place to introduce a copy-paste bug (this is mutation G2/G3 in README's mutation table)",
+      "No shared helper abstracts the common 'check revising' logic between the two",
+      "Error messages are similar enough that a caller parsing message text (vs the code field) could misinterpret which guard fired"
+    ],
+    "common_mistakes": [
+      "Assuming claimOp also checks pendingOps (it does not need to -- message ops don't conflict with each other)",
+      "Forgetting that pendingOps is a COUNTER (multiple concurrent message ops), not a boolean like revising",
+      "Believing there is a race window between the check and the flag mutation (there is none -- both are synchronous)"
+    ],
+    "follow_up_questions": [
+      "Why doesn't claimOp need to check pendingOps at all?",
+      "What would happen if claimRevision checked pendingOps BEFORE revising instead of after -- would behavior change?",
+      "How would you unit test claimOp and claimRevision in isolation without going through the full async Messenger API?"
+    ],
+    "concepts": ["claim-before-await", "mutual-exclusion", "code-reading"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-109",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "In `sendMessage`, trace exactly how the idempotency placeholder (`messageId: null`) gets set, read, finalized, and released. What happens if the commit itself throws?",
+    "answer_hinglish": "Step by step: (1) `key = conversationId:senderId:clientMessageId` banta hai. (2) `this.idempotency.get(key)` check hota hai -- agar entry mile aur `messageId === null`, matlab koi DOOSRA call isi key ko abhi commit kar raha hai, turant `SEND_IN_FLIGHT` throw hota hai. (3) Agar entry nahi hai, `this.idempotency.set(key, { body, messageId: null })` call hota hai -- yeh PLACEHOLDER claim hai, SYNCHRONOUSLY, koi await se pehle.\n\n(4) Poore try block ke andar membership check, claimOp, seq assignment, aur `await this.commit(...)` hota hai. (5) Agar commit SUCCEED kare, `this.idempotency.set(key, { body, messageId: message.id })` call hota hai -- placeholder FINALIZE ho jaata hai real messageId ke saath.\n\n(6) Agar KAHIN BHI is poore try block mein (membership check, claimOp, ya commit khud) koi error throw ho, OUTER catch block pakadta hai: `this.idempotency.delete(key)` -- placeholder RELEASE ho jaata hai, taaki ek fresh retry permanently blocked na rahe. Yeh matlab hai agar commit() reject ho jaaye (store down ho jaaye), placeholder release hota hai aur agla retry naya attempt kar sakta hai -- claim HAMESHA cleaned up hota hai, success ya failure dono cases mein, kabhi orphaned nahi rehta.",
+    "why_needed": "Interviewer exact async control flow aur error-path cleanup verify karna chahta hai -- yeh exactly woh jagah hai jahan ek missed cleanup production mein permanently-stuck idempotency keys create kar sakta hai.",
+    "real_world_analogy": "Ek ticket counter jahan clerk ek 'processing' sticky note laga deta hai customer ki form par jab tak form process ho raha hai -- agar processing fail ho jaaye, clerk sticky note hata deta hai taaki customer dobara try kar sake, bina form ko permanently 'stuck' chhode.",
+    "how_it_works": "The outer try/catch wraps everything AFTER the placeholder claim; on any throw, `this.idempotency.delete(key)` runs in the catch block before re-throwing, guaranteeing the placeholder never survives a failed attempt.",
+    "in_this_project": "src/messenger.ts sendMessage's structure: `this.idempotency.set(key, { body, messageId: null })` then `try { ... await this.commit(...); this.idempotency.set(key, { body, messageId: message.id }); ... } catch (err) { this.idempotency.delete(key); throw err; }`.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/src/errors.ts"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nthis.idempotency.set(key, { body, messageId: null }); // claimed now, before any await\ntry {\n  // ... membership check, claimOp, seq assignment ...\n  await this.commit(record, record.members, [...liveMessages, message]);\n  liveMessages.push(message);\n  this.messageById.set(message.id, message);\n  this.idempotency.set(key, { body, messageId: message.id }); // finalize the claim\n  return this.cloneMessage(message);\n} catch (err) {\n  this.idempotency.delete(key); // release the claim so a fresh retry is not permanently blocked\n  throw err;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Claim-then-finalize-or-release guarantees the idempotency map never has a permanently stuck SEND_IN_FLIGHT entry",
+      "The pattern handles both synchronous failures (claimOp throwing) and async failures (commit rejecting) identically",
+      "A concurrent duplicate always gets a clean, fast SEND_IN_FLIGHT instead of silently creating a second message"
+    ],
+    "disadvantages": [
+      "During the in-flight window, a legitimate retry gets SEND_IN_FLIGHT instead of being told to simply wait and re-check",
+      "If the process crashes between commit succeeding and the finalize line, the in-memory map never reflects success (though this is a durability gap, not a logic bug -- see MSG-105)",
+      "No backoff guidance is given to the caller on SEND_IN_FLIGHT -- it is up to the client to decide how soon to retry"
+    ],
+    "common_mistakes": [
+      "Forgetting the release-on-error path and leaving a permanently SEND_IN_FLIGHT entry after a failed commit",
+      "Checking only `existing.body !== body` for conflict without first checking `existing.messageId === null` for in-flight",
+      "Assuming the placeholder claim alone (without the later finalize step) is sufficient for idempotent replay to work"
+    ],
+    "follow_up_questions": [
+      "What would happen to a retry if the catch block's `this.idempotency.delete(key)` line were removed?",
+      "Why is the placeholder claimed synchronously, before even validating membership?",
+      "How would a client know whether to retry after SEND_IN_FLIGHT, versus treating it as a hard failure?"
+    ],
+    "concepts": ["idempotency", "claim-before-await", "error-handling", "code-reading"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-110",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Beginner",
+    "question": "What does `registerConversation` do, and when is it called? Walk through exactly how it populates `conversationsByUser`.",
+    "answer_hinglish": "`registerConversation(record)` ek naye conversation ko three jagah register karta hai: (1) `this.conversations.set(record.id, record)` -- main lookup map. (2) `this.messagesByConversation.set(record.id, [])` -- empty messages array initialize hota hai. (3) Har `record.members` ke liye, `conversationsByUser` map mein uska entry add/update hota hai -- agar userId ka pehle se Set nahi hai, naya `Set()` banta hai aur map mein daal diya jaata hai, phir `set.add(record.id)` call hota hai.\n\nYeh function sirf DO jagah call hota hai: `createDirectConversation` ke andar (jab naya pair hota hai, existing pair ke liye nahi) aur `createGroupConversation` ke andar -- matlab yeh EK-TIME setup hai jab conversation PEHLI baar banta hai. Baad mein jab koi naya member `addMember` se join karta hai, `registerConversation` dobara CALL NAHI hota -- uski jagah `addMember` khud `conversationsByUser.get(newUserId)` ko directly update karta hai apne commit ke baad.\n\n`conversationsByUser` ka purpose: `deliverPendingReceipts` (presence catch-up) ko chahiye ki ek user KIS-KIS conversation ka member hai, bina saare conversations ko scan kiye -- yeh ek reverse index hai jo O(1) lookup deta hai 'yeh user kis-kis conversation mein hai'.",
+    "why_needed": "Interviewer basic code-reading check karta hai -- function ka exact scope aur jab yeh call hota hai vs jab nahi hota, yeh samajhna zaroori hai taaki candidate conversationsByUser bookkeeping ke do alag jagah (registerConversation vs addMember/removeMember) ko bhi samjhe.",
+    "real_world_analogy": "Jab ek naya club banta hai, founding members ki list ek central registry mein likhi jaati hai (registerConversation) -- baad mein jab koi naya member join karta hai, registry mein sirf uska naam add hota hai (addMember), poori registry dobara nahi likhi jaati.",
+    "how_it_works": "for (const member of record.members) { let set = this.conversationsByUser.get(member.userId); if (!set) { set = new Set(); this.conversationsByUser.set(member.userId, set); } set.add(record.id); }",
+    "in_this_project": "src/messenger.ts ka private registerConversation method; createDirectConversation aur createGroupConversation ke andar call hota hai; addMember/removeMember isi conversationsByUser map ko BAAD mein directly maintain karte hain, registerConversation ko dobara call nahi karte.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::registerConversation",
+      "projects/22-messaging/src/messenger.ts::createDirectConversation",
+      "projects/22-messaging/src/messenger.ts::createGroupConversation"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nprivate registerConversation(record: ConversationRecord): void {\n  this.conversations.set(record.id, record);\n  this.messagesByConversation.set(record.id, []);\n  for (const member of record.members) {\n    let set = this.conversationsByUser.get(member.userId);\n    if (!set) {\n      set = new Set();\n      this.conversationsByUser.set(member.userId, set);\n    }\n    set.add(record.id);\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "A single function sets up all three bookkeeping maps consistently at creation time, avoiding drift",
+      "conversationsByUser gives deliverPendingReceipts an O(1) way to find a user's conversations instead of scanning every conversation",
+      "Clear separation: registerConversation for creation, addMember/removeMember own the ongoing updates"
+    ],
+    "disadvantages": [
+      "Two separate code paths (registerConversation at creation, addMember/removeMember afterward) maintain the SAME map, which is a duplication risk if one is updated and the other forgotten",
+      "This was exactly the real bug found during stage 2 development (B1/B2 in README's mutation table) -- addMember not registering, removeMember not cleaning up",
+      "No single source of truth function for 'add this user to this conversation's bookkeeping' -- the logic is inlined in three places"
+    ],
+    "common_mistakes": [
+      "Forgetting that registerConversation is only called ONCE per conversation, at creation, not on every membership change",
+      "Assuming addMember calls registerConversation again (it does not -- it updates conversationsByUser directly)",
+      "Not realizing removeMember must symmetrically clean up conversationsByUser or stale entries will cause incorrect catch-up behavior"
+    ],
+    "follow_up_questions": [
+      "What would go wrong (concretely) if addMember forgot to update conversationsByUser for the new member?",
+      "Why is conversationsByUser a Set of conversation ids rather than an array?",
+      "Could registerConversation's loop be refactored into a shared helper used by addMember/removeMember too?"
+    ],
+    "concepts": ["bookkeeping", "reverse-index", "code-reading"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-111",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "Trace the ENTIRE control flow of a successful `sendMessage` call, from the moment it is invoked to the moment the caller's promise resolves, naming every synchronous check, every claim, and the one await.",
+    "answer_hinglish": "Full trace, in exact order: (1) `body` validation (non-empty, <= MAX_BODY_LENGTH) -- synchronous throw if invalid. (2) `clientMessageId` validation (non-empty, <= MAX_CLIENT_MESSAGE_ID_LENGTH) -- synchronous throw. (3) idempotency key build, lookup in `this.idempotency` -- if found with `messageId === null`, throw SEND_IN_FLIGHT; if found with different body, throw IDEMPOTENCY_CONFLICT; if found matching, return a clone of the existing message (EARLY RETURN, no further steps run). (4) If no existing entry: `this.idempotency.set(key, { body, messageId: null })` -- placeholder claimed, SYNCHRONOUSLY.\n\n(5) Inside the outer try: `requireConversationRecord(conversationId)` -- throws UNKNOWN_CONVERSATION if missing. (6) `requireMember(record, senderId)` -- throws NOT_A_MEMBER if sender isn't a current member. (7) `claimOp(record)` -- throws CONVERSATION_BUSY if `record.revising` is true; otherwise `record.pendingOps++`.\n\n(8) Inside the inner try: `now = this.clock.now()`. (9) `seq = record.nextSeq++` -- claimed synchronously, THE ONE moment sequence numbers are assigned. (10) Loop over `record.members`, skip sender, build a receipt per recipient: `isOnline(member.userId) ? 'delivered' : 'sent'`. (11) Build the `Message` object. (12) THE ONE AWAIT: `await this.commit(record, record.members, [...liveMessages, message])` -- this is the only point where control can yield to another operation.\n\n(13) After commit resolves: `liveMessages.push(message)`, `this.messageById.set(message.id, message)`, `this.idempotency.set(key, { body, messageId: message.id })` -- placeholder finalized. (14) `finally { record.pendingOps--; }` -- claim released regardless of outcome. (15) Return `this.cloneMessage(message)`. If anything in steps 5-14 throws, the OUTER catch deletes the idempotency key before re-throwing.",
+    "why_needed": "Interviewer senior-level code tracing check karta hai -- candidate ko exact sequencing samajhni chahiye kyunki YEHI sequencing hai jo correctness guarantee karti hai (seq assignment se pehle claimOp, commit se pehle idempotency claim, etc).",
+    "real_world_analogy": "Ek factory assembly line jahan har station ka apna checkpoint hai -- material reject ho sakta hai kisi bhi station par, par ek baar 'in production' stamp lag jaaye (idempotency claim), poora process complete ya cleanly rolled-back hona chahiye, kabhi half-stamped nahi rehna chahiye.",
+    "how_it_works": "Validation -> idempotency lookup/claim (sync) -> membership check (sync) -> claimOp (sync) -> seq assignment (sync) -> receipts built (sync, using isOnline) -> ONE await on commit() -> apply in-memory state -> finalize idempotency -> release pendingOps in finally -> return clone.",
+    "in_this_project": "The entirety of src/messenger.ts's sendMessage method is this exact sequence; test/concurrency.test.ts's 'two sends on the same conversation at the same time' test specifically validates that step 9 (seq claim) never collides regardless of which commit resolves first.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/test/concurrency.test.ts"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Every mutation-relevant decision (membership, busy-check, seq, idempotency) happens synchronously before the single await, so no two concurrent sends can ever observe inconsistent intermediate state",
+      "The finally block guarantees pendingOps is released even if commit rejects",
+      "Clear separation between 'what must be synchronous' and 'what can safely be async' (only the store write)"
+    ],
+    "disadvantages": [
+      "The function is long and does many things (validation, idempotency, membership, sequencing, receipts, commit) -- harder to unit test individual pieces in isolation",
+      "A reader has to trace nested try/catch/finally carefully to see the exact cleanup guarantees",
+      "The early-return path for a matching idempotent replay skips essentially the entire rest of the function, which is easy to miss when scanning quickly"
+    ],
+    "common_mistakes": [
+      "Assuming claimOp happens before the idempotency check (it is actually AFTER the idempotency claim, and after membership check)",
+      "Thinking the sequence number is assigned at the same time as the idempotency claim (it is assigned later, inside claimOp's try block)",
+      "Missing that receipts are built using presence (isOnline) BEFORE the await, based on presence state at that exact synchronous moment"
+    ],
+    "follow_up_questions": [
+      "What would break if claimOp ran BEFORE the idempotency check instead of after?",
+      "Why is the receipt's delivered/sent status decided before the await rather than after commit resolves?",
+      "If two sends for the SAME clientMessageId truly race, which one gets to run steps 5-14, and how does the other learn about it?"
+    ],
+    "concepts": ["control-flow", "claim-before-await", "code-reading", "sendMessage"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping all synchronous decisions (membership, busy-check, sequence assignment, presence snapshot) BEFORE the single await is what makes the whole claim-before-await pattern sound -- splitting any of these to run AFTER the await would reopen a race window. The cost is a long, single function that is harder to decompose for testing.",
+      "failure_scenarios": "If commit() rejects (store failure) after seq was already incremented, the sequence number is effectively 'burned' -- nextSeq has moved forward even though no message with that seq was ever stored successfully, since record.nextSeq++ is not rolled back on failure. This is a minor, accepted gap (a gap in sequence numbers, never a collision or reuse).",
+      "alternatives": "A design that validates and computes the receipt snapshot but defers the actual nextSeq++ until AFTER a successful commit would avoid burning sequence numbers on failure, at the cost of needing to re-verify no other send claimed a number in between -- more complexity for a rarely-hit edge case.",
+      "scale_10x_100x": "At 10x-100x send rate on one conversation, this exact sequencing (sync claim, then one await) is what keeps correctness intact without a distributed lock. The real scaling pressure moves to how fast `commit()` itself resolves, since every send holds its pendingOps claim for that entire duration.",
+      "production_improvements": "Add structured logging around each phase (idempotency claim, membership check, claimOp, commit, finalize) for production debugging. Consider whether a burned sequence number on commit failure needs to be surfaced as a metric (gaps in sequence numbers across a conversation's history)."
+    }
+  },
+  {
+    "id": "MSG-112",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "In `markReadUpTo`, exactly what does the apply-time recheck look like, and why does it operate on `toMark` (a pre-computed list) instead of re-filtering `liveMessages` fresh after the await?",
+    "answer_hinglish": "Apply-time recheck yeh hai: `for (const m of toMark) { if (m.receipts[recipientId]!.status !== 'read') { m.receipts[recipientId] = { status: 'read', at: now }; marked++; } }` -- yeh await KE BAAD chalta hai, aur HAR message ka LIVE status firse check karta hai, na ki `toMark` banate waqt ka purana snapshot trust karta hai.\n\n`toMark` khud BEFORE the await compute hota hai (`liveMessages.filter(m => m.seq <= uptoSeq && m.receipts[recipientId] && status !== 'read')`) -- yeh decide karta hai KAUN SE messages is call ka CANDIDATE set hain. Par await ke dauraan, ek DOOSRI concurrent call (jaise ek faster markReadUpTo jo baad mein shuru hui par pehle resolve hui) un messages ko already 'read' kar sakti hai. Isliye apply-time loop candidate list (`toMark`) par iterate karta hai PAR har ek ka status WRITE-TIME par dobara check karta hai -- `if (m.receipts[recipientId]!.status !== 'read')`. Agar already 'read' hai (doosri call ne kar diya), yeh skip ho jaata hai aur `marked` count mein nahi aata.\n\nYeh design 'candidate set upfront, decision per-item at apply time' hai -- `toMark` sirf WHICH messages ko potentially touch karna hai decide karta hai (performance/early-exit ke liye, agar `toMark.length === 0` ho toh commit hi skip ho jaata hai), par FINAL decision (kya actually overwrite karna hai) hamesha LIVE status par based hai, resolve order kuch bhi ho.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai 'pre-await snapshot for candidate selection' vs 'post-await live recheck for the actual write decision' ka distinction -- yeh pattern poore project mein receipts ke har mutation mein repeat hota hai.",
+    "real_world_analogy": "Ek teacher class mein roll-call lene se pehle attendance sheet dekh ke decide karti hai kis-kis ko call karna hai (candidate list), par jab actually naam bolti hai, har student ka CURRENT status check karti hai (shayad koi already mark ho gaya ho kisi doosri entry se) -- purani sheet sirf WHO list ke liye, final mark current status se.",
+    "how_it_works": "const toMark = liveMessages.filter(...) runs synchronously BEFORE the await on commit(). After the await, the apply loop re-reads `m.receipts[recipientId]!.status` live, writing 'read' only `if (m.receipts[recipientId]!.status !== 'read')`.",
+    "in_this_project": "src/messenger.ts markReadUpTo method; test/concurrency.test.ts's 'a slower call that started first cannot overwrite a faster call's later read with a stale timestamp' test demonstrates exactly this with a FakeConversationStore controlling resolve order.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::markReadUpTo",
+      "projects/22-messaging/test/concurrency.test.ts"
+    ],
+    "code_example": "// real, src/messenger.ts markReadUpTo (trimmed)\nconst toMark = liveMessages.filter((m) => m.seq <= uptoSeq && m.receipts[recipientId] && m.receipts[recipientId]!.status !== \"read\");\nif (toMark.length === 0) return { marked: 0 };\n// ... await this.commit(...) ...\nlet marked = 0;\nfor (const m of toMark) {\n  if (m.receipts[recipientId]!.status !== \"read\") {\n    m.receipts[recipientId] = { status: \"read\", at: now };\n    marked++;\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "A slower call that started first can never overwrite a faster call's later 'read' with a stale timestamp, regardless of resolve order",
+      "The `toMark.length === 0` early exit before commit avoids an unnecessary store write entirely",
+      "The pattern is consistent across markDelivered, markReadUpTo, editMessage, and deleteMessage -- one mental model for all of them"
+    ],
+    "disadvantages": [
+      "The `marked` count returned can legitimately be lower than `toMark.length` if a concurrent call raced ahead -- callers must not assume `marked === toMark.length`",
+      "Two passes over the candidate set (filter, then apply) adds a small amount of extra iteration versus a single-pass approach",
+      "The recheck logic is duplicated by hand in each receipt-mutating method rather than factored into a shared helper"
+    ],
+    "common_mistakes": [
+      "Assuming `toMark` itself is authoritative and applying it without the live recheck (this is exactly mutation R3 in README's table -- 'markReadUpTo's apply-time recheck removed')",
+      "Thinking the early `toMark.length === 0` check makes the later recheck redundant (it does not -- a race could still happen between that check and the await resolving)",
+      "Confusing `toMark` (candidate list) with the final write decision (which is per-item, at apply time)"
+    ],
+    "follow_up_questions": [
+      "What test would fail if the apply-time recheck (`if (m.receipts[recipientId]!.status !== 'read')`) were removed?",
+      "Why is it safe to use `toMark` as the iteration list even though messages may have changed during the await?",
+      "Could this pattern be factored into a shared helper used by markDelivered and markReadUpTo both?"
+    ],
+    "concepts": ["apply-time-recheck", "receipts", "concurrency", "code-reading"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-113",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "Explain exactly what `firstIndexSeqGreaterThan` and `firstIndexSeqAtLeast` compute, how `getMessages` combines them to build a page, and why both are needed instead of just one.",
+    "answer_hinglish": "Dono binary-search helpers hain, `arr` sorted ascending by `seq` assume karte hain. `firstIndexSeqGreaterThan(arr, value)`: PEHLA index `i` jahan `arr[i].seq > value` -- matlab yeh value ke BAAD wala pehla element dhoondta hai (strictly greater). `firstIndexSeqAtLeast(arr, value)`: PEHLA index `i` jahan `arr[i].seq >= value` -- value ke BARABAR ya usse bada pehla element.\n\n`getMessages` dono ko DIFFERENT purposes ke liye use karta hai: `visibleStart = firstIndexSeqGreaterThan(all, member.joinedAtSeq)` -- yeh join-time visibility floor hai, STRICTLY greater kyunki member apne joinedAtSeq WALA message khud nahi dekh sakta (joinedAtSeq woh seq hai jo unke join ke THEEK PEHLE conversation mein tha). `end = firstIndexSeqAtLeast(all, before)` jahan `before = cursor ? decodeCursor(cursor) : Infinity` -- yeh pagination ka upper bound hai, AT LEAST kyunki cursor WAHI seq encode karta hai jahan se AAGE (exclusive) dikhana hai, toh `end` us seq tak (exclusive upper bound for slicing) hona chahiye.\n\nAgar sirf EK helper use karte (jaise dono jagah `firstIndexSeqGreaterThan`), visibility floor sahi rehta (strictly greater sahi hai joinedAtSeq ke liye), PAR pagination boundary galat ho jaata -- cursor ka seq EXCLUDE hona chahiye (already dikhaya ja chuka), 'greater than' wahi karta hai pagination ke liye bhi, toh actually dono jagah same helper kaam kar sakta tha IF `before` cursor-decoded value already 'last shown seq' hoti -- par yahan `before` Infinity default hota hai (no cursor case) jahan `firstIndexSeqAtLeast(arr, Infinity)` = `arr.length` (sab messages included), jo semantically zyada clean hai 'no upper bound' ke liye.",
+    "why_needed": "Interviewer precise binary-search boundary reasoning check karta hai -- off-by-one bugs exactly yahan hote hain (README ke mutation table mein P1-P5 isi area ke breaks hain), aur candidate ko strictly-greater vs at-least ka exact semantic difference pata hona chahiye.",
+    "real_world_analogy": "Ek library ka catalog jahan tumhe 'is number ke BAAD ki sab kitaabein' (strictly greater, visibility floor) aur 'is number TAK ki sab kitaabein' (at least/inclusive boundary, pagination cutoff) dono tarah ki queries chahiye -- dono alag binary search hain kyunki boundary condition different hai.",
+    "how_it_works": "Both are standard binary search over a sorted array, differing only in the comparison inside the loop: `arr[mid].seq <= value` (for greaterThan) versus `arr[mid].seq < value` (for atLeast) decides which half to discard.",
+    "in_this_project": "src/messenger.ts's firstIndexSeqGreaterThan and firstIndexSeqAtLeast module-level functions, both consumed inside getMessages to compute visibleStart and end before slicing `all.slice(start, end)`.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::firstIndexSeqGreaterThan",
+      "projects/22-messaging/src/messenger.ts::firstIndexSeqAtLeast",
+      "projects/22-messaging/src/messenger.ts::getMessages",
+      "projects/22-messaging/test/pagination.test.ts"
+    ],
+    "code_example": "// real, src/messenger.ts (trimmed)\nfunction firstIndexSeqGreaterThan(arr: Message[], value: number): number {\n  let lo = 0, hi = arr.length;\n  while (lo < hi) {\n    const mid = (lo + hi) >> 1;\n    if (arr[mid]!.seq <= value) lo = mid + 1; else hi = mid;\n  }\n  return lo;\n}\n\nfunction firstIndexSeqAtLeast(arr: Message[], value: number): number {\n  let lo = 0, hi = arr.length;\n  while (lo < hi) {\n    const mid = (lo + hi) >> 1;\n    if (arr[mid]!.seq < value) lo = mid + 1; else hi = mid;\n  }\n  return lo;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "O(log n) lookup for both the visibility floor and the pagination boundary, even for a conversation with huge history",
+      "Two small, focused helpers are each easy to test in isolation against boundary cases",
+      "The strictly-greater vs at-least distinction encodes the exact semantics needed (exclusive join floor, exclusive-from-cursor upper bound) correctly"
+    ],
+    "disadvantages": [
+      "Two near-identical binary searches differing by one comparison operator is an easy place for a copy-paste bug (exactly mutation P5 in README's table -- 'the other binary-search helper mutated the same way')",
+      "No shared generic binary-search utility -- the loop body is duplicated between the two functions",
+      "Reading the code requires careful attention to `<=` vs `<` to understand the boundary semantics"
+    ],
+    "common_mistakes": [
+      "Using firstIndexSeqGreaterThan where firstIndexSeqAtLeast was needed (or vice versa), causing an off-by-one that includes or excludes one extra message at a page boundary",
+      "Forgetting that `before` defaults to Infinity when no cursor is given, which must resolve to `arr.length` (no upper bound)",
+      "Assuming visibleStart and end interact simply, without checking `start = Math.max(visibleStart, end - limit)` which combines both boundaries"
+    ],
+    "follow_up_questions": [
+      "Why must the join-time floor use STRICTLY greater than, not at-least?",
+      "What would happen to pagination if firstIndexSeqAtLeast were replaced with firstIndexSeqGreaterThan for the cursor boundary?",
+      "How does `start = Math.max(visibleStart, end - limit)` ensure a page never includes messages from before the member joined?"
+    ],
+    "concepts": ["binary-search", "pagination", "cursor", "code-reading"],
+    "advanced": {
+      "architecture_tradeoffs": "Two specialized binary-search helpers (rather than one generic parameterized comparator function) keep each call site simple and readable at the cost of near-duplicate code -- a reasonable trade for a small, stable function pair, but it means any future similar boundary helper risks the same duplication.",
+      "failure_scenarios": "An off-by-one here (e.g. using the wrong helper at one call site) would either leak one pre-join message to a new member, or shift a pagination page boundary by one message -- both are exactly the kind of subtle bug mutation testing (P1-P5) was designed to catch, and both happened to be caught on the first run per README.",
+      "alternatives": "A single generic binarySearch(arr, predicate) helper parameterized by the comparison, used by both call sites, would remove the duplication at the cost of one extra layer of indirection and a slightly less direct read at each call site.",
+      "scale_10x_100x": "At 10x-100x conversation history size (hundreds of thousands of messages), the O(log n) binary search here is exactly what keeps getMessages fast regardless of history length -- a linear scan would have been the first thing to break at that scale, so this design already anticipates it.",
+      "production_improvements": "Factor the duplicated binary-search loop into one generic helper with a comparator parameter, keeping the two call sites as thin, well-named wrappers (firstIndexSeqGreaterThan, firstIndexSeqAtLeast) for readability without duplicating the search logic itself."
+    }
+  },
+  {
+    "id": "MSG-114",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "How would you extend this Messenger to run correctly across multiple server instances sharing state, given that claimOp/claimRevision's exclusion today is a single process's in-memory boolean/counter?",
+    "answer_hinglish": "In-memory `revising`/`pendingOps` single-process ke liye hi kaam karte hain -- multiple instances mein har ek ka apna copy hoga, toh exclusion guarantee TOOT jaayegi (do instances independently CONVERSATION_BUSY ka check kar sakte hain bina ek doosre ko dekhe).\n\nTeen possible approaches: (1) Single-writer-per-conversation routing -- consistent hashing se har conversationId ek SPECIFIC instance ko route karo, taaki claimOp/claimRevision apne current in-memory model mein bina change ke kaam karein, kyunki ek conversation ke liye SAB operations hamesha ek hi process mein land karte hain. Yeh sabse LOW-RISK approach hai -- code change minimal, par instance count scaling thoda awkward (hot conversation ek instance ko overload kar sakta hai).\n\n(2) Distributed lock (Redis-based) -- claimOp/claimRevision ko ek Redis `SETNX`-style lock se replace karo, jisme `revising`/`pendingOps` Redis mein stored hain, TTL ke saath (crash-safety ke liye). Yeh TRUE horizontal scaling deta hai par latency add karta hai har operation mein (ek extra network round-trip Redis ko) aur lock-expiry edge cases introduce karta hai (agar process crash ho jaaye lock hold karte hue).\n\n(3) Event-sourced/CRDT approach jahan membership changes commute kar sakein bina exclusion ke -- zyada complex, par eventually consistent model mein lock ki zaroorat hi khatam ho jaati. Main recommendation: option (1) start karo (minimal change, works today), aur agar single-conversation hot-spotting real problem ban jaaye, phir (2) ki taraf migrate karo.",
+    "why_needed": "Interviewer senior system-design thinking check karta hai -- multiple valid approaches, trade-offs, aur ek clear RECOMMENDATION with reasoning, jaisa project ke apne PLAN.md ka style hai.",
+    "real_world_analogy": "Ek bade restaurant chain mein, option 1 hai har branch apna specific set of customers handle kare (routing), option 2 hai sab branches ek shared central reservation system use karein (distributed lock), option 3 hai har branch independently operate kare aur end of day reconcile ho (eventual consistency).",
+    "how_it_works": "claimOp/claimRevision today are synchronous in-process checks on a ConversationRecord's revising/pendingOps fields; any multi-instance solution must either route all ops for one conversationId to the same process, or replace these in-memory fields with a shared, atomically-checkable external state.",
+    "in_this_project": "src/messenger.ts's claimOp/claimRevision operate purely on the in-memory ConversationRecord inside a single Messenger instance's `conversations` Map -- there is no cross-instance coordination mechanism anywhere in this project.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/src/store.ts::ConversationStore"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Single-writer-per-conversation routing requires the least code change and keeps the existing synchronous claim logic valid",
+      "A distributed lock approach generalizes to any number of instances without hot-conversation routing concerns",
+      "Both approaches preserve the project's existing correctness invariants if implemented carefully"
+    ],
+    "disadvantages": [
+      "Consistent-hash routing creates a hot-instance risk for a viral conversation, same as sticky sessions",
+      "A distributed lock adds real network latency to every single mutation, even uncontended ones",
+      "Neither approach is implemented in this project today -- this is a 'what would change' design question, not a described feature"
+    ],
+    "common_mistakes": [
+      "Assuming a load balancer alone solves this without addressing the claim mechanism itself",
+      "Proposing a distributed lock without considering TTL/crash-safety (a crashed holder must eventually release the lock)",
+      "Forgetting that presence (onlineDevices) and idempotency also need a multi-instance story, not just claimOp/claimRevision"
+    ],
+    "follow_up_questions": [
+      "How would you handle a crashed process that was holding a distributed 'revising' lock when it died?",
+      "What would change about deliverPendingReceipts if presence also needed to be shared across instances?",
+      "How would you decide between routing-based and lock-based exclusion for a specific production workload?"
+    ],
+    "concepts": ["distributed-systems", "horizontal-scaling", "claim-before-await", "system-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Routing (option 1) trades scaling flexibility for implementation simplicity; a distributed lock (option 2) trades added latency and crash-safety complexity for true elasticity; an eventually-consistent/CRDT model (option 3) trades implementation complexity and weaker guarantees for the removal of locking entirely. This project's existing design (simple, correctness-first, no external dependencies) most naturally extends toward option 1 first.",
+      "failure_scenarios": "With routing, if the routing layer itself has a bug or a rebalance happens mid-operation, two instances could briefly believe they own the same conversationId, reopening the exact lost-update bug claimRevision prevents today. With a distributed lock, a crashed lock-holder without a TTL would permanently wedge that conversation for everyone.",
+      "alternatives": "A hybrid: route for the common case (cheap, no lock overhead) but fall back to a distributed lock only during a rebalance window, accepting brief extra latency only when topology changes. Or move the entire ConversationStore AND the claim state into a transactional database that supports row-level locking natively (e.g. SELECT ... FOR UPDATE), which some real deployments would prefer over building a custom distributed lock.",
+      "scale_10x_100x": "At 10x instance count, consistent-hash routing still works well if traffic is reasonably distributed across conversations. At 100x, a single viral conversation's traffic could exceed what one instance can handle regardless of routing -- at that point, the exclusion granularity itself (whole-conversation) becomes the bottleneck, and partitioning within a conversation (e.g. sharding receipts by recipient) would need to be considered.",
+      "production_improvements": "Start with consistent-hash routing by conversationId (lowest risk). Add health-check-aware rebalancing with a safe hand-off protocol (drain in-flight ops before moving a conversation to a new instance). Monitor for hot-conversation imbalance and only invest in a distributed lock if routing-based hot-spotting becomes a real, measured problem."
+    }
+  },
+  {
+    "id": "MSG-115",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "How would you add message search to this project without breaking the join-time visibility invariant (a member never sees messages from before they joined)?",
+    "answer_hinglish": "Core constraint: search RESULTS ko bhi EXACTLY wahi visibility filter follow karna chahiye jo `getMessages` follow karta hai -- `member.joinedAtSeq` se STRICTLY greater messages hi dikhen. Agar search ek alag (jaise full-text) index se results laata hai aur yeh filter bhool jaata hai, yeh EXACTLY wahi 'leak' hai jo join-time visibility design explicitly prevent karna chahta hai (README mein likha hai: naya member purani history nahi dekh sakta).\n\nImplementation approach: search index (jaise ek inverted index ya external search engine) ko messages ke SAATH `conversationId` aur `seq` store karna chahiye, par search query execution ke BAAD, results ko Messenger ke through hi return karo -- matlab `search(query, userId)` internally `getMessage(conversationId, messageId)` ya similar ek validation call kare HAR result ke liye jo confirm kare ki yeh USER ko currently visible hai (apna khud ka joinedAtSeq check). Yeh thoda inefficient hai (post-filter) par CORRECT hai -- search index khud 'per-user visibility' ka source of truth nahi bante, Messenger hi rehta hai.\n\nBetter approach agar scale allow kare: search index ko bhi joinedAtSeq-aware banaya jaaye -- har conversation ke liye, per-member minimum visible seq ko index mein bhi encode karo, taaki search query time par hi filter ho sake, post-filter na karna pade. Par yeh extra complexity hai jo sirf is project ke scope se bahar implement hoga (is project mein search bilkul nahi hai, README explicitly 'Not built: search' kehta hai).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai ki ek NAYA feature add karte waqt EXISTING invariant ko accidentally break karna kitna aasan hai, aur retrofit karne ka safe pattern (post-filter through the same authority) kya hai.",
+    "real_world_analogy": "Ek library ka search catalog agar sirf TITLE index se results deta hai, bina yeh check kiye ki tumhara membership card kis section ke liye valid hai, toh tum restricted section ki kitaabein 'dhoond' sakte ho jinhe actually access nahi kar sakte -- search ko membership ke SAME rules follow karni chahiye jo physical access karta hai.",
+    "how_it_works": "getMessages already enforces `firstIndexSeqGreaterThan(all, member.joinedAtSeq)` as a read-time filter; any new read path (search included) must apply the identical check, either by routing through getMessage/getMessages itself, or by re-implementing the exact same joinedAtSeq comparison against the searching member's current membership record.",
+    "in_this_project": "src/messenger.ts's getMessages (the only existing read path with the join-time filter) and Member.joinedAtSeq in src/types.ts are the two pieces any search feature would need to respect; there is no search implementation in this project today.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::getMessages",
+      "projects/22-messaging/src/types.ts::Member",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Post-filtering through the existing Messenger API guarantees consistency with getMessages' visibility rule with zero duplicated logic",
+      "The invariant is centralized in one place (joinedAtSeq comparison), so any new feature can reuse it rather than reimplementing",
+      "A search index can still be built and optimized independently of this visibility concern, as long as filtering happens before returning to the user"
+    ],
+    "disadvantages": [
+      "Post-filtering after a search query means the index itself may do wasted work returning results that get filtered out, hurting result-set size predictability",
+      "Building a joinedAtSeq-aware index (the efficient alternative) adds real implementation complexity not present anywhere in this project today",
+      "No search exists in this codebase at all -- this is a from-scratch design question, not a modification of existing code"
+    ],
+    "common_mistakes": [
+      "Building a search index directly over raw message content without any visibility-awareness, assuming 'search is just read-only, so it's safe'",
+      "Forgetting that a member's joinedAtSeq can be different in different conversations, and a search spanning multiple conversations must check EACH one",
+      "Not revisiting visibility on re-join (joinedAtSeq is overwritten on each join) -- a search over message history must respect the member's CURRENT joinedAtSeq, not a historical one"
+    ],
+    "follow_up_questions": [
+      "How would you handle search results for a user who was removed and re-added to a group (joinedAtSeq overwritten)?",
+      "What would change if search needed to span many conversations at once efficiently?",
+      "How would you test that search never leaks a pre-join message, mirroring how pagination.test.ts tests getMessages?"
+    ],
+    "concepts": ["search", "visibility-invariant", "feature-design", "retrofit"],
+    "advanced": {
+      "architecture_tradeoffs": "Post-filtering through the existing Messenger API is simple and provably correct but less efficient at scale (wasted index work on filtered-out results); building visibility-awareness into the index itself is more efficient but duplicates the joinedAtSeq logic in a second place, risking drift if the visibility rule ever changes.",
+      "failure_scenarios": "If a search feature were added with its own independent index and NO visibility check, every re-join history gap (README's documented 'leaving and rejoining loses access to pre-join history') would become searchable again through the back door -- a worse leak than the original design, since even normal pagination correctly hides this.",
+      "alternatives": "A separate search service with its own eventually-consistent index (common in production), guarded by a mandatory post-query visibility check against the Messenger's live membership state; or a fully integrated search that is part of the Messenger class itself, reusing requireMember and the same binary-search helpers.",
+      "scale_10x_100x": "At 10x message volume, a basic full-text index with post-filtering is still workable. At 100x, post-filtering a huge raw result set before applying visibility becomes wasteful -- the index itself would need per-member or per-conversation partitioning so visibility can be applied as part of the query, not after it.",
+      "production_improvements": "If this were ever built, the recommended path is: index messages with conversationId and seq as metadata; serve search queries filtered first by the searching user's current conversation membership, then re-validate each surviving result's seq against that user's joinedAtSeq before returning it -- never trust the index alone as the visibility authority."
+    }
+  },
+  {
+    "id": "MSG-116",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "This project explicitly has no ownership transfer and no self-leave -- the owner can never be removed. How would you add both WITHOUT reopening the exact lost-update bug that `revising` exists to prevent?",
+    "answer_hinglish": "Key insight: ownership transfer aur self-leave DONO membership-shape-changing operations hain, EXACTLY jaisa addMember/removeMember hain -- isliye unhe BHI `claimRevision` ke through jaana chahiye, same guard, same whole-array-replace pattern. Agar koi inhe ek ALAG path se implement kare (jaise directly `record.members` mutate kare bina claimRevision claim kiye), yeh EXACT wahi lost-update bug reopen karega jo test/concurrency.test.ts mein 'illustration' describe block mein dikhaya gaya hai.\n\n`transferOwnership(conversationId, currentOwnerId, newOwnerId)`: claimRevision claim karo, phir naya members array banao jahan currentOwnerId ka role 'member' ho jaaye aur newOwnerId ka role 'owner' ho jaaye (dono EXISTING members hone chahiye -- koi naya join nahi), commit karo, phir `record.members = newMembers`.\n\n`leaveConversation(conversationId, userId)` (self-leave): claimRevision claim karo, check karo caller OWNER NAHI hai (CANNOT_REMOVE_OWNER jaisa error, ya phir force them to transferOwnership first) -- agar owner khud leave karna chahta hai, PEHLE transferOwnership mandatory karo, phir dusri call se leave. Yeh prevents a group ever ending up with ZERO owner, jo removeMember ka existing invariant hai ('the owner cannot be removed') aur naya design usko preserve karta hai, sirf ek NAYA escape-hatch (transfer-then-leave) deta hai.\n\nCRITICAL: dono operations ko SAME `claimRevision` exclusion se guzarna chahiye jo addMember/removeMember use karte hain -- isse automatic guarantee milta hai ki ek transfer aur ek concurrent removeMember kabhi ek doosre ka stale array overwrite nahi karenge, bina kisi NAYE concurrency mechanism ke.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate NAYE features ko EXISTING safety pattern ke andar fit kar sakta hai, na ki parallel/competing mechanism invent kar de jo invariant ko silently bypass kar de.",
+    "real_world_analogy": "Ek company mein CEO transition: naya CEO announce karne se pehle, OLD CEO officially apna role transfer karta hai -- yeh dusri HR announcements (jaise koi aur employee resignation) ke SAME approval process se guzarta hai, ek alag 'fast path' nahi banaya jaata sirf kyunki yeh CEO-level change hai.",
+    "how_it_works": "Both new operations would call this.claimRevision(record) exactly like addMember/removeMember do, build a new members array reflecting the role/membership change, await this.commit(...) with that new array, then apply record.members = newMembers only after the store confirms it, inside a finally { record.revising = false; } block.",
+    "in_this_project": "src/messenger.ts's addMember/removeMember are the existing pattern to mirror; claimRevision is the shared guard; README's 'Known and NOT handled' section explicitly lists this as a future gap: 'the owner can never be removed or step down... a real version needs at least the owner may transfer ownership.'",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/src/messenger.ts::addMember",
+      "projects/22-messaging/src/messenger.ts::removeMember",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Reusing claimRevision means zero new concurrency primitives -- the existing exclusion guarantee extends automatically",
+      "Forcing transfer-before-leave for an owner preserves the existing 'a group always has exactly one owner' invariant",
+      "The whole-array-replace pattern stays consistent across every membership-shape change, not just add/remove"
+    ],
+    "disadvantages": [
+      "A two-step 'transfer then leave' flow for an owner wanting to leave is more awkward for a client than a single atomic call",
+      "No code for this exists today -- both would be genuinely new methods, not a tweak to existing ones",
+      "A group with only one member (the owner) still has no way to 'close' or leave cleanly even with this fix"
+    ],
+    "common_mistakes": [
+      "Implementing transferOwnership or leaveConversation outside the claimRevision guard, reopening the exact array-replace race it exists to prevent",
+      "Allowing an owner to leave directly without first transferring ownership, leaving a group ownerless",
+      "Forgetting that a transfer target must already be an existing member -- transfer should not silently add someone"
+    ],
+    "follow_up_questions": [
+      "What should happen if the owner tries to leave a group with no other members to transfer ownership to?",
+      "Should transferOwnership and a subsequent leave be combined into one atomic call instead of two separate ones?",
+      "How would you test that a transfer racing a removeMember of the SAME target never corrupts membership?"
+    ],
+    "concepts": ["ownership-transfer", "self-leave", "claim-before-await", "feature-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Reusing claimRevision keeps the new feature's safety free, at the cost of the new operations inheriting the SAME exclusion-with-message-ops behavior (a transfer would also block sends, just like addMember/removeMember do today) -- arguably correct, since a transfer is still a membership-shape change the same reasoning applies to.",
+      "failure_scenarios": "If transferOwnership were implemented as a separate, unguarded code path (not going through claimRevision), a transfer racing a concurrent removeMember targeting the new owner-to-be could result in a members array where the 'new owner' was removed by one commit while the other commit still marks them as owner -- a worse version of the original lost-update bug, now potentially leaving a conversation owner-less or in an inconsistent role state.",
+      "alternatives": "A single atomic 'transfer-and-leave' call (owner names a successor and leaves in one operation) would be more ergonomic for clients than a mandatory two-step flow, at the cost of a slightly more complex single method that has to validate both the new owner and the leaving owner's eligibility together.",
+      "scale_10x_100x": "At 10x-100x group size, ownership transfer is a rare event regardless of group size, so the exclusion cost (blocking message ops briefly) is negligible in aggregate -- the real scaling concern remains the same whole-array-replace cost discussed for addMember/removeMember at very large member counts.",
+      "production_improvements": "Add transferOwnership and leaveConversation (owner-aware) as new Messenger methods, both routed through claimRevision. Add explicit tests mirroring test/concurrency.test.ts's existing 'lost-update bug' illustration, but for transfer-vs-removeMember and transfer-vs-transfer races specifically."
+    }
+  },
+  {
+    "id": "MSG-117",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "How would you swap `InMemoryConversationStore` for a real persisted backend (Postgres or MongoDB), and what would actually need to change in `Messenger` itself?",
+    "answer_hinglish": "Good news: `ConversationStore` interface already ek clean seam hai -- `persist(snapshot: PersistedConversation): Promise<void>` sirf EK method hai. Ek real `PostgresConversationStore` ya `MongoConversationStore` class likhni hogi jo yehi interface implement kare, aur `Messenger` ke constructor mein inject kar do (`new Messenger({ users, store: new PostgresConversationStore(pool) })`) -- `Messenger` ka koi code change NAHI chahiye is part ke liye, kyunki dependency injection already design mein hai.\n\nPAR teen real gaps hain jo sirf store swap karne se solve NAHI honge: (1) **Load path missing** -- abhi `Messenger` ka `conversations`/`messagesByConversation`/`messageById` Maps sirf process-lifetime ke liye hain, startup par kahin se bhi 'load existing conversations' ka code nahi hai. Real backend ke saath, process restart par Messenger ko in-memory state ko store se REBUILD karna padega, ya lazy-load per-conversation karna padega jab pehli baar access ho.\n\n(2) **Snapshot shape vs query patterns** -- `PersistedConversation` poora `{conversation, messages}` snapshot hai jo HAR commit par FULL messages array ke saath persist hota hai (`[...liveMessages, message]`). Yeh in-memory ke liye fine hai (cheap), par ek real database ke liye 'har message send par PURI message history re-write karo' extremely wasteful hoga -- real implementation ko sirf NAYE/CHANGED messages ko append/update karna chahiye, poora snapshot nahi.\n\n(3) **Idempotency aur presence** -- yeh dono abhi completely in-memory hain, `ConversationStore` se bypass karte hain. Real deployment mein idempotency ko bhi durable banana padega (MSG-105 dekho), aur presence ko ek shared fast store (Redis) mein -- yeh `ConversationStore` swap se UNRELATED cheezein hain jo alag se solve karni padengi.",
+    "why_needed": "Interviewer samajhna chahta hai ki candidate 'the interface is swappable' ko correctly identify kare PAR yeh bhi recognize kare ki interface swap SUFFICIENT nahi hai poori durability ke liye -- real engineering judgment yahi hai.",
+    "real_world_analogy": "Ek company apna accounting software whiteboard se Excel mein move kar leti hai (interface swap easy), par agar unka process abhi bhi 'har transaction par POORI history dobara likho' hai, Excel mein yeh approach bhi slow/wasteful rahega -- real fix sirf format badalna nahi, APPROACH bhi badalna hai.",
+    "how_it_works": "ConversationStore.persist(snapshot) is the one seam; Messenger's constructor does `this.store = options.store ?? new InMemoryConversationStore()`, so dependency injection already supports a swap with zero change to Messenger's own logic -- but every call site that builds a snapshot (`[...liveMessages, message]`, full members array) would ideally change to an incremental write pattern for a real backend.",
+    "in_this_project": "src/store.ts's ConversationStore interface and InMemoryConversationStore; src/messenger.ts's commit() method builds the full snapshot every single time, which is fine for an in-memory Map but not for a real database write pattern.",
+    "implementation_files": [
+      "projects/22-messaging/src/store.ts::ConversationStore",
+      "projects/22-messaging/src/store.ts::InMemoryConversationStore",
+      "projects/22-messaging/src/store.ts::PersistedConversation",
+      "projects/22-messaging/src/messenger.ts::commit",
+      "projects/22-messaging/src/messenger.ts::MessengerOptions"
+    ],
+    "code_example": "// real, src/store.ts (trimmed) -- the seam a real backend would implement\nexport interface ConversationStore {\n  persist(snapshot: PersistedConversation): Promise<void>;\n}\n\n// A real implementation would be injected here instead:\n// const messenger = new Messenger({ users, store: new PostgresConversationStore(pool) });",
+    "code_language": "typescript",
+    "advantages": [
+      "ConversationStore is already dependency-injected, so the swap itself needs zero change to Messenger's business logic",
+      "The snapshot shape (full conversation + messages) is simple and unambiguous for a first, correctness-focused implementation",
+      "Nothing about the claim-before-await correctness model depends on WHICH store is used -- it stays valid regardless of backend"
+    ],
+    "disadvantages": [
+      "The full-snapshot-per-commit pattern is wasteful for a real database -- every sendMessage would rewrite the ENTIRE message history",
+      "No cold-start load path exists -- a restarted process has zero conversations until recreated",
+      "Idempotency and presence remain unaddressed by a ConversationStore swap alone"
+    ],
+    "common_mistakes": [
+      "Assuming swapping the store alone makes the system restart-safe (idempotency and presence are separate gaps)",
+      "Implementing a real backend that still does 'full snapshot rewrite' per commit, inheriting the in-memory design's wastefulness",
+      "Forgetting a load path is needed for the process to recover its state after a restart"
+    ],
+    "follow_up_questions": [
+      "Would you load every conversation into memory at startup, or lazily on first access -- what are the trade-offs?",
+      "How would you redesign `commit()`'s snapshot shape to support incremental (append-only) writes instead of full rewrites?",
+      "What would a PostgresConversationStore's schema look like for conversations and messages?"
+    ],
+    "concepts": ["persistence", "production-deployment", "conversation-store", "system-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping the snapshot-based interface (full conversation + messages) simplifies the FIRST real implementation at the cost of poor write efficiency; redesigning the interface to take incremental deltas (just the new message, or just the changed members array) is more efficient but requires changing both the interface and every call site in Messenger that currently builds a full snapshot.",
+      "failure_scenarios": "A real backend write failing partway (e.g. network blip during a Postgres transaction) under the current full-snapshot model is actually SAFER than it sounds -- since persist() either fully succeeds or throws, and commit()'s caller never applies in-memory state until the await resolves, a partial write failure just means the in-memory state correctly stays unchanged and the caller gets an error, matching the existing error-means-nothing-happened guarantee.",
+      "alternatives": "A fully event-sourced design where each mutation is an append-only event (rather than a full snapshot) would be far more efficient for a message-heavy system and would also give a natural audit trail, at the cost of needing a projection/rebuild step to answer current-state queries like getMessage.",
+      "scale_10x_100x": "At 10x message volume, full-snapshot-per-send becomes clearly unacceptable (O(n) write cost per message as conversation history n grows) -- this MUST change to an incremental append before any real production use. At 100x, sharding by conversationId across database partitions becomes necessary, and the single global `messageById` Map's O(1) lookup assumption would also need a real indexed query instead.",
+      "production_improvements": "Redesign the store interface to take incremental writes (new message, or just the changed member list) instead of full snapshots. Add a startup load path (lazy-on-access recommended over eager full load). Index messages by conversationId+seq in the real backend to preserve getMessages' pagination performance characteristics."
+    }
+  },
+  {
+    "id": "MSG-118",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "`addMember`/`removeMember` replace the WHOLE `members` array on every change. At what group size does this become a real problem, and how would you migrate to a keyed structure without breaking `claimRevision`'s guarantee?",
+    "answer_hinglish": "README/PLAN.md explicitly justify whole-array-replace kyunki 'membership chhoti aur rarely-changing hai' -- yeh assumption chhote groups (dozens, low hundreds of members) ke liye bilkul fine hai: `[...record.members, newMember]` ya `record.members.filter(...)` ka cost negligible hai.\n\nProblem shuru hota hai jab groups 1000s+ members tak pahunchte hain (broadcast-style channels): har SINGLE membership change (even one member add/remove) poora array COPY karta hai -- O(n) cost per change, aur `claimRevision`'s exclusion ka matlab hai yeh change pura conversation ko BLOCK karta hai jab tak commit resolve na ho, is duration mein poore array ka size bhi commit payload mein jaata hai (`PersistedConversation.conversation.members`), jo bade groups ke liye real network/storage cost hai.\n\nMigration path: `members: Member[]` ko `Map<string, Member>` (keyed by userId) mein convert karo. `claimRevision`'s GUARANTEE (`revising` flag, `pendingOps` check) EXACTLY same rehta hai -- yeh array ke SHAPE par depend nahi karta, sirf is baat par depend karta hai ki 'ek baar mein ek hi membership-shape-change ho, aur usse koi message op na clash kare'. Change sirf yeh hai ki `addMember`/`removeMember` ab POORA structure copy nahi karte, sirf EK entry add/delete karte hain Map mein (`new Map(record.members); newMembers.set(...)` ya agar truly incremental backend ho, ek single key-level write).\n\nIMPORTANT: commit() ka snapshot abhi bhi poora members list leta hai (store.persist ke through) -- agar backend truly incremental hona hai (sirf ek member ka delta persist karna), `ConversationStore` interface ko bhi evolve karna padega (see MSG-117), na ki sirf in-memory structure.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek specific, measurable threshold identify kar sake (O(n) copy cost) aur ek migration path propose kare jo EXISTING safety invariant ko preserve kare, na ki redesign kar de.",
+    "real_world_analogy": "Ek chhoti dukaan apne customers ki list ek kaagaz par rakhti hai, naya customer aaye toh poori list dobara likh dena fine hai. Par ek bade mall mein har customer ke aane par poori member-directory dobara likhna impossible hai -- unhe ek keyed database (customer ID se direct lookup) chahiye, par 'ek time mein ek hi update' ka rule (jaisa revising) tab bhi same rehta hai.",
+    "how_it_works": "claimRevision's exclusion is purely about the revising flag and pendingOps counter on ConversationRecord -- it never inspects the shape of `members` itself. Swapping Member[] for Map<string, Member> only changes how addMember/removeMember build the NEW structure (an incremental Map mutation instead of a spread/filter), while claimRevision's guard code stays byte-for-byte identical.",
+    "in_this_project": "src/messenger.ts's addMember (`[...record.members, newMember]`) and removeMember (`record.members.filter(...)`) are the exact whole-array-replace call sites; ConversationRecord.members is typed as Member[] in the private interface; claimRevision itself has zero dependency on this shape.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::addMember",
+      "projects/22-messaging/src/messenger.ts::removeMember",
+      "projects/22-messaging/src/messenger.ts::claimRevision",
+      "projects/22-messaging/src/types.ts::Member"
+    ],
+    "code_example": "// real, src/messenger.ts addMember (trimmed) -- the exact whole-array-replace being discussed\nconst newMembers = [...record.members, { userId: newUserId, role: \"member\" as const, joinedAtSeq: record.nextSeq - 1 }];\nawait this.commit(record, newMembers, this.messagesByConversation.get(conversationId)!);\nrecord.members = newMembers; // only applied after the store confirms it",
+    "code_language": "typescript",
+    "advantages": [
+      "claimRevision's safety guarantee is completely independent of the members structure's shape, so migrating it is low-risk",
+      "A Map-keyed structure turns O(n) membership changes into O(1), which matters a great deal for very large groups",
+      "The public Conversation.members shape returned to callers could stay an array (converted from the Map) without breaking API compatibility"
+    ],
+    "disadvantages": [
+      "This migration requires changing ConversationRecord's internal shape, addMember, removeMember, and the public toConversation serialization",
+      "The ConversationStore's snapshot-based persist() interface would still need a full member list for each commit unless it is ALSO redesigned (see MSG-117)",
+      "Iteration order matters in some tests/contexts (e.g. member list order in test assertions) and would need explicit handling when converting a Map back to an ordered array"
+    ],
+    "common_mistakes": [
+      "Assuming claimRevision itself needs to change for this migration (it does not -- it is structure-agnostic)",
+      "Migrating the in-memory structure but forgetting the ConversationStore snapshot still forces an O(n) full-member-list write per change",
+      "Breaking existing tests that assert member order (e.g. owner first) if the Map-to-array conversion does not preserve insertion order carefully"
+    ],
+    "follow_up_questions": [
+      "At what approximate member count would you actually prioritize this migration over other work?",
+      "How would you preserve member ordering (owner first, etc.) when converting from a Map back to an array for the public API?",
+      "What would need to change in ConversationStore's interface to make this migration's benefit actually reach the persistence layer too?"
+    ],
+    "concepts": ["data-structure-migration", "scalability", "claim-before-await", "members-array"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping Member[] is simpler to reason about and matches this project's stated assumption (membership is small); migrating to a keyed Map adds a small amount of conversion complexity (Map<->array for the public API) in exchange for O(1) membership changes -- worth it only once group sizes genuinely justify it, not preemptively.",
+      "failure_scenarios": "Without this migration, a 10,000-member broadcast group doing frequent membership churn (people joining/leaving a large public channel) would see every single change pay an O(n) array-copy cost AND an O(n) full-member-list write to the store, each one briefly blocking ALL message traffic in that conversation via claimRevision -- a much worse version of the capacity problem described in MSG-104.",
+      "alternatives": "A fully different approach: separate 'owner/admin' metadata (small, rarely changing) from 'general membership' (large, keyed structure, possibly its own store entirely) so a membership change for a regular member never needs to touch or lock anything related to ownership or group-level settings.",
+      "scale_10x_100x": "At 10x group size (thousands of members), the Map migration alone meaningfully helps in-memory cost but the ConversationStore snapshot cost remains O(n) unless that interface also changes. At 100x (tens of thousands), BOTH the in-memory structure AND the persistence layer need to be incremental, and claimRevision's whole-conversation exclusion granularity itself may need to be reconsidered (e.g. partitioning membership operations from message operations more finely).",
+      "production_improvements": "Migrate ConversationRecord.members to a Map<string, Member> keyed by userId first (low-risk, structure-agnostic relative to claimRevision). Separately, evolve ConversationStore to support incremental member deltas instead of full-list snapshots (see MSG-117). Add a dedicated 'large group' test suite that exercises membership churn at scale."
+    }
+  },
+  {
+    "id": "MSG-119",
+    "project_slug": "p22-messaging",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "How would you integrate this project with project 21's push-notification system so a recipient gets a push when a message arrives, without breaking any of this project's delivery/read-receipt guarantees?",
+    "answer_hinglish": "Core principle: push notification ek SEPARATE concern hai delivery/read receipts se -- push 'user ko inform karo' karta hai, receipts 'user ne actually kya dekha' track karte hain. Dono ko MIX karna galat hai -- jaise ek push SUCCESSFULLY bheja jaana yeh PROOF nahi hai ki recipient ne message DELIVERED/READ kiya (push fail bhi ho sakta hai, device off ho sakta hai, user notification dismiss kar sakta hai bina khole).\n\nIntegration point: `sendMessage`'s COMMIT ke success ke BAAD (jab message safely stored ho chuka ho), ek SEPARATE call project 21 ke notification system ko trigger karo -- `onMessageSent(message, recipientIds)` jaisa ek HOOK, jo sirf OFFLINE recipients ko push bheje (online recipients already auto-delivered hain is project ke apne logic se, unhe push ki zaroorat nahi -- unka app already open/connected hai).\n\nCRITICAL design decision: yeh hook `sendMessage`'s MAIN await ke BAAD, fire-and-forget ke tarah chalna chahiye (ya ek alag queue mein), NA ki `sendMessage`'s OWN await ke andar -- agar push notification service slow/down ho, yeh `sendMessage` ko fail NAHI karna chahiye (push ek best-effort side-effect hai, message delivery ka core guarantee nahi). Isse `claimOp`/`pendingOps` ka exclusion window bhi push ki latency se unaffected rehta hai.\n\nReceipt semantics UNCHANGED rehte hain -- push ka koi role nahi hai `receipts` map mein; sirf `markDelivered`/`markReadUpTo` (client-driven acks) hi status badalte hain, jaisa aaj hai. Yeh separation of concerns is project ka EXISTING design philosophy hai (presence bhi ConversationStore se bahar hai, same reasoning) extended to ek naye integration point tak.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai ek NAYA cross-system integration (push notifications) ko kaise design karna hai bina EXISTING correctness guarantees (receipts) ko accidentally couple kiye, aur best-effort vs guaranteed semantics ka distinction.",
+    "real_world_analogy": "Ek courier company ka SMS alert ('your package is on the way') aur actual delivery confirmation (signature on door) DO alag systems hain -- SMS fail ho sakta hai (galat number), par delivery phir bhi successfully ho sakti hai; dono ko ek doosre se couple karna galat hoga.",
+    "how_it_works": "sendMessage's existing isOnline check at receipt-build time already distinguishes online (auto-delivered) from offline (stays 'sent') recipients -- a push-notification hook would only need to target the offline subset, firing AFTER commit succeeds, outside sendMessage's own await chain.",
+    "in_this_project": "src/messenger.ts's sendMessage builds receipts using `this.isOnline(member.userId)` -- this existing check already identifies exactly which recipients would need a push (the offline ones); README's 'Not built' list explicitly notes push notifications are project 21's scope, with this project positioned as the potential 'in_app-style source of truth' behind it.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/src/messenger.ts::isOnline",
+      "projects/22-messaging/PLAN.md",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Keeping push as a best-effort, post-commit, out-of-band hook preserves every existing receipt guarantee unchanged",
+      "Only targeting offline recipients avoids redundant pushes to users who are already connected and auto-delivered",
+      "Decoupling push failure from sendMessage's own success/failure keeps the core delivery guarantee independent of a third-party notification service's uptime"
+    ],
+    "disadvantages": [
+      "A fire-and-forget push hook has no built-in retry or delivery confirmation of its own within this project",
+      "No actual integration code exists today -- this is a from-scratch design, and project 21's actual API shape is not detailed here",
+      "A race exists where a recipient could come online (and get auto-delivered) in the brief window between commit and the push firing, making the push slightly redundant (harmless, but wasted work)"
+    ],
+    "common_mistakes": [
+      "Coupling push send success/failure to sendMessage's own promise, which would make an unrelated third-party outage block messaging entirely",
+      "Sending a push to an already-online recipient, creating redundant/annoying double-notification",
+      "Treating 'push delivered' as equivalent to a receipt status update -- they must never be conflated"
+    ],
+    "follow_up_questions": [
+      "What would happen if the push hook were placed INSIDE sendMessage's claimOp/commit section instead of after it?",
+      "How would you avoid pushing to a recipient who comes online in the brief window between commit and the push firing?",
+      "What retry or queueing strategy would you add around the push hook itself?"
+    ],
+    "concepts": ["push-notifications", "integration-design", "best-effort", "separation-of-concerns"],
+    "advanced": {
+      "architecture_tradeoffs": "A synchronous, in-request push call is simpler to reason about (one code path) but couples messaging's core guarantee to notification-service uptime; an async, queued push hook decouples them cleanly but introduces its own eventual-consistency and ordering questions (could a push arrive describing a message that was later edited or deleted before the user even saw the notification?).",
+      "failure_scenarios": "If the push service is down and the hook is synchronous and un-guarded, every sendMessage call would start failing for an unrelated reason -- users would see send errors for a messaging-layer problem that is actually a notifications-layer outage. With the recommended fire-and-forget design, this failure is contained entirely within the notification pipeline.",
+      "alternatives": "A fully event-driven design where sendMessage publishes a 'message sent' event to a message queue (Kafka/SQS-style), and project 21's notification system subscribes independently, would decouple the two systems even further than a direct in-process hook, at the cost of needing that queue infrastructure.",
+      "scale_10x_100x": "At 10x message volume, a direct in-process push hook per send is still workable if the push service itself scales. At 100x, pushing synchronously (even fire-and-forget) from inside the same process as message delivery risks resource contention -- an actual message queue between the two systems becomes the right architecture, decoupling their respective scaling needs entirely.",
+      "production_improvements": "Build the integration as an async event (not a direct function call) so project 21 can be deployed, scaled, and fail independently. Add a short-lived suppression window so a recipient who comes online within seconds of send does not also get a redundant push. Add observability on push hook latency and failure rate, separate from messaging's own metrics."
+    }
+  },
+  {
+    "id": "MSG-120",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a function `unreadCount(messenger, conversationId, userId)` that returns how many messages a user has not yet read in a conversation, using only the public Messenger API.",
+    "answer_hinglish": "Solution `getMessages`'s pagination ke through poori history walk karta hai (exactly jaisa test/invariants.test.ts ka `walk` helper karta hai), aur har message ke `receipts[userId]` ko check karta hai -- agar entry exist karta hai AUR status 'read' nahi hai, count badhta hai. Sender ke apne messages automatically exclude ho jaate hain kyunki `sendMessage` khud sender ko koi receipt entry NAHI deta (`for (const member of record.members) { if (member.userId === senderId) continue; ... }`), isliye `m.receipts[userId]` sender ke apne message ke liye undefined hoga, aur check naturally skip karega.\n\nPagination zaroori hai kyunki `getMessages` ek baar mein max 200 messages deta hai -- `nextCursor` null hone tak loop chalana padta hai taaki poori history cover ho, na ki sirf first page.",
+    "why_needed": "Real-world UI ke liye 'unread badge count' ek common feature hai -- yeh exercise candidate ko public API (getMessages pagination + receipts map) sahi se compose karna test karta hai.",
+    "real_world_analogy": "Ek chat app ka 'unread messages' badge jo chat list mein dikhta hai -- exactly yehi calculation har conversation ke liye background mein hota hai.",
+    "how_it_works": "Pages through getMessages using nextCursor until exhausted, counting messages whose receipts[userId] entry exists and is not 'read'.",
+    "in_this_project": "Mirrors the pagination pattern in test/invariants.test.ts's walk() helper; uses the same receipts map structure documented in src/types.ts's Message.receipts.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::getMessages",
+      "projects/22-messaging/src/types.ts::Message",
+      "projects/22-messaging/test/invariants.test.ts"
+    ],
+    "code_example": "// new, illustrative -- follows the pagination pattern used by test/invariants.test.ts's walk()\nimport type { Messenger } from \"../src/index.js\";\n\nexport function unreadCount(messenger: Messenger, conversationId: string, userId: string): number {\n  let count = 0;\n  let cursor: string | undefined;\n  do {\n    const page = messenger.getMessages(conversationId, userId, { limit: 200, ...(cursor ? { cursor } : {}) });\n    for (const m of page.items) {\n      const receipt = m.receipts[userId];\n      if (receipt && receipt.status !== \"read\") count++;\n    }\n    cursor = page.nextCursor ?? undefined;\n  } while (cursor);\n  return count;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Uses only the public Messenger API -- no reliance on private internals",
+      "Correctly excludes the user's own messages for free, since they never get a receipt entry for themselves",
+      "Naturally respects join-time visibility since getMessages already applies that filter"
+    ],
+    "disadvantages": [
+      "Walks the FULL message history every call -- O(n) per invocation with no caching, expensive for very long conversations",
+      "Makes multiple getMessages calls (one per page) for a long history, each a separate 'request' in a real networked setting",
+      "No incremental/cached unread count exists in this project -- every call recomputes from scratch"
+    ],
+    "common_mistakes": [
+      "Forgetting that getMessages returns at most MAX_PAGE_SIZE items per call and not looping over nextCursor",
+      "Checking `m.receipts[userId]!.status !== 'read'` without first confirming the receipt exists (sender's own messages have no entry, and would throw if accessed unsafely)",
+      "Not accounting for the join-time visibility cut, though getMessages already applies it automatically"
+    ],
+    "follow_up_questions": [
+      "How would you make this efficient for a conversation with 100,000 messages, rather than walking the full history every call?",
+      "How would you compute this for ALL of a user's conversations efficiently, given no public 'list my conversations' method exists?",
+      "What would change if you wanted unread count AS OF a specific point in time, not live?"
+    ],
+    "concepts": ["coding-exercise", "pagination", "receipts", "public-api"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-121",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Add a `getOnlineMembers(conversationId)` method to the Messenger class, using only the existing presence state (`isOnline`) and conversation membership.",
+    "answer_hinglish": "Yeh method existing `requireConversationRecord` (membership lookup) aur `isOnline` (presence check) ko combine karta hai -- koi naya state nahi chahiye, dono pehle se hi Messenger class mein maujood hain. `record.members` har member ka `userId` deta hai, aur `this.isOnline(userId)` check karta hai `onlineDevices` Map mein unka entry hai ya nahi (aur non-empty hai).\n\nYeh method CLASS ke ANDAR add hoga (private helpers access karne ke liye), isliye `src/messenger.ts` mein directly likha jaayega, `getMessages`/`get` jaisi existing public methods ke pattern follow karte hue.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate EXISTING private helpers (requireConversationRecord, isOnline) ko correctly reuse kar sake naya feature add karte waqt, bina duplicate logic likhe.",
+    "real_world_analogy": "Ek group chat ka 'who's online now' indicator jo WhatsApp/Slack jaisi apps mein dikhta hai -- exactly yehi presence + membership combination use hota hai.",
+    "how_it_works": "Looks up the conversation's current members via requireConversationRecord, then filters to only those for whom isOnline returns true.",
+    "in_this_project": "Would sit alongside the existing presence section in src/messenger.ts, reusing requireConversationRecord and isOnline exactly as other methods do.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::isOnline",
+      "projects/22-messaging/src/messenger.ts::requireConversationRecord"
+    ],
+    "code_example": "// new, illustrative -- a hypothetical addition inside the Messenger class in src/messenger.ts\ngetOnlineMembers(conversationId: string): string[] {\n  const record = this.requireConversationRecord(conversationId);\n  return record.members.filter((m) => this.isOnline(m.userId)).map((m) => m.userId);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Reuses existing private helpers exactly as they are -- zero new state or data structures needed",
+      "Consistent with the existing synchronous, non-mutating style of get() and isOnline()",
+      "Throws UNKNOWN_CONVERSATION naturally via requireConversationRecord, matching every other method's error behavior"
+    ],
+    "disadvantages": [
+      "O(members) cost per call -- fine for normal group sizes, less ideal for a very large broadcast group",
+      "Returns a plain string array with no device-level detail (which specific devices are online, just who)",
+      "Does not distinguish an online owner from an online regular member -- callers needing that must cross-reference getMessages/get separately"
+    ],
+    "common_mistakes": [
+      "Implementing this OUTSIDE the Messenger class and trying to access record.members directly, which is private",
+      "Forgetting requireConversationRecord already throws UNKNOWN_CONVERSATION, and redundantly re-checking for conversation existence",
+      "Returning Member objects instead of just userIds when only presence, not role/joinedAtSeq, was asked for"
+    ],
+    "follow_up_questions": [
+      "How would you extend this to return which SPECIFIC devices are online per member, not just who?",
+      "Would you add a test for this in test/devices.test.ts, and what would the key assertion be?",
+      "How would this method's cost change if group sizes grew to thousands of members?"
+    ],
+    "concepts": ["coding-exercise", "presence", "feature-addition"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-122",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Beginner",
+    "question": "Write a test proving that `deleteMessage` is idempotent -- that `deletedAt` does not change on a second delete call.",
+    "answer_hinglish": "Test strategy: ek message delete karo, uska `deletedAt` capture karo, clock ko AAGE badhao (`clock.advance`), phir DOBARA delete karo -- agar idempotent hai, dusra `deletedAt` PEHLE wale ke EXACTLY barabar hona chahiye (re-stamp NAHI hona chahiye), aur `body` dono baar `\"\"` hona chahiye.\n\nClock advance karna CRITICAL hai test mein -- agar clock advance na karte, aur `deleteMessage` buggy ho (re-stamp kar de), tab bhi dono timestamps SAME dikh sakte the kyunki `ManualClock` khud se advance nahi hota. Advance karne se yeh test GENUINELY distinguish karta hai 'same timestamp because idempotent' vs 'same timestamp because clock didn't move'.",
+    "why_needed": "Interviewer idempotency-testing discipline check karta hai -- sirf 'result same hai' check karna kaafi nahi, time ko explicitly move karna zaroori hai taaki test genuinely meaningful ho (yeh exact pattern test/edit-delete.test.ts mein already use hota hai).",
+    "real_world_analogy": "Ek dustbin jo already empty hai, dobara 'empty karo' bolne se uska 'last emptied at' time badalna nahi chahiye agar woh truly empty-already-check karta hai -- test yehi prove karta hai time ko jaanbooja ke aage badha ke.",
+    "how_it_works": "Calls deleteMessage twice, advancing the ManualClock between calls, and asserts the second call's deletedAt equals the first's -- proving no re-stamp occurred despite time having genuinely moved forward.",
+    "in_this_project": "Mirrors test/edit-delete.test.ts's existing 'is idempotent: deleting an already-deleted message succeeds and keeps the original deletedAt' test, using the same setup()/ManualClock pattern from test/helpers.ts.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::deleteMessage",
+      "projects/22-messaging/test/helpers.ts::setup",
+      "projects/22-messaging/test/edit-delete.test.ts"
+    ],
+    "code_example": "// new, illustrative -- follows the exact pattern of test/edit-delete.test.ts\nimport { describe, expect, it } from \"vitest\";\nimport { setup } from \"../test/helpers.js\";\n\ndescribe(\"deleteMessage idempotency\", () => {\n  it(\"a second delete keeps the original deletedAt, even after time has genuinely moved forward\", async () => {\n    const { messenger, clock } = setup();\n    const conv = messenger.createDirectConversation(\"u1\", \"u2\");\n    const m = await messenger.sendMessage(conv.id, \"u1\", \"oops, wrong chat\", \"c1\");\n\n    const first = await messenger.deleteMessage(conv.id, \"u1\", m.id);\n    clock.advance(10_000); // move time forward so a re-stamp would be detectable\n    const second = await messenger.deleteMessage(conv.id, \"u1\", m.id);\n\n    expect(second.deletedAt).toBe(first.deletedAt); // not re-stamped\n    expect(second.body).toBe(\"\");\n  });\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Advancing the clock between calls makes the test genuinely prove idempotency rather than coincidentally passing",
+      "Uses the project's own ManualClock/setup() test infrastructure, consistent with the rest of the suite",
+      "Directly checks the exact field (deletedAt) the idempotency guarantee is about, not an indirect proxy"
+    ],
+    "disadvantages": [
+      "Does not verify the store was not touched a second time (test/concurrency.test.ts's 'idempotent calls never touch the store' pattern would need a FakeConversationStore for that, which this simpler test does not use)",
+      "Only tests the sender-initiated double-delete path, not any concurrent-delete race (that is test/concurrency.test.ts's job)",
+      "A single assertion (deletedAt equality) could theoretically pass by coincidence if deleteMessage had a different, unrelated bug that happened to not affect deletedAt"
+    ],
+    "common_mistakes": [
+      "Not advancing the clock between the two delete calls, making the test unable to distinguish idempotent behavior from a clock that simply never moved",
+      "Forgetting to also check `body` stays `\"\"` on the second call, only checking deletedAt",
+      "Testing deleteMessage's idempotency with the SAME sender both times but never testing that a non-sender still gets SENDER_REQUIRED even on an already-deleted message"
+    ],
+    "follow_up_questions": [
+      "How would you extend this test to also prove the store is touched ZERO times on the second delete, using FakeConversationStore?",
+      "What would this test look like if you wanted to prove idempotency under TRUE concurrency (two deletes racing), not just two sequential calls?",
+      "Why does deleteMessage's early return (`if (message.deletedAt !== null) return this.cloneMessage(message);`) make this idempotency guarantee cheap to provide?"
+    ],
+    "concepts": ["coding-exercise", "idempotency", "testing", "manual-clock"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-123",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Beginner",
+    "question": "Write a function that, given two Message objects, detects whether one is a `clientMessageId` replay of the other.",
+    "answer_hinglish": "'Replay' ka matlab hai: dono messages SAME (conversationId, senderId, clientMessageId) key share karte hain, AUR unka `id` BHI same hai -- kyunki is project mein ek successful replay `sendMessage` se EXACT SAME stored message return karta hai (`return this.cloneMessage(this.messageById.get(existing.messageId)!)`), naya message object NAHI banta.\n\nIsliye sirf `clientMessageId` match check karna KAAFI NAHI hai -- agar `conversationId` ya `senderId` alag hain (idempotency key `conversationId:senderId:clientMessageId` scoped hai), yeh DO ALAG messages hain jinka sirf COINCIDENTALLY same clientMessageId hai. Aur `id` check IMPORTANT hai kyunki yeh confirm karta hai ki yeh genuinely SAME underlying message hai, na ki ek IDEMPOTENCY_CONFLICT case jahan clientMessageId same hai par body different hai (jo is project mein ek ERROR throw karta hai, do successful messages nahi banta).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate idempotency scoping (conversation+sender+clientMessageId) ko SAHI SE samajhta hai, sirf superficial field-match nahi karta.",
+    "real_world_analogy": "Do alag order receipts jinka SAME 'order confirmation number' ho sakta hai agar DO ALAG stores ne independently wahi number generate kiya ho -- tabhi tum unhe 'same order' maan sakte ho jab store aur customer BHI match karte hon, sirf confirmation number nahi.",
+    "how_it_works": "Compares conversationId, senderId, and clientMessageId (the exact idempotency scoping key used internally) plus id equality, since a true replay in this project always resolves to the identical stored Message.",
+    "in_this_project": "Mirrors the exact idempotency key construction in src/messenger.ts's sendMessage: `const key = \\`${conversationId}:${senderId}:${clientMessageId}\\`;`",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::sendMessage",
+      "projects/22-messaging/src/types.ts::Message"
+    ],
+    "code_example": "// new, illustrative\nimport type { Message } from \"../src/index.js\";\n\nexport function isClientMessageIdReplay(a: Message, b: Message): boolean {\n  return (\n    a.conversationId === b.conversationId &&\n    a.senderId === b.senderId &&\n    a.clientMessageId === b.clientMessageId &&\n    a.id === b.id // a true replay resolves to the SAME stored message, not merely the same key\n  );\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Correctly mirrors the project's actual (conversationId, senderId, clientMessageId) idempotency scoping, not just a surface-level field match",
+      "The id equality check correctly distinguishes a true replay from an IDEMPOTENCY_CONFLICT case (same key, different body, which throws rather than returning two Message objects)",
+      "Pure function, trivially unit-testable with no Messenger instance needed"
+    ],
+    "disadvantages": [
+      "Cannot detect a replay from just one Message object and a raw clientMessageId -- needs two full Message objects to compare",
+      "Does not itself call into sendMessage to verify replay behavior end-to-end -- it is a pure comparison utility, not an integration test",
+      "A caller could misuse it to compare messages from entirely different conversations without realizing the scoping check already handles that correctly"
+    ],
+    "common_mistakes": [
+      "Checking only clientMessageId equality, ignoring that the key is scoped to (conversationId, senderId) too",
+      "Assuming any two messages with the same clientMessageId are a replay, even when one represents an IDEMPOTENCY_CONFLICT error case",
+      "Comparing `body` equality instead of `id` equality to detect a true replay"
+    ],
+    "follow_up_questions": [
+      "Why is `id` equality a more reliable replay signal than comparing `body` text?",
+      "What would this function need to additionally check if it were comparing messages across DIFFERENT Messenger instances (e.g. in a multi-instance deployment)?",
+      "How would you test this function against the IDEMPOTENCY_CONFLICT case specifically?"
+    ],
+    "concepts": ["coding-exercise", "idempotency", "pure-function"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-124",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a function `getConversationsWithUnread(messenger, conversationIds, userId)` that, given a list of conversation ids the caller already knows the user belongs to, returns only the ones with at least one unread message for that user.",
+    "answer_hinglish": "Yeh function deliberately ek LIST of `conversationIds` leta hai as input, kyunki Messenger ka public API mein koi 'list this user's conversations' method EXIST NAHI karta -- `conversationsByUser` sirf INTERNAL bookkeeping hai, private hai. Ek real app apna khud ka index maintain karega (jaise ek user-to-conversations mapping apni app-level database mein), aur WAHI list is function ko dega.\n\nHar conversationId ke liye, `getMessages` ko paginate karte hain (early-exit ke saath -- jaise hi EK unread message mile, poori history check karna band kar do, `break` kar do, agle conversation par jao) -- yeh `unreadCount` (MSG-120) se EFFICIENT hai kyunki usse EXACT count nahi chahiye, sirf 'kam se kam ek hai ya nahi' boolean chahiye.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate realize kare ki Messenger ka public API mein per-user conversation listing missing hai, aur early-exit optimization ka importance samjhe jab sirf EXISTS check chahiye ho, poora count nahi.",
+    "real_world_analogy": "Ek chat app ki sidebar jo har conversation ke next to ek bold dot dikhati hai agar unread hai -- usse sirf 'kuch unread hai ya nahi' chahiye, exact count nahi, isliye woh poori history scan nahi karti, pehla unread milte hi stop kar deti hai.",
+    "how_it_works": "For each given conversationId, paginates getMessages and returns as soon as a message with an unread receipt is found for that user, avoiding a full history scan when only existence matters.",
+    "in_this_project": "Builds on the same pagination pattern as test/invariants.test.ts's walk() helper and this file's own MSG-120 exercise, but with an early-exit instead of a full count.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::getMessages",
+      "projects/22-messaging/src/types.ts::Message"
+    ],
+    "code_example": "// new, illustrative\nimport type { Messenger } from \"../src/index.js\";\n\nexport function getConversationsWithUnread(messenger: Messenger, conversationIds: string[], userId: string): string[] {\n  const result: string[] = [];\n  for (const conversationId of conversationIds) {\n    let hasUnread = false;\n    let cursor: string | undefined;\n    do {\n      const page = messenger.getMessages(conversationId, userId, { limit: 200, ...(cursor ? { cursor } : {}) });\n      if (page.items.some((m) => m.receipts[userId] && m.receipts[userId]!.status !== \"read\")) {\n        hasUnread = true;\n        break;\n      }\n      cursor = page.nextCursor ?? undefined;\n    } while (cursor);\n    if (hasUnread) result.push(conversationId);\n  }\n  return result;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Early-exit avoids scanning entire history when only an existence check is needed, unlike a full unread count",
+      "Accepting conversationIds as an explicit parameter correctly acknowledges there is no public per-user conversation listing in this project",
+      "Reuses only public, well-understood API surface (getMessages pagination and the receipts map)"
+    ],
+    "disadvantages": [
+      "Still worst-case O(history length) per conversation if the unread message happens to be the OLDEST one (requiring a full walk before finding it, since getMessages pages newest-first, so actually the newest unread is found FIRST -- worth noting this is actually efficient in the common case)",
+      "Requires the caller to already know which conversations the user belongs to -- this function does no membership discovery itself",
+      "Making one or more getMessages calls per conversation in a loop does not parallelize across conversations in this simple version"
+    ],
+    "common_mistakes": [
+      "Assuming Messenger exposes a method to list a user's conversations directly (it does not -- conversationsByUser is private)",
+      "Scanning the FULL history of every conversation instead of breaking early once one unread message is found",
+      "Forgetting getMessages pages newest-first, so the most RECENT unread message is actually found on the FIRST page in the common case, making early-exit very effective in practice"
+    ],
+    "follow_up_questions": [
+      "Why does getMessages' newest-first ordering make this early-exit approach especially effective here?",
+      "How would you parallelize the per-conversation checks if conversationIds were a large list?",
+      "What public API addition to Messenger would remove the need for the caller to supply conversationIds at all?"
+    ],
+    "concepts": ["coding-exercise", "pagination", "early-exit", "public-api-limitations"],
+    "advanced": null
+  },
+  {
+    "id": "MSG-125",
+    "project_slug": "p22-messaging",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Write a function `unreadCountByMember(messenger, conversationId)` that returns a `Map<userId, number>` of unread counts for EVERY current member of a conversation at once, using only the public Messenger API. Discuss its cost.",
+    "answer_hinglish": "Approach: `messenger.get(conversationId)` se current members ki list lo, phir HAR member ke liye independently `getMessages(conversationId, member.userId, {...})` paginate karo aur unread count accumulate karo (same logic jaisa MSG-120 ka `unreadCount`, par har member ke liye separately, kyunki HAR member ka apna `joinedAtSeq` visibility floor hai -- ek member ka unread count DOOSRE member ki visible history se directly derive NAHI ho sakta).\n\nCost discussion: yeh O(members x messages) hai -- har member apni POORI visible history paginate karta hai independently. Yeh is project ki public API ki EK LIMITATION expose karta hai: `getMessages` per-member hai (correctly, kyunki visibility per-member hai), isliye koi 'ek baar saari members ka unread batao' SHORTCUT nahi hai bina ek NAYI internal data structure (jaise per-message 'read by' reverse index) ke. Chhote groups (dozens of members) ke liye yeh approach bilkul acceptable hai; bade broadcast groups (1000s of members) ke liye yeh EXPENSIVE ho jaata, aur ek better design `receipts` ko member-indexed track karega (jaisa already hai per message) PAR ek conversation-level AGGREGATE cache bhi maintain karega jo har message par incrementally update ho, poori history re-walk kiye bina.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate correctly identify kare ki per-member visibility ki wajah se yeh batch operation inherently expensive hai is public API ke saath, aur ek real optimization direction propose kar sake.",
+    "real_world_analogy": "Ek group admin dashboard jo HAR member ka individual unread count dikhana chahta hai -- yeh exactly waisa hai jaise ek teacher har student ka individual 'kitna syllabus baaki hai' calculate kare, har student ka apna starting point (joinedAtSeq) alag hone ki wajah se yeh ek shared shortcut nahi ban sakta.",
+    "how_it_works": "For each member returned by messenger.get(conversationId).members, independently paginates getMessages for that specific userId and counts unread receipts, since visibility (joinedAtSeq) and receipt status are both per-member.",
+    "in_this_project": "Combines messenger.get (public Conversation.members) with the same per-member getMessages pagination pattern as MSG-120's unreadCount, applied once per member.",
+    "implementation_files": [
+      "projects/22-messaging/src/messenger.ts::get",
+      "projects/22-messaging/src/messenger.ts::getMessages",
+      "projects/22-messaging/src/types.ts::Member"
+    ],
+    "code_example": "// new, illustrative\nimport type { Messenger } from \"../src/index.js\";\n\nexport function unreadCountByMember(messenger: Messenger, conversationId: string): Map<string, number> {\n  const conv = messenger.get(conversationId);\n  if (!conv) throw new Error(`no conversation ${conversationId}`);\n  const counts = new Map<string, number>(conv.members.map((m) => [m.userId, 0]));\n  for (const member of conv.members) {\n    let cursor: string | undefined;\n    do {\n      const page = messenger.getMessages(conversationId, member.userId, { limit: 200, ...(cursor ? { cursor } : {}) });\n      for (const m of page.items) {\n        const receipt = m.receipts[member.userId];\n        if (receipt && receipt.status !== \"read\") counts.set(member.userId, counts.get(member.userId)! + 1);\n      }\n      cursor = page.nextCursor ?? undefined;\n    } while (cursor);\n  }\n  return counts;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Correctly respects each member's own joinedAtSeq visibility floor, since each member's history is paginated independently through the public API",
+      "Uses only public methods (get, getMessages) -- no reliance on private internals like conversationsByUser",
+      "Returns a convenient Map structure ready for a dashboard-style per-member view"
+    ],
+    "disadvantages": [
+      "O(members x messages) cost -- expensive for large groups with long history, since no shared shortcut exists across members",
+      "Makes members.length separate paginated walks, each potentially multiple getMessages calls",
+      "No caching or incremental update -- every call recomputes everything from scratch"
+    ],
+    "common_mistakes": [
+      "Assuming one member's visible history can be reused for another member, ignoring that joinedAtSeq differs per member",
+      "Not initializing the Map with ALL members up front, causing a member with zero unread messages to be silently missing from the result",
+      "Underestimating this function's cost at scale and calling it on every request instead of caching or computing it incrementally"
+    ],
+    "follow_up_questions": [
+      "How would you redesign this to be incremental (updated per message sent/read) rather than recomputed from a full walk every time?",
+      "At what group size would you stop calling this function directly and instead maintain a running aggregate?",
+      "Why can't one member's unread computation be reused or shared with another member's, even in the same conversation?"
+    ],
+    "concepts": ["coding-exercise", "pagination", "per-member-visibility", "performance"],
+    "advanced": {
+      "architecture_tradeoffs": "Computing this on-demand via full pagination per member is simple and always correct (no cache invalidation to worry about), but trades away performance at scale; an incrementally-maintained aggregate (updated on every send/read) is far cheaper to query but adds real complexity -- a counter that must be kept perfectly in sync with every receipt mutation, in every code path that touches receipts.",
+      "failure_scenarios": "At a large group size, calling this function on every dashboard refresh would generate members.length separate paginated reads per call -- under real load, this could itself become a significant source of read traffic against the ConversationStore (or a real backend), potentially competing with the write-side claimOp/claimRevision load for the same conversation's resources.",
+      "alternatives": "Maintain a per-conversation, per-member running unread counter that increments on sendMessage (for every recipient) and decrements (or resets appropriately) on markReadUpTo/markDelivered -- this moves the cost from O(members x messages) per query to O(1) per mutation, O(members) per query, at the cost of a new piece of state that must never drift from the receipts map's ground truth.",
+      "scale_10x_100x": "At 10x group size, the current approach's cost grows linearly and is likely still tolerable for occasional dashboard use. At 100x (very large groups), repeated full-history pagination per member for a frequently-refreshed view becomes untenable -- an incremental aggregate (or a dedicated read-model service) becomes necessary, not optional.",
+      "production_improvements": "Add an incrementally-maintained unread-count aggregate alongside the receipts map, updated inside sendMessage/markDelivered/markReadUpTo's existing apply steps. Expose it as a cheap public method instead of requiring callers to hand-roll a full per-member pagination walk."
+    }
+  }
+]

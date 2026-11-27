@@ -1,0 +1,188 @@
+{
+ "project_slug": "p22-messaging",
+ "project": "Messaging System (B15)",
+ "source_dir": "projects/22-messaging",
+ "summary": "A TypeScript library (in memory, zero runtime dependencies) for the core of a messaging system (WhatsApp / Slack style): direct and group conversations, strict per-conversation ordering, idempotent sends, and per-recipient delivery/read receipts, built in two stages. Stage 1 is fully synchronous: message order is a per-conversation sequence number, never a timestamp, so two servers' clocks disagreeing can never reorder anything; delivery and read state live in a receipts map keyed by recipient (not one enum on the message), because a group message is 'delivered' to the sender's UI only once every recipient has it and 'read' only once everyone has read it -- the single/double/blue-tick rule, implemented as overallStatus() returning the WORST receipt among recipients. markReadUpTo marks every message up to a sequence number in one call (mirroring this repo's 21-notification project's markAllRead); markDelivered is per message, matching how a client actually acks arrivals one at a time. Sends are idempotent via a caller-supplied clientMessageId scoped to (conversation, sender): the same id with the same body returns the original message and consumes no new sequence number, a different body is IDEMPOTENCY_CONFLICT. A new group member sees messages from their joinedAtSeq onward, enforced as a read-time filter in getMessages, never by hiding anything at send time. Stage 2 makes every mutation a real async round trip to a ConversationStore, guarded by claim-before-await mirrored from 23-password-manager's VaultStore/claimEntryOp/commit: pendingOps (message ops: send/deliver/read/edit/delete) and revising (membership changes) exclude each other via CONVERSATION_BUSY, preventing a real lost-update bug where addMember/removeMember's wholesale replace of the members array lets two concurrent membership changes silently undo each other. The idempotency key itself needs a synchronous claim, not just a synchronous lookup, under real async code -- found by porting stage 1's 20-concurrent-identical-sends test unchanged and watching it immediately produce 20 messages instead of 1; the fix claims a placeholder entry before any await and answers every later concurrent call with SEND_IN_FLIGHT. Every receipt mutation rechecks LIVE status immediately before writing, so a slower call that started first can never downgrade a status or stamp a stale timestamp over a newer one, regardless of resolve order. Stage 2 adds presence (connectDevice/disconnectDevice/isOnline, several devices per user) kept deliberately OUT of the ConversationStore since it is ephemeral by nature; an already-online recipient is auto-delivered at send time, and reconnecting after being offline triggers a one-time catch-up (deliverPendingReceipts) across every conversation the user belongs to via a conversationsByUser index, skipping (not failing) a conversation that happens to be mid-revision at that exact moment. Multi-device read sync needed no new code since receipts are keyed by userId, not deviceId. Message edit and delete-for-everyone are sender-only; delete clears body outright (never a deleted:true flag next to retained text) and is idempotent; a delete that lands while an edit is in flight always wins, silently, because editMessage's apply step rechecks deletedAt immediately before writing. 91 tests total (stage 1: 50; stage 2 added 41), including a randomized invariant test (6 seeds x 400 sequential operations against two groups, checked live) and a dedicated concurrency test file reproducing and fixing each real race directly, plus a standalone illustration of the unguarded version of the membership bug for contrast. Mutation checks: 57 total across both stages (37 stage 1, 20 stage 2), all caught (3 stage-1 survivors and 2 stage-2 survivors were real, correctness-harmless test gaps, each closed with a precise new test rather than a behavior change). Not built: a real transport (WebSocket/long-poll), ownership transfer or self-leave, push notifications (project 21's job), media attachments, search, a group size limit, read-receipt undo, retained access to pre-rejoin history, an HTTP API (stage 3 is not yet scoped).",
+ "pitch": {
+  "intro_30s": "Maine ek messaging system ka core banaya hai, TypeScript mein, in memory, do stages mein. Message order ek per-conversation sequence number se decide hota hai, timestamp se nahi. Delivery aur read status per-recipient hote hain, group mein 'delivered'/'read' tab tak nahi dikhta jab tak SAB recipients wahan na pahunch jaayen. Sends idempotent hain client-generated id se. Stage 2 mein har mutation ek real async ConversationStore call ban jaati hai, aur har mutation apne await ko ek synchronous claim se guard karta hai taaki membership changes aur message ops ek doosre ko corrupt na karen. Presence, multiple devices, offline catch-up, aur sender-only edit/delete bhi hai. 91 tests, 57 mutation checks, sab caught.",
+  "explain_2min": "'Design WhatsApp ya Slack' LLD round mein almost har baar poocha jaata hai, aur asli sawaal ek hi cheez ke around hote hain: 'delivered' ka matlab kya hai, aur jab do cheezein ek saath hoti hain (do log same waqt message read karen, ek naya member mid-conversation join kare, client ek send retry kare jiska response kabhi mila hi nahi) to kya hota hai. Stage 1 synchronous core banata hai jahan har aisa sawaal ek rule aur ek test ban jaata hai. Stage 2 concurrency aur offline side add karta hai -- ek offline recipient, ek user ke multiple devices, aur real async code ke neeche concurrent read-receipt races.\n\nStage 1 ki teen sabse important design choices: (1) order ek sequence number hai, kyunki do servers ka clock disagree kar sakta hai ya jump kar sakta hai; (2) receipts ek map hain, keyed by recipient, kyunki ek group message ka status ek single enum nahi ho sakta jab 5 logon mein se 3 ne hi dekha ho; overallStatus() sabse WORST receipt return karta hai -- yehi single/double/blue-tick rule hai. (3) sends idempotent hain caller ke apne clientMessageId se, kyunki client hi jaanta hai ki yeh retry hai ya naya send.\n\nStage 2 mein sabse bada change: ab har mutation ek real await hai ek ConversationStore ko. Yahi woh jagah hai jahan do operations genuinely race kar sakte hain. Isliye har mutation apna ek await ek SYNCHRONOUS claim (pendingOps ya revising) mein wrap karta hai, 23-password-manager ke claimEntryOp/commit pattern ko exactly mirror karte hue -- koi lock library nahi, kyunki JavaScript synchronous code ko kabhi preempt nahi karta. Yeh exact ek real bug fix karta hai: removeMember/addMember poora members array replace karte hain, aur bina claim ke do concurrent membership changes ek doosre ko silently undo kar sakte the.\n\nStage 2 presence bhi add karta hai -- offline recipient ka ek catch-up jab woh reconnect kare, multiple devices per user, aur sender-only edit/delete jahan delete hamesha ek racing edit se jeetta hai. 91 tests, 57 mutation checks, sab caught.",
+  "deep_5min": "Ek message ki journey, Asha se ek group tak, phir ek membership change ke beech mein.\n\nConversation banana. Asha createDirectConversation('u1','u2') call karti hai -- yeh unordered pair ke liye unique hai, dobara call karne par wahi conversation milta hai, pair key sorted hoti hai taaki order matter na kare. Group ke liye createGroupConversation ek ownerId aur memberIds leta hai -- owner khud memberIds mein included hona chahiye (G1 check), duplicate members reject hote hain (G2). Har member ka joinedAtSeq us waqt ke current sequence par set hota hai -- yahi field decide karega woh kitni history dekh sakta hai.\n\nMessage bhejna. Asha sendMessage(conv.id, 'u1', 'hey', clientMessageId) call karti hai. Pehla kaam: idempotency key claim karna -- SYNCHRONOUSLY, koi await se pehle. Agar yeh clientMessageId pehle se claimed hai (messageId: null, matlab abhi commit ho raha hai), to turant SEND_IN_FLIGHT. Yeh zaroori hai kyunki real async code mein, 20 truly concurrent identical sends stage 1 ke plain map-lookup check ko dekh hi nahi pate the apne apne claim se pehle -- maine yeh test porting karte waqt khud dekha, jab stage 1 ka test (jo sirf isliye pass hota tha kyunki stage 1 mein kabhi real await nahi tha) seedha 20 alag messages bana deta tha. Claim milne ke baad, claimOp(record) chalta hai -- yeh record.revising check karta hai; agar koi membership change already chal rahi ho, turant CONVERSATION_BUSY, idempotency placeholder catch block mein release ho jaata hai. Sequence number assign hota hai, har current member (sender ko chhod ke) ke liye ek receipt banta hai 'sent' status se -- agar recipient already online hai (isOnline check), status seedha 'delivered' set hota hai, auto-delivery. Commit store.persist() ko await hota hai; sirf success par hi in-memory record update hota hai, finally mein pendingOps-- aur idempotency map ka placeholder final messageId se replace hota hai.\n\nReceipts aur presence. Bilal apna phone connect karta hai -- connectDevice('u2','phone'). Agar woh PEHLE offline tha, ab deliverPendingReceipts(userId) chalta hai: conversationsByUser map se uski saari conversation ids nikaalti hain, har ek ke liye claimOp lete hain (try/catch mein -- agar koi conversation mid-revision ho, usey best-effort skip karte hain, poora reconnect fail nahi hota), aur har pending receipt ko 'delivered' tak le aate hain. markReadUpTo(conv.id, 'u2', seq) call hone par, har receipt mutation apna apply-time par LIVE status firse check karta hai ('if status !== read') -- isliye agar ek slower call pehle shuru hui thi par baad mein resolve hoti hai, woh kabhi ek naye 'read' status ko 'delivered' se overwrite nahi kar sakti. Multi-device: Bilal ka laptop bhi 'read' dekhega, kyunki receipt userId se keyed hai, deviceId se nahi -- koi naya code nahi likhna pada.\n\nMembership change ke beech race. Suppose Asha removeMember(group.id, 'u3') aur, almost same waqt, koi doosra removeMember(group.id, 'u4') call kare -- dono claimRevision(record) try karte hain. Pehla jo synchronously claim karta hai (record.revising = true), doosra turant CONVERSATION_BUSY dekhta hai, apna stale members array kabhi commit nahi kar paata. Bina is guard ke (jo test/concurrency.test.ts mein ek standalone naiveRemove function se illustrate hota hai), dono apni purani snapshot se naya array banate, aur jo last commit kare woh doosre ka removal silently undo kar deta -- array-replace ka wahi lost-update bug jo 23-password-manager ke map-wholesale-replace rotation mein tha.\n\nEdit aur delete. Asha editMessage call karti hai apne hi message par -- sender-only (SENDER_REQUIRED), apply-time par deletedAt recheck hota hai: agar ussi waqt koi deleteMessage land ho gaya ho, edit silently no-op ho jaata hai, current (deleted) state return karta hai, kabhi resurrect nahi karta. deleteMessage khud idempotent hai -- dobara delete karne se deletedAt ka original timestamp nahi badalta.",
+  "architecture_walkthrough": "src/types.ts: Conversation, Message (seq, body, receipts map, edited/editedAt/deletedAt), Member (joinedAtSeq). src/errors.ts: MessagingError, 20-odd error codes (CONVERSATION_BUSY, SEND_IN_FLIGHT, SENDER_REQUIRED, MESSAGE_DELETED, UNKNOWN_DEVICE sab stage 2 mein add hue). src/clock.ts: Clock interface, systemClock, ManualClock -- tests deterministic rakhta hai bina sleep ke. src/users.ts: InMemoryUsers -- upsert/get, har get() ek copy return karta hai (aliasing bachne ke liye). src/store.ts: ConversationStore interface aur InMemoryConversationStore -- stage 2 ka ek naya async dependency, yahi jagah hai jahan do operations genuinely race kar sakte hain. src/messenger.ts: sabse bada file, poora Messenger class -- conversations (createDirectConversation, createGroupConversation, addMember, removeMember, get), messages (sendMessage, getMessage, getMessages pagination ke saath), receipts (markDelivered, markReadUpTo, overallStatus top-level function), edit/delete (editMessage, deleteMessage), presence (connectDevice, disconnectDevice, isOnline, deliverPendingReceipts private), aur private helpers (claimOp, claimRevision, commit, registerConversation, conversationsByUser bookkeeping). src/demo.ts: npm run demo, direct chat, group chat, receipts, retried send, join-time history cut, offline catch-up, multiple devices, edit/delete sab ek saath. src/index.ts: public exports. test/: 9 files -- users, conversations, messages, receipts, pagination, invariants (randomized), devices (presence/catch-up), edit-delete, concurrency (actual races with a FakeConversationStore for controlled interleaving).",
+  "difficult_decisions": [
+   "Order per-conversation sequence number se, timestamp se nahi. Wall-clock timestamps do servers ke beech skew ya jump kar sakte hain; ek monotonic integer kabhi peeche nahi jaata aur ordering ke liye koi clock sync chahiye hi nahi.",
+   "Receipts ek map, keyed by recipient, ek single status enum ke bajaye. Ek group message ka 'delivered' tab tak true nahi ho sakta jab tak HAR recipient ke paas na pahunch jaaye -- single enum yeh partial-delivery state express hi nahi kar sakta.",
+   "Race prevention claim-before-await se, lock primitive se nahi -- 23-password-manager ka exact proven pattern reuse kiya gaya, naya mechanism design karna matlab naye bugs dhoondhne ka risk, bina kisi real fayde ke.",
+   "Idempotency key khud ek synchronous claim leti hai, sirf synchronous CHECK nahi. Yeh design-reasoning se mila, kisi failing test se nahi -- stage 1 ka plain map-lookup real async ke neeche N concurrent sends ko N messages bana deta.",
+   "Presence ConversationStore se bahar, kyunki ephemeral hai -- real system mein Redis+TTL jaisa kuch hota, delivery CORRECTNESS kabhi presence ke restart survive karne par depend nahi karti.",
+   "Delete-for-everyone body ko CLEAR karta hai, ek deleted:true flag ke saath original text rakhne ke bajaye -- ek missed check kahin bhi 'deleted' content leak kar sakta tha."
+  ],
+  "biggest_challenges": [
+   "Idempotency-key race pakadna real async code ke neeche, bina kisi test ke fail hue -- sirf yeh sochte hue ki stage 1 ka 20-concurrent-sends test agar seedha port kiya jaaye to kya hoga. Fix: ek placeholder claim synchronously, koi await se pehle, catch block mein release.",
+   "conversationsByUser bookkeeping gap -- addMember se naya member future catch-up ke liye register nahi ho raha tha, removeMember se gaya hua member cleanup nahi ho raha tha. Mutation candidates brainstorm karte waqt mila, implementation se pehle hi do naye tests likh ke band kiya gaya.",
+   "Mutation testing ke do survivors (M7: markDelivered ka idempotent early return, M17: deliverPendingReceipts ka empty-pending skip) -- dono correctness-harmless the (final state hamesha sahi tha) par ek genuine untested guarantee reveal karte the: 'yeh call store ko ZERO baar touch karta hai'. Behavior badla nahi, sirf precise naye tests add kiye jo synchronously assert karte hain ki store.pending ki length 0 hai.",
+   "Stage 1 mein U3 mutation survivor -- ek message ko GALAT conversation id se bhi access kiya ja sakta tha jab tak recipient us message ka real recipient ho (apni actual conversation mein). Pehla test is wajah se galat reason se pass ho raha tha. Fix: ek recipient jo genuinely us message ka recipient hai, par call doosri conversation se jo woh bhi member hai."
+  ],
+  "failure_scenarios": [
+   "ConversationStore.persist() hang ya reject ho jaaye: claim (pendingOps ya revising) finally block mein release hota hai chahe commit fail ho ya succeed -- ek stuck commit poori conversation ko permanently wedge nahi karta.",
+   "Do membership changes same conversation par ek saath aayein: jo pehle synchronously claim kare woh jeetta hai, doosra turant CONVERSATION_BUSY dekhta hai, apna stale array kabhi commit nahi karta -- lost update impossible by construction.",
+   "20 identical concurrent sends same clientMessageId se: sirf ek commit hota hai, baaki 19 SEND_IN_FLIGHT dekhte hain; settlement ke baad retry normally dedupe hota hai (original message wapas milta hai, naya sequence number consume nahi hota).",
+   "Ek recipient offline hote hue 10 messages miss kare, phir reconnect kare: deliverPendingReceipts har conversation mein unki saari pending receipts ek saath 'delivered' tak le aata hai, except ek conversation jo ussi exact waqt mid-revision ho -- woh best-effort skip hoti hai, next reconnect ya explicit ack par catch up hoti hai.",
+   "Ek edit aur ek delete same message par race karen: delete hamesha jeetta hai, chahe woh resolve mein pehle ho ya baad mein -- editMessage apply-time par deletedAt recheck karta hai aur silently no-op ho jaata hai.",
+   "markReadUpTo do baar almost saath call ho, ek purane seq ke saath ek naye ke saath: apply-time recheck (status !== 'read') ensure karta hai ki purana call kabhi naye 'read' status ko overwrite na kare, resolve order kuch bhi ho."
+  ],
+  "improvements": [
+   "Real transport abhi nahi hai -- ConversationStore in-memory hai, koi WebSocket ya long-poll delivery nahi.",
+   "Ownership transfer aur self-leave abhi nahi hai -- owner kabhi remove nahi ho sakta, group owner ke chale jaane se survive nahi karta.",
+   "Leave-and-rejoin se poori purani history ka access lose ho jaata hai -- joinedAtSeq har join par overwrite hota hai, pehle ki wider window yaad nahi rehti.",
+   "Push notifications, media attachments, search, group size limit, rate limiting -- koi bhi abhi nahi hai (push notifications is repo ke 21-notification project ka scope hai).",
+   "Read receipt 'undo' nahi hai -- ek baar read-up-to record ho jaaye, usse unread nahi kiya ja sakta, real chat apps jaisa hi.",
+   "HTTP API abhi nahi hai -- stage 3 scope decide nahi hua (PLAN.md dekho)."
+  ]
+ },
+ "learning_path": [
+  {
+   "concept": "Sequence numbers, not timestamps: how message order is decided",
+   "steps": [
+    "1. Concept: har conversation ka apna per-conversation sequence number hai, sendMessage par assign hota hai; createdAt sirf display ke liye store hota hai, koi order ya comparison usse nahi hoti.",
+    "2. Project need: do servers ka clock disagree ya jump kar sakta hai -- ek monotonic integer kabhi peeche nahi jaata, aur ordering ke liye koi clock sync bhi nahi chahiye.",
+    "3. Code/API: src/messenger.ts sendMessage (seq assignment), src/types.ts Message.seq.",
+    "4. Detail: seq record-level counter se liya jaata hai, claimOp ke andar, koi await se pehle -- isliye do concurrent sends kabhi same seq nahi paa sakte, resolve order kuch bhi ho.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/messages.test.ts -t 'sequence' test/concurrency.test.ts -t 'sequence' -- 'two sends never collide on sequence number regardless of resolve order'.",
+    "6. Interviewer next: agar multiple servers ek hi conversation ko handle kar rahe hote, sequence number kaise coordinate karte bina single point of failure ke?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/types.ts",
+    "projects/22-messaging/test/messages.test.ts"
+   ]
+  },
+  {
+   "concept": "Per-recipient receipts and the single/double/blue-tick rule",
+   "steps": [
+    "1. Concept: har message ka status ek single enum nahi hai -- message.receipts ek map hai userId -> {status, at}. overallStatus() sabse WORST receipt return karta hai saare recipients mein se.",
+    "2. Project need: ek group message 5 logon ko gaya hai -- sender ki UI mein woh 'delivered' sirf tab dikhna chahiye jab SAB 5 ne receive kiya ho, 'read' sirf tab jab sab ne dekha ho. Ek single status field yeh partial state express nahi kar sakta.",
+    "3. Code/API: src/messenger.ts overallStatus, markDelivered, markReadUpTo.",
+    "4. Detail: ek message jiske zero recipients hain (sab doosre log group chhod gaye) 'sent' reporta karta hai, kabhi false 'read' nahi -- edge case jo explicitly test hoti hai.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/receipts.test.ts -- 'overallStatus (the tick rule end to end, the zero-recipient case)'.",
+    "6. Interviewer next: agar ek group mein 10,000 members hon, per-recipient receipt map scale karega kya, ya kahan toot jaayega?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/test/receipts.test.ts"
+   ]
+  },
+  {
+   "concept": "Idempotent sends, and why the idempotency key itself needs a synchronous claim under real async code",
+   "steps": [
+    "1. Concept: caller clientMessageId deta hai, scoped to (conversation, sender). Same id + same body = original message wapas, koi naya sequence consume nahi hota. Same id + alag body = IDEMPOTENCY_CONFLICT.",
+    "2. Project need: ek client jiska response kabhi mila hi nahi, retry karega -- bina idempotency ke yeh duplicate message bana deta. Stage 2 mein, real async ke neeche, sirf ek synchronous CHECK kaafi nahi: N truly concurrent identical sends sab ek saath map-lookup miss kar sakte hain.",
+    "3. Code/API: src/messenger.ts sendMessage (idempotency claim, messageId: null placeholder), src/errors.ts SEND_IN_FLIGHT.",
+    "4. Detail: placeholder claim SYNCHRONOUSLY hota hai, koi await se pehle; ek thrown error par catch block usse release karta hai; success par hi final messageId se replace hota hai.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/messages.test.ts -t 'idempot' -- '20 truly concurrent duplicates -- exactly one commits, the other 19 get SEND_IN_FLIGHT'.",
+    "6. Interviewer next: agar yeh placeholder claim na hoti, production mein yeh bug kaise manifest hota, aur kaise detect karte (koi metric, koi log)?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/errors.ts",
+    "projects/22-messaging/test/messages.test.ts",
+    "projects/22-messaging/PLAN.md"
+   ]
+  },
+  {
+   "concept": "Claim-before-await: pendingOps and revising excluding each other",
+   "steps": [
+    "1. Concept: har mutation apna ek await ek SYNCHRONOUS claim mein wrap karta hai -- JavaScript synchronous code kabhi preempt nahi hota, isliye exclusion by construction guaranteed hai, lock primitive ki zaroorat nahi.",
+    "2. Project need: stage 2 mein har save ek real ConversationStore.persist() await hai -- yahi jagah hai jahan do operations genuinely interleave kar sakte hain. pendingOps (message ops) aur revising (membership changes) ek doosre ko exclude karte hain, CONVERSATION_BUSY dono directions mein.",
+    "3. Code/API: src/messenger.ts claimOp, claimRevision, commit.",
+    "4. Detail: claimOp record.revising check karta hai; claimRevision record.revising AUR record.pendingOps dono check karta hai -- membership change ek message op ko bhi exclude karta hai, taaki ek send kabhi mid-replace member list se receipts na banaye.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/concurrency.test.ts -t 'claim' -- claim guard tests (G1/G2/G3 mutation checks inke against hain).",
+    "6. Interviewer next: yeh single-process guarantee hai ya distributed system (multiple server instances) mein bhi kaam karega?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/store.ts",
+    "projects/22-messaging/test/concurrency.test.ts"
+   ]
+  },
+  {
+   "concept": "The membership lost-update bug: wholesale array replace, and the fix",
+   "steps": [
+    "1. Concept: addMember aur removeMember poora members array REPLACE karte hain, ek keyed map ke bajaye -- membership chhoti aur rarely-changing hoti hai, isliye keyed structure over-engineering hogi.",
+    "2. Project need: bina guard ke, do concurrent membership changes SAME stale array se build hote hain -- jo LAST commit kare woh doosre ka change silently undo kar deta hai. 23-password-manager ke map-wholesale-replace rotation bug ka exact array-replace mirror.",
+    "3. Code/API: src/messenger.ts claimRevision, addMember, removeMember; test/concurrency.test.ts ka naiveRemove standalone illustration (Messenger use nahi karta, sirf concept dikhata hai).",
+    "4. Detail: claimRevision ke bina, do removeMember calls dono apna copy banate purani member list se; jo commit baad mein lands wahi 'wins', pehle wale ka removal discard ho jaata hai -- claimRevision isse impossible banata hai, dono directions mein.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/concurrency.test.ts -t 'lost-update' -- 'the lost-update bug revising prevents (illustrated unguarded, then shown fixed)'.",
+    "6. Interviewer next: agar members array badi ho jaaye (jaise 10,000-member broadcast group), wholesale replace ka cost kya banega, aur kaise migrate karte keyed structure mein?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/test/concurrency.test.ts",
+    "projects/22-messaging/PLAN.md"
+   ]
+  },
+  {
+   "concept": "Join-time visibility: a new member sees only messages from the moment they join",
+   "steps": [
+    "1. Concept: har member ka joinedAtSeq us waqt ke conversation sequence par set hota hai jab woh join karta hai. getMessages (pagination) is field se filter karta hai -- naya member purani history nahi dekh sakta.",
+    "2. Project need: full history dikhana ek naye member ko jo kabhi room mein nahi tha, ek zyada surprising leak hai is doosre option (sirf-aage-se) ke mukaable. Rule ek single read-time filter hai, isliye 'show full history' mein switch karna future mein ek chhota, isolated change hai.",
+    "3. Code/API: src/messenger.ts getMessages, addMember (joinedAtSeq assignment); src/types.ts Member.joinedAtSeq.",
+    "4. Detail: yeh filter SEND time par kuch hide nahi karta -- message har kisi ke liye normally store hota hai, sirf READ time par member ka apna joinedAtSeq floor ban jaata hai pagination mein.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/pagination.test.ts -t 'join' test/conversations.test.ts -t 'joinedAtSeq' -- 'the join-time cut applies while paging'.",
+    "6. Interviewer next: Slack jaisa public-channel-full-history model agar add karna ho, exactly kahan change karoge?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/types.ts",
+    "projects/22-messaging/test/pagination.test.ts"
+   ]
+  },
+  {
+   "concept": "Presence, multiple devices, and offline catch-up on reconnect",
+   "steps": [
+    "1. Concept: presence (connectDevice/disconnectDevice/isOnline) ConversationStore se bahar rakha gaya hai -- ephemeral hai, real system mein Redis+TTL jaisa. Online recipient auto-delivered hota hai send time par; offline->online transition pe deliverPendingReceipts har conversation mein catch up karta hai.",
+    "2. Project need: ek connected device ko push seedha succeed hota hai -- caller se explicit ack maangna ek delay model karta jo exist hi nahi karta. Reconnect par catch-up ek real client ka backlog-fetch model karta hai, exactly ek baar.",
+    "3. Code/API: src/messenger.ts connectDevice, deliverPendingReceipts (private), conversationsByUser bookkeeping (registerConversation, addMember, removeMember).",
+    "4. Detail: deliverPendingReceipts har conversation ke liye claimOp try/catch mein leta hai -- agar ek conversation mid-revision ho, usey best-effort skip karta hai, poora reconnect fail nahi hota; multi-device read sync ke liye koi naya code nahi chahiye kyunki receipts userId se keyed hain, deviceId se nahi.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/devices.test.ts -- 'offline catch-up on reconnect (spans every conversation...)', 'multi-device read sync needs no per-device call'.",
+    "6. Interviewer next: agar presence HAMESHA survive restart chahiye ho (jaise analytics ke liye), yeh design kaise badlega?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/store.ts",
+    "projects/22-messaging/test/devices.test.ts"
+   ]
+  },
+  {
+   "concept": "Sender-only edit/delete, and why a delete always wins over a racing edit",
+   "steps": [
+    "1. Concept: editMessage aur deleteMessage sirf sender hi call kar sakta hai (SENDER_REQUIRED). deleteMessage body ko CLEAR karta hai, ek deleted:true flag nahi rakhta -- editMessage apply-time par deletedAt recheck karta hai.",
+    "2. Project need: ek deleted:true flag next to original text ka matlab har reader ko flag check karna yaad rakhna padta -- ek bhi missed check 'deleted' content leak kar deta. Clearing at the source yeh mistake impossible banata hai.",
+    "3. Code/API: src/messenger.ts editMessage, deleteMessage; src/errors.ts SENDER_REQUIRED, MESSAGE_DELETED.",
+    "4. Detail: agar delete pehle land ho jaaye ek edit se jo pehle shuru hui thi, edit ka apply step deletedAt dekh ke silently no-op ho jaata hai -- error nahi, kyunki editor ke perspective se unhone ek normal edit maanga tha, conflict handle karna unka kaam nahi hona chahiye.",
+    "5. Demo: cd projects/22-messaging && npx vitest run test/edit-delete.test.ts test/concurrency.test.ts -t 'delete' -- 'an edit racing a delete always loses to the delete, either resolve order'.",
+    "6. Interviewer next: agar 'edit history' dikhana ho (jaise Slack ka 'edited' label with old versions), data model mein kya add karna padega?"
+   ],
+   "files": [
+    "projects/22-messaging/src/messenger.ts",
+    "projects/22-messaging/src/errors.ts",
+    "projects/22-messaging/test/edit-delete.test.ts"
+   ]
+  },
+  {
+   "concept": "Testing honestly: randomized invariants and mutation checks",
+   "steps": [
+    "1. Concept: randomized invariant test = random operations ek shadow model ke against chalao, har step par independently re-derive karke check karo. Mutation check = jaan-boojh ke ek line todo, suite chalao, dekho koi test fail hota hai ya nahi, file byte-for-byte restore karo.",
+    "2. Project need: concurrency x presence x edit/delete ke combinations haath ke tests cover nahi karte, aur '91 tests pass' yeh nahi batata ki tests kuch pakadte hain ya nahi.",
+    "3. Code/API: test/invariants.test.ts (6 seeds x 400 operations), test/concurrency.test.ts (actual races, FakeConversationStore se controlled interleaving), README.md ki mutation tables.",
+    "4. Detail: 57 mutation checks total (37 stage 1 + 20 stage 2), sab caught -- 5 genuine survivors mile (U3 ka wrong-conversation scoping gap, Y1/Y2 ka missing users.test.ts, M7/M17 ka zero-store-write gap), sab naye precise tests se close kiye gaye, chhupaye nahi gaye.",
+    "5. Demo: cd projects/22-messaging && npm test (91 tests), aur npx vitest run test/invariants.test.ts test/concurrency.test.ts.",
+    "6. Interviewer next: ek mutation jo 'malformed' lage (test kabhi fark dekh hi nahi sakta, kisi doosre check ki wajah se) aur ek jo genuine 'test gap' ho, dono ke beech kaise pehchanoge?"
+   ],
+   "files": [
+    "projects/22-messaging/test/invariants.test.ts",
+    "projects/22-messaging/test/concurrency.test.ts",
+    "projects/22-messaging/README.md"
+   ]
+  }
+ ]
+}
