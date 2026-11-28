@@ -238,8 +238,9 @@ a saved original) before moving to the next one; none of this was committed.
 **11 checks: 10 caught, 1 equivalent mutant.** ALLOW10 was investigated, not blindly closed with a test: tracing
 `BlockList.isBlocked()` shows its internal `labelsOf()` helper already lowercases and strips one trailing dot
 from whatever string it is given, which is exactly what `canonicalName()` also does before calling it. The two
-code paths -- "canonicalize, then look up" and "look up the raw wire name directly" -- produce IDENTICAL results
-for every possible input, so no test could ever distinguish them; writing one anyway would not be closing a real
+code paths -- "canonicalize, then look up" and "look up the raw wire name directly" -- produce identical results
+for every supported input, so no test of supported behavior can distinguish them (the one exception, a label
+ending in literal "." bytes like `x.com..`, is already out of scope -- see PLAN.md); writing one anyway would not be closing a real
 gap, it would be padding the suite with a test that happens to pass. This is recorded as an equivalent mutant
 rather than "closed," per this project's house rule: a survivor only gets a new test when the mutation actually
 changes observable behavior (see PLAN.md "Stage 2 decisions" for the same note in context).

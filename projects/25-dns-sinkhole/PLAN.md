@@ -155,9 +155,11 @@ real TTL semantics on top of a proxy that does not fully understand the protocol
 - **A noted equivalent mutant, not a real gap:** mutating the allowlist lookup from the canonicalized `name` to
   the raw `q.name` (as decoded off the wire, case preserved, trailing dot not stripped) was NOT caught by any
   test. This is not a real bug: `BlockList.isBlocked()`'s own `labelsOf()` helper already lowercases and strips
-  one trailing dot internally, so canonicalizing before calling it and not canonicalizing produce IDENTICAL
-  results for every possible input -- there is no test that could ever distinguish the two, because the two
-  code paths are behaviorally equivalent, not just untested. Recorded here instead of forcing a test that cannot
+  one trailing dot internally, so canonicalizing before calling it and not canonicalizing produce identical
+  results for every SUPPORTED input. (One unsupported input differs: a name whose last label ends in literal "."
+  bytes, e.g. `x.com..`, gets one dot stripped by each helper on the original path but only one in total on the
+  mutant path, which then throws on the empty label. Literal "." bytes inside a label are already out of scope --
+  see "Not in scope" -- so no test inside the supported input space can distinguish the two.) Recorded here instead of forcing a test that cannot
   exist, per this project's mutation-testing culture: a survivor gets closed with a new test only when the
   mutation actually changes observable behavior.
 
