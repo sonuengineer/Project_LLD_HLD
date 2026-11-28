@@ -1,17 +1,20 @@
 # B15 Messaging System (low-level design)
 
 A TypeScript library (no runtime dependencies, in memory) for the core of a messaging system (WhatsApp / Slack
-style): direct and group conversations, ordering, and per-recipient delivery and read receipts. There is no real
-transport: nothing in this project sends anything over a network.
+style): direct and group conversations, ordering, and per-recipient delivery and read receipts, plus an HTTP API
+(stage 3) in front of it. The core library itself stays dependency-free; only `src/http/` adds Express. There is
+no real transport: nothing in this project sends anything over a network on its own.
 
-Status (2026-11-27): stage 1 DONE -- 50 tests, 37 mutation checks, all caught. Stage 2 DONE -- 91 tests (41
-new), 20 new mutation checks, all caught (see "Mutation checks"). Details in [PLAN.md](PLAN.md).
+Status (2026-11-28): stage 1 DONE -- 50 tests, 37 mutation checks, all caught. Stage 2 DONE -- 91 tests (41
+new), 20 new mutation checks, all caught. Stage 3 DONE -- 117 tests (26 new), 24 new mutation checks, all caught
+(see "Mutation checks"). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 91 tests
+npm test        # 117 tests
 npm run demo    # direct chat, group chat, receipts, a retried send, the join-time history cut, offline
                 # catch-up on reconnect, multiple devices, message edit/delete
+npm start       # the HTTP API on http://127.0.0.1:3000 (needs MESSAGING_API_KEY set; see src/main.ts)
 ```
 
 ## Usage
@@ -34,6 +37,22 @@ await messenger.connectDevice("u2", "phone"); // u2 comes online; any OTHER pend
 await messenger.editMessage(conv.id, "u1", message.id, "hey, got a sec for a call?");
 await messenger.deleteMessage(conv.id, "u1", message.id); // delete-for-everyone: body is cleared, not just hidden
 ```
+
+### Over HTTP (stage 3)
+
+```
+curl -X POST http://127.0.0.1:3000/conversations/direct \
+  -H "Authorization: Bearer $MESSAGING_API_KEY" -H "Content-Type: application/json" \
+  -d '{"userIdA": "u1", "userIdB": "u2"}'
+# 200 { "id": "...", "kind": "direct", "members": [...], ... }
+
+curl -X POST http://127.0.0.1:3000/conversations/<conversationId>/messages \
+  -H "Authorization: Bearer $MESSAGING_API_KEY" -H "Content-Type: application/json" \
+  -d '{"senderId": "u1", "body": "hey, free for a call?", "clientMessageId": "client-generated-id-1"}'
+# 201 { "id": "...", "seq": 1, "status": "sent", ... } (u2 is offline); Location: /conversations/<id>/messages/<id>
+```
+
+See `src/http/app.ts` for the full route list and status-code mapping, and "Mutation checks" below.
 
 ## The rules
 
@@ -71,6 +90,9 @@ await messenger.deleteMessage(conv.id, "u1", message.id); // delete-for-everyone
   reading "on one device" is already visible from every other device of the same user -- nothing to implement.
 - **Message edit and delete-for-everyone are sender-only.** Receipts are untouched by either. A delete that lands
   while an edit is in flight always wins: a deleted message can never be resurrected by a racing edit.
+- **The HTTP API (stage 3) is a thin wrapper, not a new set of rules.** One route per `Messenger` method, a
+  single bearer API key, and every `MessagingErrorCode` mapped 1:1 to a status code via a fixed table (never
+  500) -- see `src/http/app.ts`.
 
 ## Design choices
 
@@ -104,6 +126,7 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
 | test/devices.test.ts | 16 | `connectDevice`/`disconnectDevice`/`isOnline` (several devices at once, unknown user/device), auto-delivery to an already-online recipient (per recipient, independently), offline catch-up on reconnect (spans every conversation, untouched if already delivered/read, only on the offline->online transition, `addMember`/`removeMember` keep `conversationsByUser` correct), multi-device read sync needs no per-device call |
 | test/edit-delete.test.ts | 13 | `editMessage` (sender-only, length validation, unknown conversation/message, cannot edit a deleted message, receipts untouched, returns a copy), `deleteMessage` (clears the body, idempotent and keeps the original `deletedAt`, sender-only, unknown conversation/message, cross-conversation scoping, receipts untouched) |
 | test/concurrency.test.ts | 12 | two sends never collide on sequence number regardless of resolve order; the lost-update bug `revising` prevents (illustrated unguarded, then shown fixed for `removeMember` vs `removeMember` and for a message op vs a membership change, both directions); concurrent reads never regress status or timestamp even out of order; an edit racing a delete always loses to the delete, either resolve order; idempotent calls commit nothing to the store; offline catch-up skips a conversation mid-revision without failing the whole reconnect |
+| test/http.test.ts | 26 | auth (missing/wrong API key, short `apiKey` rejected at `createApp`); every route's happy path (direct/group conversations, add/remove member, send/get/list/edit/delete message, markDelivered/markReadUpTo, connect/disconnect device, isOnline); every mapped error status (400/403/404/409) through a real route; an idempotent send replayed over HTTP and a same-key-different-body 409; a deterministic `SEND_IN_FLIGHT` and `CONVERSATION_BUSY` using a `FakeConversationStore` held open (a real concurrent-fetch race settles too far apart in time to trigger these reliably); pagination via `limit`/`cursor` query params; a bracketed query key (`?cursor[x]=1`) that would otherwise crash `decodeCursor`; auto-delivery to an already-connected device end to end; 404/415/400/413 HTTP-layer errors; an unexpected error mapped to 500 and logged, not leaked |
 
 ## Mutation checks
 
@@ -149,7 +172,20 @@ status was always correct either way, so no earlier test caught the wasted round
 | presence | P1 `connectDevice` never catches up, P2 `disconnectDevice`'s `UNKNOWN_DEVICE` check removed, P3 catch-up's empty-pending skip removed |
 | membership bookkeeping | B1 `addMember` does not register the new member for future catch-up, B2 `removeMember` does not clean up a departed member's catch-up registration |
 
-## Known and NOT handled (stage 2)
+Stage 3: 24 deliberate breaks in `src/http/app.ts`, each applied alone with the full suite run against it, the
+file restored byte for byte. All 24 were caught on the first run -- no new tests were needed.
+
+| Area | Breaks |
+|---|---|
+| status-code mapping | one break per `STATUS_BY_CODE` entry, changed to 200 (`INVALID_REQUEST`, `UNKNOWN_USER`, `UNKNOWN_CONVERSATION`, `UNKNOWN_MESSAGE`, `NOT_A_MEMBER`, `ALREADY_MEMBER`, `OWNER_REQUIRED`, `CANNOT_REMOVE_OWNER`, `IDEMPOTENCY_CONFLICT`, `INVALID_CURSOR`, `CONVERSATION_BUSY`, `SEND_IN_FLIGHT`, `SENDER_REQUIRED`, `MESSAGE_DELETED`, `UNKNOWN_DEVICE`), plus one break removing the `UNKNOWN_DEVICE` entry outright (exercises the `?? 500` fallback and its log call, not just a wrong value) |
+| auth guard | the `match !== null` check removed from `keyMatches` (a malformed Authorization header crashes instead of cleanly refusing), `timingSafeEqual`'s result hardcoded to `true` (any Bearer value with the right shape would be accepted) |
+| asyncRoute | `.catch(next)` removed (a rejected promise in an async route would hang the request instead of reaching the error handler) |
+| validation passthrough | `bodyField` forced to always return `undefined` (no field ever reaches the library) |
+| response shape | `messageView` stops spreading the message (only `status` would come back) |
+| requireJson | the Content-Type check inverted (JSON requests rejected, non-JSON accepted) |
+| 404 guards | the `undefined` check removed from both `GET /conversations/:id` and `GET /conversations/:id/messages/:messageId` |
+
+## Known and NOT handled
 
 - **No ownership transfer and no self-leave.** The owner can never be removed or step down; a member who wants to
   leave needs the owner to remove them. A real version needs at least "the owner may transfer ownership" so the
@@ -168,4 +204,10 @@ status was always correct either way, so no earlier test caught the wasted round
   their next full reconnect, still catches it up (see `test/concurrency.test.ts`).
 - **No read receipt "undo".** Once read-up-to has been recorded there is no way to mark a message unread again,
   mirroring real chat apps.
-- **No HTTP API.** Stage 3 is not decided yet (see PLAN.md).
+- **No HTTP endpoint to register a user.** `Messenger` takes a `UserDirectory` as a constructor dependency and
+  does not own user management itself (see `src/users.ts`), so the HTTP layer (stage 3) does not invent one
+  either; `src/main.ts` boots with an empty `InMemoryUsers`, which a real deployment would replace with a
+  directory backed by the app's actual user service.
+- **No rate limiting, no CORS, no per-user login at the HTTP layer.** One API key authenticates a legitimate
+  caller of the API (another service), the same model as the password-manager and notification HTTP layers in
+  this repo -- it is not an end-user auth system.
