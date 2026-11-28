@@ -1,11 +1,14 @@
-import { Peer } from "../src/peer.js";
+import { Peer, type PeerOptions } from "../src/peer.js";
 import { VpnNode } from "../src/transport.js";
 
 // A pair of Peers that already trust each other's REAL static public key -- the common starting point for
 // most tests. Tests that want to exercise the "wrong public key" failure build their own pair instead.
-export function trustedPeerPair(nameA = "alice", nameB = "bob"): { a: Peer; b: Peer } {
-  const a = new Peer(nameA);
-  const b = new Peer(nameB);
+// `options` (e.g. { clock, rekeyAfterMs }) is applied to BOTH peers -- harmless for the side that ends up in
+// the "responder" role, since only a role-"initiator" session ever acts on a rekey trigger (see
+// Peer.checkRekey), but it keeps the grace/retry bookkeeping consistent on both sides of a rekey test.
+export function trustedPeerPair(nameA = "alice", nameB = "bob", options?: PeerOptions): { a: Peer; b: Peer } {
+  const a = new Peer(nameA, options);
+  const b = new Peer(nameB, options);
   a.trustPeer(nameB, b.staticPublicKey);
   b.trustPeer(nameA, a.staticPublicKey);
   return { a, b };
@@ -13,8 +16,12 @@ export function trustedPeerPair(nameA = "alice", nameB = "bob"): { a: Peer; b: P
 
 // A pair of connected VpnNodes on real UDP loopback sockets, handshake already completed. Callers must
 // close() both when done (see afterEach in the test files that use this).
-export async function connectedNodePair(nameA = "alice", nameB = "bob"): Promise<{ a: VpnNode; b: VpnNode; peerA: Peer; peerB: Peer }> {
-  const { a: peerA, b: peerB } = trustedPeerPair(nameA, nameB);
+export async function connectedNodePair(
+  nameA = "alice",
+  nameB = "bob",
+  options?: PeerOptions,
+): Promise<{ a: VpnNode; b: VpnNode; peerA: Peer; peerB: Peer }> {
+  const { a: peerA, b: peerB } = trustedPeerPair(nameA, nameB, options);
   const a = new VpnNode(peerA);
   const b = new VpnNode(peerB);
   const portA = await a.bind(0, "127.0.0.1");

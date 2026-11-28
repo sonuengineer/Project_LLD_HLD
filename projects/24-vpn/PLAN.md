@@ -1,7 +1,9 @@
 # B-series: build your own VPN (low-level design): plan
 
 Status (2026-11-28): stage 1 DONE (X25519 handshake, ChaCha20-Poly1305 transport, sliding-window anti-replay,
-real UDP loopback transport, pseudo-TUN abstraction; 65 tests, 22 mutation checks, 1 survivor closed).
+real UDP loopback transport, pseudo-TUN abstraction; 65 tests, 22 mutation checks, 1 survivor closed). Stage 2
+DONE (periodic session rekeying with a bounded grace period for the old session; 82 tests total, 20 new
+mutation checks, 0 survivors).
 
 ## Why this project
 
@@ -79,12 +81,81 @@ TLS, SSH, and every other secure-channel protocol -- a VPN is just the applicati
 | Stage | What | Status |
 |---|---|---|
 | 1 | X25519 handshake with static + ephemeral keypairs, forward secrecy, mutual authentication via DH algebra; ChaCha20-Poly1305 transport with per-session counters; RFC 6479-style anti-replay window; pseudo-TUN abstraction (`TunDevice`/`InMemoryTunDevice`) wired to real UDP loopback sockets (`VpnNode`); randomized invariant test over real sockets with simulated reordering/duplication/tamper; demo; mutation checks | DONE 2026-11-28 |
-| 2 | Not decided yet -- candidates: a real Linux `/dev/net/tun` adapter (needs root, would only be demonstrable on the owner's Linux box, not built/tested here), periodic re-handshake / session rekeying on a timer, handshake cookies for DoS resistance, multiple simultaneous peers routed by destination (a real "VPN concentrator" shape instead of point-to-point) | not started |
+| 2 | Periodic session rekeying: an injected `Clock` (mirroring `22-messaging`/`23-password-manager`/`25-dns-sinkhole`'s exact shape), time- and/or message-count-based rekey triggers, a bounded grace period so the OLD session keeps decrypting in-flight packets after a rekey installs a NEW one, a retry/abandon mechanism for a lost rekey handshake, demo update, mutation checks | DONE 2026-11-28 |
+
+## Stage 2 decisions (one recommendation each)
+
+1. **Primary trigger: elapsed time since the CURRENT session was established, via the new injected `Clock`.**
+   An optional message-count threshold is also supported (`rekeyAfterMessages`) -- either one alone is enough
+   to arm rekeying, and if both are configured, whichever fires first wins (checked in that order:
+   `src/peer.ts`'s `checkRekey()`). This mirrors real WireGuard's own rule (a 120s time cap and a message/byte
+   cap, whichever happens first): time bounds how long a stolen key matters regardless of traffic volume;
+   a count bounds how much ciphertext any one key ever protects regardless of how slowly time passes. Neither
+   trigger is armed by default -- a `Peer` built with no rekey options behaves exactly like stage 1's (never
+   rekeys), so stage 1's entire test suite needed zero changes.
+2. **Per peer name, track a `current` session plus an optional `retiring` one; the old session is NEVER torn
+   down synchronously, only scheduled to expire.** `Peer.installSession` (the one path both the original
+   handshake and every rekey go through) does not delete the previous session's entry from
+   `sessionsByReceiverId` when a rekey lands -- it marks that entry `retiring` with `retireAt = now +
+   rekeyGraceMs` and leaves it exactly as it was: own keys, own independent `AntiReplayWindow`, still reachable
+   by its own receiverId. `encryptPacket` always uses `current` only (so outbound traffic switches the instant
+   the LOCAL side installs the new session), but inbound dispatch (`decryptPacket`, keyed by receiverId) keeps
+   accepting packets addressed to either id until the retiring one's grace deadline passes
+   (`pruneRetiredSessions`, called automatically by both `decryptPacket` and `checkRekey`, so the grace period
+   is self-enforcing -- nothing external has to remember to sweep it). Because each side installs its own half
+   of a rekey independently (the initiator the moment it gets the response, the responder the moment it SENDS
+   one), the two sides can and generally do switch over at genuinely different instants -- this design makes
+   that fine, since a packet addressed to either receiverId just works until its own session ages out. Only
+   ONE retiring generation is ever kept per peer name: if a second rekey lands before the first retiring
+   session's grace deadline, that older session is dropped immediately rather than tracked indefinitely --
+   a deliberate bound (at most 2 live sessions per peer at any time), not a general multi-generation
+   retention scheme.
+3. **Only the side that originally called `initiateHandshake()` ever re-initiates a rekey.** `Peer` records a
+   `role` ("initiator"/"responder") the first time a session is established for a given peer name, and
+   `installSession` carries that role forward across every subsequent rekey regardless of which `defaultRole`
+   a later call passes in -- so even if the non-initiating side manually calls `initiateHandshake()` itself
+   (Peer-level APIs allow it; nothing stops a test or a misbehaving caller), its role for automatic-rekey
+   purposes never flips to "initiator" (see test/rekey.test.ts's "the original RESPONDER manually
+   re-handshaking does not make it eligible for automatic rekeying"). `checkRekey()` only ever reports peers
+   whose role is "initiator". Letting EITHER side decide independently was considered and rejected: the
+   receiverId/grace-period design above makes a simultaneous double-rekey technically harmless, but it would
+   mean two churned ephemeral keypairs and two sets of pending/retiring bookkeeping in flight for zero benefit
+   over the single-dialer shape `VpnNode` already committed to (one node always being the one that called
+   `connect()`).
+4. **A lost rekey handshake never touches the still-valid old session -- it is just retried later.** Nothing
+   in `installSession` runs until `receiveHandshakeInit`/`receiveHandshakeResponse` actually succeeds, so a
+   dropped `HANDSHAKE_INIT` (or its response) leaves the current session completely untouched; traffic keeps
+   flowing on it with zero interruption. The half-started attempt sits in `pendingHandshakes` until
+   `rekeyRetryMs` elapses, at which point `checkRekey`'s own `abandonStaleRekeyAttempts` sweep deletes it --
+   scoped to ONLY peers that already have an established session (i.e. a rekey attempt, never a first-ever
+   `connect()`, which has its own promise-based timeout in `VpnNode` and must not be raced by this). The very
+   next `checkRekey` call then sees the same aged session with no pending attempt and retries with a fresh
+   ephemeral keypair.
+5. **Yes, the anti-replay window resets for every rekey.** Each rekey produces a brand-new `Session` object
+   via `installSession`, and `Session`'s constructor always builds a fresh `AntiReplayWindow` -- there is no
+   code path that copies or carries forward a counter or bitmap from the old session. The new session's
+   counter space starts at 0, completely independent of whatever the retiring session's window looked like
+   (tested directly: the same wire counter value, e.g. 0, is accepted once on the old session and once again,
+   independently, on the new one).
+
+Also decided along the way:
+- **No internal timer anywhere in this stage.** `Peer.checkRekey()` takes `now` as a parameter (defaulting to
+  its own injected Clock) and is otherwise a pure read of local state plus two small cleanup sweeps; it is the
+  caller's job to invoke it periodically. `VpnNode.checkRekey()` wraps it and is itself what a real
+  `setInterval` drives (`VpnNode.startRekeyTimer`/`stopRekeyTimer`, used by the demo) -- but tests never need a
+  real timer at all, they just call `checkRekey()` directly after `ManualClock.advance()`, same "inject the
+  driver, don't hide it" rule the rest of this project's time-based logic (`clock.ts`) already follows.
+- **A `sessionGeneration(peerName)` counter (1 = original handshake, 2+ = each rekey after it) is exposed
+  purely for observability.** It plays no protocol role -- it exists so a caller (the demo, tests waiting for
+  a real-UDP rekey handshake to actually complete) can tell "a rekey happened" without reaching into any key
+  material.
 
 ## Not in scope
 
 Carrying real IP packets (payloads are opaque bytes, by design -- see the project brief); a real OS TUN/TAP
 device and the routing table changes a real VPN client makes; NAT traversal / endpoint roaming (WireGuard's
-"allowed IPs" and roaming are both bigger topics than stage 1 needs); DoS-resistant handshake cookies; session
-rekeying/expiry; IPv6; any configuration file format or CLI -- `Peer`/`VpnNode` are a library, driven directly
-from TypeScript, the same shape as every other project in this repo.
+"allowed IPs" and roaming are both bigger topics than stage 1 needs); DoS-resistant handshake cookies; IPv6;
+any configuration file format or CLI -- `Peer`/`VpnNode` are a library, driven directly from TypeScript, the
+same shape as every other project in this repo. Still not in scope after stage 2: handshake-replay protection,
+multiple simultaneous peers routed by destination (a "VPN concentrator" shape), and a real Linux `/dev/net/tun`
+adapter (needs root, would only be demonstrable on the owner's Linux box, not built/tested here).

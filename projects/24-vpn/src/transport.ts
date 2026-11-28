@@ -25,6 +25,7 @@ export class VpnNode {
   private readonly remotes = new Map<string, Address>(); // peerName -> where to send packets for it
   private readonly pendingConnects = new Map<string, { resolve: () => void; reject: (err: Error) => void }>();
   private readonly droppedCallbacks: Array<(reason: string) => void> = [];
+  private rekeyTimer: NodeJS.Timeout | undefined;
   activePeerName: string | undefined;
 
   constructor(private readonly peer: Peer, tun: InMemoryTunDevice = new InMemoryTunDevice()) {
@@ -87,7 +88,45 @@ export class VpnNode {
     this.droppedCallbacks.push(callback);
   }
 
+  // Stage 2: periodic rekey housekeeping. Asks the Peer (via Peer.checkRekey, which wraps whatever Clock it
+  // was built with) which peers this node is the original initiator for have aged past their configured
+  // rekey threshold, and for each one, starts a brand new handshake toward that peer's already-known
+  // address -- exactly like connect() does for a first handshake, minus the Promise/timeout bookkeeping,
+  // since nothing here is waiting on the result (the existing HANDSHAKE_RESPONSE path in handleMessage()
+  // installs the new session the same way it always does; there is nothing rekey-specific left for this
+  // method to do once the bytes are on the wire). The OLD session is untouched by this call either way -- see
+  // peer.ts / PLAN.md's "Stage 2 decisions" for exactly how it stays usable through the whole transition.
+  //
+  // No timer lives inside this method itself -- call it directly (e.g. right after ManualClock.advance() in
+  // a test) or via startRekeyTimer() for a real wall-clock interval, same "inject the driver" rule the rest
+  // of this project's time-based logic follows.
+  checkRekey(now?: number): void {
+    const due = this.peer.checkRekey(now);
+    for (const { peerName } of due) {
+      const remote = this.remotes.get(peerName);
+      if (!remote) continue; // can't happen for an established session, but a housekeeping tick should never throw over it
+      const message = this.peer.initiateHandshake(peerName);
+      this.socket.send(message, remote.port, remote.host);
+    }
+  }
+
+  // Convenience for real usage (see demo.ts): drives checkRekey() on a real wall-clock interval. Tests call
+  // checkRekey() directly instead, so a ManualClock advance takes effect immediately rather than waiting on
+  // a real timer tick.
+  startRekeyTimer(intervalMs = 1000): void {
+    this.stopRekeyTimer();
+    this.rekeyTimer = setInterval(() => this.checkRekey(), intervalMs);
+  }
+
+  stopRekeyTimer(): void {
+    if (this.rekeyTimer) {
+      clearInterval(this.rekeyTimer);
+      this.rekeyTimer = undefined;
+    }
+  }
+
   close(): Promise<void> {
+    this.stopRekeyTimer();
     return new Promise((resolve) => this.socket.close(() => resolve()));
   }
 

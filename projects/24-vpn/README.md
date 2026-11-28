@@ -4,14 +4,15 @@ A simplified, WireGuard-style point-to-point encrypted tunnel: an X25519 handsha
 ChaCha20-Poly1305 transport with a sliding-window anti-replay check, wired to real UDP loopback sockets. There
 is no kernel TUN device -- see "Known and NOT handled" for exactly what that means and why.
 
-Status (2026-11-28): stage 1 DONE -- 65 tests, 22 mutation checks (1 survivor, closed). Details in
-[PLAN.md](PLAN.md).
+Status (2026-11-28): stage 1 DONE, stage 2 (periodic session rekeying) DONE -- 82 tests, 42 mutation checks (1
+survivor from stage 1, closed; 0 survivors from stage 2). Details in [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 65 tests
+npm test        # 82 tests
 npm run demo    # two peers handshake and exchange packets over real loopback UDP, with a replay and a
-                # tampered packet both deliberately shown being dropped
+                # tampered packet both deliberately shown being dropped, then a session rekey happening
+                # transparently with traffic still flowing across the boundary
 ```
 
 ## Usage
@@ -34,6 +35,33 @@ bob.tun.onReceive((packet) => console.log("bob got:", packet.toString()));
 await alice.connect("bob", "127.0.0.1", bobPort); // handshake over real UDP
 
 alice.tun.send(Buffer.from("hello, bob")); // encrypted, sent over UDP, decrypted, delivered to bob's TunDevice
+```
+
+### Session rekeying (stage 2)
+
+```ts
+import { Peer, VpnNode } from "./src/index.js";
+
+// rekeyAfterMs is deliberately tiny here just so this example's rekey actually happens quickly.
+const alicePeer = new Peer("alice", { rekeyAfterMs: 150 });
+const bobPeer = new Peer("bob", { rekeyAfterMs: 150 }); // harmless on bob: only the original initiator ever rekeys
+alicePeer.trustPeer("bob", bobPeer.staticPublicKey);
+bobPeer.trustPeer("alice", alicePeer.staticPublicKey);
+
+const alice = new VpnNode(alicePeer);
+const bob = new VpnNode(bobPeer);
+const bobPort = await bob.bind(0, "127.0.0.1");
+await alice.bind(0, "127.0.0.1");
+await alice.connect("bob", "127.0.0.1", bobPort);
+
+alice.tun.send(Buffer.from("before the rekey")); // uses session generation 1
+
+await new Promise((resolve) => setTimeout(resolve, 150)); // let the session age past rekeyAfterMs
+alice.checkRekey(); // notices the threshold was crossed, starts a brand new handshake over the wire
+alice.tun.send(Buffer.from("still goes out fine, even mid-handshake")); // zero interruption either way
+
+// Or, for real continuous use instead of calling checkRekey() by hand:
+//   alice.startRekeyTimer(1000); // checks every second on a real wall-clock interval
 ```
 
 ## The rules
@@ -76,6 +104,11 @@ alice.tun.send(Buffer.from("hello, bob")); // encrypted, sent over UDP, decrypte
 - **`VpnNode` is point-to-point: one active remote peer per node.** `tun.send()` always has an unambiguous
   destination -- whichever peer the node's handshake most recently completed with. `Peer` itself has no such
   limit (it can trust and hold sessions with several named peers at once; see `test/peer.test.ts`).
+- **(Stage 2) A session can rekey itself: a time and/or message-count threshold, checked by `checkRekey()`,
+  starts a brand new handshake while the OLD session keeps working.** Only the side that originally called
+  `initiateHandshake()` ever does this; the old session is kept `retiring` (not deleted) for a configurable
+  grace period so any packet the peer already sent under the old keys still decrypts correctly, however the
+  two sides happen to interleave switching over. See PLAN.md's "Stage 2 decisions" for the full reasoning.
 
 ## Design choices
 
@@ -92,6 +125,11 @@ See [PLAN.md](PLAN.md) for the full reasoning. In short:
 - Not used on purpose: a single shared send/receive key (would put both directions' counters in one nonce
   space); a growing replay set instead of a bitmap (unbounded memory); sending the sender's identity or
   address in the transport header (receiver-chosen ids avoid needing either).
+- (Stage 2) Rekeying is opt-in and off by default -- a `Peer` built with no `rekeyAfterMs`/`rekeyAfterMessages`
+  behaves exactly like stage 1's, never rekeys, and needed zero changes to stage 1's tests.
+- (Stage 2) The old session past a rekey is retired on a grace TIMER, not torn down the instant the new one
+  installs -- tearing it down immediately is exactly the race this stage exists to avoid (an in-flight packet
+  encrypted under the old keys, received after the new session exists, would otherwise be dropped).
 
 ## Tests
 
@@ -104,6 +142,7 @@ See [PLAN.md](PLAN.md) for the full reasoning. In short:
 | test/peer.test.ts | 16 | end-to-end handshake + transport in both directions, `UNKNOWN_PEER`/`NO_SESSION`/`HANDSHAKE_IN_PROGRESS` guards, the initiator's wrong-static-key case (AUTH_FAILED) and the responder's wrong-expected-key case (UNTRUSTED_PEER) as two distinct failure paths, malformed handshake messages rejected not thrown, a response with no matching pending handshake, replay and tamper rejected through the full API, re-trusting a peer under a corrected key, re-handshaking the same peer after a prior handshake already completed |
 | test/transport.test.ts | 8 | the same handshake/transport/replay/tamper scenarios again but over REAL UDP loopback sockets end to end (app write -> encrypt -> UDP send -> UDP receive -> decrypt -> app deliver), both directions, several packets in order, `connect()` timing out when the static key is wrong, `sendRawTo` validation |
 | test/invariants.test.ts | 5 | randomized (5 seeds x 300 packets) over real UDP sockets: a shuffled/duplicated/tampered dispatch schedule, asserting every original payload is delivered to the right `InMemoryTunDevice` exactly once with no corruption regardless of delivery order, and every duplicate/tampered packet is dropped and never delivered |
+| test/rekey.test.ts | 17 | (stage 2) time- and message-count-based triggers fire at the exact configured boundary and not before; a responder-role session never rekeys on its own; no duplicate rekey attempt while one is already pending; a packet encrypted just before a rekey still decrypts after the new session exists; old and new sessions' anti-replay windows are independent (same counter value accepted on each); the old session is retired after its grace period, both via an explicit `pruneRetiredSessions()` call and automatically through `decryptPacket()`; a rapid second rekey immediately retires an already-retiring older session; a lost rekey `HANDSHAKE_INIT` leaves the old session fully usable and a later retry succeeds; `abandonStaleRekeyAttempts` never touches a pending FIRST handshake; role is pinned at first establishment even if the non-initiating side manually re-handshakes; a `startRekeyTimer`/`stopRekeyTimer`/`close()` real-timer lifecycle test; a real-UDP test sending packets across two rekey boundaries with zero packet loss and zero corruption |
 
 ## Mutation checks
 
@@ -129,6 +168,23 @@ caught on the first run. One survived and was a real test gap, now closed:
 | peer: transport | P2 a missing session throws a bare `TypeError` instead of `VpnError`, P4 the `UNKNOWN_SESSION` guard removed (crashes instead of rejecting), P6 a new session never registered for receive-side lookup |
 | handshake crypto | H1 the two DH terms chained in a different order on the responder than the initiator expects, H2 message 1's AEAD authentication skipped entirely, H3 message 2's AEAD authentication skipped entirely, H4 the ephemeral-ephemeral DH term left out of the key chain |
 
+### Mutation checks -- stage 2 (rekeying)
+
+20 deliberate breaks across `src/peer.ts`'s rekey logic and `src/transport.ts`'s `VpnNode.checkRekey`/timer
+lifecycle, same method as stage 1's (one break at a time, full suite run, file restored byte for byte via a
+throwaway script never committed, restore in a `finally` block). All 20 were caught on the first run -- 0
+survivors, so no test gaps to close this time.
+
+| Area | Breaks |
+|---|---|
+| `Peer.checkRekey` | RK1 the role guard removed (a responder-role session would rekey on its own), RK2 the already-pending guard removed (piles on a second attempt), RK3 the time-trigger boundary off by one, RK4 the message-count-trigger boundary off by one, RK5 the TIME trigger reports the wrong reason string |
+| `Peer.pruneRetiredSessions` / `decryptPacket` | RK6 the grace-deadline boundary off by one, RK16 `decryptPacket`'s automatic prune call removed |
+| `Peer.abandonStaleRekeyAttempts` | RK7 the retry-timeout boundary off by one, RK8 the "only a REKEY attempt, never a first handshake" scope guard removed |
+| `Peer.installSession` | RK9 the older-retiring-session cleanup removed (a second rapid rekey would leak a receiverId forever), RK10 the old session is never kept retiring at all (hard cutover, breaks in-flight packets), RK11 the retiring entry records the NEW receiverId instead of the OLD one, RK12 role no longer carried forward across a rekey, RK13 the generation counter never increments, RK14 the new session never registered for receive-side lookup |
+| `Peer.encryptPacket` | RK15 the `NO_SESSION` guard removed (crashes instead of rejecting) |
+| `VpnNode.checkRekey` | TK1 a due rekey never actually calls `initiateHandshake`/sends anything, TK2 the HANDSHAKE_INIT is built but never put on the wire |
+| `VpnNode` timer lifecycle | TK3 `stopRekeyTimer` no longer calls `clearInterval` (timer keeps firing), TK4 `close()` no longer stops the rekey timer |
+
 ## Known and NOT handled
 
 - **No real OS TUN/TAP device.** A real VPN hands the kernel a `/dev/net/tun` (Linux) device so the OS routes
@@ -145,10 +201,13 @@ caught on the first run. One survived and was a real test gap, now closed:
   computations. Neither is built here -- a captured `HANDSHAKE_INIT` CAN be replayed, producing a harmless
   extra handshake attempt (not a working session, since the responder just re-derives the same response and
   the real initiator's already-pending attempt is unaffected), but nothing stops an attacker from doing this
-  repeatedly to burn CPU.
-- **No periodic re-handshake / session rekeying.** A session's keys last for the lifetime of the `Peer`
-  object; there is no timer-based rotation the way a real VPN rotates session keys every so often to bound
-  how much traffic any one key ever protects.
+  repeatedly to burn CPU. Stage 2's rekeying does not change this -- a REKEY's `HANDSHAKE_INIT` is just as
+  replayable as the original one, for the same reason and with the same (lack of) consequence.
+- **(Stage 2 note) At most one retiring session per peer name.** If a second rekey lands before the first
+  retiring session's grace period elapses, that older session is dropped immediately rather than tracked --
+  a deliberate bound (current + at most one retiring = 2 live sessions max per peer), not a general
+  multi-generation retention scheme. Misconfiguring `rekeyGraceMs` much longer than the real round-trip time
+  between rekeys is the only way this bound is ever reached in practice.
 - **64-bit wire counters are modeled as JS `number`, not `bigint`.** The counter is written/read as an 8-byte
   big-endian integer on the wire (matching a real 64-bit counter's width), but is kept as a `number`
   internally, which is exact only up to 2^53. No test in this project sends anywhere near that many packets

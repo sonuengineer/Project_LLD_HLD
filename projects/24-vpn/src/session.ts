@@ -24,6 +24,12 @@ export class Session {
   private sendCounter = 0;
   private readonly window = new AntiReplayWindow();
 
+  // How many packets this session has sent so far -- exposed so Peer can drive a message-count rekey trigger
+  // (see PLAN.md's "Stage 2 decisions") without this class knowing anything about rekeying itself.
+  get sentCount(): number {
+    return this.sendCounter;
+  }
+
   // Builds a ready-to-send TRANSPORT_DATA packet, consuming the next counter. Never reuses a counter for this
   // session's lifetime -- the counter only ever goes up, which is exactly what the nonce rule requires.
   encrypt(payload: Buffer): Buffer {

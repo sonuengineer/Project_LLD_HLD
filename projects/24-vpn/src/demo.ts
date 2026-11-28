@@ -1,12 +1,16 @@
 // Two peers, Alice and Bob, handshake and exchange a few packets over real UDP loopback sockets. Then one
 // deliberately duplicated (replayed) packet and one deliberately tampered packet are injected at the wire
-// level to show both get rejected -- never delivered, never a crash.
+// level to show both get rejected -- never delivered, never a crash. Finally, a Stage 2 rekey: alice's
+// session with bob is configured to age out almost immediately, so a real rekey happens transparently while
+// traffic keeps flowing across the boundary -- no dropped packet, no interruption either peer notices.
 import { Peer } from "./peer.js";
 import { VpnNode } from "./transport.js";
 
 async function main(): Promise<void> {
-  const alicePeer = new Peer("alice");
-  const bobPeer = new Peer("bob");
+  // rekeyAfterMs is absurdly short on purpose, just so this demo actually shows a rekey happening within a
+  // few real wall-clock sleeps below, instead of waiting on anything close to a production-sized threshold.
+  const alicePeer = new Peer("alice", { rekeyAfterMs: 150 });
+  const bobPeer = new Peer("bob", { rekeyAfterMs: 150 }); // bob never initiates (he's the responder); harmless either way
   alicePeer.trustPeer("bob", bobPeer.staticPublicKey);
   bobPeer.trustPeer("alice", alicePeer.staticPublicKey);
 
@@ -40,6 +44,21 @@ async function main(): Promise<void> {
   const tampered = Buffer.from(alicePeer.encryptPacket("bob", Buffer.from("this payload will be corrupted")));
   tampered[tampered.length - 1] = (tampered[tampered.length - 1]! ^ 0xff) & 0xff; // flip a byte in the auth tag
   alice.sendRawTo("bob", tampered);
+  await sleep(50);
+
+  console.log("\n--- session rekey (Stage 2) ---");
+  console.log(`before rekey: alice's session generation with bob = ${alicePeer.sessionGeneration("bob")}`);
+  await sleep(150); // let alice's session with bob age past the 150ms rekeyAfterMs threshold configured above
+
+  // Nothing above required any special handling -- sending one more packet right now would already use the
+  // OLD session, exactly as before. checkRekey() is what makes the rekey actually happen: it notices the
+  // threshold was crossed and starts a brand new handshake over the wire, transparently to the app.
+  alice.checkRekey();
+  alice.tun.send(Buffer.from("sent right as the rekey handshake is in flight")); // still goes out on the OLD session
+  await sleep(50); // let the real rekey handshake (HANDSHAKE_INIT -> HANDSHAKE_RESPONSE) complete over UDP
+  console.log(`after rekey: alice's session generation with bob = ${alicePeer.sessionGeneration("bob")}, bob's = ${bobPeer.sessionGeneration("alice")}`);
+
+  alice.tun.send(Buffer.from("sent after the rekey completed")); // now goes out on the NEW session
   await sleep(50);
 
   await alice.close();
