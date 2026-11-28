@@ -42,8 +42,13 @@ async function main() {
   const blockList = new BlockList(["ads.example.com", "doubleclick.net"]);
   console.log("blocklist entries:", blockList.size);
 
+  console.log("\n-- the allowlist (Stage 2): overrides the blocklist, even for a subdomain of a blocked name --");
+  const allowList = new BlockList(["safe.ads.example.com"]);
+  console.log("allowlist entries:", allowList.size);
+
   const proxy = new SinkholeProxy({
     blockList,
+    allowList,
     mode: "sinkhole",
     sinkholeAddress: "0.0.0.0",
     upstream: upstreamAddr,
@@ -58,9 +63,22 @@ async function main() {
   const blocked = await ask(addr.port, "tracker.ads.example.com", TYPE.A); // subdomain of a blocked name
   console.log("tracker.ads.example.com ->", blocked.header.rcode === RCODE.NOERROR ? blocked.answers[0] : "NXDOMAIN", "| upstream calls so far:", upstream.callCount);
 
-  console.log("\n-- an allowed query is forwarded and relayed back --");
-  const allowed = await ask(addr.port, "news.example.com", TYPE.A);
-  console.log("news.example.com ->", allowed.answers[0], "| upstream calls so far:", upstream.callCount);
+  console.log("\n-- a non-blocked query is forwarded and relayed back --");
+  const forwarded = await ask(addr.port, "news.example.com", TYPE.A);
+  console.log("news.example.com ->", forwarded.answers[0], "| upstream calls so far:", upstream.callCount);
+
+  console.log("\n-- an allowlisted subdomain of a BLOCKED parent is still forwarded: the allowlist always wins --");
+  const overridden = await ask(addr.port, "safe.ads.example.com", TYPE.A);
+  console.log("safe.ads.example.com ->", overridden.answers[0], "| upstream calls so far:", upstream.callCount);
+
+  console.log("\n-- a sibling subdomain NOT on the allowlist, under the same blocked parent, is still blocked --");
+  const stillBlocked = await ask(addr.port, "other.ads.example.com", TYPE.A);
+  console.log(
+    "other.ads.example.com ->",
+    stillBlocked.header.rcode === RCODE.NOERROR ? stillBlocked.answers[0] : "NXDOMAIN",
+    "| upstream calls so far:",
+    upstream.callCount,
+  );
 
   console.log("\n-- the same allowed query again: served from cache, upstream is not called a second time --");
   const callsBefore = upstream.callCount;

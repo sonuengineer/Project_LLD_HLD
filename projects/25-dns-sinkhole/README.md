@@ -5,8 +5,9 @@ A Pi-hole-style DNS proxy in TypeScript, **zero runtime dependencies**: it answe
 answer for as long as its TTL says it is good for. It replaces a paid ad blocker with something you can read start
 to finish in one sitting.
 
-Status (2026-11-28): **Stage 1 done** -- wire format, trie blocklist, both block modes, UDP-with-TCP-fallback
-forwarding, TTL cache, a real UDP server, mutation checks. See PLAN.md for the design decisions.
+Status (2026-11-28): **Stage 1 and Stage 2 done** -- wire format, trie blocklist, both block modes,
+UDP-with-TCP-fallback forwarding, TTL cache, a real UDP server, mutation checks (Stage 1); allowlist support
+that always overrides the blocklist, regardless of specificity (Stage 2). See PLAN.md for the design decisions.
 
 ```
 browser / OS stub resolver         src/server.ts            src/proxy.ts                     src/transport.ts
@@ -21,22 +22,23 @@ browser / OS stub resolver         src/server.ts            src/proxy.ts        
 
 ```
 npm install
-npm test          # 89 tests, no internet needed -- the "upstream" in every test is a stub server we control
+npm test          # 97 tests, no internet needed -- the "upstream" in every test is a stub server we control
 npm run typecheck
-npm run demo       # starts a stub upstream + the proxy, shows a block, a forward, and a cache hit
+npm run demo       # starts a stub upstream + the proxy, shows a block, a forward, a cache hit, and an allowlist override
 ```
 
-To actually run it against the real internet (outside the scope of Stage 1's test suite, but the pieces are all
+To actually run it against the real internet (outside the scope of the test suite, but the pieces are all
 there): point `SinkholeProxyOptions.upstream` at a real resolver (e.g. `{ host: "1.1.1.1", port: 53 }`), load a
-real blocklist with `loadBlockListFile("config/blocklist.txt")`, and bind `SinkholeServer` to a port your OS or
-router will actually query (53 needs admin/root; this project defaults to the high port 15353 so nothing above
-needs elevated privileges).
+real blocklist with `loadBlockListFile("config/blocklist.txt")` (and, optionally, a real allowlist the same way
+with `config/allowlist.txt`), and bind `SinkholeServer` to a port your OS or router will actually query (53
+needs admin/root; this project defaults to the high port 15353 so nothing above needs elevated privileges).
 
 ```ts
 import { BlockList, SinkholeProxy, SinkholeServer, loadBlockListFile } from "./src/index.js";
 
 const proxy = new SinkholeProxy({
   blockList: new BlockList(loadBlockListFile("config/blocklist.txt")),
+  allowList: new BlockList(loadBlockListFile("config/allowlist.txt")), // optional; omit for Stage 1 behaviour
   mode: "sinkhole", // or "nxdomain"
   sinkholeAddress: "0.0.0.0",
   upstream: { host: "1.1.1.1", port: 53 },
@@ -49,7 +51,11 @@ await server.listen();
 
 - A blocklist line blocks that **exact domain and every subdomain of it** (`ads.example.com` also blocks
   `tracker.ads.example.com`), never the other way around (blocking `ads.example.com` does NOT block
-  `example.com`). Blank lines and lines starting with `#` or `;` are comments.
+  `example.com`). Blank lines and lines starting with `#` or `;` are comments. An allowlist line (same file
+  format, same exact-domain-plus-subdomain matching) is checked FIRST, and always wins: a name matching the
+  allowlist is never blocked, **unconditionally, regardless of whether the matching allow entry or the matching
+  block entry is more specific** (same behavior as Pi-hole's own documented allowlist; see PLAN.md "Stage 2
+  decisions"). `allowList` is optional; omitting it reproduces Stage 1's behavior exactly.
 - A blocked query is answered **immediately, without ever contacting upstream** -- in `"nxdomain"` mode with
   NXDOMAIN, in `"sinkhole"` mode with a configured A record (default `0.0.0.0`) for an A query, and NXDOMAIN for
   every other query type in BOTH modes (AAAA sinkholing is not implemented -- see PLAN.md).
@@ -136,6 +142,19 @@ answer's name/type/class/ttl), and relays everything it does not understand as t
 | `stats` counts blocked/cacheHits/forwarded/servfail correctly | `handle` | `proxy.test.ts` "stats" |
 | The SAME behaviour holds end to end over a REAL UDP socket (not just calling `handle()` directly); server binds a high port (15353), never 53; refuses a non-loopback bind without `allowNonLoopback` | `SinkholeServer` | `test/server.test.ts`, 6 tests |
 
+## Stage 2: allowlist (`src/proxy.ts`'s `allowList` option)
+
+| Rule | Where | Proven by (`test/proxy.test.ts` "allowlist (Stage 2)", 8 tests) |
+|---|---|---|
+| A domain on the allowlist is forwarded even though it is ALSO exactly on the blocklist | `handle` | "...even though it is ALSO exactly on the blocklist" |
+| A domain whose PARENT is blocklisted but the domain ITSELF is allowlisted is forwarded (the specific-override case) | `handle` | "...the domain itself is allowlisted is forwarded" |
+| A sibling subdomain NOT on the allowlist, under the same blocklisted parent, is still blocked -- the override is scoped to the allowlisted name's own subtree, not the whole parent's | `handle` | "a sibling subdomain NOT on the allowlist..." |
+| A broader ALLOWED parent beats a narrower BLOCKED subdomain too -- allowlist wins unconditionally, not by comparing specificity either direction | `handle` | "...allowlist wins unconditionally, not by specificity" |
+| A domain on neither list behaves exactly as Stage 1 did | `handle` | "a domain on neither list behaves exactly as Stage 1 did (regression)" |
+| `loadBlockListFile`/`parseBlockListText` are reused as-is to load a real allowlist file end to end | `handle` | "loading a real allowlist file end to end" |
+| `stats.allowed` counts allowlist-overridden queries, incremented ALONGSIDE (not instead of) `cacheHits`/`forwarded` | `handle` | "stats.allowed counts allowlist-overridden queries..." |
+| A proxy constructed with NO `allowList` option behaves identically to Stage 1 (backward compatible) -- and the entire unmodified Stage 1 suite above still passes with zero changes | `handle` | "a proxy constructed with NO allowlist configured..." |
+
 ## Randomized invariant (`test/invariant.test.ts`, 5 seeds)
 
 A 400-query random mix of blocked and allowed domains, with the clock jumping forward by random amounts, checked
@@ -195,6 +214,36 @@ each confirmed it is now caught:
   `"wrong-id"` (a confused/buggy upstream that answers with `(id + 1) & 0xffff`), plus a test asserting the
   client gets SERVFAIL with ITS OWN id, never the mismatched answer.
 
+### Stage 2 mutation checks (2026-11-28): allowlist precedence
+
+Same process as above, scoped to the allowlist precedence logic specifically (`handle()`'s `allowed` computation
+and the `!allowed && this.blockList.isBlocked(name)` guard, plus the `stats.allowed` bookkeeping). Run against the
+full 97-test suite that existed at that point; each break was restored byte-for-byte (verified with `diff` against
+a saved original) before moving to the next one; none of this was committed.
+
+| # | Deliberate break | Result |
+|---|---|---|
+| ALLOW1 | `allowed` computation: `?? false` fallback flipped to `?? true` (no allowlist configured now means "everything is allowed") | caught |
+| ALLOW2 | `stats.allowed++` removed entirely | caught |
+| ALLOW3 | `!allowed &&` guard removed from the block check (allowlist computed but never actually consulted) | caught |
+| ALLOW4 | Copy-paste bug: `allowed` computed from `this.blockList` instead of `this.allowList` | caught |
+| ALLOW5 | `allowed` boolean inverted (`!(...)`) | caught |
+| ALLOW6 | Optional chaining removed (`this.allowList!.isBlocked(name)`, throws when no allowlist configured) | caught |
+| ALLOW7 | Allowlist and blocklist checks reordered: blocklist checked first, allowlist computed (too late) after | caught |
+| ALLOW8 | `stats.allowed++` changed to `stats.blocked++` | caught |
+| ALLOW9 | `&&` flipped to `\|\|` in the block guard (`!allowed \|\| this.blockList.isBlocked(name)`) | caught |
+| ALLOW10 | Allowlist lookup uses raw `q.name` instead of canonicalized `name` | **not caught -- equivalent mutant, not a real gap** |
+| ALLOW11 | `if (allowed)` guard removed from `stats.allowed++` (increments on every query, not just allowlisted ones) | caught |
+
+**11 checks: 10 caught, 1 equivalent mutant.** ALLOW10 was investigated, not blindly closed with a test: tracing
+`BlockList.isBlocked()` shows its internal `labelsOf()` helper already lowercases and strips one trailing dot
+from whatever string it is given, which is exactly what `canonicalName()` also does before calling it. The two
+code paths -- "canonicalize, then look up" and "look up the raw wire name directly" -- produce IDENTICAL results
+for every possible input, so no test could ever distinguish them; writing one anyway would not be closing a real
+gap, it would be padding the suite with a test that happens to pass. This is recorded as an equivalent mutant
+rather than "closed," per this project's house rule: a survivor only gets a new test when the mutation actually
+changes observable behavior (see PLAN.md "Stage 2 decisions" for the same note in context).
+
 ## Known and NOT handled
 
 See PLAN.md's "Not in scope" for the full list and reasoning. In short: AAAA/other-type sinkholing (NXDOMAIN only
@@ -202,20 +251,23 @@ for those, in both modes), no DNS presentation escapes (a literal "." byte insid
 real hostnames never have one), no downstream TCP (clients only reach this proxy over UDP; TCP is only ever used
 when WE talk to upstream), no anti-spoofing defence against the upstream beyond a source-address check (see
 PLAN.md's threat-model decision), no negative caching (an NXDOMAIN from upstream is relayed but never cached), no
-config hot-reload / multiple blocklists / allowlist exceptions / query log, no rate limiting on the proxy's own
-listener beyond the loopback-only bind guard.
+config hot-reload, no multiple blocklists with precedence AMONG THEMSELVES (a separate feature from the single
+allowlist-vs-blocklist precedence Stage 2 built -- see PLAN.md "Stage 2 decisions"), no query log, no rate
+limiting on the proxy's own listener beyond the loopback-only bind guard. (Allowlist/exceptions ARE handled as of
+Stage 2.)
 
 ## Files
 
 | File | Purpose |
 |---|---|
 | `src/wire.ts` | header + question decode, minimal answer-TTL decode (rdata skipped), small-message encode |
-| `src/blocklist.ts` | trie-based `BlockList`, plain-text blocklist parsing/loading |
+| `src/blocklist.ts` | trie-based `BlockList`, plain-text blocklist parsing/loading (reused as-is for the allowlist, Stage 2) |
 | `src/cache.ts` | raw-bytes `ResponseCache` with TTL expiry (lazy) and TTL countdown on read |
 | `src/clock.ts` | injectable `Clock` (`systemClock` / `ManualClock`), same shape as `22-messaging` |
 | `src/transport.ts` | one forwarded query to upstream: UDP with a timeout, TC -> TCP retry |
-| `src/proxy.ts` | `SinkholeProxy`: the decision logic (block / cache hit / forward), pure buffer in, buffer out |
+| `src/proxy.ts` | `SinkholeProxy`: the decision logic (allowlist override / block / cache hit / forward), pure buffer in, buffer out |
 | `src/server.ts` | `SinkholeServer`: the real UDP listener clients talk to |
 | `src/stub-upstream.ts` | a fully controllable fake upstream (used by tests AND the demo) |
-| `src/demo.ts` | `npm run demo`: a block, a forward, a cache hit, and a TC -> TCP retry, end to end |
+| `src/demo.ts` | `npm run demo`: a block, a forward, an allowlist override, a still-blocked sibling, a cache hit, and a TC -> TCP retry, end to end |
 | `config/blocklist.txt` | a small illustrative blocklist (not a real curated list) |
+| `config/allowlist.txt` | a small illustrative allowlist, same file format as `blocklist.txt` (Stage 2) |

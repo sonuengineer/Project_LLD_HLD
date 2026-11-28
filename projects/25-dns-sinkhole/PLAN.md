@@ -1,7 +1,9 @@
 # 25 -- DNS sinkhole (ad/tracker blocker): plan
 
 Status (2026-11-28): Stage 1 DONE. 89 tests; 23 mutation checks, 20 caught at first, 3 real gaps found and closed
-with new tests (re-run: all 23 caught). See README.md for the full test and mutation tables.
+with new tests (re-run: all 23 caught). Stage 2 (allowlist) DONE same day. 97 tests; 11 allowlist-precedence
+mutation checks, 10 caught, 1 equivalent mutant (not a real gap -- see "Stage 2 decisions"). See README.md for
+the full test and mutation tables.
 
 ## Why this project
 
@@ -95,7 +97,69 @@ real TTL semantics on top of a proxy that does not fully understand the protocol
 | Stage | What | Status |
 |---|---|---|
 | 1 | Wire format (header + question decode, minimal answer-TTL decode, small answers we build ourselves); trie blocklist with wildcard subdomains; two block-response modes; UDP-with-TCP-fallback upstream forwarding; TTL cache with lazy expiry and TTL countdown; a real UDP stub server; mutation checks | DONE 2026-11-28 |
-| 2+ | Not scoped. Candidates if ever picked up: multiple blocklists with precedence/allowlisting, a stats/query-log view, EDNS(0) passthrough, IPv6 (AAAA sinkhole), TCP on the client-facing side, config reload without a restart | not started |
+| 2 | Allowlist support: a second `BlockList` instance, checked before the blocklist in `SinkholeProxy.handle()`, always wins regardless of specificity; `config/allowlist.txt`; `ProxyStats.allowed`; mutation checks | DONE 2026-11-28 |
+| 2+ (remaining) | Not scoped. Candidates if ever picked up: multiple blocklists WITH PRECEDENCE AMONG THEMSELVES (still separate from the allowlist built above -- see "Stage 2 decisions"), a query-log view, EDNS(0) passthrough, IPv6 (AAAA sinkhole), TCP on the client-facing side, config reload without a restart | not started |
+
+## Stage 2 decisions (one recommendation each, 2026-11-28)
+
+- **Data structure: a second `BlockList` instance, not a new class or an allow-mode flag on `BlockList`.**
+  `BlockList`'s trie already gives exactly the matching rule an allowlist needs too (exact domain + every
+  subdomain), and its `isBlocked()` method is really "does this name match an entry in this list," which is
+  equally true whether the list means "block" or "allow" -- the MEANING of a match lives in the caller
+  (`SinkholeProxy.handle()`), not in the data structure. Adding a mode flag to `BlockList` itself would make one
+  class do two jobs (parsing/trie-walking AND knowing what a match should mean), for zero benefit: the trie code
+  does not change at all between the two uses. A second instance is also what makes the "optional, backward
+  compatible" requirement trivial -- `allowList` is just `BlockList | undefined`, and `undefined?.isBlocked(...)`
+  always reads as "not allowed" without a single branch dedicated to "do we even have an allowlist."
+
+- **Precedence: allowlist wins UNCONDITIONALLY, regardless of which entry is more specific.** This is a real
+  choice, not a non-choice -- the more "precise" alternative (compare the depth of the matching allow entry
+  against the depth of the matching block entry, most-specific-wins) is also defensible and arguably more
+  intuitive. We matched Pi-hole's own documented behavior instead (allowlist always wins, full stop) for two
+  reasons: (1) it is what a real operator migrating from Pi-hole would expect, and (2) it is dramatically
+  cheaper to implement correctly -- "does the query match the allowlist at all" is the exact same single trie
+  walk `isBlocked()` already does, so checking the allowlist first and short-circuiting is enough; a
+  most-specific-wins rule would need BOTH tries walked to completion to find each one's deepest matching node,
+  then a comparison, which is real additional code (and a real additional way to get it wrong) for behavior
+  that is arguably LESS intuitive anyway: a narrow "allow this one subdomain" entry silently losing to a
+  deliberately broad block entry someone added later would be a confusing support question, not a feature.
+  "Allowlist always wins" is the simpler rule to implement, the simpler rule to explain, and the one real
+  precedent (Pi-hole) already uses.
+
+- **File format: `config/allowlist.txt` reuses `parseBlockListText`/`loadBlockListFile` as-is**, no new parsing
+  function. The shape is identical (one domain per line, `#`/`;` comments, blank lines skipped) because an
+  allowlist and a blocklist are the same kind of object (a list of domains with the same subtree-matching rule)
+  used for an opposite purpose -- there is nothing allowlist-specific for a parser to know about.
+
+- **Where the check happens: in `SinkholeProxy.handle()`, before the blocklist check, as one `if`.** The
+  allowlist match is computed once (`this.allowList?.isBlocked(name) ?? false`) and the blocklist check is
+  skipped entirely (`if (!allowed && this.blockList.isBlocked(name))`) when it is true -- so an allowlisted
+  query takes the exact same cache/forward path as any other non-blocked query in Stage 1, with zero duplicated
+  logic for "what happens after a query isn't blocked."
+
+- **Stats: yes, `ProxyStats.allowed` is its own counter, incremented alongside (not instead of) `cacheHits` /
+  `forwarded`.** `allowed` and `forwarded` answer different operator questions: "how many queries were an
+  explicit allowlist override" vs. "how many queries were simply never on the blocklist to begin with." Without
+  a separate counter, an operator debugging "is my allowlist entry actually doing anything" has no way to tell
+  those two cases apart from the stats alone. An allowlisted query still increments `cacheHits` or `forwarded`
+  too (it still goes through the normal cache/forward path) -- `allowed` is additional information, not a
+  replacement bucket like `blocked`/`servfail` are.
+
+- **Configuration: `allowList` on `SinkholeProxyOptions` is optional, default `undefined`.** This is the one
+  genuinely load-bearing decision for backward compatibility: every Stage 1 test constructs a `SinkholeProxy`
+  with no `allowList` at all, and `this.allowList?.isBlocked(name) ?? false` means that code path behaves
+  exactly as if the allowlist feature did not exist -- confirmed by running the full Stage 1 suite unmodified
+  (see README's test table) and by a dedicated Stage 2 test that builds a proxy with no `allowList` option and
+  checks it still blocks/forwards exactly as Stage 1 did.
+
+- **A noted equivalent mutant, not a real gap:** mutating the allowlist lookup from the canonicalized `name` to
+  the raw `q.name` (as decoded off the wire, case preserved, trailing dot not stripped) was NOT caught by any
+  test. This is not a real bug: `BlockList.isBlocked()`'s own `labelsOf()` helper already lowercases and strips
+  one trailing dot internally, so canonicalizing before calling it and not canonicalizing produce IDENTICAL
+  results for every possible input -- there is no test that could ever distinguish the two, because the two
+  code paths are behaviorally equivalent, not just untested. Recorded here instead of forcing a test that cannot
+  exist, per this project's mutation-testing culture: a survivor gets closed with a new test only when the
+  mutation actually changes observable behavior.
 
 ## Not in scope
 
@@ -122,8 +186,11 @@ real TTL semantics on top of a proxy that does not fully understand the protocol
   skipping that guard would not have crashed -- it would have silently cached a zero-answer response as if it had
   an effectively infinite TTL. The guard is there specifically because "no answers" and "nothing to cache" are the
   same condition, not two things to remember separately.
-- **No config hot-reload, no multiple blocklists with precedence, no allowlist/exceptions, no query logging or
-  stats page beyond the in-memory `proxy.stats` counters.**
+- **No config hot-reload, no multiple blocklists with precedence AMONG THEMSELVES, no query logging or stats
+  page beyond the in-memory `proxy.stats` counters.** (Allowlist/exceptions ARE now handled -- see Stage 2
+  above. "Multiple blocklists with precedence" is a different feature: several independently loaded blocklists
+  that need their own ordering rule when they disagree with EACH OTHER, not the single allowlist-vs-blocklist
+  precedence Stage 2 built.)
 - **No rate limiting or other abuse protection** on the proxy's own UDP listener, beyond the loopback-only bind
   guard (same reasoning as `15-dns-resolver`'s stub server: an open resolver with no access control is useful for
   DNS amplification attacks against a third party).

@@ -26,6 +26,15 @@ export type BlockMode = "nxdomain" | "sinkhole";
 
 export interface SinkholeProxyOptions {
   blockList: BlockList;
+  /**
+   * Optional allowlist (Stage 2). Same shape and same trie-based exact-domain-plus-every-subdomain matching as
+   * `blockList` -- it is the identical `BlockList` class, just holding a different set of names (see PLAN.md
+   * "Stage 2 decisions" for why one class covers both). A name that matches this list is NEVER blocked, even if
+   * it (or an ancestor of it) also matches `blockList` -- unconditionally, regardless of which entry is more
+   * specific (this matches Pi-hole's own documented allowlist behaviour; see PLAN.md). Omitting it entirely
+   * (the default) reproduces Stage 1's behaviour exactly -- no allowlist check is even reached.
+   */
+  allowList?: BlockList;
   mode: BlockMode;
   /** IPv4 address returned for a blocked A query in "sinkhole" mode. Default "0.0.0.0". */
   sinkholeAddress?: string;
@@ -40,6 +49,15 @@ export interface SinkholeProxyOptions {
 export interface ProxyStats {
   total: number;
   blocked: number;
+  /**
+   * Queries that matched the allowlist, so the blocklist check was skipped for them (Stage 2). This is counted
+   * SEPARATELY from -- and alongside -- cacheHits/forwarded below: an allowlisted query still goes on to be
+   * either a cache hit or a forward, and increments that counter too. `allowed` answers a different question
+   * than `forwarded` does: "how many queries were an explicit allowlist override" vs. "how many queries were
+   * never going to be blocked in the first place." A query that was simply never on the blocklist is NOT
+   * counted here -- only one that actually matched the allowlist is.
+   */
+  allowed: number;
   cacheHits: number;
   forwarded: number;
   servfail: number;
@@ -53,6 +71,7 @@ function patchId(buf: Buffer, id: number): Buffer {
 
 export class SinkholeProxy {
   readonly blockList: BlockList;
+  readonly allowList?: BlockList;
   readonly cache: ResponseCache;
   private readonly mode: BlockMode;
   private readonly sinkholeAddress: string;
@@ -60,10 +79,11 @@ export class SinkholeProxy {
   private readonly upstream: Endpoint;
   private readonly udpTimeoutMs: number;
   private readonly tcpTimeoutMs: number;
-  readonly stats: ProxyStats = { total: 0, blocked: 0, cacheHits: 0, forwarded: 0, servfail: 0 };
+  readonly stats: ProxyStats = { total: 0, blocked: 0, allowed: 0, cacheHits: 0, forwarded: 0, servfail: 0 };
 
   constructor(opts: SinkholeProxyOptions) {
     this.blockList = opts.blockList;
+    this.allowList = opts.allowList;
     this.mode = opts.mode;
     this.sinkholeAddress = opts.sinkholeAddress ?? "0.0.0.0";
     this.sinkholeTtl = opts.sinkholeTtl ?? 60;
@@ -109,7 +129,15 @@ export class SinkholeProxy {
 
     const name = canonicalName(q.name);
 
-    if (this.blockList.isBlocked(name)) {
+    // Allowlist is checked FIRST and wins unconditionally: if it matches, the blocklist is never even
+    // consulted for this query, so a narrower allowed subdomain beats a broader blocked parent AND a broader
+    // allowed parent beats a narrower blocked subdomain -- same "always wins" rule either way (see PLAN.md
+    // "Stage 2 decisions"). This is also why one shared `isBlocked`-style trie lookup is enough: there is no
+    // specificity comparison to make, just "does this query match the allowlist at all."
+    const allowed = this.allowList?.isBlocked(name) ?? false;
+    if (allowed) this.stats.allowed++;
+
+    if (!allowed && this.blockList.isBlocked(name)) {
       this.stats.blocked++;
       return this.buildBlockResponse(base, q);
     }

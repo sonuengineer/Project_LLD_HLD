@@ -1,5 +1,6 @@
+import { fileURLToPath } from "node:url";
 import { afterEach, describe, expect, it } from "vitest";
-import { BlockList } from "../src/blocklist.js";
+import { BlockList, loadBlockListFile } from "../src/blocklist.js";
 import { ResponseCache } from "../src/cache.js";
 import { ManualClock } from "../src/clock.js";
 import { SinkholeProxy } from "../src/proxy.js";
@@ -16,13 +17,22 @@ afterEach(async () => {
 /** Starts a stub upstream with the given behavior and a proxy pointed at it, with a ManualClock-backed cache. */
 async function harness(
   behavior: (name: string, type: number) => StubBehavior,
-  opts: { blocked?: string[]; mode?: "nxdomain" | "sinkhole"; clock?: ManualClock; sinkholeAddress?: string; udpTimeoutMs?: number; tcpTimeoutMs?: number } = {},
+  opts: {
+    blocked?: string[];
+    allowed?: string[];
+    mode?: "nxdomain" | "sinkhole";
+    clock?: ManualClock;
+    sinkholeAddress?: string;
+    udpTimeoutMs?: number;
+    tcpTimeoutMs?: number;
+  } = {},
 ) {
   stub = new StubUpstream({ behavior });
   const upstream = await stub.listen();
   const clock = opts.clock ?? new ManualClock(0);
   const proxy = new SinkholeProxy({
     blockList: new BlockList(opts.blocked ?? []),
+    allowList: opts.allowed ? new BlockList(opts.allowed) : undefined,
     mode: opts.mode ?? "nxdomain",
     sinkholeAddress: opts.sinkholeAddress,
     upstream,
@@ -90,6 +100,73 @@ describe("block modes", () => {
     const { proxy } = await harness(() => answer, { blocked: ["ads.test"], mode: "sinkhole" });
     const reply = decodeResponse((await proxy.handle(buildQuery(1, "ads.test", TYPE.AAAA)))!);
     expect(reply.header.rcode).toBe(RCODE.NXDOMAIN);
+  });
+});
+
+describe("allowlist (Stage 2)", () => {
+  it("a domain on the allowlist is forwarded even though it is ALSO exactly on the blocklist", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.test"], allowed: ["ads.test"] });
+    const reply = decodeResponse((await proxy.handle(buildQuery(1, "ads.test", TYPE.A)))!);
+    expect(reply.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1);
+  });
+
+  it("a domain whose PARENT is blocklisted but the domain itself is allowlisted is forwarded (specific override)", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: ["safe.ads.example.com"] });
+    const reply = decodeResponse((await proxy.handle(buildQuery(1, "safe.ads.example.com", TYPE.A)))!);
+    expect(reply.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1);
+  });
+
+  it("a sibling subdomain NOT on the allowlist, under the same blocklisted parent, is still blocked", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: ["safe.ads.example.com"] });
+    const reply = decodeResponse((await proxy.handle(buildQuery(1, "other.ads.example.com", TYPE.A)))!);
+    expect(reply.header.rcode).toBe(RCODE.NXDOMAIN);
+    expect(stub.callCount).toBe(0); // the override did not accidentally un-block the whole parent subtree
+  });
+
+  it("a broader ALLOWED parent beats a narrower BLOCKED subdomain too -- allowlist wins unconditionally, not by specificity", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: ["example.com"] });
+    const reply = decodeResponse((await proxy.handle(buildQuery(1, "ads.example.com", TYPE.A)))!);
+    expect(reply.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1);
+  });
+
+  it("a domain on neither list behaves exactly as Stage 1 did (regression)", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: ["safe.ads.example.com"] });
+    const blocked = decodeResponse((await proxy.handle(buildQuery(1, "tracker.ads.example.com", TYPE.A)))!);
+    expect(blocked.header.rcode).toBe(RCODE.NXDOMAIN);
+    const forwarded = decodeResponse((await proxy.handle(buildQuery(2, "news.example.com", TYPE.A)))!);
+    expect(forwarded.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1); // only the non-blocked, non-allowlist-related query reached upstream
+  });
+
+  it("loading a real allowlist file end to end", async () => {
+    const domains = loadBlockListFile(fileURLToPath(new URL("../config/allowlist.txt", import.meta.url)));
+    expect(domains).toContain("allowed.ads.example.com");
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: domains });
+    const reply = decodeResponse((await proxy.handle(buildQuery(1, "allowed.ads.example.com", TYPE.A)))!);
+    expect(reply.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1);
+  });
+
+  it("stats.allowed counts allowlist-overridden queries, distinct from forwarded/cacheHits", async () => {
+    const { proxy } = await harness(() => answer, { blocked: ["ads.example.com"], allowed: ["safe.ads.example.com"] });
+    await proxy.handle(buildQuery(1, "safe.ads.example.com", TYPE.A)); // allowed + forwarded (cache miss)
+    await proxy.handle(buildQuery(2, "safe.ads.example.com", TYPE.A)); // allowed + cache hit
+    await proxy.handle(buildQuery(3, "tracker.ads.example.com", TYPE.A)); // blocked, not allowed
+    await proxy.handle(buildQuery(4, "news.example.com", TYPE.A)); // forwarded, never touched either list's allow side
+    expect(proxy.stats).toMatchObject({ total: 4, allowed: 2, blocked: 1, forwarded: 2, cacheHits: 1 });
+  });
+
+  it("a proxy constructed with NO allowlist configured behaves identically to Stage 1 (backward compatible)", async () => {
+    const { proxy, stub } = await harness(() => answer, { blocked: ["ads.example.com"] }); // no `allowed` option at all
+    const blocked = decodeResponse((await proxy.handle(buildQuery(1, "ads.example.com", TYPE.A)))!);
+    expect(blocked.header.rcode).toBe(RCODE.NXDOMAIN);
+    const forwarded = decodeResponse((await proxy.handle(buildQuery(2, "news.example.com", TYPE.A)))!);
+    expect(forwarded.header.rcode).toBe(RCODE.NOERROR);
+    expect(stub.callCount).toBe(1);
+    expect(proxy.stats.allowed).toBe(0);
   });
 });
 
