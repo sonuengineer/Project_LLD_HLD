@@ -1,0 +1,1389 @@
+[
+  {
+    "id": "SOC-101",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "Why does ChannelDelivery use a single status enum (pending/sent/dead_letter/canceled) instead of a separate transient 'failed' status next to a boolean 'willRetry' flag?",
+    "answer_hinglish": "Decision PLAN.md mein clearly likha hai: ek status enum, do field nahi. Agar ek alag 'failed' status hota ek 'willRetry' boolean ke saath, toh woh sirf 'pending' kehne ka doosra, zyada complicated tarika hota -- ek failed attempt jiske paas retries bache hain, woh conceptually EXACTLY wahi state mein hai jaisa woh apne pehle attempt se pehle tha: woh apne next attempt ka wait kar raha hai. Isliye is repo ka rule hai 'a status field with guarded transitions is enough' (projects 21/22 mein bhi yehi pattern hai).\n\nAgar do fields hote (status='failed' + willRetry=true/false), tab ek naya risk aata: dono fields ko hamesha SYNC rakhna padta -- ek jagah status update ho jaaye aur willRetry update hona bhool jaaye, toh ek inconsistent state ban jaata jisko catch karna mushtkil hota. Single enum mein yeh risk hi exist nahi karta kyunki sirf EK field hai jo transition karta hai.\n\nActual implementation src/scheduler.ts ke dispatchChannel mein hai: jab provider.send() fail hota hai, delivery.lastError set hota hai, aur phir sirf ek check hota hai -- `attempts >= maxAttempts` toh 'dead_letter', nahi toh status 'pending' hi rehta hai (sirf nextAttemptAt update hota hai backoff ke saath). Koi intermediate 'failed' state kabhi bani hi nahi -- dispatch ke beech mein bhi status 'pending' hi dikhta hai.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai redundant state fields ka risk, aur 'single source of truth' principle kaise status design mein apply hota hai.",
+    "real_world_analogy": "Ek delivery package ka status 'in transit' hi rehta hai jab tak woh 'delivered' ya 'returned to sender' na ho jaaye -- beech mein ek baar truck breakdown hua ya nahi, yeh ek alag 'breakdown-happened' flag nahi banata, package abhi bhi 'in transit' hi hai.",
+    "how_it_works": "ChannelStatus = pending | sent | dead_letter | canceled. attempts aur nextAttemptAt diagnostic/scheduling info carry karte hain bina status ko change kiye jab tak koi terminal transition (sent ya dead_letter) na ho.",
+    "in_this_project": "src/types.ts ka ChannelStatus type aur src/scheduler.ts ka dispatchChannel -- failure path mein status sirf dead_letter ya pending set hota hai, koi third transient value nahi.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/types.ts::ChannelStatus",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "// real, src/types.ts\nexport type ChannelStatus = \"pending\" | \"sent\" | \"dead_letter\" | \"canceled\";",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek hi field, koi sync risk do fields ke beech",
+      "Guarded transitions se invalid states (jaise sent+willRetry=true) possible hi nahi",
+      "Simpler tests -- sirf ek field assert karna padta hai"
+    ],
+    "disadvantages": [
+      "Caller ko 'is this pending because it never started, or because a retry is coming' jaanne ke liye attempts field bhi dekhna padta hai",
+      "Ek naya consumer status ko standalone dekh kar confuse ho sakta hai agar woh attempts/nextAttemptAt na dekhe"
+    ],
+    "common_mistakes": [
+      "Do fields banana jo ek doosre se out of sync ho sakte hain",
+      "Yeh sochna ki 'failed' ek terminal state hai -- yahan sirf dead_letter terminal hai",
+      "Status ko dispatch ke BEECH mein temporarily 'failed' set karna, jo race conditions ke liye extra surface banata"
+    ],
+    "follow_up_questions": [
+      "If you needed to distinguish 'never attempted' from 'failed, awaiting retry' in the API response, how would you do it without adding a new status value?",
+      "What would a State pattern implementation of ChannelDelivery look like here, and why did this project avoid it?"
+    ],
+    "concepts": ["status-enum", "state-management", "trade-offs"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-102",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "Why is due-post dispatch a polled tick() instead of a job queue with leases, like project 21's stage 2?",
+    "answer_hinglish": "PLAN.md mein yeh explicitly compare kiya gaya hai project 21 (notification) stage 2 ke saath. Lease-based job queue ka poora point yeh hai ki MULTIPLE WORKERS ek SHARED queue se job 'claim' kar sakein, aur agar ek worker crash/stall ho jaaye, uska claimed job timeout ke baad DOOSRE worker ko mil jaaye. Yeh problem is project ke stage 1 mein exist hi nahi karti -- sirf EK caller hai jo tick() drive karta hai, kabhi doosra worker uska job 'steal' nahi karega.\n\nJo problem yahan actually exist karti hai: SAME caller ka tick() dobara call ho jaana jabki pehla abhi ek slow provider ka wait kar raha hai (ya ek cancel usi waqt race kare). Iske liye poora lease/claim-token system overkill hai -- ek lightweight 'dispatching' Set (sirf \"postId:channel\" keys currently in-flight) kaafi hai, bahut kam complexity ke saath.\n\ntick() khud simple hai: due channels scan karo, unko dispatching set mein add karo, Promise.all se saari dispatchChannel() calls chalao, finally mein set se remove karo. Agar kabhi multiple WORKER PROCESSES same scheduler ko drive karna pade (stage 2, if it happens), PLAN.md khud kehta hai ki project 21 ka lease/claim-token design reused hoga wholesale, redesign nahi.",
+    "why_needed": "Interviewer samajhna chahta hai ki candidate 'YAGNI' (you aren't gonna need it) ko architecture decision ke roop mein apply kar sakta hai -- sahi complexity level choose karna, requirement ke hisaab se.",
+    "real_world_analogy": "Ek chhoti dukaan mein ek hi salesperson hai jo order list dekh kar kaam karta hai -- usse kisi 'token system' ki zaroorat nahi jo bataye kaunsa order kiska hai, kyunki koi doosra salesperson hai hi nahi jo wahi order utha le.",
+    "how_it_works": "tick() poll karta hai due+pending channels, dispatching Set same-caller overlap se bachata hai. Koi lease timeout, koi claim token, koi 'another worker stole this' scenario nahi hai.",
+    "in_this_project": "src/scheduler.ts ka tick() method aur dispatching Set -- compare project 21 ke src/queue.ts ka InMemoryJobQueue (claim/owns/complete/reschedule with leaseToken/leaseUntil).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "// real, src/scheduler.ts tick() (trimmed)\nfor (const { record, delivery } of due) this.dispatching.add(`${record.id}:${delivery.channel}`);\nawait Promise.all(due.map(({ record, delivery }) => this.dispatchChannel(record, delivery)));",
+    "code_language": "typescript",
+    "advantages": [
+      "Bahut kam complexity jab sirf ek caller hai",
+      "Testing easy hai -- koi lease timing simulate karne ki zaroorat nahi",
+      "Code directly readable hai, koi claim-token bookkeeping nahi"
+    ],
+    "disadvantages": [
+      "Multiple worker processes support nahi karta -- sab ek hi process mein tick() call karte hain",
+      "Agar scale badhe, poora redesign chahiye hoga (project 21 jaisa lease system laana padega)"
+    ],
+    "common_mistakes": [
+      "Chhoti scale ke liye bhi lease-based queue bana dena, jab zaroorat na ho",
+      "Yeh sochna ki dispatching Set multi-worker race ko bhi cover karta hai -- yeh sirf SAME caller ke overlap ke against hai"
+    ],
+    "follow_up_questions": [
+      "If a second process also started calling tick() on a separate in-memory instance, what would break?",
+      "What is the minimal change needed to make dispatchChannel work with project 21's lease-based queue instead of the dispatching Set?"
+    ],
+    "concepts": ["polling", "job-queue", "leases", "trade-offs"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-103",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Beginner",
+    "question": "Why is a channel just a string key into a providers map, instead of a closed enum of named platforms (linkedin, twitter, mastodon)?",
+    "answer_hinglish": "README mein pehla hi rule yeh hai: 'A channel is a string key into the providers map given to the constructor.' Agar ek closed enum hota (jaise `type Channel = \"linkedin\" | \"twitter\" | \"mastodon\"`), toh scheduler ko hardcoded pata hona padta kaunse platforms exist karte hain -- naya channel add karne ke liye scheduler ke TYPE ko hi change karna padta.\n\nString-key design mein scheduler ko bilkul pata nahi hota channel ASLI mein kya hai -- usse sirf yeh pata hota hai ki `providers` object mein koi key registered hai usse handle karne ke liye. Yeh exactly Strategy pattern hai: FakeChannelProvider interface hi matter karta hai, implementation (AlwaysSucceeds/AlwaysFails/Flaky, ya kal koi real LinkedIn provider) scheduler ke liye invisible hai.\n\nValidation iska downside cover karta hai: `schedulePost` ek unknown channel key ko `UNKNOWN_CHANNEL` error se reject karta hai, AT REQUEST TIME (construction ke baad kabhi bhi, jab tak provider registered nahi hai) -- isliye type-safety ka fayda (compile-time typo-catch) na hone ka trade-off ek clean runtime check se cover hota hai, dispatch time tak wait nahi karna padta.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate Strategy pattern aur runtime-vs-compile-time validation ka trade-off samajhta hai.",
+    "real_world_analogy": "Ek universal power socket adapter jo kisi bhi plug shape ko accept karta hai jab tak uske liye koi adapter attachment maujood ho -- socket khud nahi jaanta duniya mein kitne plug types hain, sirf yeh jaanta hai ki kaunsa adapter is waqt attached hai.",
+    "how_it_works": "providers: Record<string, FakeChannelProvider> constructor mein diya jaata hai. requireValidChannels shape check ke baad har channel string ke liye this.providers[channel] exist karta hai ya nahi dekhta hai.",
+    "in_this_project": "src/scheduler.ts ka SchedulerOptions.providers field aur requireValidChannels method; src/providers.ts ka FakeChannelProvider interface.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::requireValidChannels",
+      "projects/26-social-scheduler/src/providers.ts::FakeChannelProvider",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "// real, src/scheduler.ts (trimmed)\nprivate requireValidChannels(channels: unknown): string[] {\n  const shaped = this.requireChannelsShape(channels);\n  for (const channel of shaped) {\n    if (!this.providers[channel]) throw new SchedulerError(\"UNKNOWN_CHANNEL\", `no provider registered for channel \"${channel}\"`);\n  }\n  return shaped;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Naya channel add karna sirf providers map mein ek entry add karna hai, scheduler code change nahi hota",
+      "Strategy pattern -- scheduler kabhi provider ki real identity nahi jaanta",
+      "Request-time validation, dispatch time tak surprise nahi"
+    ],
+    "disadvantages": [
+      "Compile-time typo-catch nahi milta (jaise `\"linkedn\"` typo sirf runtime par UNKNOWN_CHANNEL dega)",
+      "IDE autocomplete nahi milta valid channel names ke liye"
+    ],
+    "common_mistakes": [
+      "Yeh sochna ki channel keys kahin globally defined hain -- woh sirf jo construction ke waqt providers mein diye gaye hain",
+      "Validation dispatch time tak defer karna instead of request time"
+    ],
+    "follow_up_questions": [
+      "What would a closed enum design cost you when adding a new platform later?",
+      "How does this design differ from a Strategy pattern used elsewhere in this repo, like FakeChannelProvider vs a real sender?"
+    ],
+    "concepts": ["strategy-pattern", "runtime-validation", "trade-offs"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-104",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "cancelChannel/cancelPost use a plain 'still pending' rule, but editPost requires zero attempts on every non-canceled channel. Why is editing stricter than canceling?",
+    "answer_hinglish": "PLAN.md mein yeh literally is paragraph mein diya gaya hai: dono rules 'only while still pending' ke READING hain, par edit ki reading strict hai. Cancel ke liye kuch 'undo' karne ki zaroorat NAHI hai -- ek provider call jo abhi tak hui hi nahi hai, usko future mein hone se rokna hai. Chahe channel mid-retry ho (attempts > 0, status pending), cancel safe hai kyunki ab koi aur attempt hoga hi nahi.\n\nEdit alag hai kyunki CONTENT ek field hai POORE POST par, per channel nahi. Agar twitter ko ek baar provider ne already dekh liya hai (chahe woh attempt fail hua ho), toh us provider ka 'seen' hona un-see nahi ho sakta. Ek post jiske 2 channels hain -- ek already attempted, ek abhi fresh -- agar edit allow kare, toh content badal jaayega aur jo channel already attempted tha usne PURANA content dekha tha, naya channel NAYA content dekhega. Yeh half-edited state hai jisko express karne ka koi tarika nahi hai single `content` field mein.\n\nIsliye editPost loop karta hai har non-canceled delivery par: `if (delivery.attempts > 0) throw POST_ALREADY_DISPATCHED`. Canceled channel ko skip kiya jaata hai kyunki woh future mein kuch dekhega hi nahi -- uska attempts count matter hi nahi karta.",
+    "why_needed": "Interviewer samajhna chahta hai ki candidate 'what can be undone vs what cannot' ka distinction samajhta hai, aur single-field-vs-per-field content design ka implication.",
+    "real_world_analogy": "Ek letter jo abhi post nahi hui, use rewrite karna easy hai. Par ek letter jiska ek copy already kisi ko bheja gaya hai, uska content badalna matlab ab do log do alag versions dekhenge -- dono copies ko sync rakhna impossible hai bina dono ko wapas mangaye.",
+    "how_it_works": "cancelChannel/cancelPost: delivery.status === 'pending' hi kaafi hai. editPost: har non-canceled delivery.attempts === 0 zaroori hai, nahi toh POST_ALREADY_DISPATCHED.",
+    "in_this_project": "src/scheduler.ts ke cancelChannel, cancelPost aur editPost methods; test/cancel-edit.test.ts ka 'rejects editing a post once ANY channel has been attempted, even if that channel is still pending (mid-retry)'.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::editPost",
+      "projects/26-social-scheduler/src/scheduler.ts::cancelChannel",
+      "projects/26-social-scheduler/test/cancel-edit.test.ts",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "// real, src/scheduler.ts editPost() (trimmed)\nfor (const delivery of Object.values(record.deliveries)) {\n  if (delivery.status === \"canceled\") continue;\n  if (delivery.attempts > 0) {\n    throw new SchedulerError(\"POST_ALREADY_DISPATCHED\", `post ${postId} has already been attempted on channel ${delivery.channel}, it can no longer be edited`);\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Content consistency guaranteed -- koi channel kabhi mismatched content nahi dekhega",
+      "Cancel remains flexible -- mid-retry bhi cancel ho sakta hai, no wasted provider calls prevented from stopping"
+    ],
+    "disadvantages": [
+      "Ek single channel ka ek attempt poore post ka edit lock kar deta hai, chahe doosre channels abhi fresh hon",
+      "Caller ko workaround karna padta hai: pehle attempted channel cancel karo, phir edit karo"
+    ],
+    "common_mistakes": [
+      "Cancel aur edit ko same rule maan lena -- dono 'pending' check karte hain par different depth par",
+      "Canceled channel ko bhi attempts>0 check mein include karna, jo valid edit scenarios ko galat block kar deta"
+    ],
+    "follow_up_questions": [
+      "If content became per-channel instead of per-post, how would editPost's restriction change?",
+      "Why does canceling an attempted channel BEFORE editing unlock the edit for the rest of the post?"
+    ],
+    "concepts": ["cancel-vs-edit", "mutability", "trade-offs"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-105",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Advanced",
+    "question": "This project has no distinction between a retryable and a permanent provider failure -- every failure retries until maxAttempts. Project 21's SendResult has a retryable flag. Why the gap here?",
+    "answer_hinglish": "README ka 'Known and NOT handled' section aur PLAN.md dono explicitly yeh gap maante hain: project 21 ka `SendResult` type ek `retryable: boolean` field carry karta hai failed status ke saath (plus `invalidAddress` push tokens ke liye) -- matlab 21 jaanta hai ki kaunsi failure KABHI succeed nahi hogi (invalid credentials, deleted account) aur usse seedha skip-to-dead-letter kar sakta hai, baaki backoff schedule waste kiye bina.\n\nYeh project 26 mein nahi hai -- `ProviderResult` ka failed branch sirf `{ status: \"failed\"; reason: string }` hai, koi retryable field nahi. Har failure, chahe woh 'instance down' (temporary) ho ya 'invalid API token' (permanent) ho, SAME path se guzarti hai -- maxAttempts tak retry, phir dead_letter. Yeh ek DELIBERATE scope cut hai stage 1 ke liye, redesign nahi: PLAN.md khud kehta hai 'that is one more field on ProviderResult to add later, not a redesign.'\n\nIsko add karna low-risk hai kyunki dispatchChannel ka structure already 'result.status === sent/failed' check karta hai -- sirf failed branch mein ek naya check add hoga: `if (!result.retryable || attempts >= maxAttempts) status = dead_letter`. Existing dead-letter test (jo 'exhausts attempts' assert karta hai) bilkul waisa hi pass hota rahega kyunki woh abhi bhi maxAttempts tak retry karne wale failures ke liye valid hai -- naya path sirf EXTRA cases cover karega (retryable=false foran dead-letter).",
+    "why_needed": "Interviewer samajhna chahta hai ki candidate ek scope-cut ko identify kar sakta hai aur yeh justify kar sakta hai ki backward-compatible extension kaise design karte hain.",
+    "real_world_analogy": "Ek customer support ticket system jo har complaint ko same 3-retry escalation path se bhejta hai -- chahe woh ek simple network glitch ho ya account hi permanently band ho gaya ho. Smarter system pehle hi 'account band hai' type ki complaints ko escalate kar deta bina 3 retries waste kiye.",
+    "how_it_works": "Future ProviderResult: `{ status: \"failed\"; reason: string; retryable: boolean }`. dispatchChannel ka failure branch check karega `!result.retryable || attempts >= maxAttempts` dead_letter ke liye, instead of sirf `attempts >= maxAttempts`.",
+    "in_this_project": "src/types.ts ka current ProviderResult (no retryable field); src/scheduler.ts ka dispatchChannel failure branch; contrast project 21's src/types.ts::SendResult.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/types.ts::ProviderResult",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/21-notification/src/types.ts::SendResult",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "// current, src/types.ts\nexport type ProviderResult = { status: \"sent\"; providerId: string } | { status: \"failed\"; reason: string };\n\n// project 21's richer version, for contrast (projects/21-notification/src/types.ts)\n// | { status: \"failed\"; retryable: boolean; reason: string; invalidAddress?: boolean };",
+    "code_language": "typescript",
+    "advantages": [
+      "Simple ProviderResult shape -- fewer fields to get wrong in a fake provider",
+      "Every failure follows one uniform retry path, easy to reason about and test"
+    ],
+    "disadvantages": [
+      "A permanent failure (bad credentials) wastes the full backoff schedule before dead-lettering, delaying the dead-letter signal",
+      "No way for a provider to signal 'do not even try again' early"
+    ],
+    "common_mistakes": [
+      "Assuming every failed attempt is equally worth retrying -- real platforms do have permanent failures",
+      "Breaking the existing maxAttempts-exhaustion test when adding retryable, by forgetting attempts >= maxAttempts must still dead-letter even for retryable=true failures"
+    ],
+    "follow_up_questions": [
+      "How would you add a retryable field to ProviderResult without breaking the existing dead-letter test suite?",
+      "What should happen if a provider marks a failure retryable=false on attempt 1 -- does attempts still increment?",
+      "How does project 21's invalidAddress field suggest a similar 'permanent' signal for social channels (e.g. account disconnected)?"
+    ],
+    "concepts": ["retryable-failures", "provider-result", "scope-cut", "trade-offs"],
+    "advanced": {
+      "architecture_tradeoffs": "Retryable field add karna ProviderResult ka shape thoda complex karta hai, par dispatchChannel ka control flow barely badalta -- sirf dead_letter condition mein ek OR clause add hota hai. Yeh backward-compatible extension hai, is design ki flexibility prove karta hai.",
+      "failure_scenarios": "Bina is distinction ke, ek permanently-broken provider (jaise revoked OAuth token) poore maxAttempts * average-backoff time tak retry karta rahega bekar mein, dead-letter rate ko artificially delay karta hai aur monitoring ko confuse karta hai (channel abhi bhi 'pending' dikhta hai jab woh actually hopeless hai).",
+      "alternatives": "Provider khud circuit-breaker jaisa pattern use kare internally; ya ek alag error taxonomy (permanent/transient/unknown) banayi jaaye jo sirf dispatchChannel ki jagah kahin upar manage ho.",
+      "scale_10x_100x": "10x posts par yeh gap minor hai -- thoda wasted backoff time. 100x+ par, agar bahut saare channels ek hi permanently-broken OAuth integration share karte hain, poora backlog un sab channels ka maxAttempts*backoff tak queue mein atka rahega, jo tick()'s per-call work ko unnecessarily inflate karta hai.",
+      "production_improvements": "ProviderResult mein retryable: boolean field add karna (aur optionally invalidAddress-jaisa field channel-specific permanent issues ke liye). dispatchChannel ka dead_letter condition update karna. Dead-letter reason mein 'retryable=false, skipped remaining attempts' jaisa context add karna diagnostics ke liye."
+    }
+  },
+  {
+    "id": "SOC-106",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Advanced",
+    "question": "Why does schedulePost's idempotency check-then-set need no synchronous claim, unlike project 22 (messaging) stage 2's placeholder claim?",
+    "answer_hinglish": "Yeh PLAN.md ka sabse deliberately-contrasted decision hai. Project 22 (messaging) stage 2 mein, send/deliver jaise operations ke beech mein ek REAL `await` tha commit se pehle -- matlab do truly concurrent calls same clientRequestId ke saath dono await ke PEHLE map check kar sakte the (dono ko lagta 'yeh naya hai'), aur dono apna commit kar dete, duplicate records ban jaate. Isliye ek synchronous PLACEHOLDER claim (`pendingOps` jaisa) zaroori thi check aur commit ke beech mein 'yeh request already claim ho gaya hai' bolne ke liye.\n\nIs project mein, `schedulePost()` POORA synchronous hai -- validation, idempotency map check, record build, map set -- koi await kahin bhi nahi hai is poore path mein. JavaScript ek function body ko EK turn mein chalata hai (single-threaded event loop) -- matlab jab tak `schedulePost()` ka pehla call `return` nahi karta, uska code kabhi 'pause' nahi hota taaki doosra call beech mein shuru ho sake. Isliye doosra `schedulePost()` call, SAME clientRequestId ke saath, ONLY tab start ho sakta hai jab pehla call already return kar chuka ho -- aur us waqt tak idempotency key already map mein set ho chuki hai.\n\nYeh deliberate hai, oversight nahi -- `tick()` hi is project ka EK jagah hai jahan await hota hai, aur tick() scheduling path par kahin nahi hai.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai JavaScript ke single-threaded run-to-completion model ka exact implication concurrency safety par, aur yeh bhi ki yeh guarantee TABHI tak valid hai jab tak code truly synchronous rahe.",
+    "real_world_analogy": "Ek clerk jo pura form EK saans mein fill karta hai bina kahin rukne ke -- usse pehle woh form complete na kar le, doosra customer line mein kabhi uski jagah nahi le sakta. Par agar woh form fill karte-karte ek baar coffee break le (await), tab doosra customer uski jagah aa sakta hai aur confusion ho sakta hai.",
+    "how_it_works": "schedulePost: requireClientRequestId -> idempotency.get() check -> (if new) validate content/channels/scheduledAt -> build record -> posts.set() + idempotency.set(). Koi await kahin nahi, isliye 'check then set' hi dedupe ke liye enough hai.",
+    "in_this_project": "src/scheduler.ts ka schedulePost method -- poora method body mein koi `await` keyword hi nahi hai. Contrast: projects/22-messaging/src/messenger.ts ka claimOp/pendingOps pattern, jo waha zaroori hai kyunki wahan async commit path hai.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::schedulePost",
+      "projects/22-messaging/src/messenger.ts::claimOp",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "// real, src/scheduler.ts schedulePost() (trimmed) -- note: no `await` anywhere in this method\nconst existingId = this.idempotency.get(clientRequestId);\nif (existingId !== undefined) {\n  const existing = this.posts.get(existingId)!;\n  // ... fingerprint compare, return existing or throw IDEMPOTENCY_CONFLICT\n}\n// ... build record synchronously ...\nthis.posts.set(record.id, record);\nthis.idempotency.set(clientRequestId, record.id);",
+    "code_language": "typescript",
+    "advantages": [
+      "No extra placeholder/claim bookkeeping needed -- simpler code",
+      "No risk of a claim being left behind if something throws mid-commit (nothing is 'half-committed' since there's no await to interleave)"
+    ],
+    "disadvantages": [
+      "This guarantee breaks the moment ANY await is introduced on the scheduling path -- fragile to a future refactor",
+      "A reader unfamiliar with JS's run-to-completion model might assume a race exists and add unnecessary locking"
+    ],
+    "common_mistakes": [
+      "Adding an await to schedulePost (e.g. for a future real DB write) without also adding back a synchronous claim",
+      "Assuming this synchronous-safety argument applies to tick(), which DOES await provider.send()"
+    ],
+    "follow_up_questions": [
+      "If schedulePost() someday needed to await a real database write before committing, what would break, and what would you add back?",
+      "Why is this argument specific to JavaScript's concurrency model and would not hold in a genuinely multi-threaded language?"
+    ],
+    "concepts": ["idempotency", "concurrency", "event-loop", "trade-offs"],
+    "advanced": {
+      "architecture_tradeoffs": "Synchronous-only scheduling path ek strong simplicity win hai, par yeh ek IMPLICIT invariant hai jo code review discipline par depend karta hai -- koi automated check nahi rokta kisi future developer ko ek await add karne se bina claim wapas laaye.",
+      "failure_scenarios": "Agar koi future change schedulePost mein ek await daal de (jaise ek real persistence call) bina synchronous claim wapas laaye, toh N truly-concurrent calls same clientRequestId ke saath N duplicate posts bana sakte hain -- exactly woh bug jo messaging stage 2 explicitly guard karta hai.",
+      "alternatives": "Hamesha ek synchronous claim pattern use karna (messaging ka pendingOps jaisa) chahe abhi zaroorat na ho, taaki future-proof rahe -- par yeh is stage ke liye unnecessary complexity hoti, jab koi await hi nahi hai.",
+      "scale_10x_100x": "Yeh guarantee scale-independent hai (single process ke andar) -- 10x ya 100x calls bhi is same single-threaded run-to-completion rule follow karte hain. Jo scale IMPACT karta hai woh multi-PROCESS deployment hai, jahan har process ka apna idempotency Map hoga -- shared storage (Redis/DB) chahiye hoga cross-process dedupe ke liye.",
+      "production_improvements": "Jab bhi schedulePost real persistence add kare, PEHLE yeh decide karna ki woh persistence synchronous rahegi (in-memory ki tarah) ya async -- agar async, messaging stage 2 ka claim pattern seedha reuse karna, redesign nahi."
+    }
+  },
+  {
+    "id": "SOC-107",
+    "project_slug": "p26-social-scheduler",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Beginner",
+    "question": "Why does each post fan out to one independent ChannelDelivery per channel instead of keeping a single status field on the post as a whole?",
+    "answer_hinglish": "README/PLAN.md dono isi reasoning use karte hain jo project 22 (messaging) ke per-recipient receipts use karta hai: 'delivered' ek property hai (post, channel) PAIR ki, sirf post ki nahi. Agar poore post par ek single status hota, toh ek sawal hamesha ambiguous rehta -- agar linkedin sent ho gaya par twitter abhi retry kar raha hai, poore post ka status kya kahoge? 'Partially sent'? Yeh ek naya status value banana padta jo khud bahut kam information deta (kaunsa channel sent hua, kaunsa nahi, yeh abhi bhi alag se track karna padta).\n\nPer-channel fan-out mein yeh ambiguity hi exist nahi karti -- har channel independently apna status, attempts, nextAttemptAt, aur terminal fields (providerId/sentAt ya lastError) carry karta hai. Post-level koi aggregate status nahi hai; caller ko simply `post.deliveries` ke through har channel dekhna hota hai.\n\nYeh independence sirf STORAGE mein nahi, BEHAVIOR mein bhi guarantee hoti hai: ek channel ka provider fail/throw/dead-letter kabhi doosre channel ke counters ya status ko touch nahi karta -- dedicated tests (jaise tick.test.ts ka 'per-channel independence' describe block) isko directly assert karte hain, do providers ke beech.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate 'granularity of state' ka sahi level pick karna samajhta hai -- jab ek entity ka outcome actually kayi independent sub-entities ka outcome hai.",
+    "real_world_analogy": "Ek courier jo ek hi shipment mein 3 alag packages 3 alag addresses par bhej raha ho -- har package ka apna tracking status hota hai, poori shipment ka koi single 'delivered' ya 'not delivered' status nahi ho sakta jab tak sab packages terminal na ho jaayein.",
+    "how_it_works": "ScheduledPost.deliveries: Record<string, ChannelDelivery>. Har channel ki apni independent status/attempts/nextAttemptAt/providerId/lastError/sentAt/canceledAt fields hoti hain.",
+    "in_this_project": "src/types.ts ka ScheduledPost.deliveries aur ChannelDelivery; test/tick.test.ts ka 'per-channel independence' describe block jo 2 providers ke beech counters ko assert karta hai.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/types.ts::ScheduledPost",
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery",
+      "projects/26-social-scheduler/test/tick.test.ts"
+    ],
+    "code_example": "// real, src/types.ts\nexport interface ScheduledPost {\n  readonly id: string;\n  readonly channels: readonly string[];\n  readonly deliveries: Record<string, ChannelDelivery>; // keyed by channel, each independent\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "No ambiguous aggregate status -- each channel's truth is explicit",
+      "A failing channel never masks or corrupts a sibling's state",
+      "Natural to extend: adding a channel is just adding another entry in the deliveries map"
+    ],
+    "disadvantages": [
+      "Caller must iterate deliveries themselves to answer 'is this post fully done' -- there is no single convenience field",
+      "A post targeting many channels has proportionally more state to inspect"
+    ],
+    "common_mistakes": [
+      "Trying to derive a single post-level status and caching it, which then needs to be kept in sync with every channel change",
+      "Assuming one channel's retry count affects a sibling's -- the tests exist specifically to disprove this"
+    ],
+    "follow_up_questions": [
+      "If a post targets 100 channels, at what point does a plain object keyed by channel stop being the right data structure?",
+      "How would you compute a derived 'overall post status' for a UI without storing it as mutable state?"
+    ],
+    "concepts": ["per-channel-state", "data-modeling", "trade-offs"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-108",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "What is missing from this project before it could actually schedule real posts to real social platforms?",
+    "answer_hinglish": "Sabse pehla aur sabse bada gap: REAL provider implementations. Abhi `FakeChannelProvider` interface ko sirf `AlwaysSucceedsProvider`/`AlwaysFailsProvider`/`FlakyProvider` implement karte hain -- koi inme se kabhi real LinkedIn/Twitter/Mastodon API call nahi karta. Production mein har platform ke liye ek real provider likhna padega jo unke actual REST/GraphQL APIs call kare.\n\nUske saath hi OAuth zaroori hai -- har social platform apne account ko access karne ke liye OAuth token maangta hai, aur woh tokens EXPIRE hote hain, refresh karne padte hain. Abhi iska koi trace nahi hai is project mein -- FakeChannelProvider ka `send()` kabhi kisi credential ki parwaah nahi karta.\n\nTeesra: per-channel content length rules. Abhi `MAX_CONTENT_LENGTH = 2000` HAR channel ke liye same hai, par Twitter ka limit ~280 characters hai, LinkedIn ka ~3000 -- ek post jo linkedin ke liye theek hai woh twitter ko bhejne par turant reject ho sakta hai REAL platform se, jo abhi is project mein kabhi nahi hoga kyunki fake providers content length check hi nahi karte.\n\nChautha: `tick()` abhi polled hai, ek single in-process caller ke through -- real deployment mein multiple workers chahiye honge throughput ke liye, jiske liye project 21 jaisa job queue with leases zaroori hoga, idempotency key expiry (abhi keys kabhi expire nahi hote, memory grow karti hai), aur ek HTTP/worker layer jo abhi exist hi nahi karti.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek 'fake provider, in-memory' prototype aur ek real production system ke beech ka GAP identify kar sakta hai, specifically is codebase ke context mein.",
+    "real_world_analogy": "Ek demo app jo screenshot dikhata hai 'email sent!' bina kabhi real SMTP server ko touch kiye -- woh demo kaam karta hai, par production mein actual email provider, credentials, retry policy, aur rate limits sab chahiye honge.",
+    "how_it_works": "FakeChannelProvider interface already abstraction hai jahan real providers plug ho sakte hain -- scheduler khud kabhi nahi badalna padega, sirf naya class likhna hoga jo FakeChannelProvider implement kare real API calls ke saath.",
+    "in_this_project": "src/providers.ts ka FakeChannelProvider interface aur teen fake implementations; src/scheduler.ts ka MAX_CONTENT_LENGTH constant (single, not per-channel).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/providers.ts::FakeChannelProvider",
+      "projects/26-social-scheduler/src/scheduler.ts::MAX_CONTENT_LENGTH",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "FakeChannelProvider interface already provides the right seam -- real providers can be dropped in without touching SocialScheduler",
+      "The fake-provider test suite (providers/tick/cancel-edit) gives confidence the orchestration logic is correct before real integrations are added"
+    ],
+    "disadvantages": [
+      "Real providers introduce network latency, rate limits, and partial failures the fake providers never model",
+      "OAuth token lifecycle management is a whole additional subsystem not represented anywhere in this project today"
+    ],
+    "common_mistakes": [
+      "Assuming the orchestration logic (retry/backoff/dead-letter) needs to change for real providers -- it does not, only the provider implementations do",
+      "Forgetting per-channel content limits until a real post gets rejected by a real platform"
+    ],
+    "follow_up_questions": [
+      "How would you design a real LinkedinProvider that implements FakeChannelProvider's send() signature?",
+      "Where would OAuth token refresh logic live -- inside the provider, or as a separate concern the scheduler is unaware of?",
+      "What would need to change in schedulePost's validation to support per-channel content limits?"
+    ],
+    "concepts": ["production-readiness", "providers", "oauth", "gap-analysis"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-109",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "How would you add per-channel content length rules (Twitter's ~280 characters vs LinkedIn's ~3000) to this project?",
+    "answer_hinglish": "Abhi `requireContent` sirf EK global check karta hai: `content.length > MAX_CONTENT_LENGTH` (2000). Yeh check `schedulePost`/`editPost` dono mein, VALIDATION time par hota hai, channel-specific nahi -- content ek single string hai poore post ke liye, channels sirf ek list hain.\n\nPer-channel limits add karne ke liye sabse pehla sawal yeh hai: content TOH ek field hai poore post par (jaisa SOC-104/107 mein discuss hua), toh ek hi content string ko ALAG-ALAG limits ke against kaise check karoge? Simplest approach: schedulePost validation mein, har channel ke liye ek `CHANNEL_LIMITS: Record<string, number>` config dekho, aur `content.length` ko SABSE CHHOTE applicable limit ke against check karo (jo channels is post mein target kiye gaye hain) -- taaki jo bhi content accept ho, woh HAR target channel ke liye valid ho.\n\nIska downside yeh hai ki agar koi post sirf linkedin (3000 limit) target kare, uska content bhi 280 se bada nahi ho sakta agar validation 'minimum of all registered channels' use kare instead of 'minimum of THIS post's channels' -- isliye sahi design woh hai jo sirf is specific schedulePost call ke `request.channels` ko dekhe, poore providers map ko nahi.\n\nEk alternative (zyada flexible, zyada complex): per-channel content override allow karna -- post ka ek base content ho, aur optionally per-channel override. Yeh scope creep hai is stage ke liye; PLAN.md explicitly 'one content length limit for every channel' ko current scope ke andar hi rakhta hai.",
+    "why_needed": "Interviewer yeh dekhna chahta hai ki candidate 'single content field + multiple target constraints' ka validation design kar sakta hai, aur per-post vs per-provider scope ka difference samajhta hai.",
+    "real_world_analogy": "Ek hi speech jo tum alag-alag venues mein doge -- agar ek venue ka time-limit 2 minute hai aur doosre ka 10 minute, tumhe apni speech itni chhoti rakhni padegi ki SABSE CHHOTE venue mein bhi fit ho jaaye, warna har venue ke liye alag speech likhni padegi.",
+    "how_it_works": "Proposed: har channel ke liye ek max-length config maintain karo (provider-level ya constructor option). schedulePost ke requireContent mein, is post ke target channels ke limits ka MINIMUM lo, aur content ko uske against check karo.",
+    "in_this_project": "src/scheduler.ts ka requireContent (current single MAX_CONTENT_LENGTH check) aur requireValidChannels (jahan channel list already iterate hoti hai validation ke dauraan).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::requireContent",
+      "projects/26-social-scheduler/src/scheduler.ts::requireValidChannels",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "// illustrative, not in the repo today\nconst CHANNEL_LIMITS: Record<string, number> = { twitter: 280, linkedin: 3000, mastodon: 500 };\n\nfunction requireContentForChannels(content: string, channels: string[]): string {\n  const limit = Math.min(...channels.map((c) => CHANNEL_LIMITS[c] ?? MAX_CONTENT_LENGTH));\n  if (content.length > limit) {\n    throw new SchedulerError(\"INVALID_REQUEST\", `content exceeds the ${limit}-character limit for one of the targeted channels`);\n  }\n  return content;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "A single content field stays simple to reason about -- no per-channel override complexity",
+      "Catches an unpostable-on-one-channel post at request time, before any channel ever dispatches"
+    ],
+    "disadvantages": [
+      "A post targeting Twitter and LinkedIn together is forced down to Twitter's tighter limit even for LinkedIn's delivery",
+      "Does not let a caller write a longer LinkedIn-specific version and a shorter Twitter-specific one in the same post"
+    ],
+    "common_mistakes": [
+      "Checking content length against the minimum limit across ALL registered providers instead of just this post's target channels",
+      "Forgetting to apply the same per-channel check inside editPost's content validation, not just schedulePost's"
+    ],
+    "follow_up_questions": [
+      "How would per-channel content overrides change the ScheduledPost and ChannelDelivery types?",
+      "Where should the CHANNEL_LIMITS config live -- hardcoded, a constructor option, or a property the provider itself exposes?"
+    ],
+    "concepts": ["validation", "per-channel-limits", "production-gap"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-110",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Senior/System Design",
+    "question": "A marketing team wants multiple worker processes dispatching due posts concurrently for higher throughput. What has to change?",
+    "answer_hinglish": "Abhi `tick()` ek single-caller model assume karta hai -- `dispatching` Set sirf SAME caller ke apne overlap (slow provider + doosra tick() call) ke against protect karta hai. Agar DO ALAG processes same scheduler instance (ya worse, alag in-memory instances) par tick() call karein, do problems aayenge: (1) agar woh same in-memory SocialScheduler object share kar rahe hain, `dispatching` Set abhi bhi kaam karega kyunki JS single-threaded hai -- par yeh in-process multi-worker scenario hai, real multi-PROCESS nahi. (2) Agar har process ka apna ALAG SocialScheduler instance hai (jo horizontal scaling mein normal hai), har process ka apna `posts` Map, apna `idempotency` Map, apna `dispatching` Set hoga -- koi coordination nahi, SAME due channel do processes se dobara dispatch ho sakta hai.\n\nReal fix: PLAN.md khud point karta hai project 21 (notification) stage 2 ki taraf -- ek lease-based job queue (`InMemoryJobQueue` jaisa, par real deployment mein ek shared backend jaisa Postgres `FOR UPDATE SKIP LOCKED` ya Redis). Har due channel ek 'job' ban jaata, ek worker usse `claim(now, max, leaseMs)` karta -- ek `leaseToken` milta hai, aur sirf WOHI token wala worker `complete`/`reschedule` kar sakta hai. Agar worker crash ho jaaye lease expire hone se pehle commit kiye bina, job automatically visible ho jaata hai doosre worker ke liye.\n\nSaath hi, `posts`/`idempotency`/`dispatching` sab ek SHARED durable store mein jaana chahiye (abhi sab in-memory Maps hain, per-process) -- nahi toh workers ek doosre ki state dekh hi nahi payenge.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate single-process polling se multi-worker distributed dispatch tak scale karne ka poora path samajhta hai, aur existing codebase (project 21) ka reference kar sakta hai.",
+    "real_world_analogy": "Ek hi restaurant mein ek waiter sab orders khud track karta hai apne notepad par -- yeh kaam karta hai jab tak sirf ek waiter hai. Jaise hi 5 waiters ek saath kaam karte hain, sabko ek SHARED order board chahiye jahan ek order EK hi waiter ko assign ho, aur agar woh waiter busy ho jaaye, kisi aur ko mil sake.",
+    "how_it_works": "Each due channel becomes a claimable job (postId:channel). A worker calls claim(), gets a leaseToken, dispatches, then complete()/reschedule(). Shared state (posts, idempotency, the job queue itself) must live in a backend all worker processes can see.",
+    "in_this_project": "src/scheduler.ts's current in-process dispatching Set and tick(); project 21's src/queue.ts (JobQueue interface, InMemoryJobQueue) and src/worker.ts are the reusable reference design named in PLAN.md.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/21-notification/src/queue.ts::InMemoryJobQueue",
+      "projects/21-notification/src/worker.ts",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "A lease-based queue lets throughput scale roughly linearly with worker count (within the backend's capacity)",
+      "Project 21's design is already built and tested -- this is reuse, not a from-scratch design"
+    ],
+    "disadvantages": [
+      "Requires a shared durable backend (DB/Redis) instead of in-memory Maps -- a real infrastructure dependency",
+      "Lease tuning (leaseMs too short re-claims live work, too long delays recovery from a dead worker) becomes an operational concern"
+    ],
+    "common_mistakes": [
+      "Running multiple workers against separate in-memory SocialScheduler instances and assuming the dispatching Set protects across processes -- it does not, it is per-instance",
+      "Forgetting that posts/idempotency also need to be shared, not just the job queue"
+    ],
+    "follow_up_questions": [
+      "What happens to a channel's attempts counter if a worker claims it, starts dispatching, then crashes before completing?",
+      "How would you size leaseMs relative to how long a real provider's send() call might take?",
+      "What would the migration path look like from today's in-memory tick() to this design, without a full rewrite?"
+    ],
+    "concepts": ["job-queue", "leases", "horizontal-scaling", "system-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Moving to a lease-based job queue trades today's zero-infrastructure simplicity (in-memory Maps/Set) for a real shared backend dependency -- a necessary trade the moment more than one process needs to drive dispatch, but not free: every operation that used to be a plain Map lookup becomes a network call.",
+      "failure_scenarios": "A worker that claims a job, calls provider.send(), then crashes before calling complete() leaves the job claimed until its lease expires -- during that window the channel is neither dispatched again nor visibly stuck, which could look like a silent delay to monitoring unless lease-expiry events are also tracked.",
+      "alternatives": "A fully external managed queue (SQS, Pub/Sub) instead of a custom lease table; or sharding posts across workers by postId hash so each worker owns a disjoint subset with no claiming needed at all, trading dynamic load-balancing for simplicity.",
+      "scale_10x_100x": "At 10x throughput needs, a handful of workers against a shared InMemoryJobQueue-style backend is enough. At 100x, the backend itself (claim()'s scan, lock contention) becomes the bottleneck, pushing toward a database-indexed or broker-backed queue instead of a simple shared table.",
+      "production_improvements": "Reuse project 21's JobQueue interface and InMemoryJobQueue as the starting contract, swap its backing store for a durable one (Postgres SKIP LOCKED or Redis) before going multi-process, and add lease-expiry monitoring so a crashed worker's stuck claim is visible, not silent."
+    }
+  },
+  {
+    "id": "SOC-111",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "What would you monitor in production to catch a channel that's quietly dead-lettering more than it should?",
+    "answer_hinglish": "Sabse direct metric: DEAD-LETTER RATE PER CHANNEL -- har channel ke liye, kitne percent delivery attempts `dead_letter` par khatam hue, ek rolling window (jaise last 1 hour) mein. Is project mein `ChannelDelivery.status === \"dead_letter\"` aur `lastError` already available hai har delivery record par -- ek monitoring layer `scheduler.list()` ko poll kar sakta hai (ya events emit karne ka mechanism add kiya ja sakta hai dispatchChannel mein) aur per-channel count nikal sakta hai.\n\nEk acha threshold: agar ek specific channel ka dead-letter rate baaki channels se SIGNIFICANTLY zyada hai (jaise linkedin 1% par hai par mastodon 40% par), yeh ek strong signal hai ki us channel ka PROVIDER problem hai -- shayad token expire ho gaya, shayad rate-limited ho raha hai, shayad instance down hai -- is project ke context mein, `lastError` string isi reason ko already carry karta hai diagnostics ke liye.\n\nDoosra complementary metric: AVERAGE ATTEMPTS-TO-SUCCESS per channel. Agar ek channel consistently `attempts=1` par sent ho raha hai, woh healthy hai. Agar average attempts 3-4 ke close pahunch raha hai (maxAttempts ke close), yeh channel 'almost dead-lettering' zone mein hai -- ek EARLY WARNING signal dead-letter rate spike hone se PEHLE.\n\nTeesra: BACKLOG size -- kitne channels abhi `pending` aur `nextAttemptAt <= now` hain (due but undispatched) -- agar yeh number badh raha hai, matlab tick() itni frequently nahi chal rahi ya throughput kaafi nahi hai.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate per-channel observability design kar sakta hai existing data model (status, attempts, lastError) ka use karke, bina naya infrastructure invent kiye.",
+    "real_world_analogy": "Ek call center jahan har agent ka apna 'dropped call rate' track hota hai -- agar ek agent ka rate suddenly spike kare baaki sabse zyada, supervisor usi agent ki line check karega, poore call center ko nahi.",
+    "how_it_works": "Poll (or event-hook) scheduler.list(), aggregate deliveries by channel: count of dead_letter / total terminal (sent + dead_letter) over a time window = dead-letter rate. Sum of attempts for sent deliveries / count of sent = average attempts-to-success.",
+    "in_this_project": "src/types.ts ka ChannelDelivery (status, attempts, lastError fields already present); src/scheduler.ts ka list() method jo saare posts snapshot deta hai.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery",
+      "projects/26-social-scheduler/src/scheduler.ts::list"
+    ],
+    "code_example": "// illustrative monitoring snippet, built on the public API\nfunction deadLetterRateByChannel(scheduler: SocialScheduler): Record<string, number> {\n  const terminal: Record<string, { dead: number; total: number }> = {};\n  for (const post of scheduler.list()) {\n    for (const d of Object.values(post.deliveries)) {\n      if (d.status !== \"sent\" && d.status !== \"dead_letter\") continue;\n      terminal[d.channel] ??= { dead: 0, total: 0 };\n      terminal[d.channel]!.total++;\n      if (d.status === \"dead_letter\") terminal[d.channel]!.dead++;\n    }\n  }\n  return Object.fromEntries(Object.entries(terminal).map(([c, v]) => [c, v.dead / v.total]));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Uses data already on ChannelDelivery -- no new fields or events strictly required to get started",
+      "Per-channel granularity immediately isolates which integration is unhealthy"
+    ],
+    "disadvantages": [
+      "Polling scheduler.list() repeatedly over many posts is O(n) each time -- a real deployment would want this emitted as events instead",
+      "A rolling window needs its own time-series storage; this project has no built-in metrics emission"
+    ],
+    "common_mistakes": [
+      "Looking only at an aggregate dead-letter rate across all channels, which hides one badly-behaving channel among many healthy ones",
+      "Alerting only on dead_letter count instead of a RATE, which doesn't account for traffic volume differences between channels"
+    ],
+    "follow_up_questions": [
+      "How would you turn this polling-based metric into an event-driven one without changing tick()'s public signature?",
+      "What would you alert on first: a dead-letter rate spike, or a rising average-attempts-to-success trend?"
+    ],
+    "concepts": ["monitoring", "observability", "dead-letter", "production"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-112",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Intermediate",
+    "question": "What would you check first if an on-call engineer gets paged 'posts aren't going out'?",
+    "answer_hinglish": "Sabse pehla sawal: tick() CALL ho raha hai ya nahi? Yeh project bilkul explicitly 'tick() is polled' hai -- koi internal scheduler loop nahi hai (README mein likha hai, project 21's flushDue() jaisa). Agar caller ne tick() ko call karna ROKH diya (cron job down, worker process crashed), koi post kabhi dispatch nahi hoga chahe scheduler ka internal state bilkul healthy ho. Yeh sabse common aur sabse boring cause hota hai production mein.\n\nDoosra check: due-but-undispatched BACKLOG kitna bada hai -- `pending` status wale channels jinka `nextAttemptAt <= now`. Agar backlog grow kar raha hai (tick() chal raha hai par posts accumulate ho rahe hain), matlab tick() ki FREQUENCY kaafi nahi hai load ke against, ya ek specific tick() call fail/hang ho rahi hai.\n\nTeesra: kya saare posts affected hain ya sirf ek CHANNEL? Agar sirf ek channel (jaise mastodon) stuck hai aur baaki (linkedin/twitter) normally dispatch ho rahe hain, problem us specific provider mein hai (dead letters, ya provider.send() hang ho raha hai) -- `dispatching` guard set check karo: agar koi `postId:channel` key permanently stuck reh gayi hai (jo ek bug hoga -- `finally` block mein `dispatching.delete()` guaranteed hona chahiye), woh channel kabhi phir se claimed nahi hoga.\n\nChautha: clock drift -- agar is deployment mein `systemClock` use ho raha hai aur server ka system time galat set hai, `scheduledAt`/`nextAttemptAt` comparisons galat result de sakte hain.",
+    "why_needed": "Interviewer ek realistic on-call debugging checklist expect karta hai, is specific project ke actual mechanisms (polled tick, dispatching guard, per-channel independence) ke against grounded.",
+    "real_world_analogy": "Ek factory assembly line jahan koi worker kabhi machine ka start button nahi dabata -- machine khud bilkul theek hai, bas koi usse chalaa hi nahi raha. Pehla check hamesha yeh hona chahiye ki machine chalaayi gayi thi ya nahi, phir machine ke andar jaake dekhna chahiye.",
+    "how_it_works": "Check: (1) is tick() being invoked at all, (2) due-but-pending backlog size and trend, (3) is the stall isolated to one channel/provider, (4) clock correctness. Each maps to a distinct known failure mode in this project's design.",
+    "in_this_project": "src/scheduler.ts ka tick() (the only dispatch entrypoint) aur dispatching Set (should never leak a stuck key thanks to the try/finally in dispatchChannel).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "Each check maps directly to a known, documented mechanism in this project -- no guesswork needed",
+      "The checks are ordered cheapest-and-most-likely-first (is tick even running?) before deeper state inspection"
+    ],
+    "disadvantages": [
+      "Without added monitoring (SOC-111/113), several of these checks require manually inspecting scheduler.list() rather than a dashboard",
+      "A stuck dispatching key due to a real bug would be very hard to detect without inspecting the Set directly, since it is private"
+    ],
+    "common_mistakes": [
+      "Jumping straight to 'the provider must be down' before confirming tick() is even being called",
+      "Treating a single-channel stall as a whole-system outage instead of checking per-channel independence first"
+    ],
+    "follow_up_questions": [
+      "How would you expose the dispatching Set's size or contents for debugging without making it part of the public API?",
+      "What would make you suspect a clock problem specifically, versus a tick()-not-running problem?"
+    ],
+    "concepts": ["debugging", "on-call", "production", "tick"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-113",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Senior/System Design",
+    "question": "How would you monitor the backlog of due-but-undispatched channels, and what would you alert on?",
+    "answer_hinglish": "Backlog ka definition yahan precise hai: woh channels jinka `status === \"pending\"` AND `nextAttemptAt <= now` -- matlab woh dispatch ho jaane CHAHIYE the par abhi tak nahi hue (ya toh tick() nahi chala, ya `dispatching` guard ne unhe skip kiya pichhle call mein). Yeh backlog size ek SINGLE number hai jo poore system ki dispatch-health ko summarize karta hai.\n\nComputation: `scheduler.list()` se saare posts lo, har delivery check karo `status === 'pending' && nextAttemptAt <= clock.now()`. Is project mein koi built-in metric emitter nahi hai, isliye production mein yeh ek periodic job hoga jo scheduler state snapshot leta hai (ya better, tick() ke return value -- jo 'count of attempts made this call' deta hai -- ko ek counter mein track karta hai, plus ek ALAG query jo backlog size directly measure kare).\n\nAlerting strategy: ABSOLUTE size se zyada important hai TREND aur AGE. Ek backlog of 50 channels normal ho sakta hai agar woh hamesha turant clear ho jaata hai next tick() par. Par agar backlog GROW kar raha hai consistently (tick() rate se zyada tezi se naye due channels aa rahe hain), ya agar koi channel backlog mein LAMBE time se (jaise 10+ minutes se due) hai, yeh dono clear signals hain ki dispatch throughput kaafi nahi hai ya kuch stuck hai.\n\nEk additional refinement: backlog ko PER-CHANNEL bhi track karna -- agar sirf ek channel ka backlog badh raha hai (baaki clear ho rahe hain), problem us specific provider mein hai, poore tick() mechanism mein nahi.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate throughput-health metrics design kar sakta hai aur trend/age ko absolute count se zyada important samajhta hai alerting ke liye.",
+    "real_world_analogy": "Ek airport ki security line -- line ki length khud itni problem nahi jitna yeh ki line KITNI DER se badh rahi hai ya koi passenger line mein 30 minute se zyada waqt se khada hai. Ek line jo turant clear ho jaati hai woh fine hai, chahe woh lambi dikh rahi ho.",
+    "how_it_works": "backlogSize = count of channels where status==pending and nextAttemptAt<=now. Track this over time (trend) and separately track max(now - nextAttemptAt) across those channels (age/staleness) for the oldest stuck one.",
+    "in_this_project": "src/scheduler.ts ka tick() internal due-detection logic (same filter, exposed read-only for monitoring) and ChannelDelivery.nextAttemptAt.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery"
+    ],
+    "code_example": "// illustrative monitoring snippet, built on the public API\nfunction dueBacklog(scheduler: SocialScheduler, now: number): { channel: string; staleMs: number }[] {\n  const stuck: { channel: string; staleMs: number }[] = [];\n  for (const post of scheduler.list()) {\n    for (const d of Object.values(post.deliveries)) {\n      if (d.status === \"pending\" && d.nextAttemptAt <= now) {\n        stuck.push({ channel: d.channel, staleMs: now - d.nextAttemptAt });\n      }\n    }\n  }\n  return stuck;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Directly derived from existing fields -- no schema change needed to start measuring this",
+      "Separating trend/age from raw count avoids false alarms on a naturally-bursty but healthy backlog"
+    ],
+    "disadvantages": [
+      "Computing this by scanning every post (O(n)) does not scale well without an index by nextAttemptAt as post volume grows",
+      "No built-in event hook in this project -- monitoring has to poll externally"
+    ],
+    "common_mistakes": [
+      "Alerting on raw backlog count alone without considering normal traffic bursts",
+      "Not distinguishing a backlog that clears within one tick() cycle from one that keeps growing cycle over cycle"
+    ],
+    "follow_up_questions": [
+      "What data structure change would make computing this backlog cheaper than an O(n) scan over every post?",
+      "How would you turn tick()'s return value (count of channel-attempts made) into a throughput metric alongside this backlog metric?"
+    ],
+    "concepts": ["backlog", "monitoring", "alerting", "system-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Computing backlog by scanning scheduler.list() is the simplest possible implementation and needs zero schema changes, but it couples monitoring cost directly to total post volume rather than to backlog size itself -- an architecture with a proper due-time index would decouple the two.",
+      "failure_scenarios": "A slow but steady backlog growth (tick() running, but at a rate slightly below incoming due-channel rate) is easy to miss with a simple threshold alert, since the backlog may stay under any fixed number for a long time before suddenly becoming large -- a trend-based alert (rate of change) catches this far earlier than an absolute-size alert.",
+      "alternatives": "Emit a backlog-size event directly from inside tick() itself (computed once per call as a byproduct of the existing scan, nearly free) instead of a separate external polling job that re-scans everything; or maintain a running due-count incrementally as deliveries transition status, avoiding full rescans entirely.",
+      "scale_10x_100x": "At 10x post volume, the O(n) scan-based backlog check is still cheap enough to run every few seconds. At 100x+, re-scanning every post purely for monitoring becomes a meaningful tax on top of tick()'s own scan cost (SOC-114) -- at that point, deriving the metric from tick()'s own pass (rather than a separate scan) becomes worth the refactor.",
+      "production_improvements": "Have tick() itself emit {due: due.length, oldestStaleMs} as part of its return/telemetry instead of relying on an external poll that duplicates the scan. Alert on sustained upward trend over a rolling window and on any single channel's staleness exceeding an SLA threshold, not on raw backlog size alone."
+    }
+  },
+  {
+    "id": "SOC-114",
+    "project_slug": "p26-social-scheduler",
+    "category": "Production Scenarios",
+    "difficulty": "Advanced",
+    "question": "A marketing team wants to schedule thousands of posts across hundreds of channels for a product launch. What in this project's current design would fall over first, and how would you plan capacity around it?",
+    "answer_hinglish": "Pehla bottleneck: `tick()` ka due-detection step `for (const record of this.posts.values()) for (const delivery of Object.values(record.deliveries))` -- yeh HAR post, HAR channel ko scan karta hai HAR tick() call par, chahe woh due ho ya nahi. Thousands of posts x hundreds of channels each matlab lakhon deliveries HAR tick() mein scan ho rahi hain -- yeh O(total deliveries) hai, O(due deliveries) nahi. Jaise volume badhta hai, tick()'s latency badhta jaayega chahe actual due work chhota ho.\n\nDoosra: `providers` map ek fixed set hai -- agar launch mein naye channels (jaise naye regional accounts) dynamically add karna ho, abhi sirf constructor time par providers diye ja sakte hain, runtime par naya provider register karne ka koi method nahi hai.\n\nTeesra: sab kuch ek single in-memory process mein hai -- ek bada launch burst (thousands of posts simultaneously due, jaise sabka `scheduledAt` ek hi campaign-launch-time ho) ek SINGLE tick() call ko bahut saari `Promise.all` dispatches ek saath chalane ke liye force karega -- yeh is project ke current design mein koi concurrency limit nahi hai, matlab ek burst poore event loop ko busy kar sakta hai.\n\nCapacity planning ke liye: (1) ek indexed due-queue (nextAttemptAt se sorted) banana taaki tick() sirf ACTUALLY due channels scan kare, O(n) nahi. (2) tick() ki dispatch batch size limit karna (jaise ek baar mein max 500 channels), taaki ek bada burst poora event loop block na kare. (3) SOC-110 wala multi-worker job queue design, taaki throughput single-process limit se aage badh sake.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate specific implementation details (O(n) scan, Promise.all without a concurrency cap) se real scaling bottleneck identify kar sakta hai, generic answers nahi deta.",
+    "real_world_analogy": "Ek chhoti reception desk jahan ek person HAR visitor ka naam poore guest-book mein scan karta hai yeh check karne ke liye ki unka appointment abhi hai ya nahi -- yeh fine hai 10 visitors ke liye, par 10,000 visitors ke saath, poora guest-book baar-baar scan karna khud ek bottleneck ban jaata hai.",
+    "how_it_works": "tick()'s current scan is O(total deliveries across all posts) every call. A burst of simultaneously-due channels is dispatched via a single unbounded Promise.all, with no concurrency cap.",
+    "in_this_project": "src/scheduler.ts ka tick() method -- the full for-loop over this.posts.values() and the unbounded Promise.all(due.map(...)).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "",
+    "code_language": "text",
+    "advantages": [
+      "The current O(n) scan is simple and correct for the scale this project targets (stage 1, interview-focused)",
+      "Identifying this now, before it is a real bottleneck, is cheap -- the fix is additive (an index, a batch cap), not a rewrite"
+    ],
+    "disadvantages": [
+      "Without an index, due-detection cost grows linearly with total post volume, not with actual due work",
+      "An unbounded Promise.all on a large burst risks exhausting resources (open connections, memory) all at once"
+    ],
+    "common_mistakes": [
+      "Assuming more frequent tick() calls alone solves a throughput problem, when the scan cost itself is the bottleneck",
+      "Launching a huge simultaneous burst (same scheduledAt for thousands of posts) without staggering it, maximizing the worst-case tick() cost"
+    ],
+    "follow_up_questions": [
+      "What data structure would turn tick()'s due-detection from O(total deliveries) into O(due deliveries)?",
+      "How would you stagger a marketing team's bulk scheduledAt values to avoid a single enormous due-burst?",
+      "What concurrency cap would you add to tick()'s dispatch step, and how would you choose its value?"
+    ],
+    "concepts": ["capacity-planning", "scalability", "algorithmic-complexity", "production"],
+    "advanced": {
+      "architecture_tradeoffs": "Ek sorted due-index (jaise min-heap by nextAttemptAt) tick() ko fast banata hai, par maintain karna costlier hai -- har status transition (cancel, retry-reschedule, dead-letter) ko index update karna padega, jo abhi plain object mutation se zyada complex hai.",
+      "failure_scenarios": "Bina kisi fix ke, ek bada launch burst tick()'s scan cost ko spike karega exactly jab system ki zaroorat sabse zyada ho (launch time) -- worst-case timing ka classic example, jahan monitoring (SOC-113) backlog ek sudden spike dikhayega.",
+      "alternatives": "Ek priority-queue/min-heap by nextAttemptAt; ya posts ko channel-wise bucket karna taaki ek channel ka backlog doosre channel ki scan cost ko affect na kare; ya database-backed indexing agar persistence add ho rahi hai (SOC jobs queue design).",
+      "scale_10x_100x": "10x par current O(n) scan abhi bhi manageable hai (milliseconds). 100x+ (lakhon deliveries) par, scan cost noticeable lag create karega har tick() call mein -- is point par ek indexed due-queue ya database query (SOC-110 ka shared backend) zaroori ban jaata hai.",
+      "production_improvements": "Due-detection ko O(due) banane ke liye ek index add karna. tick()'s dispatch batch ko concurrency-capped banana. Bulk-scheduling tools ko staggered scheduledAt suggest karne ke liye guide karna, taaki simultaneous due-bursts avoid ho sakein."
+    }
+  },
+  {
+    "id": "SOC-115",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "Walk through tick()'s exact control flow, from scanning posts to calling a FakeChannelProvider.",
+    "answer_hinglish": "`tick()` teen phases mein chalta hai, poore method mein. Phase 1 (scan): `const now = this.clock.now()`, phir DOUBLE for-loop -- `for (const record of this.posts.values())` aur uske andar `for (const delivery of Object.values(record.deliveries))`. Har delivery ke liye check hota hai teen conditions ek saath: `delivery.status === \"pending\"`, `delivery.nextAttemptAt <= now`, aur `!this.dispatching.has(key)` jahan `key = postId:channel`. Teeno true hone par hi woh `due` array mein push hota hai `{ record, delivery }` ke saath.\n\nPhase 2 (claim): due array ke HAR entry ke liye, `this.dispatching.add(key)` call hota hai -- yeh LOOP hai, saari claims phase 1 scan khatam hone ke BAAD hoti hain, ek saath (synchronously, ek hi for-loop mein, koi await nahi abhi tak).\n\nPhase 3 (dispatch): `await Promise.all(due.map(({ record, delivery }) => this.dispatchChannel(record, delivery)))` -- yeh SAARE claimed channels ko PARALLEL dispatch karta hai. `dispatchChannel` private method hai: `delivery.attempts += 1` (SYNCHRONOUS, await se pehle), phir `provider.send({...})` await hota hai try/catch ke andar (throw bhi 'failed' treat hota hai), phir result ke hisaab se status/providerId/sentAt ya lastError/nextAttemptAt/dead_letter update hota hai, aur `finally` block mein `this.dispatching.delete(key)` GUARANTEED chalta hai.\n\n`tick()` return karta hai `due.length` -- kitne channel-attempts is call mein hue.",
+    "why_needed": "Interviewer exact code-trace expect karta hai, line-by-line, is method ko samajhne ke liye kitni depth tak -- yeh dekhne ke liye ki candidate ne sirf docs nahi, actual code pada hai.",
+    "real_world_analogy": "Ek kitchen order system -- pehle saare pending orders dekho jo abhi ready-to-cook hain (scan), phir unhe ek chef ko assign karo taaki do chef same order na bana lein (claim), phir sab chefs apna-apna order parallel mein banate hain (dispatch), aur jab koi chef khatam kare, uska naam board se hatao chahe order succeed ho ya fail ho (finally).",
+    "how_it_works": "Scan (filter pending+due+not-already-dispatching) -> claim (mark dispatching) -> dispatch (Promise.all over dispatchChannel, each with attempts++ before its one await, and a finally that always releases the dispatching claim).",
+    "in_this_project": "src/scheduler.ts ka tick() method aur private dispatchChannel method -- exact two-phase (scan-then-claim, then dispatch) structure.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel"
+    ],
+    "code_example": "// real, src/scheduler.ts (trimmed)\nasync tick(): Promise<number> {\n  const now = this.clock.now();\n  const due: { record: PostRecord; delivery: ChannelDelivery }[] = [];\n  for (const record of this.posts.values()) {\n    for (const delivery of Object.values(record.deliveries)) {\n      const key = `${record.id}:${delivery.channel}`;\n      if (delivery.status === \"pending\" && delivery.nextAttemptAt <= now && !this.dispatching.has(key)) {\n        due.push({ record, delivery });\n      }\n    }\n  }\n  for (const { record, delivery } of due) this.dispatching.add(`${record.id}:${delivery.channel}`);\n  await Promise.all(due.map(({ record, delivery }) => this.dispatchChannel(record, delivery)));\n  return due.length;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Clear two-phase separation (scan-and-claim fully synchronous, then dispatch) makes the one race window easy to reason about",
+      "finally guarantees dispatching never leaks a stuck key even if a provider throws or the whole method is interrupted"
+    ],
+    "disadvantages": [
+      "The scan is O(total deliveries across all posts), not O(due deliveries) -- see SOC-114",
+      "Promise.all has no concurrency cap -- a huge due batch dispatches all at once"
+    ],
+    "common_mistakes": [
+      "Assuming dispatching.add() happens INSIDE the scan loop -- it is a separate loop, after scanning finishes",
+      "Forgetting that the dispatching check happens during the SCAN, so a channel already being dispatched is excluded before it is even claimed again"
+    ],
+    "follow_up_questions": [
+      "Why are the claim loop and the scan loop kept separate instead of combined into one pass?",
+      "What would happen if dispatching.add() were called inside dispatchChannel instead of in tick() before the Promise.all?"
+    ],
+    "concepts": ["tick", "control-flow", "code-trace"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-116",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Beginner",
+    "question": "What is the exact formula for backoffMs(attempt), and how is it capped?",
+    "answer_hinglish": "Formula hai: `backoffMs(attempt, initialMs, maxMs) = min(maxMs, initialMs * 2^(attempt-1))`. `attempt` yahan `delivery.attempts` hai -- jo value ABHI increment ho chuki hai current attempt ke liye (1 on first try, 2 on first retry, waghera).\n\nIsliye attempt=1 ke baad (pehla attempt fail hua), backoff = `initialMs * 2^0 = initialMs` -- pehla retry delay EXACTLY `initialInitialBackoffMs` hai. attempt=2 ke baad, backoff = `initialMs * 2^1 = 2 * initialMs` -- DOUBLE. attempt=3 ke baad, `4 * initialMs`. Yeh classic EXPONENTIAL backoff hai, base 2 ke saath.\n\n`Math.min(maxMs, ...)` HAR computation mein apply hota hai -- matlab jaise hi `initialMs * 2^(attempt-1)` `maxBackoffMs` se bada ho jaaye, result hamesha `maxBackoffMs` par CAP ho jaata hai, kabhi usse aage nahi badhta chahe attempt kitna bhi bada ho jaaye. Yeh prevent karta hai ki backoff delay HOURS ya DAYS tak na badh jaaye agar `maxAttempts` bahut bada set kiya gaya ho.\n\n`dispatchChannel` mein yeh call hoti hai sirf FAILURE path par: `delivery.nextAttemptAt = now + backoffMs(delivery.attempts, this.initialBackoffMs, this.maxBackoffMs)` -- `now` is `this.clock.now()`, jo FAILURE ke baad liya jaata hai, result ke success/fail check hone ke baad.",
+    "why_needed": "Interviewer exact formula aur edge-case behavior (capping) check karna chahta hai -- yeh dikhata hai candidate ne implementation detail tak dhyaan diya hai, sirf high-level concept nahi.",
+    "real_world_analogy": "Ek speed limit sign -- koi car jitna bhi accelerate kare, speed limit (maxBackoffMs) se aage kabhi nahi ja sakti, chahe uska engine (attempt count) kitna bhi powerful ho.",
+    "how_it_works": "Pure function: Math.min(maxMs, initialMs * Math.pow(2, attempt - 1)). No internal state, no side effects -- purely derived from the attempt count and the two configured bounds.",
+    "in_this_project": "src/scheduler.ts ka top-level backoffMs function; iska caller dispatchChannel ke failure branch mein.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::backoffMs",
+      "projects/26-social-scheduler/test/tick.test.ts"
+    ],
+    "code_example": "// real, src/scheduler.ts\nfunction backoffMs(attempt: number, initialMs: number, maxMs: number): number {\n  return Math.min(maxMs, initialMs * Math.pow(2, attempt - 1));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Pure function, trivially unit-testable without any scheduler state",
+      "Cap prevents unbounded growth -- predictable worst-case delay"
+    ],
+    "disadvantages": [
+      "No jitter -- many channels failing at the same moment will all retry at exactly the same computed delay (see SOC-124)",
+      "Exponential growth with no cap would otherwise explode fast; relying on a hardcoded cap is simple but not configurable per-failure-type"
+    ],
+    "common_mistakes": [
+      "Off-by-one: using attempt instead of attempt-1 in the exponent, which would double the very first backoff unexpectedly",
+      "Applying the cap only at the end of accumulated delay instead of per-call, which this implementation avoids by capping every single computation"
+    ],
+    "follow_up_questions": [
+      "What would backoffMs(1, 1000, 1000) return, and why does that make sense given the formula?",
+      "How would you verify, with a test, that the cap is actually applied and not just that backoff grows?"
+    ],
+    "concepts": ["exponential-backoff", "retry", "code-trace"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-117",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "How exactly is editPost's 'zero attempts on every non-canceled channel' rule implemented?",
+    "answer_hinglish": "`editPost` ek for-loop chalata hai `Object.values(record.deliveries)` par, VALIDATION phase ke start mein (content/scheduledAt validate hone se pehle bhi) -- `for (const delivery of Object.values(record.deliveries)) { if (delivery.status === \"canceled\") continue; if (delivery.attempts > 0) throw POST_ALREADY_DISPATCHED; }`.\n\nLoop ka logic exactly do lines mein hai: pehla check -- `status === 'canceled'` ho toh `continue` (skip, is delivery ko bilkul ignore karo, chahe uske attempts kuch bhi ho). Doosra check -- agar skip nahi hua, toh `attempts > 0` ho toh THROW, immediately, poore method se bahar.\n\nYeh order important hai: canceled check PEHLE hota hai, isliye ek canceled channel jiska `attempts` already `> 0` hai (mid-retry cancel ka scenario) us throw ko kabhi nahi hit karta -- woh `continue` se hi nikal jaata hai. Agar order reverse hota (attempts check pehle), toh ek canceled-but-previously-attempted channel bhi galat se block kar deta edit ko.\n\nLoop poore `record.deliveries` par chalta hai, sirf first failing delivery par throw hota hai -- matlab agar MULTIPLE channels attempted hain, error message sirf ek channel ka naam carry karega (jo bhi Object.values() order mein pehle aaya), baaki check hi nahi hote kyunki throw method ko exit kar deta hai.",
+    "why_needed": "Interviewer exact loop structure aur early-exit behavior check karna chahta hai -- yeh common interview follow-up hai jab candidate kahta hai 'editPost checks attempts > 0' bina yeh explain kiye ki canceled channels kaise skip hote hain.",
+    "real_world_analogy": "Ek teacher class attendance check kar rahi hai 'sabne homework kiya ya nahi' -- jo student already absent mark hua (canceled) usse homework ka sawal hi nahi poochha jaata, baaki sab se poochha jaata hai, aur pehla jo 'nahi kiya' bole usi par teacher ruk jaati hai.",
+    "how_it_works": "for-loop over Object.values(deliveries): canceled -> continue (never checked for attempts); else attempts > 0 -> throw POST_ALREADY_DISPATCHED immediately, short-circuiting the rest of the loop.",
+    "in_this_project": "src/scheduler.ts ka editPost method, specifically the validation for-loop before content/scheduledAt are touched; test/cancel-edit.test.ts ka 'allows editing a post whose only channel was canceled AFTER an attempt'.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::editPost",
+      "projects/26-social-scheduler/test/cancel-edit.test.ts"
+    ],
+    "code_example": "// real, src/scheduler.ts editPost() (trimmed)\nfor (const delivery of Object.values(record.deliveries)) {\n  if (delivery.status === \"canceled\") continue;\n  if (delivery.attempts > 0) {\n    throw new SchedulerError(\"POST_ALREADY_DISPATCHED\", `post ${postId} has already been attempted on channel ${delivery.channel}, it can no longer be edited`);\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Two simple sequential checks, easy to read and reason about",
+      "Canceled-skip ordered first means a mid-retry-then-canceled channel never blocks the edit, matching the design intent"
+    ],
+    "disadvantages": [
+      "Error message only names the FIRST offending channel found via Object.values() iteration order, not every blocking channel",
+      "Object key iteration order (insertion order for string keys) is relied upon implicitly, though it does not affect correctness here since the loop checks ALL deliveries regardless of order until it throws"
+    ],
+    "common_mistakes": [
+      "Swapping the order of the two checks, which would incorrectly block edits around a mid-retry-then-canceled channel",
+      "Checking attempts > 0 across only non-canceled count aggregated, instead of per-delivery with per-delivery skip"
+    ],
+    "follow_up_questions": [
+      "What test would specifically catch the two checks being swapped (the exact mutation E3 found)?",
+      "If you wanted the error to list every blocking channel instead of just the first, how would you change this loop?"
+    ],
+    "concepts": ["editPost", "validation-loop", "code-trace"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-118",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "How does the idempotency fingerprint comparison work -- why is it order-independent across channels but not across content or scheduledAt?",
+    "answer_hinglish": "`fingerprintOf(content, channels, scheduledAt)` function hai: `return JSON.stringify({ content, channels: [...new Set(channels)].sort(), scheduledAt })`. Teen cheezein is object mein hain -- content (string, as-is), channels (TRANSFORMED), scheduledAt (number, as-is).\n\nChannels transformation do steps mein hoti hai: `new Set(channels)` duplicates remove karta hai (though validation already duplicates reject karti hai, toh yeh practically redundant hai par safe hai), phir `[...set].sort()` ALPHABETICALLY sort karta hai array ko. Isliye `[\"twitter\", \"linkedin\"]` aur `[\"linkedin\", \"twitter\"]` dono SAME sorted array `[\"linkedin\", \"twitter\"]` banate hain -- yehi wajah hai ki channel ORDER fingerprint ko affect nahi karta, bas SET of channels matter karta hai.\n\nContent aur scheduledAt ko koi transformation nahi milta -- woh EXACT value honi chahiye match karne ke liye. Agar content ek character bhi different hai, `JSON.stringify` ka output different hoga, fingerprint mismatch hoga.\n\nComparison khud `schedulePost` mein hota hai: naya request ka fingerprint compute karo (`fingerprintOf` call karke SHAPE-validated content/channels/scheduledAt ke saath, chahe woh replay ho ya nahi), aur `existing.fingerprint` (jo ORIGINAL schedule time par stored hua tha) se STRING EQUALITY (`!==`) compare karo. Mismatch par `IDEMPOTENCY_CONFLICT`, match par original post return.",
+    "why_needed": "Interviewer exact implementation detail (Set + sort + JSON.stringify) poochhta hai, yeh dekhne ke liye ki candidate 'order-independent comparison' ka ACTUAL mechanism samajhta hai, sirf result nahi.",
+    "real_world_analogy": "Do grocery lists match karna chahiye content ke hisaab se, order ke hisaab se nahi -- 'milk, bread, eggs' aur 'eggs, milk, bread' SAME shopping trip hai, par 'milk, bread, eggs' aur 'milk, bread, cheese' DIFFERENT hai, chahe order kuch bhi ho.",
+    "how_it_works": "fingerprintOf: JSON.stringify({ content, channels: [...new Set(channels)].sort(), scheduledAt }). Deduplicated+sorted channels make the fingerprint order-independent across channels; content and scheduledAt participate as exact values.",
+    "in_this_project": "src/scheduler.ts ka top-level fingerprintOf function; schedulePost ke dono paths (replay check aur fresh record creation) mein isi function ka use.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::fingerprintOf",
+      "projects/26-social-scheduler/src/scheduler.ts::schedulePost",
+      "projects/26-social-scheduler/test/schedule.test.ts"
+    ],
+    "code_example": "// real, src/scheduler.ts\nfunction fingerprintOf(content: string, channels: readonly string[], scheduledAt: number): string {\n  return JSON.stringify({ content, channels: [...new Set(channels)].sort(), scheduledAt });\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Channel-order-independence matches the user-facing promise exactly (README: 'the same set of channels, order does not matter')",
+      "JSON.stringify gives a simple, deterministic string key without hashing"
+    ],
+    "disadvantages": [
+      "JSON.stringify-based fingerprints grow with content size -- fine for this project's in-memory scale, less ideal for a huge content field at real scale",
+      "Deduplication via Set is dead code in practice since requireChannelsShape already rejects duplicate channels before fingerprintOf is reached on the fresh-schedule path"
+    ],
+    "common_mistakes": [
+      "Comparing channels arrays directly without sorting, which would treat a reordered-but-identical channel list as a conflict",
+      "Forgetting that content and scheduledAt are NOT normalized -- they must match exactly, unlike channels"
+    ],
+    "follow_up_questions": [
+      "Why is the Set wrapper still useful even though schedulePost's own validation already rejects duplicate channels?",
+      "What would change in fingerprintOf if content needed to be compared case-insensitively?"
+    ],
+    "concepts": ["idempotency", "fingerprint", "code-trace"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-119",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "Why is dispatchChannel's dispatching.delete(key) inside a finally block, and what breaks if it weren't?",
+    "answer_hinglish": "`dispatchChannel` ka poora body ek `try { ... } finally { this.dispatching.delete(key); }` structure mein hai. `finally` block GUARANTEE karta hai ki `delete(key)` chalega -- chahe `try` block normally complete ho (success ya failed-but-handled provider result), ya chahe andar kahin UNEXPECTED throw ho jaaye jo already catch nahi hua.\n\nNote karo: `provider.send()` ka throw already andar ek NESTED try/catch se handled hota hai (treated as a failed attempt, 'result' bana diya jaata hai) -- isliye woh normally `finally` tak pahunchne se pehle hi handle ho jaata hai. Par `finally` ek EXTRA safety net hai agar KISI aur reason se (jaise `this.clock.now()` throw kare, ya koi future code change jo bina socha try block mein throw kare) method genuinely crash kare -- tab bhi `dispatching` Set se key hatana zaroori hai.\n\nAgar `finally` nahi hota aur sirf `try` ke END mein `delete(key)` likha hota, toh ek UNEXPECTED throw (jo nested catch na pakde) us delete line ko kabhi reach nahi karne deta -- `key` PERMANENTLY `dispatching` Set mein reh jaata. Iska result: woh exact channel `tick()`'s scan mein HAMESHA exclude ho jaata (`!this.dispatching.has(key)` false ho jaata), aur `cancelChannel`/`cancelPost` bhi HAMESHA `DISPATCH_IN_PROGRESS` throw karte us channel ke liye -- ek PERMANENTLY stuck channel, kabhi dispatch nahi, kabhi cancel nahi.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate try/finally ka EXACT purpose samajhta hai is context mein -- resource cleanup guarantee, specifically jab exception paths involved hain.",
+    "real_world_analogy": "Ek library book checkout system jahan 'book is checked out' flag HAMESHA hatana hai jab return process khatam ho, chahe return process EXACTLY kaise khatam ho (normally ya kisi error ke saath) -- warna book PERMANENTLY 'checked out' dikhti rahegi, koi aur kabhi issue nahi kar sakega.",
+    "how_it_works": "try { attempts++; await provider.send() wrapped in its own try/catch; update status/backoff } finally { dispatching.delete(key) }. The finally runs on every exit path from the try block, normal or exceptional.",
+    "in_this_project": "src/scheduler.ts ka dispatchChannel private method -- the outer try/finally wrapping the whole dispatch logic.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel"
+    ],
+    "code_example": "// real, src/scheduler.ts dispatchChannel() (trimmed)\nprivate async dispatchChannel(record: PostRecord, delivery: ChannelDelivery): Promise<void> {\n  const key = `${record.id}:${delivery.channel}`;\n  try {\n    delivery.attempts += 1;\n    // ... await provider.send(), update status ...\n  } finally {\n    this.dispatching.delete(key); // guaranteed, even on an unexpected throw\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Guarantees the dispatching Set never leaks a stuck key, even under an unanticipated error",
+      "Separates 'normal failure handling' (the nested try/catch around provider.send()) from 'guaranteed cleanup' (the outer finally) -- two different concerns, two different mechanisms"
+    ],
+    "disadvantages": [
+      "A genuinely stuck key (from a bug elsewhere) would still be undetectable from the outside since dispatching is private",
+      "The safety net only matters for truly unexpected errors -- the expected failure path (provider throws) is already handled before it would ever reach this concern"
+    ],
+    "common_mistakes": [
+      "Putting dispatching.delete(key) only at the end of the try block instead of in finally, assuming the nested catch covers every possible failure",
+      "Assuming finally changes the method's return value or re-throws -- it only runs cleanup, the original throw (if any) still propagates after finally completes"
+    ],
+    "follow_up_questions": [
+      "What test would prove this finally actually matters, versus just appearing defensive?",
+      "If dispatchChannel's provider.send() call were NOT wrapped in its own try/catch, would the outer finally still be enough to keep the system correct?"
+    ],
+    "concepts": ["try-finally", "resource-cleanup", "code-trace"],
+    "advanced": {
+      "architecture_tradeoffs": "Outer finally ek defensive guarantee hai jiska cost bahut kam hai (ek extra delete call) par value sirf UNEXPECTED errors ke against hai -- is project ka actual, expected failure path (provider throws/rejects) already andar handle hota hai, isliye yeh finally zyada ek 'belt and suspenders' safety net hai, primary mechanism nahi.",
+      "failure_scenarios": "Agar koi future code change (jaise ek naya side-effect provider.send() se PEHLE) genuinely throw kare bina try/catch ke andar hue, finally nahi hone ki surat mein woh specific channel PERMANENTLY stuck ho jaata -- na dispatch, na cancel, forever.",
+      "alternatives": "Ek explicit cleanup helper function jo HAR exit point par manually call ho (zyada error-prone, duplicate code); ya ek wrapper/decorator jo automatically claim-and-release pattern enforce kare (zyada abstraction, is scale ke liye overkill).",
+      "scale_10x_100x": "Yeh guarantee scale-independent hai -- ek single stuck key bhi bahut problematic hai chahe 10 channels hon ya 10 lakh, kyunki woh specific channel kabhi progress nahi karega. Scale badhne se is guarantee ki ZAROORAT nahi badhti, par ek stuck key ko MANUALLY detect karna bahut harder ho jaata hai zyada channels ke beech.",
+      "production_improvements": "Dispatching Set ki size/age ko monitoring mein expose karna (abhi private hai) taaki ek stuck key production mein jaldi detectable ho, is finally guarantee ke bawajood bhi (defense in depth)."
+    }
+  },
+  {
+    "id": "SOC-120",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Advanced",
+    "question": "There's a window between tick()'s scan phase and its claim phase where both run synchronously -- how does requireNotDispatching's check interact with that timing, and is there still a race?",
+    "answer_hinglish": "`tick()` ka scan loop aur claim loop DONO fully synchronous hain, EK HI function call ke andar, koi await beech mein nahi -- isliye JavaScript ke run-to-completion model ki wajah se, JAB TAK `tick()` ka pehla `await` (jo `Promise.all` ke andar hai) nahi lagta, koi doosra code (koi `cancelChannel` call, koi doosra `tick()` call) beech mein interleave NAHI ho sakta. Matlab scan aur claim ke beech mein genuinely koi race window hai hi nahi JS single-threaded event loop mein -- yeh wahi guarantee hai jo SOC-106 mein schedulePost ke liye discuss hui.\n\n`requireNotDispatching` (jo `cancelChannel`/`cancelPost` use karte hain) is `dispatching` Set ko check karta hai -- `if (this.dispatching.has(key)) throw DISPATCH_IN_PROGRESS`. Yeh method sirf TAB meaningful hai jab `cancelChannel` ek `tick()` call ke AWAIT ke dauraan chale -- us waqt `dispatching` Set mein key already add ho chuki hai (claim phase complete ho chuka tha before the await), isliye `requireNotDispatching` correctly DISPATCH_IN_PROGRESS throw karega.\n\nActual race jo EXIST karti hai: ek `tick()` call `await Promise.all(...)` par ruka hai, us waqt EK channel ka `dispatchChannel` andar `await provider.send()` par ruka hai -- ISI waqt agar `cancelChannel` call ho, `requireNotDispatching` use detect kar leta hai kyunki key already `dispatching` mein hai. Yeh exact scenario `test/dispatch-guard.test.ts` mein manually-resolved provider se test kiya gaya hai -- har DOOSRA provider is project mein turant resolve hota hai, isliye koi aur test file yeh genuinely exercise hi nahi karta.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate synchronous-vs-asynchronous race windows ka FARAK samajhta hai -- kahan JS ki single-threaded guarantee kaafi hai, aur kahan ek explicit guard (dispatching Set) genuinely zaroori hai.",
+    "real_world_analogy": "Ek clerk jo pehle SAARI files ek saath uthata hai apne desk par (scan+claim, ek breath mein), phir unhe EK-EK karke process karna shuru karta hai, har file ke beech mein ek break leta hai (await) -- koi doosra clerk usi file ko tabhi touch kar sakta hai jab woh already uthayi hui ho AUR ek break ke dauraan ho.",
+    "how_it_works": "Scan+claim is one synchronous block, no race possible there. The real race window is during dispatchChannel's single await (provider.send()) -- that's exactly where requireNotDispatching's check matters, because the dispatching Set was already populated before that await started.",
+    "in_this_project": "src/scheduler.ts ka tick() (synchronous scan+claim) aur requireNotDispatching; test/dispatch-guard.test.ts jo is exact window ko deferred provider se exercise karta hai.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/src/scheduler.ts::requireNotDispatching",
+      "projects/26-social-scheduler/test/dispatch-guard.test.ts"
+    ],
+    "code_example": "// real, src/scheduler.ts\nprivate requireNotDispatching(postId: string, channel: string): void {\n  if (this.dispatching.has(`${postId}:${channel}`)) {\n    throw new SchedulerError(\"DISPATCH_IN_PROGRESS\", `channel ${channel} of post ${postId} is being dispatched right now, try again`);\n  }\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "No race exists within the synchronous scan+claim block -- no extra guard needed there",
+      "The dispatching guard precisely targets the ONE real race window (the await inside dispatchChannel), rather than over-guarding everything"
+    ],
+    "disadvantages": [
+      "Understanding WHY there's no race in the scan+claim phase requires knowing JS's run-to-completion model -- not obvious to someone assuming true parallelism",
+      "A caller unfamiliar with this project could add an await somewhere in the scan/claim phase without realizing it reintroduces a genuine race"
+    ],
+    "common_mistakes": [
+      "Assuming a race exists between scan and claim just because they are two separate loops -- they are still one synchronous call",
+      "Assuming requireNotDispatching protects against every possible race, when it specifically targets the dispatchChannel await window"
+    ],
+    "follow_up_questions": [
+      "If an await were introduced between the scan loop and the claim loop inside tick(), what new race would open up?",
+      "Why does test/dispatch-guard.test.ts need a manually-resolved provider instead of using any of the existing fake providers?"
+    ],
+    "concepts": ["race-conditions", "event-loop", "dispatching-guard", "code-trace"],
+    "advanced": {
+      "architecture_tradeoffs": "Relying on JS's synchronous run-to-completion for the scan+claim phase avoids an explicit lock there, keeping tick() simple -- but this is implicit, undocumented-at-the-type-level safety that depends on no future await being introduced mid-phase.",
+      "failure_scenarios": "If a future refactor split the scan and claim loops across an await (e.g. an async filter), two overlapping tick() calls could both scan before either claims, double-dispatching the same channel -- exactly the bug the dispatching Set exists to prevent, reintroduced by breaking the synchronous assumption.",
+      "alternatives": "Combine scan and claim into a single pass (filter-and-add in one loop) to make the synchronous requirement more visually obvious in the code, even though behaviorally it is already equivalent.",
+      "scale_10x_100x": "This reasoning is scale-independent within one process -- it depends on the event loop model, not on data volume. It breaks down entirely, regardless of scale, the moment multiple processes are involved (see SOC-110), since JS's single-threaded guarantee only holds within one process.",
+      "production_improvements": "Add a comment or a lint rule flagging any new await introduced between the scan and claim loops in tick(), since that boundary is where this project's race-safety assumption lives."
+    }
+  },
+  {
+    "id": "SOC-121",
+    "project_slug": "p26-social-scheduler",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "In schedulePost, why does the idempotency replay check run AFTER the clientRequestId shape check but BEFORE the channel/content/scheduledAt semantic checks?",
+    "answer_hinglish": "`schedulePost` ka validation order EXACTLY teen tiers mein hai, aur order DELIBERATE hai. Tier 1: `requireClientRequestId` -- yeh ALWAYS chalta hai, replay ho ya na ho, kyunki ek malformed `clientRequestId` ek 400-style error hai REGARDLESS of whether it is a replay (tum ek invalid key se kabhi lookup bhi nahi kar sakte).\n\nTier 2: idempotency map lookup -- `this.idempotency.get(clientRequestId)`. Agar key MILTI hai, yeh REPLAY hai -- aur ek replay apne FINGERPRINT se match karega, original request ke deeper semantic checks (unknown channel, past scheduledAt) ko RE-RUN nahi karega. Yeh important hai: agar original request VALID tha jab accept hua, ek replay (SAME exact data ke saath) usko dobara reject NAHI karna chahiye sirf isliye ki duniya mein kuch badal gaya (jaise clock aage badh gaya aur `scheduledAt` ab 'past' lag raha hai).\n\nTier 3 (sirf agar replay NAHI hai): `requireContent`, `requireValidChannels` (jo UNKNOWN_CHANNEL check karta hai), `requireFutureScheduledAt`. Yeh sab sirf EK FRESH request ke liye chalte hain.\n\nNote karo: fingerprint COMPUTE karne ke liye SHAPE checks (`requireContent`, `requireChannelsShape`, `requireScheduledAtShape`) replay path mein BHI chalte hain -- kyunki fingerprint banane ke liye content/channels/scheduledAt ka VALID shape chahiye hi hota hai, par UNKNOWN_CHANNEL jaisa SEMANTIC check replay path mein skip ho jaata hai.",
+    "why_needed": "Interviewer exact validation-tier ordering poochhta hai -- yeh dikhata hai ki candidate samajhta hai 'a replay answers from the stored result, it does not re-validate the original request' ka implementation-level implication.",
+    "real_world_analogy": "Ek courier jo ek PEHLE SE DELIVERED package ka tracking number dobara scan kare -- woh usse 'already delivered, here's your receipt' bolega, dobara address verify nahi karega ya dobara check nahi karega ki address abhi bhi valid hai ya nahi.",
+    "how_it_works": "requireClientRequestId (always) -> idempotency.get() lookup -> if found: compute fingerprint via SHAPE-only checks, compare, return existing or throw IDEMPOTENCY_CONFLICT -> if not found: full semantic validation (content, channels incl. UNKNOWN_CHANNEL, future scheduledAt) -> build and store.",
+    "in_this_project": "src/scheduler.ts ka schedulePost method -- the comment directly above it ('The idempotency check itself runs AFTER the cheap shape checks... BEFORE the deeper semantic checks') and the requireChannelsShape vs requireValidChannels distinction.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::schedulePost",
+      "projects/26-social-scheduler/src/scheduler.ts::requireChannelsShape",
+      "projects/26-social-scheduler/src/scheduler.ts::requireValidChannels"
+    ],
+    "code_example": "// real, src/scheduler.ts schedulePost() (trimmed)\nconst clientRequestId = this.requireClientRequestId(request.clientRequestId);\nconst existingId = this.idempotency.get(clientRequestId);\nif (existingId !== undefined) {\n  const existing = this.posts.get(existingId)!;\n  const fingerprint = fingerprintOf(\n    this.requireContent(request.content),\n    this.requireChannelsShape(request.channels), // SHAPE only, no UNKNOWN_CHANNEL check\n    this.requireScheduledAtShape(request.scheduledAt), // SHAPE only, no past-time check\n  );\n  if (fingerprint !== existing.fingerprint) throw new SchedulerError(\"IDEMPOTENCY_CONFLICT\", \"...\");\n  return this.toPublicPost(existing);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "A replay of an originally-valid request never fails later due to the world changing (e.g. clock advancing past the original scheduledAt)",
+      "clientRequestId shape is validated unconditionally -- you can't even attempt a lookup with a malformed key"
+    ],
+    "disadvantages": [
+      "requireChannelsShape and requireValidChannels being two separate methods (shape-only vs shape+semantic) adds a layer of indirection a reader has to notice",
+      "A replay with a channel that's since had its provider REMOVED from the providers map would still succeed, since UNKNOWN_CHANNEL is never re-checked"
+    ],
+    "common_mistakes": [
+      "Running requireValidChannels (with the UNKNOWN_CHANNEL check) on the replay path, which would incorrectly fail a replay if a provider was removed after the original schedule succeeded",
+      "Skipping requireClientRequestId's shape check before the idempotency lookup, risking a lookup with garbage input"
+    ],
+    "follow_up_questions": [
+      "What would happen on a replay if a provider for one of the original channels were removed from the providers map in between?",
+      "Why is it safe for the replay path to skip the SCHEDULED_AT_IN_PAST check specifically?"
+    ],
+    "concepts": ["validation-order", "idempotency", "code-trace"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-122",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "Design the change to add a retryable-vs-permanent failure distinction to ProviderResult without breaking any existing dead-letter test.",
+    "answer_hinglish": "Change ka shape chhota hai, par usko CAREFULLY backward-compatible rakhna hoga. `ProviderResult`'s failed branch mein ek field add hota hai: `retryable: boolean`. Existing teen fake providers (`AlwaysSucceedsProvider`, `AlwaysFailsProvider`, `FlakyProvider`) sab abhi `{ status: \"failed\", reason }` return karte hain -- unhe DEFAULT value dena hoga (`retryable: true`) taaki existing behavior EXACTLY same rahe jab tak koi explicitly `retryable: false` pass na kare.\n\n`dispatchChannel`'s failure branch mein current condition hai `if (delivery.attempts >= delivery.maxAttempts) dead_letter`. Naya condition: `if (!result.retryable || delivery.attempts >= delivery.maxAttempts) dead_letter`. Yeh OR hai, matlab EXISTING maxAttempts-based dead-lettering BILKUL same rehta hai (woh condition abhi bhi check hoti hai), sirf EXTRA case add hota hai jahan `retryable: false` hone par IMMEDIATELY dead-letter, chahe attempts kam hi ho.\n\nExisting test 'exhausting maxAttempts moves the channel to dead_letter' is change se UNAFFECTED hai kyunki `AlwaysFailsProvider` (jo woh test use karta hai) default `retryable: true` return karega -- same number of attempts, same dead-letter timing. Naya test add hoga specifically ek provider ke liye jo `retryable: false` pehle hi attempt par return kare, aur assert kare ki `attempts === 1` hote hi `dead_letter` ho gaya, baaki retries kiye bina.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate backward-compatible extension design kar sakta hai -- existing behavior ko ek default value se preserve karna, aur naya behavior ko OR-condition se additive rakhna.",
+    "real_world_analogy": "Ek insurance policy mein naya 'pre-existing condition' clause add karna -- purane claims jinke paas yeh info hi nahi thi, unhe DEFAULT assume kiya jaata hai ki woh is clause ke against nahi aate, taaki purane approved claims kabhi retroactively reject na hon.",
+    "how_it_works": "ProviderResult failed branch gets retryable: boolean. dispatchChannel's dead-letter condition becomes `!result.retryable || attempts >= maxAttempts`. Existing fake providers updated to explicitly return retryable: true, preserving current behavior exactly.",
+    "in_this_project": "src/types.ts ka ProviderResult; src/scheduler.ts ka dispatchChannel failure branch; src/providers.ts ke teen fake providers (jinhe retryable: true add karna hoga).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/types.ts::ProviderResult",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/src/providers.ts::AlwaysFailsProvider"
+    ],
+    "code_example": "// proposed change\nexport type ProviderResult =\n  | { status: \"sent\"; providerId: string }\n  | { status: \"failed\"; reason: string; retryable: boolean };\n\n// AlwaysFailsProvider.send() updated:\nasync send(message: OutboundPost): Promise<ProviderResult> {\n  this.attempts.push({ ...message });\n  return { status: \"failed\", reason: this.reason, retryable: true }; // preserves old behavior\n}\n\n// dispatchChannel's failure branch (trimmed):\nif (!result.retryable || delivery.attempts >= delivery.maxAttempts) {\n  delivery.status = \"dead_letter\";\n} else {\n  delivery.nextAttemptAt = now + backoffMs(delivery.attempts, this.initialBackoffMs, this.maxBackoffMs);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Existing tests pass unmodified as long as existing providers default to retryable: true",
+      "The OR-condition is purely additive -- it can only move a channel to dead_letter EARLIER than before, never later, so no existing 'stays pending' assertion breaks"
+    ],
+    "disadvantages": [
+      "Every existing FakeChannelProvider implementation (including any the test suite or callers wrote) must be updated to include the new field, a breaking TypeScript change even if behavior is preserved",
+      "A provider that forgets to set retryable (if it were optional with a default inside dispatchChannel instead) could behave inconsistently"
+    ],
+    "common_mistakes": [
+      "Making retryable optional and defaulting it inside dispatchChannel instead of making it required on ProviderResult -- this silently masks a provider that forgot to set it",
+      "Forgetting that attempts still needs to increment even for a retryable: false failure, since attempts is diagnostic and incremented unconditionally before the await"
+    ],
+    "follow_up_questions": [
+      "Would you make retryable required or optional-with-a-default, and what does that choice cost in terms of type safety?",
+      "How would you test that attempts >= maxAttempts STILL dead-letters even for a retryable: true failure, after this change?"
+    ],
+    "concepts": ["backward-compatibility", "retryable-failures", "extension-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Required field (retryable: boolean) force karta hai HAR provider ko explicitly decide karne ke liye, jo safer hai par breaking change hai type level par. Optional-with-default-inside-dispatchChannel kam breaking hai par ek silent behavior-mismatch risk banata hai agar koi provider forget kare.",
+      "failure_scenarios": "Agar koi naya provider accidentally `retryable: false` return kare EK transient network blip ke liye (jo actually retry se theek ho jaata), woh channel immediately dead-letter ho jaayega jab woh asal mein retry se succeed ho sakta tha -- false negative, over-eager dead-lettering.",
+      "alternatives": "ProviderResult ko ek enum-based error taxonomy dena (transient/permanent/unknown) instead of boolean, jo zyada expressive hai par zyada complex; ya retryable decision ko dispatchChannel ke bahar, ek pluggable policy function mein rakhna.",
+      "scale_10x_100x": "Chhote scale par yeh change negligible overhead hai. Bade scale par (SOC-105 jaisa), yeh potentially SIGNIFICANT backoff-time save karta hai agar permanent failures common hain -- dead-letter rate ACCURATE ho jaata hai jaldi, monitoring (SOC-111) ko fast, correct signal milta hai.",
+      "production_improvements": "retryable field rollout karte waqt, phased migration: pehle optional field add karo (default true), existing providers unaffected rahen; phir gradually naye providers retryable explicitly set karein; phir, jab sab migrate ho jaayein, field ko required bana do type safety ke liye."
+    }
+  },
+  {
+    "id": "SOC-123",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "Design per-channel content length limits so that schedulePost and editPost both enforce them consistently.",
+    "answer_hinglish": "Core challenge: content EK field hai poore post par, par limit CHANNEL-specific honi chahiye. Design: ek `CHANNEL_LIMITS: Record<string, number>` config object (ya constructor option, `SchedulerOptions.channelContentLimits?: Record<string, number>`), default fallback `MAX_CONTENT_LENGTH` agar kisi channel ka specific limit na diya gaya ho.\n\n`requireContent` ko extend karna hoga ek naya parameter lena: `requireContent(content: unknown, channels: readonly string[])`. Andar, HAR targeted channel ke limit nikalo aur SABSE CHHOTA lo: `const limit = Math.min(...channels.map(c => this.channelContentLimits[c] ?? MAX_CONTENT_LENGTH))`, phir `content.length > limit` check karo.\n\nSabse tricky part: `schedulePost` mein, `requireContent` ABHI `requireValidChannels` se PEHLE call hota hai (order dekho current code mein) -- naya design mein content check channel-dependent hai, isliye ORDER FLIP karna padega: pehle channels validate/shape karo, PHIR content ko unhi channels ke against check karo. `editPost` mein bhi same tarika -- agar sirf content badal raha hai, EXISTING `record.channels` use karo limit compute karne ke liye; agar koi future design channel-list-edit bhi allow kare (abhi nahi hai, SOC-127 dekho), tab naye channels use honge.\n\nEdge case: schedulePost's IDEMPOTENCY REPLAY path bhi `requireContent` call karta hai fingerprint banane ke liye (shape-only abhi) -- yeh SHAPE check hai, channel-specific length check NAHI honi chahiye replay path par (SOC-121 ka reasoning: replay re-validate nahi karta).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek seemingly-simple feature request (per-channel limits) ke andar hidden complexity (ordering dependency, replay-path interaction) dhoondh sakta hai.",
+    "real_world_analogy": "Ek speech jo tumhe alag venues mein deni hai, jahan har venue ka apna time-limit hai -- tumhe apni speech ko venue list dekhne ke BAAD measure karna padega (channels check pehle), content measure karne se pehle, warna tumhe pata hi nahi chalega kis limit ke against check karna hai.",
+    "how_it_works": "Validate channels first (to know which limits apply), then validate content against the MINIMUM limit among this post's target channels. Idempotency replay path keeps using shape-only content validation, not the new per-channel length check.",
+    "in_this_project": "src/scheduler.ts ka requireContent, requireValidChannels, schedulePost (current call order), editPost.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::requireContent",
+      "projects/26-social-scheduler/src/scheduler.ts::schedulePost",
+      "projects/26-social-scheduler/src/scheduler.ts::editPost"
+    ],
+    "code_example": "// proposed change (illustrative)\nprivate requireContentForChannels(content: unknown, channels: readonly string[]): string {\n  const base = this.requireContent(content); // existing shape + global MAX_CONTENT_LENGTH check\n  const limit = Math.min(...channels.map((c) => this.channelContentLimits[c] ?? MAX_CONTENT_LENGTH));\n  if (base.length > limit) {\n    throw new SchedulerError(\"INVALID_REQUEST\", `content exceeds the ${limit}-character limit for one of the targeted channels`);\n  }\n  return base;\n}\n// schedulePost: validate channels BEFORE calling requireContentForChannels(content, channels)",
+    "code_language": "typescript",
+    "advantages": [
+      "Reuses the existing requireContent as a base layer, only adding a channel-aware check on top",
+      "A post is guaranteed postable on every one of its target channels at schedule time, not discovered as a per-channel failure at dispatch time"
+    ],
+    "disadvantages": [
+      "Forces content down to the tightest channel's limit even when other channels could accept more -- no per-channel content variation",
+      "Requires reordering validation in schedulePost (channels before content), a non-trivial refactor given how idempotency replay currently calls requireContent early for fingerprinting"
+    ],
+    "common_mistakes": [
+      "Applying the new per-channel check to the idempotency replay's fingerprint-shape validation, which should remain shape-only",
+      "Forgetting editPost needs the same per-channel check when content is being changed, using the post's EXISTING channel list"
+    ],
+    "follow_up_questions": [
+      "How would this design change if a post could target channels with wildly different limits (e.g. 50 vs 3000 characters) and the caller wanted per-channel content instead of one shared field?",
+      "What happens to this check if editPost someday allows adding a new channel to an existing post?"
+    ],
+    "concepts": ["validation", "per-channel-limits", "refactoring"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping content as ONE field and enforcing the tightest limit is the simplest extension of the current design, but it fundamentally caps what a post can say to its most permissive channels, trading flexibility for simplicity -- a per-channel content model would remove that cap but is a bigger redesign (touching ScheduledPost's shape itself).",
+      "failure_scenarios": "A caller targeting Twitter and LinkedIn together would have their LinkedIn post artificially truncated to Twitter's limit at validation time, which could confuse a caller who expected LinkedIn to get the full-length version -- a documentation/error-message clarity issue more than a correctness bug.",
+      "alternatives": "Add an OPTIONAL per-channel content override map alongside the base content field (channels without an override use the base content, checked against their own limit); this is a bigger type change but solves the flexibility problem directly.",
+      "scale_10x_100x": "This validation cost is O(channels per post), negligible at any scale this project targets. The real scaling question is whether per-channel content overrides (the alternative above) become necessary as the number of distinct channel types grows.",
+      "production_improvements": "Ship the tightest-limit version first (smallest change, matches real Twitter/LinkedIn-style limits), then evaluate whether real usage needs per-channel content overrides before building that bigger feature."
+    }
+  },
+  {
+    "id": "SOC-124",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "Design a real job queue with leases for multiple concurrent dispatch workers, reusing project 21's design, without a full rewrite of SocialScheduler.",
+    "answer_hinglish": "Project 21's `JobQueue` interface (`claim`, `owns`, `complete`, `reschedule`) already generic hai -- is project mein isko REUSE karne ka sabse clean tarika yeh hai ki `tick()` ko redesign karo taaki woh due-channel SCAN khud na kare, balki `JobQueue.claim(now, max, leaseMs)` call kare jo already ready jobs return karta hai leaseToken ke saath.\n\nHar 'job' ek `postId:channel` pair represent karega. `dispatchChannel`'s core logic (attempts++, provider.send(), status update) WAISA HI rehta hai -- bas ab yeh ek `ClaimedJob` leta hai jiske paas `leaseToken` hai, aur complete hone par `queue.owns(id, leaseToken, now)` check karta hai BEFORE committing the status change (taaki agar lease expire ho gaya ho AUR koi doosra worker ne already job reclaim kar liya ho, yeh worker apna STALE result commit na kare) -- yeh `complete()`/`reschedule()` calls ke through hota hai jo khud internally `owns` check karte hain.\n\n`posts` Map ko bhi ek SHARED backend mein jaana hoga (abhi in-memory hai, per-instance) -- yeh sabse bada structural change hai, kyunki `SocialScheduler` abhi assume karta hai ki `this.posts` sirf usi process mein accessible hai. Minimal viable version: `posts`/`idempotency` ko ABHI bhi in-memory rakho EK SHARED process mein (jaise ek single scheduler-coordinator service), par MULTIPLE WORKER processes sirf `JobQueue` ke through jobs claim karen aur dispatch karen, result wapas coordinator ko REPORT karen (RPC/message queue se) jo `posts` Map update kare. Yeh poora redesign nahi hai `dispatchChannel`'s core logic ka -- sirf `tick()`'s due-detection aur claim mechanism badalta hai, aur commit-reporting ek naya step hai.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek EXISTING reusable component (project 21's JobQueue) ko is project ke context mein wire kar sakta hai, bina core dispatch logic (dispatchChannel) ko rewrite kiye.",
+    "real_world_analogy": "Ek call center jo apne existing ticket-claiming system (jo already kisi doosre department mein kaam kar raha hai) ko reuse kare, instead of naya system banaye -- agents ka actual call-handling kaam (dispatchChannel jaisa) same rehta hai, sirf 'kaunsa agent kaunsa ticket uthaye' logic badalta hai.",
+    "how_it_works": "tick() delegates due-detection+claiming to JobQueue.claim(). dispatchChannel's core logic stays the same but checks queue.owns() before committing, and reports completion/reschedule via queue.complete()/reschedule(). posts/idempotency state needs a shared backend for true multi-process workers.",
+    "in_this_project": "src/scheduler.ts ka current tick()/dispatchChannel (in-process scan+dispatching Set); project 21's src/queue.ts (JobQueue interface, InMemoryJobQueue) and src/worker.ts as the reusable reference.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::tick",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/21-notification/src/queue.ts::JobQueue",
+      "projects/21-notification/src/worker.ts"
+    ],
+    "code_example": "// illustrative sketch, reusing project 21's JobQueue shape\nasync function workerTick(queue: JobQueue, scheduler: SocialScheduler, leaseMs: number): Promise<void> {\n  const jobs = queue.claim(Date.now(), 50, leaseMs); // channels due, claimed with a lease token\n  await Promise.all(jobs.map(async (job) => {\n    const result = await dispatchOneChannel(scheduler, job.postId, job.channel); // reuses dispatchChannel's core logic\n    if (queue.owns(job.id, job.leaseToken, Date.now())) {\n      result.terminal ? queue.complete(job.id, job.leaseToken, Date.now()) : queue.reschedule(job.id, job.leaseToken, result.nextAttemptAt, Date.now());\n    } // else: lease expired, another worker already reclaimed it -- discard this result\n  }));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Reuses a proven, already-tested design (project 21's JobQueue) instead of inventing a new concurrency primitive",
+      "dispatchChannel's core send/retry/backoff logic is preserved almost unchanged -- the change is concentrated in how work is claimed and committed"
+    ],
+    "disadvantages": [
+      "posts/idempotency state still needs a real shared backend for true multi-process correctness -- the job queue alone does not solve that",
+      "Introduces a new failure mode: a worker's result arriving after its lease expired must be discarded, which needs careful handling to avoid silently losing a successful send"
+    ],
+    "common_mistakes": [
+      "Wiring in the JobQueue for claiming jobs but forgetting the owns() check before committing a result, risking a stale worker overwriting a reclaimed job's state",
+      "Assuming the JobQueue alone makes posts/idempotency safe across processes -- they are separate concerns"
+    ],
+    "follow_up_questions": [
+      "What happens to a channel's attempts count if two workers both claim it due to a lease racing right at expiry?",
+      "How would you choose leaseMs relative to how long a real provider.send() call is expected to take?"
+    ],
+    "concepts": ["job-queue", "leases", "distributed-systems", "reuse"],
+    "advanced": {
+      "architecture_tradeoffs": "Reusing project 21's JobQueue interface wholesale keeps this project's own code additions small, but couples its concurrency model to a design built for a DIFFERENT project's needs -- any JobQueue limitation (e.g. O(n) claim scan in InMemoryJobQueue) is inherited as-is unless also addressed.",
+      "failure_scenarios": "A worker that claims a job, starts dispatchChannel's provider.send(), then stalls past leaseMs (e.g. a slow network call) will have its job reclaimed by another worker mid-flight -- when the first worker's send() eventually resolves, owns() correctly tells it to discard the result, but the ACTUAL provider call may have already succeeded, meaning the channel could be double-sent to the real platform unless the provider itself is idempotent.",
+      "alternatives": "A fully external message queue (SQS/RabbitMQ) instead of a custom lease-based InMemoryJobQueue, trading custom code for operational infrastructure; or a database-backed queue (Postgres SKIP LOCKED, as InMemoryJobQueue's own comment references) for both leasing and durable state in one place.",
+      "scale_10x_100x": "At 10x worker count, the shared JobQueue backend becomes the new bottleneck (claim() contention) rather than any single worker's CPU. At 100x, InMemoryJobQueue's O(n) claim scan (same shape as this project's tick() scan, see SOC-114) would need its own indexing fix to keep up.",
+      "production_improvements": "Move the JobQueue itself to a durable, indexed backend (Postgres with SKIP LOCKED, or a managed queue service). Make real providers idempotent (so a double-send from a lease race is harmless) wherever the underlying platform API allows it (e.g. an idempotency key the platform itself honors)."
+    }
+  },
+  {
+    "id": "SOC-125",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "Design idempotency key expiry with an LRU bound, similar to what project 21 stage 2 would need, for this project's idempotency Map.",
+    "answer_hinglish": "Abhi `this.idempotency = new Map<string, string>()` kabhi shrink nahi hota -- har naya `clientRequestId` permanently is Map mein reh jaata hai, memory traffic ke saath grow karti hai, README mein yeh explicitly 'Known and NOT handled' mein documented hai.\n\nLRU (Least Recently Used) bound design: ek MAX_IDEMPOTENCY_KEYS limit set karo (jaise 100,000). Jab limit hit ho, SABSE PURANA (least-recently-accessed) key evict karo naya add karne se pehle. JavaScript ka `Map` already INSERTION ORDER maintain karta hai iteration ke liye -- par 'recently used' track karne ke liye, HAR access (lookup, not just insert) par key ko RE-INSERT karna padega (delete + set) taaki woh Map ke END mein chali jaaye 'most recently used' ban kar.\n\nActual integration point: `schedulePost`'s idempotency lookup (`this.idempotency.get(clientRequestId)`) ko wrap karna hoga ek helper mein jo access par bhi re-insert kare. Naya key add karte waqt (`this.idempotency.set(...)` call se pehle), size check karo -- agar `size >= MAX_IDEMPOTENCY_KEYS`, Map ka FIRST key (`this.idempotency.keys().next().value`, jo least-recently-used hai insertion-order ki wajah se) delete karo.\n\nCRITICAL risk: agar ek key EVICT ho jaaye jiska POST abhi bhi `posts` Map mein exist karta hai, ek REPLAY us clientRequestId ke saath ab 'naya' treat hoga (idempotency check miss ho jaayega) aur ek DUPLICATE post ban jaayega -- same clientRequestId, do alag posts. Yeh ek genuine trade-off hai jo project 21 ka TTL+LRU design bhi accept karta hai: bahut purani, LIKELY-NEVER-REPLAYED requests ka dedupe guarantee kho jaata hai memory bound ke against.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate bounded-memory data structures (LRU) design kar sakta hai AUR is design ka real correctness trade-off (eviction = lost dedupe guarantee) explicitly articulate kar sakta hai.",
+    "real_world_analogy": "Ek fridge jisme limited space hai -- naya khaana rakhne ke liye sabse PURANA (jo sabse kam use hua) item hatana padta hai. Agar koi item hata diya aur woh asal mein kisi ko abhi bhi chahiye tha, woh dobara order karna padega -- bilkul naya samajh kar.",
+    "how_it_works": "Map's insertion order is repurposed as LRU order: every get() re-inserts the accessed key (delete+set) to move it to the 'most recent' end. On a new set(), if size exceeds the bound, the first (oldest) key is evicted.",
+    "in_this_project": "src/scheduler.ts ka idempotency Map (currently unbounded) inside SocialScheduler; schedulePost's get()/set() calls on it.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::schedulePost",
+      "projects/26-social-scheduler/README.md",
+      "projects/21-notification/PLAN.md"
+    ],
+    "code_example": "// proposed addition (illustrative)\nconst MAX_IDEMPOTENCY_KEYS = 100_000;\n\nprivate touchIdempotency(key: string, postId: string): void {\n  this.idempotency.delete(key); // no-op if absent; re-insert moves it to the 'most recent' end\n  this.idempotency.set(key, postId);\n  if (this.idempotency.size > MAX_IDEMPOTENCY_KEYS) {\n    const oldest = this.idempotency.keys().next().value!;\n    this.idempotency.delete(oldest); // evicts the least-recently-used key\n  }\n}\n// schedulePost: on lookup hit, call this.touchIdempotency(clientRequestId, existingId) to mark it fresh;\n// on a new schedule, call this.touchIdempotency(clientRequestId, record.id) after storing the post.",
+    "code_language": "typescript",
+    "advantages": [
+      "Memory stays bounded regardless of traffic volume, unlike the current unbounded Map",
+      "Reuses JavaScript's native Map insertion-order behavior -- no separate linked-list bookkeeping needed"
+    ],
+    "disadvantages": [
+      "An evicted key silently loses its dedupe guarantee -- a very late, legitimate replay becomes a duplicate post instead of IDEMPOTENCY_CONFLICT-or-replay",
+      "Every lookup now does an extra delete+set to maintain LRU order, a small but real cost on the hot schedulePost path"
+    ],
+    "common_mistakes": [
+      "Checking size and evicting BEFORE adding the new key instead of after, which can evict the just-inserted key if the check is off by one",
+      "Forgetting to re-insert on READ (not just on write), which would make this a simple FIFO bound instead of a true LRU"
+    ],
+    "follow_up_questions": [
+      "Why is a time-based TTL (expire after N hours) a different trade-off than a size-based LRU bound, and could you combine both?",
+      "What would you log or monitor to know how often legitimate replays are being lost to eviction in production?"
+    ],
+    "concepts": ["lru-cache", "idempotency", "memory-bound", "trade-offs"],
+    "advanced": {
+      "architecture_tradeoffs": "LRU bound trades perfect dedupe correctness for bounded memory -- this is the same trade-off project 21 stage 2 documents for its own idempotency keys. The alternative, a TTL-based expiry, trades a DIFFERENT axis (time since creation vs. recency of access), and the two can be combined (whichever fires first evicts).",
+      "failure_scenarios": "A caller that retries a schedulePost call after an unusually long delay (e.g. a client that batches retries and replays after hours), on a system under heavy unrelated traffic, could have its key evicted in between -- the retry would then create a genuine duplicate post instead of returning the original.",
+      "alternatives": "A TTL-only expiry (simpler, bounded by time not memory, but can still grow unbounded under high enough sustained traffic); a hybrid LRU+TTL (evict on whichever limit is hit first, matching project 21's actual design); or moving idempotency keys to an external store (Redis with native TTL) which handles both concerns outside the process's own memory.",
+      "scale_10x_100x": "At 10x traffic, a fixed-size LRU bound holds up fine -- it just evicts more aggressively, shortening the EFFECTIVE replay window. At 100x, if replay windows need to stay long (e.g. clients that can legitimately retry after hours), the bound would need to grow correspondingly, which reintroduces the original unbounded-memory problem unless paired with external storage.",
+      "production_improvements": "Add the LRU bound as a quick, self-contained fix today. Separately, plan a migration to an external TTL-capable store (Redis) for idempotency keys once this moves to a real multi-instance deployment, matching project 21's eventual design."
+    }
+  },
+  {
+    "id": "SOC-126",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Advanced",
+    "question": "Add jitter to the backoff delay to avoid a thundering herd of many channels retrying at the exact same moment. Where exactly does this go, and what must NOT change?",
+    "answer_hinglish": "Problem: `backoffMs(attempt, initialMs, maxMs) = min(maxMs, initialMs * 2^(attempt-1))` ek PURE, DETERMINISTIC function hai -- SAME attempt number, SAME initialMs/maxMs ke saath, HAMESHA EXACT SAME delay deta hai. Agar bahut saare channels EK SAME waqt par fail hon (jaise ek platform-wide outage), sab EXACTLY SAME `nextAttemptAt` par phir se due ho jaayenge -- ek 'thundering herd' jahan sab EK SAME tick() call mein ek saath retry karte hain, provider par ek bada spike daal dete hain exactly jab woh already struggling tha.\n\nJitter fix: backoff delay mein ek SMALL RANDOM component add karo. Standard pattern: 'full jitter' -- `actualDelay = random(0, computedBackoff)` -- ya 'equal jitter' -- `actualDelay = computedBackoff/2 + random(0, computedBackoff/2)`. Is project mein, change `dispatchChannel`'s failure branch mein jaayega, JAHAN `nextAttemptAt` compute hota hai: `delivery.nextAttemptAt = now + jitter(backoffMs(delivery.attempts, this.initialBackoffMs, this.maxBackoffMs))`.\n\nCRITICAL constraint: `backoffMs` khud PURE rehna chahiye -- usko mutate nahi karna. Jitter EK ALAG function honi chahiye jo `backoffMs`'s output ko wrap kare, taaki EXISTING tests jo `backoffMs(attempt, ...)` ko DIRECTLY call karte hain (determinstic output expect karte hue) UNAFFECTED rahein. Ek TESTABILITY concern bhi hai: random jitter test karna mushkil hai bina ek injected random source ke -- is project mein `Clock` jaisa hi ek injectable `rng: () => number` parameter add karna chahiye, taaki tests deterministic seed de sakein (jaisa `test/invariants.test.ts` ka `prng(seed)` pattern already karta hai).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate jitter ka PURPOSE (thundering herd avoid karna) samajhta hai, aur yeh bhi ki random behavior ko TESTABLE kaise banate hain (injected RNG, same pattern jaisa Clock injection).",
+    "real_world_analogy": "Ek office mein sab employees ki lunch break EXACTLY 1:00 PM par ho toh cafeteria overload ho jaata hai -- agar har employee ka break time thoda RANDOM stagger kiya jaaye (1:00-1:15 ke beech), cafeteria load spread ho jaata hai bina kisi ek employee ke break time ko significantly change kiye.",
+    "how_it_works": "jitter(baseMs, rng) returns a randomized delay derived from baseMs (e.g. full jitter: rng() * baseMs). dispatchChannel's nextAttemptAt computation wraps backoffMs's deterministic output with this jitter function, using an injected rng source for testability.",
+    "in_this_project": "src/scheduler.ts ka backoffMs (stays pure) aur dispatchChannel's failure branch (where nextAttemptAt is set) -- the integration point for a new jitter wrapper.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::backoffMs",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/test/invariants.test.ts"
+    ],
+    "code_example": "// proposed addition (illustrative) -- backoffMs itself is untouched\nfunction withFullJitter(baseMs: number, rng: () => number): number {\n  return Math.floor(rng() * baseMs); // full jitter: uniformly random between 0 and baseMs\n}\n\n// dispatchChannel's failure branch (trimmed):\nconst base = backoffMs(delivery.attempts, this.initialBackoffMs, this.maxBackoffMs);\ndelivery.nextAttemptAt = now + withFullJitter(base, this.rng); // this.rng injected, defaults to Math.random",
+    "code_language": "typescript",
+    "advantages": [
+      "Spreads retry load over time instead of all channels retrying in lockstep, reducing the spike a recovering provider sees",
+      "backoffMs stays pure and unchanged, so every existing deterministic backoff test keeps passing untouched"
+    ],
+    "disadvantages": [
+      "Makes nextAttemptAt non-deterministic, which complicates any test asserting an EXACT delay value (tests now must assert a RANGE)",
+      "Full jitter can occasionally produce a very short delay (close to 0), retrying almost immediately -- a deliberate trade for better spread, not a bug"
+    ],
+    "common_mistakes": [
+      "Adding randomness directly inside backoffMs instead of wrapping its output, breaking its purity and every existing test that expects a deterministic value",
+      "Using Math.random() directly instead of an injected rng, making the new behavior untestable with a fixed seed"
+    ],
+    "follow_up_questions": [
+      "Why is full jitter (0 to baseMs) sometimes preferred over equal jitter (baseMs/2 to baseMs), and what's the trade-off between them?",
+      "How would you write a test that proves jitter is applied without asserting an exact nextAttemptAt value?"
+    ],
+    "concepts": ["jitter", "thundering-herd", "backoff", "testability"],
+    "advanced": {
+      "architecture_tradeoffs": "Wrapping backoffMs's output (rather than modifying it) preserves a clean separation: backoffMs answers 'what is the nominal delay', jitter answers 'how do we spread load around that nominal delay' -- two composable, independently testable concerns instead of one tangled function.",
+      "failure_scenarios": "Without jitter, a provider-wide outage affecting many channels at once (e.g. a platform-wide API degradation) causes every affected channel to retry in near-perfect lockstep at each backoff boundary, repeatedly hammering an already-struggling provider with synchronized bursts instead of a spread-out trickle.",
+      "alternatives": "Equal jitter (less variance, still spreads load, retries never get TOO short); decorrelated jitter (AWS's recommended scheme, which also factors in the previous delay); or jittering only above a certain attempt count, keeping early retries deterministic and fast.",
+      "scale_10x_100x": "At 10x channels, jitter's benefit is modest since collisions are rarer. At 100x+ channels sharing one provider, jitter becomes essential -- without it, a provider recovering from an outage would face recurring synchronized retry storms at every backoff interval, potentially never fully recovering.",
+      "production_improvements": "Ship full or equal jitter as the default. Expose the rng as an injectable constructor option (mirroring Clock) so tests stay deterministic. Monitor actual retry timing distribution in production to confirm the jitter is achieving real spread, not just theoretically."
+    }
+  },
+  {
+    "id": "SOC-127",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "Design support for editing a post's channel list itself (adding or removing a channel), which editPost currently does not support at all.",
+    "answer_hinglish": "Abhi `editPost` sirf `content`/`scheduledAt` accept karta hai -- README explicitly kehta hai 'Editing the channel list itself is not supported... to add or remove a channel, cancel that one channel (or the whole post) and schedule a new one.' Yeh workaround kaam karta hai par ek NAYA post id banata hai, jo caller-side tracking complicate karta hai (same logical 'campaign' ab do post ids mein split ho gaya).\n\nDesign for channel-list editing: `EditPostRequest` mein ek naya optional field, `addChannels?: string[]` aur `removeChannels?: string[]`. REMOVE ek channel ke liye, SIMPLEST approach: internally `cancelChannel`'s logic reuse karo (status pending hone chahiye, nahi toh error) -- removed channel `canceled` ban jaata hai, delete nahi hota (history preserve karne ke liye, same jaise cancel karta hai).\n\nADD ek channel ke liye, zyada tricky hai: naya channel validate karna hoga (`UNKNOWN_CHANNEL` same jaisa schedulePost mein), aur naya `ChannelDelivery` banana hoga `status: pending, attempts: 0, nextAttemptAt: record.scheduledAt`. Par IMPORTANT edge case: agar edit mein `scheduledAt` BHI badal raha hai saath mein, naya channel ka `nextAttemptAt` NAYE `scheduledAt` ko use karega (jaisa existing pending channels already karte hain existing editPost code mein).\n\nSabse bada DESIGN QUESTION: kya naya channel add karna EXISTING attempts>0 restriction ke against bhi check hona chahiye? Reasoning: ek naya channel ne kabhi KUCH attempt nahi kiya -- isliye ADD karna hamesha safe hona CHAHIYE, chahe doosre channels already attempted hon (jo already EDIT content ko block karta hai, par add-only operation content nahi badal raha). Yeh matlab `addChannels` ek SEPARATE, LESS RESTRICTIVE path hona chahiye jo content/scheduledAt edit ke `POST_ALREADY_DISPATCHED` check se BYPASS kare.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek documented gap ko real feature design mein convert kar sakta hai, including non-obvious edge cases (add vs remove ki ALAG restrictiveness, fingerprint impact).",
+    "real_world_analogy": "Ek guest list mein naya guest add karna (jo abhi tak invite hi nahi hua) hamesha fine hai, chahe baaki guests ko already invite bheji ja chuki ho. Par kisi EXISTING guest ko list se hatana (jisko already invite mil gayi hai) ek alag concern hai -- unhe explicitly 'disinvite' karna padega.",
+    "how_it_works": "removeChannels reuses cancelChannel's pending-check logic per channel. addChannels validates new channels and creates fresh ChannelDelivery records (attempts: 0), bypassing the attempts>0 restriction that blocks content/scheduledAt edits, since a brand-new channel has nothing to 'un-see'.",
+    "in_this_project": "src/scheduler.ts ka editPost (current content/scheduledAt-only shape), EditPostRequest interface, cancelChannel (reused logic for remove), schedulePost (reused validation for add).",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::editPost",
+      "projects/26-social-scheduler/src/scheduler.ts::cancelChannel",
+      "projects/26-social-scheduler/README.md"
+    ],
+    "code_example": "// proposed addition (illustrative)\nexport interface EditPostRequest {\n  content?: string;\n  scheduledAt?: number;\n  addChannels?: string[]; // new channels, validated like schedulePost's channels\n  removeChannels?: string[]; // existing pending channels to cancel\n}\n\n// inside editPost, addChannels handling (sketch):\nfor (const channel of updates.addChannels ?? []) {\n  if (!this.providers[channel]) throw new SchedulerError(\"UNKNOWN_CHANNEL\", `no provider for \"${channel}\"`);\n  if (record.deliveries[channel]) continue; // already targeted, no-op\n  record.deliveries[channel] = { channel, status: \"pending\", attempts: 0, maxAttempts: this.maxAttempts, nextAttemptAt: record.scheduledAt };\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Removes the need for the 'cancel the whole post and reschedule a new one' workaround, keeping one logical campaign under one post id",
+      "Add and remove reuse existing, already-tested validation logic (schedulePost's channel checks, cancelChannel's pending checks) rather than duplicating it"
+    ],
+    "disadvantages": [
+      "Adding a channel mid-flight changes the post's channel SET, which breaks the idempotency fingerprint's assumption that channels are fixed at creation -- the fingerprint would need to be recomputed or the feature kept entirely outside idempotency's scope",
+      "Significantly more edge cases than the current content/scheduledAt-only editPost (e.g. adding a channel that was previously removed)"
+    ],
+    "common_mistakes": [
+      "Blocking addChannels behind the same attempts>0 check that blocks content edits -- a brand-new channel has nothing to un-see and should not be blocked by a sibling's prior attempts",
+      "Forgetting that the new channel's nextAttemptAt must track the CURRENT scheduledAt, not some stale value, if scheduledAt is also being edited in the same call"
+    ],
+    "follow_up_questions": [
+      "Should re-adding a previously-removed (canceled) channel reuse its old ChannelDelivery record or create a fresh one?",
+      "How does this feature interact with the idempotency fingerprint, which currently bakes the channel set in at schedule time?"
+    ],
+    "concepts": ["editPost", "feature-design", "channel-management"],
+    "advanced": {
+      "architecture_tradeoffs": "Treating add and remove as asymmetric operations (add bypasses the attempts-restriction, remove reuses cancel's stricter pending-only rule) matches the project's existing philosophy (SOC-104's cancel-vs-edit asymmetry) but adds a THIRD distinct rule to learn, alongside cancel's and edit's existing two.",
+      "failure_scenarios": "If addChannels were allowed to re-target a channel that is currently mid-retry on another provider instance of the SAME channel key (not possible today since deliveries is keyed by channel name, but worth stating), the design must guarantee exactly one ChannelDelivery per channel key, never two.",
+      "alternatives": "Keep the current 'cancel and reschedule a new post' workaround as a documented pattern instead of building this feature, if the complexity (especially the idempotency fingerprint interaction) outweighs the convenience for this project's actual use cases.",
+      "scale_10x_100x": "This feature's complexity is per-post, not traffic-scale-dependent -- it does not get harder at 10x or 100x volume. What DOES get harder at scale is reasoning about the idempotency fingerprint once channel sets become mutable, since replay-matching logic (SOC-118) assumed the channel set never changes after schedule time.",
+      "production_improvements": "If built, exclude addChannels/removeChannels from idempotency fingerprint comparisons entirely (treat edits as mutations outside the original fingerprint's scope, same as content/scheduledAt edits already are), and document clearly that a replay of the ORIGINAL schedulePost call still only matches the ORIGINAL channel set, not any edited one."
+    }
+  },
+  {
+    "id": "SOC-128",
+    "project_slug": "p26-social-scheduler",
+    "category": "Advanced",
+    "difficulty": "Senior/System Design",
+    "question": "If this scheduler were deployed with multiple instances behind a load balancer (not even calling tick() concurrently, just handling schedulePost/cancelChannel calls), what breaks, and why is the dispatching Set the wrong thing to fix it with?",
+    "answer_hinglish": "Sabse fundamental problem: `SocialScheduler`'s SAARI state -- `posts`, `idempotency`, `dispatching` -- sab IN-MEMORY Maps/Sets HAIN, PER-INSTANCE. Agar do instances (A aur B) ek load balancer ke peeche hain, EK clientRequestId ke saath do requests A aur B par ALAG-ALAG land kar sakti hain -- A ko iska pata hi nahi hoga ki B ne already same clientRequestId process kar liya hai, kyunki A ka `idempotency` Map sirf A ki apni memory mein hai. Result: DUPLICATE posts, same clientRequestId ke saath, idempotency guarantee COMPLETELY BROKEN cross-instance.\n\n`dispatching` Set yahan HELP NAHI karega, kyunki uska PURPOSE hi different hai -- woh sirf SAME-PROCESS overlap (ek slow provider + doosra tick() call, SAME instance ke andar) ke against protect karta hai. Yeh ek IN-MEMORY, PER-PROCESS synchronization primitive hai -- do ALAG processes ke beech koi visibility hi nahi hai ek doosre ke `dispatching` Set ki. Agar A aur B dono `tick()` chalayen apne-apne in-memory `posts` copies par (jo already divergent hain), har instance apna khud ka `dispatching` tracking karega, par woh DOOSRE instance ke concurrent dispatch ko kabhi dekh hi nahi payega.\n\nActual fix: `posts`/`idempotency`/`dispatching` teeno SHARED, EXTERNAL state mein jaane chahiye (database + distributed lock/lease mechanism, jaisa SOC-124 discuss karta hai project 21's JobQueue reuse ke saath). `dispatching` Set jaisa in-memory guard SIRF single-process ke liye sahi hai -- cross-process coordination ke liye ek GENUINELY shared mechanism chahiye (DB row lock, Redis lock, ya lease-based claim jaisa SOC-124/110).",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate samajhta hai ki ek IN-MEMORY, SINGLE-PROCESS guard (dispatching Set) GENUINELY distributed coordination ka substitute NAHI hai -- yeh common mistake hai jo engineers karte hain jab single-process code ko naively horizontally scale karte hain.",
+    "real_world_analogy": "Do alag bank branches, jinke paas apna-apna SEPARATE ledger hai (koi shared database nahi), dono ek hi account number ke liye withdrawal process kar sakte hain SIMULTANEOUSLY -- har branch ko lagta hai woh pehla hai, kyunki dono ko doosre branch ki activity ka pata hi nahi hai. Ek branch ke andar ek 'teller is busy' sign (dispatching Set jaisa) doosre branch ko kabhi nahi dikhega.",
+    "how_it_works": "posts/idempotency/dispatching are all per-process in-memory state today. Multiple instances mean multiple independent copies of this state with zero cross-instance visibility -- the dispatching Set's guarantee (same-process overlap protection) simply does not extend across a network boundary.",
+    "in_this_project": "src/scheduler.ts ka SocialScheduler constructor -- the posts/idempotency/dispatching fields, all declared as in-process Map/Set with no external backing.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::SocialScheduler",
+      "projects/26-social-scheduler/README.md",
+      "projects/26-social-scheduler/PLAN.md"
+    ],
+    "code_example": "// real, src/scheduler.ts -- all three are PER-PROCESS in-memory state\nprivate readonly posts = new Map<string, PostRecord>();\nprivate readonly idempotency = new Map<string, string>();\nprivate readonly dispatching = new Set<string>();\n// None of these are visible to another SocialScheduler instance in another process.",
+    "code_language": "typescript",
+    "advantages": [
+      "In-memory state is extremely fast and simple for a single-process deployment, which is this project's actual stage 1 scope",
+      "Identifying this limitation clearly (rather than papering over it with a same-process-only fix) avoids a false sense of safety"
+    ],
+    "disadvantages": [
+      "Zero horizontal scalability as built -- any multi-instance deployment silently breaks idempotency, dispatch-overlap protection, and basic data consistency (one instance's cancelChannel is invisible to another)",
+      "The failure mode (duplicate posts, double-dispatch) is SILENT -- there is no error or crash, just quietly wrong behavior"
+    ],
+    "common_mistakes": [
+      "Believing the dispatching Set or the idempotency Map provide any cross-process safety -- they are explicitly process-local",
+      "Scaling horizontally by just running more instances of this class without first moving its state to a shared backend"
+    ],
+    "follow_up_questions": [
+      "What is the minimal shared-state change needed to make just schedulePost's idempotency check safe across multiple instances, without touching tick()?",
+      "Why would a distributed lock (e.g. Redis) for the idempotency check alone not be enough to fix cross-instance dispatch overlap too?"
+    ],
+    "concepts": ["horizontal-scaling", "distributed-systems", "state-management", "system-design"],
+    "advanced": {
+      "architecture_tradeoffs": "Keeping all state in-process is the right call for THIS project's stated scope (a library, single caller, interview-focused) -- the mistake would be assuming this design 'mostly works' under multiple instances. Making it genuinely multi-instance-safe means replacing every one of posts/idempotency/dispatching with a shared, consistent backend, which is a different project, not a small patch.",
+      "failure_scenarios": "Under a load balancer with 2+ instances: (1) duplicate posts from idempotency misses across instances, (2) a channel dispatched twice if two instances' tick() calls both see it as due and neither's dispatching Set knows about the other, (3) a cancelChannel call landing on instance B while the channel is mid-send on instance A succeeding silently (no DISPATCH_IN_PROGRESS, since B's dispatching Set is empty for that key) -- the exact race the guard exists to prevent, now bypassed entirely by the deployment topology.",
+      "alternatives": "A shared database for posts/idempotency with transactional writes; a distributed lock (Redis, or a DB advisory lock) for mutual exclusion during dispatch; or routing all writes for a given postId to a single instance (sharding by postId) so no cross-instance coordination is needed at all for that post's operations.",
+      "scale_10x_100x": "This is not really a '10x vs 100x' scaling question -- it breaks the MOMENT a second instance exists, regardless of traffic volume. The question that scales is how much contention a shared backend can handle once correctness is restored.",
+      "production_improvements": "Before any multi-instance deployment: move posts/idempotency to a shared durable store with the right consistency guarantees (SOC-124's job-queue design for dispatch, a transactional store for schedulePost's idempotency check). Document clearly, as this question's analysis does, that today's SocialScheduler is single-process-only."
+    }
+  },
+  {
+    "id": "SOC-129",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a function deadLetteredChannels(scheduler, postId): string[] using only the public API.",
+    "answer_hinglish": "Yeh exercise public API ko correctly navigate karna test karta hai -- `getPost` se poora post object milta hai (ya `undefined` agar postId exist nahi karta), aur `post.deliveries` ek `Record<string, ChannelDelivery>` hai jisko `Object.values()` se iterate karna hota hai har delivery ka `status` check karne ke liye.\n\nUnknown postId ka handling important hai: `getPost` `undefined` return karta hai (throw nahi karta), isliye function ko bhi gracefully empty array return karna chahiye, exception nahi throw karni chahiye -- yeh is project ke 'read' methods (`getPost`, `list`) ka consistent behavior hai, sirf MUTATING methods (`cancelChannel`, `editPost`, etc.) UNKNOWN_POST throw karte hain.\n\nFunction khud ek simple filter+map hai: `Object.values(post.deliveries).filter(d => d.status === 'dead_letter').map(d => d.channel)`. Koi mutation nahi hoti, koi internal state access nahi -- poora public `ScheduledPost`/`ChannelDelivery` shape se kaam chal jaata hai, jo ScheduledPost already export karta hai index.ts se.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate public API shape (deliveries ek Record hai, Array nahi) sahi se handle kar sakta hai, including the undefined-vs-throw distinction between read and mutating methods.",
+    "real_world_analogy": "Ek dashboard jo ek order ke saare shipped-but-returned items dhoondta hai -- order na mile toh empty list dikhata hai, crash nahi karta.",
+    "how_it_works": "getPost(postId) returns ScheduledPost | undefined. Object.values(post.deliveries) gives every ChannelDelivery; filter by status === 'dead_letter', map to .channel.",
+    "in_this_project": "src/scheduler.ts ka getPost method aur src/types.ts ka ScheduledPost.deliveries shape.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::getPost",
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery"
+    ],
+    "code_example": "import type { SocialScheduler } from \"../src/scheduler.js\";\n\nfunction deadLetteredChannels(scheduler: SocialScheduler, postId: string): string[] {\n  const post = scheduler.getPost(postId);\n  if (!post) return [];\n  return Object.values(post.deliveries)\n    .filter((d) => d.status === \"dead_letter\")\n    .map((d) => d.channel);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Uses only the public, documented API -- no access to private scheduler internals",
+      "Handles an unknown postId gracefully, matching getPost's own undefined-not-throw contract"
+    ],
+    "disadvantages": [
+      "Returns channel NAMES only, without the lastError reason -- a caller wanting diagnostics would need to re-derive that from the full deliveries object themselves"
+    ],
+    "common_mistakes": [
+      "Assuming deliveries is an array and calling .filter() directly on it, when it is actually a Record keyed by channel",
+      "Throwing on an unknown postId instead of returning an empty array, inconsistent with getPost's own contract"
+    ],
+    "follow_up_questions": [
+      "How would you extend this to also return each dead-lettered channel's lastError reason?",
+      "How would you write this same function across EVERY post in the scheduler, not just one?"
+    ],
+    "concepts": ["public-api", "coding-exercise"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-130",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Write a function that computes the worst-case number of tick() calls a channel needs before it reaches a terminal state, given maxAttempts (assuming the caller advances the clock to exactly each next due time between calls).",
+    "answer_hinglish": "Key insight: HAR `tick()` call, jab clock exactly due time par advance kiya jaaye, EXACTLY EK attempt use karta hai ek channel ke liye -- chahe backoff kitna bhi bada ho, woh sirf YEH decide karta hai KAB next tick() due hoga, kitne tick() CALLS chahiye honge yeh nahi badalta. Isliye worst case (channel HAMESHA fail hota hai har attempt par) mein, exactly `maxAttempts` tick() calls chahiye honge dead_letter tak pahunchne ke liye -- pehla tick() attempt 1, doosra attempt 2, ... akhri tick() attempt maxAttempts (jahan `attempts >= maxAttempts` ho jaata hai aur dead_letter set hota hai).\n\nYeh `backoffMs` formula se INDEPENDENT hai -- `initialBackoffMs`/`maxBackoffMs` sirf TIME determine karte hain (kitna clock advance karna padega), COUNT nahi. Function khud trivial hai validation ke saath -- same validation jo `SocialScheduler`'s constructor already karta hai `maxAttempts >= 1` ke liye, consistency ke liye reuse kiya gaya hai.\n\nYeh function test karne ka tarika: ek scheduler banao `AlwaysFailsProvider` ke saath given `maxAttempts`, phir actual worst-case ticks GINO (har backoff ke baad clock advance karte hue) jab tak `dead_letter` na ho jaaye, aur compare karo function ke output se -- yeh exactly SOC-134 ka settle() helper pattern use karta hai.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate backoffMs aur maxAttempts ke beech ka RELATIONSHIP samajhta hai -- backoff sirf TIMING affect karta hai, tick() CALL COUNT nahi.",
+    "real_world_analogy": "Ek exam mein tumhe max 5 attempts milte hain pass karne ke liye, chahe har attempt ke beech wait time 1 din ho ya 1 hafta -- wait time badalne se tumhare TOTAL ATTEMPTS ki ginti nahi badalti, sirf poora process kitne CALENDAR time lega yeh badalta hai.",
+    "how_it_works": "Each tick() call, assuming the caller advances the clock to exactly the next due time, consumes exactly one attempt for a channel that keeps failing. So the worst case is simply maxAttempts tick() calls, independent of backoff values.",
+    "in_this_project": "src/scheduler.ts ka dispatchChannel (one attempt per dispatch) aur tick() (one dispatch per due channel per call); test/tick.test.ts ka 'exhausting maxAttempts' test demonstrates this count directly.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/test/tick.test.ts"
+    ],
+    "code_example": "function worstCaseTicksToTerminal(maxAttempts: number): number {\n  if (!Number.isInteger(maxAttempts) || maxAttempts < 1) {\n    throw new RangeError(\"maxAttempts must be an integer >= 1\");\n  }\n  // backoffMs only determines WHEN the next tick() must happen (the clock-advance amount),\n  // never HOW MANY tick() calls are needed -- each due tick() consumes exactly one attempt.\n  return maxAttempts;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Trivial, O(1) computation once you see that backoff timing and attempt count are independent concerns",
+      "Directly useful for capacity planning (SOC-114): tells you the upper bound on tick() calls a single stubbornly-failing channel will ever consume"
+    ],
+    "disadvantages": [
+      "Assumes the caller always advances the clock to exactly the next due time -- in a real deployment with periodic polling, the ACTUAL number of tick() calls could be higher if polling is less frequent than the backoff interval"
+    ],
+    "common_mistakes": [
+      "Trying to compute this from the backoff formula (summing delays) instead of realizing the answer is simply maxAttempts",
+      "Forgetting the constructor-level validation (maxAttempts must be an integer >= 1), producing a nonsensical result for invalid input"
+    ],
+    "follow_up_questions": [
+      "How would this answer change if tick() were called on a FIXED interval (e.g. every 30 seconds) instead of exactly at each due time?",
+      "How would you write a test using ManualClock that proves this worst-case number against a real AlwaysFailsProvider?"
+    ],
+    "concepts": ["backoff", "maxAttempts", "coding-exercise"],
+    "advanced": {
+      "architecture_tradeoffs": "This question's answer only holds under the idealized assumption of 'clock advanced to exactly the next due time' -- a real production polling interval decouples CLOCK time from CALL count, so this exercise is a theoretical bound, not an operational guarantee.",
+      "failure_scenarios": "If a real deployment polls tick() less frequently than the computed backoff delay, a channel could sit well past its nextAttemptAt without being dispatched sooner -- the channel still only consumes maxAttempts total dispatches, but the WALL-CLOCK time to reach dead_letter grows with the polling gap.",
+      "alternatives": "A more operationally useful metric would be worst-case WALL-CLOCK time to dead_letter (summing backoffMs across all attempts, capped), rather than tick() call count, since that is what actually matters for monitoring/alerting SLAs.",
+      "scale_10x_100x": "This bound is per-channel and traffic-independent -- it does not change at 10x or 100x post volume. What changes at scale is how many channels are SIMULTANEOUSLY in this worst case at once, which is a tick() throughput concern (SOC-114), not a per-channel count concern.",
+      "production_improvements": "Pair this theoretical bound with a real wall-clock-time calculation (sum of backoffMs across attempts, capped at maxBackoffMs each) to give on-call engineers a concrete 'this channel will be stuck retrying for at most X minutes' answer."
+    }
+  },
+  {
+    "id": "SOC-131",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a test proving that canceling a channel mid-retry stops all future dispatch attempts for it.",
+    "answer_hinglish": "Yeh test SOC-104's trade-off ko DIRECTLY exercise karta hai -- cancel ek 'still pending' channel par kaam karta hai CHAHE woh mid-retry ho (attempts > 0). Test ka structure: PEHLE ek channel ko fail karo EK baar (attempts=1, status pending, retry ka wait), phir usse CANCEL karo, phir clock ko BAHUT aage advance karo (far past any backoff), phir tick() call karo -- aur ASSERT karo ki provider ko DOBARA call hi nahi kiya gaya.\n\nKey assertion do parts mein hai: (1) `mastodon.attempts` (provider ka internal call log) ki LENGTH same rehti hai cancel se PEHLE aur BAAD mein -- yeh PROVES ki koi naya `send()` call nahi hua. (2) `scheduler.getPost(...)` ka status `canceled` reh jaata hai, `pending` ya kuch aur nahi ban jaata.\n\nYeh pattern EXACTLY `test/tick.test.ts`'s 'exhausting maxAttempts' test se milta hai (jo bhi provider call count ko before/after compare karta hai), par yahan termination CANCEL se hoti hai, maxAttempts exhaustion se nahi -- isliye attempts count SIRF 1 par RUK jaata hai, 3 ya 5 tak nahi badhta.",
+    "why_needed": "Interviewer ek REAL test likhwana chahta hai jo mid-retry cancel ka exact guarantee prove kare, provider call count assertion ke through -- sirf status check se yeh PROOF nahi milta ki provider dobara call NAHI hua.",
+    "real_world_analogy": "Ek factory worker jisko ek order ke liye retry karte waqt BEECH mein rok diya jaaye -- test karne ka sahi tarika yeh hai ki worker ka ACTUAL output (parts banaye) count karo, sirf uska status board check karna kaafi nahi, kyunki status board galat bhi ho sakta hai.",
+    "how_it_works": "Schedule a post with an always-failing provider -> tick() once (attempts=1, still pending) -> cancelChannel() mid-retry -> advance the clock far past any backoff -> tick() again -> assert the provider's call count is unchanged and status stays canceled.",
+    "in_this_project": "src/scheduler.ts ka cancelChannel aur tick(); test/cancel-edit.test.ts ka existing cancelChannel describe block (same pattern, different assertion focus); src/providers.ts ka AlwaysFailsProvider.attempts array.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::cancelChannel",
+      "projects/26-social-scheduler/src/providers.ts::AlwaysFailsProvider",
+      "projects/26-social-scheduler/test/cancel-edit.test.ts"
+    ],
+    "code_example": "import { describe, expect, it } from \"vitest\";\nimport { ManualClock } from \"../src/clock.js\";\nimport { AlwaysFailsProvider } from \"../src/providers.js\";\nimport { SocialScheduler } from \"../src/scheduler.js\";\n\ndescribe(\"cancel mid-retry\", () => {\n  it(\"canceling a channel mid-retry stops every future dispatch attempt for it\", async () => {\n    const NOW = Date.UTC(2026, 10, 28, 9, 0);\n    const clock = new ManualClock(NOW);\n    const mastodon = new AlwaysFailsProvider(\"instance down\");\n    const scheduler = new SocialScheduler({\n      providers: { mastodon }, clock, maxAttempts: 5, initialBackoffMs: 1000, maxBackoffMs: 60_000,\n    });\n    const post = scheduler.schedulePost({\n      clientRequestId: \"r1\", content: \"hi\", channels: [\"mastodon\"], scheduledAt: NOW,\n    });\n\n    await scheduler.tick(); // attempt 1 fails, still pending, awaiting retry\n    expect(mastodon.attempts).toHaveLength(1);\n\n    scheduler.cancelChannel(post.id, \"mastodon\"); // canceled mid-retry (attempts > 0)\n\n    clock.advance(10 * 60 * 60_000); // advance far past any backoff window\n    await scheduler.tick();\n    expect(mastodon.attempts).toHaveLength(1); // no further provider calls, ever\n    expect(scheduler.getPost(post.id)!.deliveries.mastodon!.status).toBe(\"canceled\");\n  });\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Asserts on the PROVIDER's call log, not just the delivery status -- proves the provider was genuinely never called again, not just that the status label looks right",
+      "Advancing the clock far beyond any backoff window rules out 'it just hasn't become due again yet' as an alternative explanation"
+    ],
+    "disadvantages": [
+      "Does not cover the DISPATCH_IN_PROGRESS race (cancel while a send is actually mid-flight) -- that is test/dispatch-guard.test.ts's job, a separate concern"
+    ],
+    "common_mistakes": [
+      "Only checking the delivery's status after cancel, without also advancing the clock and ticking again to prove no further dispatch happens",
+      "Canceling the channel BEFORE any attempt (attempts=0), which would not actually exercise the 'mid-retry' scenario at all"
+    ],
+    "follow_up_questions": [
+      "How would you adapt this test to use cancelPost instead of cancelChannel?",
+      "What would need to change in this test to also prove the SIBLING channel of a multi-channel post is unaffected by this cancel?"
+    ],
+    "concepts": ["cancel", "testing", "coding-exercise"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-132",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Beginner",
+    "question": "Write a function pendingChannelCount(scheduler): number that counts every pending channel across every post.",
+    "answer_hinglish": "Yeh exercise do levels ki iteration test karta hai -- `scheduler.list()` saare posts ka ARRAY deta hai (`ScheduledPost[]`), aur har post ke `deliveries` ek Record hai jisko phir se `Object.values()` se iterate karna hota hai. Yeh EXACTLY `tick()`'s apna internal scan jaisa double-loop hai (SOC-115 dekho), bas yahan filter 'pending AND due' ke bajaye sirf 'pending' hai (koi `nextAttemptAt` check nahi, koi `dispatching` check nahi).\n\nFunction khud ek simple accumulator hai: har post ke har delivery ko check karo, `status === 'pending'` ho toh counter badhao. Koi mutation nahi, `list()` already `structuredClone` se safe copies deta hai (`toPublicPost` internally use karta hai), isliye yeh function scheduler ki internal state ko kabhi touch nahi karta.\n\nYeh BACKLOG metric ka EK building block hai (SOC-113 mein poora backlog-with-staleness discuss hua), par yahan sirf RAW COUNT hai, 'due' filter ke bina -- matlab ek post jo abhi 5 minute baad due hai, woh BHI count hota hai (kyunki woh 'pending' hai), chahe woh ABHI dispatch-ready na ho.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate list() ka public shape (array of posts, each with a deliveries Record) sahi se navigate kar sakta hai, aur 'pending' ko 'due' se distinguish kar sakta hai.",
+    "real_world_analogy": "Ek poore mall ke har store mein kitne customers abhi queue mein khade hain, unhe COUNT karna -- chahe unka turn abhi aaya ho ya nahi, 'queue mein hona' matter karta hai, 'turn aa gaya' nahi.",
+    "how_it_works": "scheduler.list() returns every ScheduledPost. For each, Object.values(post.deliveries) gives every ChannelDelivery; count those with status === 'pending', summed across all posts.",
+    "in_this_project": "src/scheduler.ts ka list() method; src/types.ts ka ScheduledPost.deliveries shape.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::list",
+      "projects/26-social-scheduler/src/types.ts::ScheduledPost"
+    ],
+    "code_example": "import type { SocialScheduler } from \"../src/scheduler.js\";\n\nfunction pendingChannelCount(scheduler: SocialScheduler): number {\n  let count = 0;\n  for (const post of scheduler.list()) {\n    for (const delivery of Object.values(post.deliveries)) {\n      if (delivery.status === \"pending\") count++;\n    }\n  }\n  return count;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Simple, readable double-loop, matching tick()'s own scan structure closely enough to be instantly recognizable",
+      "Works entirely off the public list()/deliveries shape, no private state access needed"
+    ],
+    "disadvantages": [
+      "Does not distinguish 'pending and due' from 'pending but not yet due' -- for that, SOC-113's richer backlog function is needed instead",
+      "O(total deliveries across all posts) every call, same complexity concern as tick()'s own scan (SOC-114)"
+    ],
+    "common_mistakes": [
+      "Counting posts instead of individual channel deliveries (a post with 3 pending channels should add 3, not 1)",
+      "Confusing this with a due-only backlog count -- this counts ALL pending, including ones not yet due"
+    ],
+    "follow_up_questions": [
+      "How would you modify this to only count channels that are both pending AND due right now?",
+      "How would you make this O(1) if it needed to be queried very frequently, instead of scanning everything each call?"
+    ],
+    "concepts": ["public-api", "coding-exercise"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-133",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Advanced",
+    "question": "Write a settle() helper that advances a ManualClock and calls tick() repeatedly until every channel of every post reaches a terminal state, with a round budget to avoid an infinite loop.",
+    "answer_hinglish": "Yeh exercise `test/invariants.test.ts`'s ACTUAL `settle()` helper ka pattern follow karta hai -- yeh ek realistic 'simulate the whole system to completion' utility hai jo randomized tests mein use hota hai. Logic: HAR round mein, saare posts scan karo, dhoondo SABSE CHHOTA `nextAttemptAt` jo abhi bhi PENDING hai (`anyPending` flag se track karo ki kuch pending bacha hai ya nahi). Agar kuch pending nahi bacha, RETURN (already settled). Agar bacha hai, clock ko us NEXT DUE TIME tak advance karo (`clock.advance(nextDue - clock.now())`, SIRF agar woh future mein hai), phir `tick()` call karo.\n\n`maxAttempts` FINITE hai, isliye HAR channel jo canceled nahi hua, EVENTUALLY terminal (sent ya dead_letter) ho jaayega -- isliye yeh loop BOUNDED hai theoretically, par ek `maxRounds` safety limit zaroori hai taaki ek GENUINE BUG (jaise ek channel jo kabhi terminal na ho) infinite loop na bana de test suite ko hang karne ke liye.\n\nYeh helper standalone bhi useful hai (SOC-130 jaisa exercise isko use kar sakta hai verify karne ke liye), aur yeh dikhata hai ki is project ka POLLED `tick()` model (koi internal timer) kaise manually driven jaata hai tests mein -- koi real `setTimeout`/sleep kabhi nahi lagta.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate 'advance to fixed point' pattern design kar sakta hai -- yeh is project ki pura test-design philosophy ka core hai (ManualClock + polled tick()).",
+    "real_world_analogy": "Ek simulation jo ek vending machine ke poore din ka operation FAST-FORWARD karti hai -- sirf AGLE important moment (jab koi coin daalega, jab koi item restock hoga) tak time jump karti hai, bina har second ko individually simulate kiye.",
+    "how_it_works": "Each round: scan all posts for the minimum nextAttemptAt among still-pending deliveries. If none are pending, return (settled). Otherwise advance the clock to that minimum (if it's in the future) and call tick(). Repeat up to maxRounds.",
+    "in_this_project": "test/invariants.test.ts ka existing settle() function -- this exercise reproduces its exact pattern; src/clock.ts ka ManualClock.advance().",
+    "implementation_files": [
+      "projects/26-social-scheduler/test/invariants.test.ts::settle",
+      "projects/26-social-scheduler/src/clock.ts::ManualClock"
+    ],
+    "code_example": "import type { ManualClock } from \"../src/clock.js\";\nimport type { SocialScheduler } from \"../src/scheduler.js\";\n\nasync function settle(scheduler: SocialScheduler, clock: ManualClock, maxRounds = 200): Promise<void> {\n  for (let round = 0; round < maxRounds; round++) {\n    let nextDue = Infinity;\n    let anyPending = false;\n    for (const post of scheduler.list()) {\n      for (const delivery of Object.values(post.deliveries)) {\n        if (delivery.status === \"pending\") {\n          anyPending = true;\n          nextDue = Math.min(nextDue, delivery.nextAttemptAt);\n        }\n      }\n    }\n    if (!anyPending) return; // every channel is terminal (sent/dead_letter/canceled)\n    if (nextDue > clock.now()) clock.advance(nextDue - clock.now());\n    await scheduler.tick();\n  }\n  throw new Error(`did not settle within ${maxRounds} rounds`);\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Deterministically drives the whole system to completion without any real sleeps, keeping tests fast",
+      "The maxRounds safety net turns a potential infinite loop (from a real bug) into a clear, fast-failing test instead of a hang"
+    ],
+    "disadvantages": [
+      "Assumes every pending channel will eventually terminate within maxRounds -- a pathological maxAttempts/backoff combination could need tuning of that bound",
+      "Advances the clock to the EARLIEST due time across ALL posts each round, which can mean many rounds if posts have very staggered due times"
+    ],
+    "common_mistakes": [
+      "Forgetting the `if (nextDue > clock.now())` guard, which could try to advance the clock backwards or by zero unnecessarily",
+      "Not having a maxRounds bound at all, risking a genuine infinite loop if some future bug introduces a channel that never reaches a terminal state"
+    ],
+    "follow_up_questions": [
+      "Why is this pattern necessary for invariants.test.ts's randomized test specifically, versus the simpler hand-advanced clock steps used in tick.test.ts?",
+      "What would happen to this helper if a canceled channel were somehow left with status 'pending' by a bug -- would settle() hang or fail fast?"
+    ],
+    "concepts": ["manual-clock", "test-utilities", "coding-exercise"],
+    "advanced": {
+      "architecture_tradeoffs": "A generic settle() helper trades a little bit of per-test flexibility (you cannot easily inspect intermediate states between rounds without instrumenting it) for a huge reduction in test duplication across randomized and exploratory tests -- this project's invariants.test.ts relies on exactly this trade.",
+      "failure_scenarios": "If a real bug introduced a channel that stays 'pending' forever (e.g. a dead-letter condition that never fires due to an off-by-one), settle() would exhaust maxRounds and throw a clear, fast error -- much better than a silent infinite loop or a flaky timeout failure.",
+      "alternatives": "A per-post settle (only advancing/ticking until ONE specific post is done) instead of a global one, useful when a test only cares about one post among many unrelated ones in the same scheduler.",
+      "scale_10x_100x": "At 10x-100x posts, this helper's per-round scan cost grows the same way tick()'s own scan does (SOC-114) -- for very large randomized tests, the number of distinct nextAttemptAt values (and thus rounds) could also grow, making maxRounds tuning more important.",
+      "production_improvements": "None needed in production -- this is purely a test utility. If reused across many test files, it is worth extracting into a shared test-helpers module (this project's test/queued-helpers.ts in project 21 is a precedent for that pattern)."
+    }
+  },
+  {
+    "id": "SOC-134",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a function postsWithDeadLetters(scheduler) that returns, for every post with at least one dead-lettered channel, its postId and the list of dead-lettered channel names.",
+    "answer_hinglish": "Yeh exercise SOC-129's single-post version ka MULTI-POST extension hai -- har post ke liye `deadLetteredChannels`-jaisa filter apply karo, par is baar sirf un posts ko RESULT mein include karo jinke paas KAM SE KAM EK dead-lettered channel hai (empty-result posts ko skip karo, poori list clutter na ho).\n\nLogic: `scheduler.list()` se saare posts lo, har post ke `deliveries` ko filter karo `status === 'dead_letter'` ke liye, map karo `.channel` nikalne ke liye. Agar resulting array `length > 0` hai, result mein `{ postId: post.id, channels }` push karo -- agar `length === 0`, us post ko SKIP karo (yeh healthy post hai, report mein noise nahi daalna).\n\nYeh function EXACTLY ek PRODUCTION monitoring tool jaisa use case hai (SOC-111 ka dead-letter-rate-per-channel ka precursor) -- 'kaunse posts abhi incomplete hain kyunki unka ek channel permanently fail ho gaya' turant dikha deta hai, ek on-call engineer ke liye SOC-112's checklist ka ek concrete tool.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate ek single-post utility ko MULTI-post aggregation mein extend kar sakta hai, aur 'only include non-empty results' filtering logic correctly apply kar sakta hai.",
+    "real_world_analogy": "Ek warehouse manager ka report jo SIRF un orders ko list karta hai jinka KAM SE KAM EK item permanently out-of-stock hai -- poori tarah fulfilled orders ya abhi-processing orders is report mein nahi dikhte, sirf genuinely problematic ones.",
+    "how_it_works": "For each post from scheduler.list(), filter its deliveries for status === 'dead_letter' and map to channel names. Only include the post in the result if that filtered list is non-empty.",
+    "in_this_project": "src/scheduler.ts ka list() method; src/types.ts ka ChannelDelivery.status.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::list",
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery"
+    ],
+    "code_example": "import type { SocialScheduler } from \"../src/scheduler.js\";\n\nfunction postsWithDeadLetters(scheduler: SocialScheduler): { postId: string; channels: string[] }[] {\n  const result: { postId: string; channels: string[] }[] = [];\n  for (const post of scheduler.list()) {\n    const channels = Object.values(post.deliveries)\n      .filter((d) => d.status === \"dead_letter\")\n      .map((d) => d.channel);\n    if (channels.length > 0) result.push({ postId: post.id, channels });\n  }\n  return result;\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Only surfaces genuinely problematic posts, keeping the result focused and useful for a human or alerting system to act on",
+      "Reuses the same filter pattern as SOC-129's single-post version, just wrapped in an outer loop -- easy to recognize and maintain"
+    ],
+    "disadvantages": [
+      "Does not include lastError reasons -- a caller wanting root-cause context has to go back to post.deliveries themselves",
+      "O(total deliveries) scan, same as every other list()-based utility in this project (SOC-114's concern applies here too at large scale)"
+    ],
+    "common_mistakes": [
+      "Including EVERY post in the result with an empty channels array instead of skipping posts with no dead letters",
+      "Returning the full ChannelDelivery objects instead of just the channel name strings, when the question specifically asks for channel names"
+    ],
+    "follow_up_questions": [
+      "How would you extend this to also include each dead-lettered channel's lastError for root-cause triage?",
+      "How would you turn this into a periodic monitoring job that alerts when the result's length grows past a threshold?"
+    ],
+    "concepts": ["public-api", "monitoring", "coding-exercise"],
+    "advanced": null
+  },
+  {
+    "id": "SOC-135",
+    "project_slug": "p26-social-scheduler",
+    "category": "Coding Exercises",
+    "difficulty": "Intermediate",
+    "question": "Write a function sentChannelsForPost(scheduler, postId): { channel: string; providerId: string; sentAt: number }[] that returns the delivery details of every successfully sent channel for one post.",
+    "answer_hinglish": "Yeh exercise TYPE NARROWING ka ek acha example hai -- `ChannelDelivery` ke `providerId`/`sentAt` fields OPTIONAL hain type definition mein (`providerId?: string; sentAt?: number`) kyunki woh sirf `status === 'sent'` hone PAR set hote hain. Isliye function ko sirf `status === 'sent'` filter karna hi KAAFI nahi -- TypeScript ko bhi explicitly batana padta hai (ya runtime assertion) ki in deliveries ke paas yeh fields DEFINITELY set hain.\n\nSafe approach: filter karo `status === 'sent'`, phir map karte waqt `providerId!`/`sentAt!` use karo (non-null assertion) -- yeh SAFE hai kyunki `dispatchChannel`'s code GUARANTEE karta hai ki `status = 'sent'` set hone se PEHLE `providerId`/`sentAt` dono already assign ho chuke hote hain (same statement block mein, sequentially).\n\nUnknown postId ka handling SOC-129 jaisa hi hai -- `getPost` undefined return karta hai, function empty array return kare, throw na kare.",
+    "why_needed": "Interviewer dekhna chahta hai ki candidate optional fields ko SAFELY narrow kar sakta hai jab unka presence ek STATUS value se guaranteed ho, aur is guarantee ko actual source code se justify kar sakta hai.",
+    "real_world_analogy": "Ek parcel ka tracking number sirf TAB available hota hai jab parcel 'shipped' status mein pahunch jaaye -- agar status 'shipped' hai, tumhe PATA hai tracking number zaroor hoga, isliye usse safely access kar sakte ho bina null check kiye.",
+    "how_it_works": "getPost(postId) -> if undefined, return []. Otherwise filter Object.values(deliveries) for status === 'sent', then map each to { channel, providerId: d.providerId!, sentAt: d.sentAt! }, relying on dispatchChannel's guarantee that both fields are set before status becomes 'sent'.",
+    "in_this_project": "src/scheduler.ts ka getPost aur dispatchChannel (where providerId/sentAt are set together with status='sent'); src/types.ts ka ChannelDelivery's optional providerId/sentAt fields.",
+    "implementation_files": [
+      "projects/26-social-scheduler/src/scheduler.ts::getPost",
+      "projects/26-social-scheduler/src/scheduler.ts::dispatchChannel",
+      "projects/26-social-scheduler/src/types.ts::ChannelDelivery"
+    ],
+    "code_example": "import type { SocialScheduler } from \"../src/scheduler.js\";\n\nfunction sentChannelsForPost(\n  scheduler: SocialScheduler,\n  postId: string,\n): { channel: string; providerId: string; sentAt: number }[] {\n  const post = scheduler.getPost(postId);\n  if (!post) return [];\n  return Object.values(post.deliveries)\n    .filter((d) => d.status === \"sent\")\n    .map((d) => ({ channel: d.channel, providerId: d.providerId!, sentAt: d.sentAt! }));\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Correctly relies on the status==='sent' invariant to safely narrow optional fields, instead of adding unnecessary runtime null checks",
+      "Returns a clean, purpose-shaped result rather than the full ChannelDelivery with every other status-specific field"
+    ],
+    "disadvantages": [
+      "The non-null assertions (!) trust dispatchChannel's invariant rather than verifying it at runtime -- if that invariant were ever violated by a future bug, this function would produce a runtime error instead of a type error"
+    ],
+    "common_mistakes": [
+      "Using optional chaining (d.providerId ?? 'unknown') instead of asserting, which silently hides a genuine bug if the invariant is ever broken",
+      "Forgetting the status filter entirely and trying to map providerId/sentAt off every delivery, most of which won't have them set"
+    ],
+    "follow_up_questions": [
+      "Why is it safe here to use the non-null assertion operator instead of an explicit runtime check?",
+      "How would you write a mutation-style test proving dispatchChannel always sets providerId and sentAt together with status='sent', never one without the other?"
+    ],
+    "concepts": ["type-narrowing", "public-api", "coding-exercise"],
+    "advanced": null
+  }
+]
