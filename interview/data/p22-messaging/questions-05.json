@@ -1100,5 +1100,250 @@
       "scale_10x_100x": "At 10x group size, the current approach's cost grows linearly and is likely still tolerable for occasional dashboard use. At 100x (very large groups), repeated full-history pagination per member for a frequently-refreshed view becomes untenable -- an incremental aggregate (or a dedicated read-model service) becomes necessary, not optional.",
       "production_improvements": "Add an incrementally-maintained unread-count aggregate alongside the receipts map, updated inside sendMessage/markDelivered/markReadUpTo's existing apply steps. Expose it as a cheap public method instead of requiring callers to hand-roll a full per-member pagination walk."
     }
+  },
+  {
+    "id": "MSG-126",
+    "project_slug": "p22-messaging",
+    "category": "Trade-offs & Design Decisions",
+    "difficulty": "Intermediate",
+    "question": "In the stage 3 HTTP layer, why does no MessagingErrorCode map to 500, and why do NOT_A_MEMBER/OWNER_REQUIRED/SENDER_REQUIRED map to 403 while CANNOT_REMOVE_OWNER/ALREADY_MEMBER map to 409?",
+    "answer_hinglish": "Seedha jawab: har MessagingError ek EXPECTED outcome hai -- library ne jaan-boojh ke request reject ki, kuch toota nahi. 500 ka matlab hota hai 'server mein bug hai', aur caller usko retry ya alert ke signal ki tarah treat karta hai. Agar UNKNOWN_CONVERSATION ya IDEMPOTENCY_CONFLICT 500 par girte, calling service ek galat request ko ek outage samajh ke retry karti rehti, aur on-call ko false alerts milte. Isliye src/http/app.ts ka STATUS_BY_CODE ek `Record<MessagingErrorCode, number>` hai -- TypeScript khud force karta hai ki har code ki entry ho -- aur har value 400, 403, 404 ya 409 hai.\n\n403 vs 409 ka split 'kaun pooch raha hai' vs 'resource ki state kya hai' par hai. API key caller ko already authenticate kar chuki hai (401 sirf uske liye reserved hai). NOT_A_MEMBER, OWNER_REQUIRED, SENDER_REQUIRED teeno ka matlab hai 'TUM, specifically, yeh action nahi kar sakte' -- koi doosra user (owner, sender) wahi request kare toh chal jaati. Yeh 403 ki definition hai. CANNOT_REMOVE_OWNER aur ALREADY_MEMBER caller par depend nahi karte: owner ko koi bhi remove nahi kar sakta, aur already-member ko koi bhi dobara add nahi kar sakta -- resource ki current state request se conflict karti hai, toh 409. Same logic se CONVERSATION_BUSY, SEND_IN_FLIGHT, MESSAGE_DELETED, IDEMPOTENCY_CONFLICT bhi 409 hain. 500 sirf tab aata hai jab error MessagingError hi na ho (ek plain Error, ek genuine bug) -- toHttp() usse log karta hai aur caller ko sirf generic 'internal error' deta hai.",
+    "why_needed": "Status code ek contract hai calling service ke saath -- uski retry, alerting aur user-facing error message isi par decide hote hain. Galat mapping ek correct library ko bhi bahar se buggy dikha deti hai.",
+    "real_world_analogy": "Bank counter par 'aapka account is branch ka nahi hai' (403), 'yeh cheque already encash ho chuka hai' (409), aur 'system down hai, baad mein aaiye' (500) -- teeno alag jawab hain, aur customer ka agla kadam teeno mein alag hai. Agar clerk har mana karne ko 'system down' bole, customer baar baar line mein lagta rahega.",
+    "how_it_works": "toHttp() pehle HttpError check karta hai (HTTP layer ke apne errors), phir MessagingError ke liye `STATUS_BY_CODE[error.code] ?? 500` lookup karta hai; status >= 500 hone par log() call karke code INTERNAL aur message 'internal error' return karta hai. Baaki sab ke liye `{ error: { code, message } }` library ka hi code aur message bhejta hai.",
+    "in_this_project": "src/http/app.ts mein STATUS_BY_CODE ki 15 entries: INVALID_REQUEST/INVALID_CURSOR 400; UNKNOWN_USER/UNKNOWN_CONVERSATION/UNKNOWN_MESSAGE/UNKNOWN_DEVICE 404; NOT_A_MEMBER/OWNER_REQUIRED/SENDER_REQUIRED 403; ALREADY_MEMBER/CANNOT_REMOVE_OWNER/IDEMPOTENCY_CONFLICT/CONVERSATION_BUSY/SEND_IN_FLIGHT/MESSAGE_DELETED 409. PLAN.md 'Stage 3 decisions' mein yeh reasoning likhi hai. Stage 3 ke 24 mutation checks mein se 15 isi table ki ek ek entry ko 200 kar dete hain, aur ek UNKNOWN_DEVICE entry ko poori tarah hata deta hai taaki `?? 500` fallback aur uska log call exercise ho -- sab caught.",
+    "implementation_files": [
+      "projects/22-messaging/src/http/app.ts::STATUS_BY_CODE",
+      "projects/22-messaging/src/http/app.ts::toHttp",
+      "projects/22-messaging/src/errors.ts",
+      "projects/22-messaging/PLAN.md"
+    ],
+    "code_example": "// real, src/http/app.ts (trimmed)\nconst STATUS_BY_CODE: Record<MessagingErrorCode, number> = {\n  INVALID_REQUEST: 400,\n  NOT_A_MEMBER: 403,\n  OWNER_REQUIRED: 403,\n  CANNOT_REMOVE_OWNER: 409,\n  CONVERSATION_BUSY: 409,\n  // ... every MessagingErrorCode, none of them 500\n};\n\nif (error instanceof MessagingError) {\n  const status = STATUS_BY_CODE[error.code] ?? 500;\n  if (status >= 500) {\n    log(\"messaging API: server-side error\", error);\n    return { status, code: \"INTERNAL\", message: \"internal error\" };\n  }\n  return { status, code: error.code, message: error.message };\n}",
+    "code_language": "typescript",
+    "advantages": [
+      "Calling service 4xx ko 'meri request galat thi' aur 5xx ko 'retry/alert karo' ki tarah reliably treat kar sakti hai",
+      "Record<MessagingErrorCode, number> type ki wajah se naya error code add karne par compiler mapping maangta hai",
+      "Library ka apna error code response body mein jaata hai, toh caller status se zyada specific reason bhi dekh sakta hai"
+    ],
+    "disadvantages": [
+      "403 vs 409 ka boundary ek judgment call hai; kuch teams NOT_A_MEMBER ko 404 dena prefer karti hain taaki conversation ka existence hi leak na ho",
+      "CONVERSATION_BUSY ek transient conflict hai jise retry karna theek hai, par 409 akela yeh nahi batata -- caller ko code padhna padta hai"
+    ],
+    "common_mistakes": [
+      "Har library exception ko ek catch-all handler mein 500 bana dena",
+      "401 aur 403 mix karna -- 401 'tum kaun ho, pata nahi', 403 'pata hai, par permission nahi'",
+      "500 response mein asli error message ya stack trace bhej dena"
+    ],
+    "follow_up_questions": [
+      "Would you return 404 instead of 403 for NOT_A_MEMBER to avoid revealing that a conversation exists? What would you lose?",
+      "How should a client distinguish a retryable 409 (CONVERSATION_BUSY, SEND_IN_FLIGHT) from a permanent one (IDEMPOTENCY_CONFLICT)?",
+      "Which mutation check exercises the `?? 500` fallback, and why was a separate one needed beyond changing a value to 200?"
+    ],
+    "concepts": [
+      "http-status-codes",
+      "error-mapping",
+      "403-vs-409",
+      "api-contract"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "MSG-127",
+    "project_slug": "p22-messaging",
+    "category": "Code-Level",
+    "difficulty": "Intermediate",
+    "question": "Why does src/http/app.ts wrap some routes in asyncRoute() but not others, and what exactly would happen in Express 4 without it?",
+    "answer_hinglish": "Express 4 sirf SYNCHRONOUS throw ko error handler tak le jaata hai. Agar ek route handler async function hai aur uska promise reject hota hai, Express 4 us promise ko dekhta hi nahi -- handler ne bas ek promise return kiya, Express ne usko ignore kar diya. Nateeja: response kabhi bheja hi nahi jaata, request tab tak hang rehti hai jab tak client ka timeout na aaye, aur Node ek unhandled rejection warning deta hai. (Express 5 isko natively handle karta hai, par yeh project Express 4.22.3 par hai.)\n\nasyncRoute() ek chhota adapter hai: `handler(req, res).catch(next)`. Rejection seedha next(err) ko jaata hai, aur wahan se four-argument error handler toHttp() ke through sahi status bhejta hai -- jaise sendMessage ka NOT_A_MEMBER 403 ban jaata hai.\n\nSirf woh routes wrapped hain jo ek ASYNC Messenger method await karte hain: addMember, removeMember, sendMessage, editMessage, deleteMessage, markDelivered, markReadUpTo, connectDevice -- yeh sab stage 2 ki real ConversationStore round trip hain. createDirectConversation, createGroupConversation, get, getMessage, getMessages, isOnline aur disconnectDevice synchronous hain, unka throw Express 4 already pakad leta hai, toh wrapper bekaar hota. Yeh sirf theory nahi hai: stage 3 ke mutation checks mein ek break `.catch(next)` hata deta hai, aur suite usse pakadta hai, kyunki async routes ke error-status tests (jaise 403 NOT_A_MEMBER on send) phir response hi nahi paate.",
+    "why_needed": "Async/await ke saath Express 4 use karna bahut common hai, aur yeh gap production mein 'kuch requests randomly hang hoti hain' jaisa confusing symptom banata hai -- interviewer dekhna chahta hai ki tum framework ka asli contract jaante ho.",
+    "real_world_analogy": "Ek receptionist jo sirf saamne khade aadmi ki complaint sunta hai, par phone par aayi complaint ke liye koi register nahi rakhta -- phone wali complaint kabhi kisi tak pahunchti hi nahi. asyncRoute woh register hai jo har phone complaint ko bhi manager (error handler) tak forward karta hai.",
+    "how_it_works": "asyncRoute(handler) ek normal (req, res, next) middleware return karta hai jo handler ko call karke uske promise par .catch(next) lagata hai. Express next(err) dekh ke baaki routes skip karta hai aur seedha error-handling middleware (jo 4 arguments leta hai) chalata hai.",
+    "in_this_project": "src/http/app.ts ka asyncRoute function, aur file ke top comment mein explicitly list hai ki kaunse routes synchronous Messenger methods call karte hain aur isliye wrapper nahi lete. Error handler `app.use((error, _req, res, _next) => ...)` hai -- comment: 'Four arguments: this is how Express recognises an error handler.' README ke stage 3 mutation table mein 'asyncRoute: .catch(next) removed' ek break hai, caught.",
+    "implementation_files": [
+      "projects/22-messaging/src/http/app.ts::asyncRoute",
+      "projects/22-messaging/src/http/app.ts::createApp",
+      "projects/22-messaging/test/http.test.ts",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "// real, src/http/app.ts (trimmed)\nfunction asyncRoute(handler: (req: Request, res: Response) => Promise<void>) {\n  return (req: Request, res: Response, next: NextFunction) => {\n    handler(req, res).catch(next);\n  };\n}\n\napp.post(\n  \"/conversations/:conversationId/messages\",\n  asyncRoute(async (req, res) => {\n    requireJson(req);\n    const message = await messenger.sendMessage(/* ... */);\n    res.status(201).json(messageView(message));\n  }),\n);",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek line ka wrapper, koi extra dependency (express-async-errors jaisa) nahi",
+      "Har async route ka rejection same toHttp() mapping se guzarta hai, sync routes jaisa hi",
+      "Mutation check se proven hai, sirf comment par bharosa nahi"
+    ],
+    "disadvantages": [
+      "Naya async route add karte waqt wrapper bhoolna aasaan hai -- TypeScript isko nahi pakadta",
+      "Express 5 par migrate karne ke baad yeh redundant ho jaata hai"
+    ],
+    "common_mistakes": [
+      "Async handler ke andar try/catch har route mein copy-paste karna instead of ek wrapper",
+      "Yeh maan lena ki Express 4 async functions ka rejection khud handle karta hai",
+      "Error handler ko 3 arguments ke saath likhna -- Express usse normal middleware samajhta hai"
+    ],
+    "follow_up_questions": [
+      "How would you make it impossible to forget asyncRoute on a new async route?",
+      "What changes if this project upgrades to Express 5?",
+      "Why does requireJson() throwing synchronously inside an async handler still reach the error handler?"
+    ],
+    "concepts": [
+      "express-4",
+      "async-error-handling",
+      "middleware",
+      "promise-rejection"
+    ],
+    "advanced": null
+  },
+  {
+    "id": "MSG-128",
+    "project_slug": "p22-messaging",
+    "category": "Failure Scenarios",
+    "difficulty": "Advanced",
+    "question": "A caller sends GET /conversations/:id/messages?cursor[x]=1. Walk through what would happen without the HTTP layer's cursor check, and why the same reasoning does NOT justify an HTTP-level check on limit.",
+    "answer_hinglish": "Express 4 ka default query parser (qs) bracketed keys ko nested objects bana deta hai, toh `?cursor[x]=1` se req.query.cursor ek string nahi, `{ x: \"1\" }` object ban jaata hai. Bina check ke yeh object getMessages ko jaata, aur wahan decodeCursor() `Buffer.from(cursor, \"base64url\")` call karta. Buffer.from ek plain object par ek raw TypeError phenkta hai -- yeh MessagingError NAHI hai, toh toHttp() usse 'unexpected' maan ke 500 INTERNAL deta aur log karta. Matlab ek galat request ek server bug jaisi dikhti, aur koi bhi bahar wala har request par ek 500 aur ek error log line trigger kar sakta.\n\nIsliye app.ts mein ek structural check hai: `if (cursor !== undefined && typeof cursor !== \"string\") throw new HttpError(400, \"INVALID_CURSOR\", ...)`. Yeh HTTP layer ki EKLAUTI field check hai -- baaki sab fields seedha Messenger ki apni validation par chhode gaye hain.\n\nlimit ke liye same reasoning nahi lagti, kyunki wahan crash hota hi nahi. limit `Number(limit)` se convert hota hai; garbage (ek array, 'not-a-number', ek object) NaN ban jaata hai, aur Messenger ka apna `Number.isInteger` guard NaN ko INVALID_REQUEST (400) bana deta hai. Outcome check ke saath ya bina identical hai, toh HTTP-side check sirf duplicated validation hoti. Rule simple hai: HTTP layer tabhi check add karta hai jab library ke paas us input ke liye koi guard na ho aur bina check ke error MessagingError ki jagah raw exception ban jaaye.",
+    "why_needed": "Yeh dikhata hai ki 'validation kahan honi chahiye' ka jawab principle se aata hai, habit se nahi -- aur ki 500 sirf crash nahi, ek attack surface (log flooding, false alerts) bhi hai.",
+    "real_world_analogy": "Ek ATM jo PIN pad par sirf digits expect karta hai; agar koi card slot mein sikka daal de, machine 'galat PIN' nahi bolti, poori jam ho jaati hai. Sikke ke liye slot ka shape check chahiye; par galat digits ke liye bank ka apna PIN check already kaafi hai, wahan alag check lagana bekaar hai.",
+    "how_it_works": "Route req.query se memberId, limit, cursor nikaalta hai. cursor defined hai par string nahi -> HttpError 400 INVALID_CURSOR, getMessages tak pahunchta hi nahi. cursor string hai par garbage -> decodeCursor ka regex fail hota hai aur library khud INVALID_CURSOR MessagingError phenkti hai (400). limit -> Number() -> getMessages ki apni validation.",
+    "in_this_project": "src/http/app.ts ka GET /conversations/:conversationId/messages route aur uske upar ka lamba comment; src/messenger.ts ka decodeCursor (`Buffer.from(cursor, \"base64url\")`). test/http.test.ts ka 'pagination via HTTP' test teeno cases cover karta hai: `limit=not-a-number` 400 INVALID_REQUEST, `cursor=garbage` 400 INVALID_CURSOR, aur `cursor[x]=1` 400 INVALID_CURSOR. PLAN.md 'Stage 3 decisions' isko 23-password-manager ke share-token-shape check jaisi category batata hai.",
+    "implementation_files": [
+      "projects/22-messaging/src/http/app.ts::createApp",
+      "projects/22-messaging/src/messenger.ts::decodeCursor",
+      "projects/22-messaging/test/http.test.ts",
+      "projects/22-messaging/PLAN.md"
+    ],
+    "code_example": "// real, src/http/app.ts (trimmed)\napp.get(\"/conversations/:conversationId/messages\", (req, res) => {\n  const { memberId, limit, cursor } = req.query;\n  if (cursor !== undefined && typeof cursor !== \"string\") throw new HttpError(400, \"INVALID_CURSOR\", \"a cursor must be a single string\");\n  const page = messenger.getMessages(req.params.conversationId!, memberId as string, {\n    ...(limit !== undefined ? { limit: Number(limit) } : {}),\n    ...(cursor !== undefined ? { cursor } : {}),\n  });\n  res.json({ items: page.items.map(messageView), nextCursor: page.nextCursor });\n});",
+    "code_language": "typescript",
+    "advantages": [
+      "Ek bahar wala caller kisi bhi input se 500 trigger nahi kar sakta is route par",
+      "Check minimal hai -- sirf shape, cursor ka asli meaning library hi validate karti hai",
+      "limit par duplicate check na hone se validation ka ek hi source of truth rehta hai"
+    ],
+    "disadvantages": [
+      "Har naye query param ke liye manually sochna padta hai ki library us type ko safely handle karti hai ya nahi",
+      "memberId bhi `as string` cast hai; aaj woh safe hai kyunki library ka lookup ek non-string ko unknown member maanta hai, par yeh ek implicit assumption hai"
+    ],
+    "common_mistakes": [
+      "`req.query.x as string` ko type safety samajhna -- yeh sirf compiler ko chup karata hai, runtime shape nahi badalta",
+      "Har field par HTTP layer mein poori validation duplicate karna, jisse do jagah rules drift karte hain",
+      "Yeh maan lena ki query params hamesha strings hote hain"
+    ],
+    "follow_up_questions": [
+      "Would switching Express's query parser to 'simple' remove the need for this check? What else would change?",
+      "Why is a repeated key like ?cursor=a&cursor=b also caught by the same typeof check?",
+      "How would you audit every other route for the same class of raw-TypeError leak?"
+    ],
+    "concepts": [
+      "input-validation",
+      "query-parsing",
+      "error-leakage",
+      "validation-placement"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "Trade-off hai 'ek jagah validation' vs 'har layer apna input check kare'. Is project ne library ko single source of truth rakha aur HTTP layer ko sirf woh check karne diya jo library ke type contract (cursor: string) ke bahar gir sakta hai. Isse duplication kam hai, par har naya param ek conscious review maangta hai.",
+      "failure_scenarios": "Bina check ke: har `cursor[x]=1` request ek 500 aur ek log line, jo monitoring mein error rate badhata aur on-call ko page kar sakta. Ek attacker loop mein yeh bhej ke logs flood kar sakta. Check ke saath yeh ek normal 400 hai jo alert threshold ko touch nahi karta.",
+      "alternatives": "Ek schema validator (zod jaisa) har route ke query/body ke liye -- strong, par library ki validation duplicate karta aur ek nayi dependency laata. Ya decodeCursor khud typeof check kare -- par library ka public type already string kehta hai, toh galat-type input HTTP boundary ki problem hai, library ki nahi.",
+      "scale_10x_100x": "Scale se check ka cost nahi badalta (ek typeof). 100x traffic par asli fark monitoring mein hai: 4xx aur 5xx ka saaf separation hi alerting ko usable rakhta hai jab absolute error count bada ho.",
+      "production_improvements": "Ek generic test jo har route ko unexpected shapes (array, object, number) ke saath hit kare aur assert kare ki koi 500 nahi aata; aur 500 ke log mein route aur request id daalna taaki aisa leak jaldi pakda jaaye."
+    }
+  },
+  {
+    "id": "MSG-129",
+    "project_slug": "p22-messaging",
+    "category": "Concurrency & Distributed Systems",
+    "difficulty": "Advanced",
+    "question": "How does test/http.test.ts prove SEND_IN_FLIGHT and CONVERSATION_BUSY over real HTTP deterministically, when two concurrent fetch() calls would normally not race reliably?",
+    "answer_hinglish": "Problem yeh hai ki InMemoryConversationStore ka persist() ek microtask mein resolve ho jaata hai. Do fetch() calls real socket par alag alag TCP round trips hain -- jab tak doosri request server tak pahunchti hai, pehli ka commit kab ka ho chuka hota hai. Toh 'do concurrent sends' wala test kabhi kabhi hi race karta, ya kabhi nahi -- ek flaky test jo kuch prove nahi karta.\n\nFix: race ko timing par chhodne ki jagah, commit ko HAATH se pakad ke rakho. Test ek FakeConversationStore (test/helpers.ts) inject karta hai `new Messenger({ users, store })` se. Uska persist() ek promise return karta hai jo `pending` array mein baitha rehta hai jab tak test `resolveNext()` na call kare. Steps: pehli request bhejo par await mat karo (firstPromise); `while (store.pending.length === 0) await flush()` se wait karo jab tak pehli request ka synchronous claim ho chuka ho aur commit store mein pending ho; ab doosri request bhejo aur await karo -- woh guaranteed 409 SEND_IN_FLIGHT dekhti hai, kyunki idempotency placeholder (messageId: null) abhi set hai. Phir `store.resolveNext()` aur pehli request 201 ke saath complete hoti hai.\n\nCONVERSATION_BUSY ka test same technique use karta hai: addMember request ka commit pending rakho (revising = true), phir sendMessage bhejo -- claimOp revising dekh ke 409 deta hai. Isse do cheezein ek saath prove hoti hain: library ka claim-before-await real HTTP par bhi kaam karta hai, aur STATUS_BY_CODE in dono codes ko 409 par map karta hai.",
+    "why_needed": "Concurrency tests jo real timing par depend karte hain flaky hote hain aur jhootha confidence dete hain. Interviewer dekhna chahta hai ki tum race ko deterministic bana sakte ho bina production code mein test hooks daale.",
+    "real_world_analogy": "Do log ek hi seat book karne ka race test karna hai. Unhe 'ek saath' button dabane bolne se kabhi race hoti hai kabhi nahi. Behtar: pehle aadmi ki payment screen par ruk jao (commit pending), phir doosre ko try karne do -- ab har baar exactly wahi moment test hota hai.",
+    "how_it_works": "Messenger ConversationStore ko dependency injection se leta hai, toh test production code chhuye bina ek controllable store de sakta hai. FakeConversationStore.persist() resolve ko `pending` mein push karta hai; flush() microtasks ko chalne deta hai; resolveNext() FIFO order mein sabse purana commit resolve karta hai.",
+    "in_this_project": "test/http.test.ts ke do tests: 'two concurrent sends with the same clientMessageId: the second is 409 SEND_IN_FLIGHT while the first is still committing' aur 'a conversation that is mid-revision (addMember in flight) rejects a concurrent message op with 409 CONVERSATION_BUSY'. Dono ke andar comment hai ki 'over a real socket, two plain fetch() calls settle too far apart in time to race reliably'. FakeConversationStore aur flush test/helpers.ts mein hain, wahi jo test/concurrency.test.ts use karta hai.",
+    "implementation_files": [
+      "projects/22-messaging/test/http.test.ts",
+      "projects/22-messaging/test/helpers.ts::FakeConversationStore",
+      "projects/22-messaging/test/helpers.ts::flush",
+      "projects/22-messaging/src/store.ts::ConversationStore"
+    ],
+    "code_example": "// real, test/http.test.ts (trimmed)\nconst store = new FakeConversationStore();\nconst messenger = new Messenger({ users, store });\nconst { base } = await start({ messenger });\nconst conv = messenger.createDirectConversation(\"u1\", \"u2\");\n\nconst firstPromise = fetch(`${base}/conversations/${conv.id}/messages`, { method: \"POST\", headers: authed(), body: JSON.stringify({ senderId: \"u1\", body: \"hi\", clientMessageId: \"c-race\" }) });\nwhile (store.pending.length === 0) await flush();\nconst second = await fetch(/* same body, same clientMessageId */);\nexpect(second.status).toBe(409); // SEND_IN_FLIGHT\n\nstore.resolveNext();\nexpect((await firstPromise).status).toBe(201);",
+    "code_language": "typescript",
+    "advantages": [
+      "Test har run par exactly same interleaving check karta hai -- zero flakiness",
+      "Production code mein koi test-only hook nahi, sirf constructor injection",
+      "Library ka concurrency guard aur HTTP mapping dono ek end-to-end test mein prove hote hain"
+    ],
+    "disadvantages": [
+      "while-loop polling flush() par -- agar request kabhi store tak pahunche hi nahi (jaise auth fail), test hang hoga jab tak vitest timeout na aaye",
+      "Test real InMemoryConversationStore ka timing nahi dikhata, sirf logical interleaving"
+    ],
+    "common_mistakes": [
+      "Promise.all([fetch(), fetch()]) likh ke maan lena ki race test ho gaya",
+      "Race ko setTimeout/sleep se force karne ki koshish -- slow aur phir bhi flaky",
+      "Doosri request bhejne se pehle confirm na karna ki pehli ka claim actually ho chuka hai"
+    ],
+    "follow_up_questions": [
+      "Why does the test wait on store.pending.length instead of a fixed number of flush() calls?",
+      "What would this test look like if the store were a real Postgres database?",
+      "Why must the first request be resolved at the end of the test, rather than just abandoned?"
+    ],
+    "concepts": [
+      "deterministic-concurrency-testing",
+      "dependency-injection",
+      "claim-before-await",
+      "test-doubles"
+    ],
+    "advanced": {
+      "architecture_tradeoffs": "ConversationStore ko injectable rakhne ka stage 2 ka decision yahan fayda deta hai: HTTP tests bhi wahi fake use kar paate hain. Cost: production code ek interface ke peeche hai jo sirf ek real implementation rakhta hai -- ek chhoti abstraction jo testability ke liye justified hai.",
+      "failure_scenarios": "Agar claim await ke BAAD hota (bug), toh pehli request ka commit pending hote hue bhi doosri request placeholder nahi dekhti aur 201 milta -- test turant fail hota. Isliye yeh test exactly woh bug pakadta hai jo stage 2 mein 20-concurrent-sends test ne pakda tha, ab HTTP boundary ke paar.",
+      "alternatives": "Ek alternative: Messenger mein ek test-only delay option. Woh production code ko test concerns se pollute karta. Doosra: bahut saari concurrent requests bhej ke statistically race hone ki umeed -- slow, flaky, aur failure reproduce karna mushkil.",
+      "scale_10x_100x": "Multi-instance deployment mein yeh in-process claim kaam nahi karega -- do instances alag memory rakhte hain. Tab test ko bhi shared store (Redis/DB constraint) ke level par race control karna padega, jaise DB transaction ko ek barrier par rok ke.",
+      "production_improvements": "Production mein SEND_IN_FLIGHT aur CONVERSATION_BUSY ki rate ko metric banana chahiye (retryable 409s), aur client SDK ko inke liye backoff ke saath retry karna chahiye, kyunki yeh dono transient conflicts hain."
+    }
+  },
+  {
+    "id": "MSG-130",
+    "project_slug": "p22-messaging",
+    "category": "Security",
+    "difficulty": "Intermediate",
+    "question": "The HTTP layer compares the API key using sha256 digests and timingSafeEqual, and checks it before parsing the body. Why each of those choices, and what does this key still NOT protect against?",
+    "answer_hinglish": "Teen choices hain, teeno ek specific leak band karti hain. Pehli, timingSafeEqual: ek normal `===` string comparison pehle mismatched character par ruk jaata hai, toh ek wrong guess jitna lamba sahi prefix rakhta hai, utna zyada time leta hai -- attacker response time naap ke key character-by-character guess kar sakta hai. timingSafeEqual hamesha poore buffer ko compare karta hai. Doosri, dono taraf sha256 digest: timingSafeEqual ko equal-length buffers chahiye; agar raw key compare karte, toh pehle length check karna padta, aur woh length check khud key ki LENGTH leak kar deta. Digest hamesha 32 bytes ka hota hai, toh na content na length timing se leak hoti hai. Teesri, auth sabse pehla middleware hai, express.json se bhi pehle: ek unauthenticated caller 401 paata hai bina uski body parse kiye -- matlab anonymous koi bhi JSON parser ka CPU/memory nahi kha sakta, aur test 'rejects a request with no API key... before the body is even looked at' invalid JSON bhej ke bhi 401 hi expect karta hai.\n\nPlus, createApp() 16 characters se chhoti key par RangeError phenkta hai, aur main.ts key sirf MESSAGING_API_KEY env var se leta hai -- koi open mode nahi.\n\nKya protect NAHI karta: yeh SERVICE-level auth hai. Key prove karti hai ki caller ek trusted service hai, par senderId/actingUserId body se aate hain aur trust hote hain -- koi per-user identity nahi. Koi rate limiting nahi, toh ek leaked key se unlimited calls. Koi TLS nahi (plain http, default 127.0.0.1), toh network par key plaintext jaati agar HOST badla jaaye. Aur ek hi key hai -- rotation ke liye restart chahiye.",
+    "why_needed": "Constant-time comparison ek classic security interview topic hai, aur 'yeh auth kya NAHI karta' bata paana dikhata hai ki tum service auth aur user auth ka fark samajhte ho.",
+    "real_world_analogy": "Ek building ka guard jo har visitor ka pass utni hi der dekhta hai chahe pass pehle akshar par galat ho ya aakhri par -- taaki koi guard ka reaction time dekh ke pass ki copy na bana sake. Aur guard gate par hi rokta hai, lobby mein bitha ke baad mein nahi. Par guard sirf 'yeh company ka van hai' check karta hai, van mein baitha har aadmi kaun hai, woh nahi.",
+    "how_it_works": "createApp mein `expected = digest(options.apiKey)` ek baar banta hai. Har request par keyMatches header ko `/^Bearer (.+)$/` se match karta hai, match na ho toh false, warna `timingSafeEqual(expected, digest(match[1]))`. False par HttpError(401, 'UNAUTHORIZED').",
+    "in_this_project": "src/http/app.ts: `digest`, `keyMatches`, `MIN_API_KEY_LENGTH = 16`, aur pehla `app.use` jiska comment hai 'Auth first: an unauthenticated caller gets 401 before its body is even parsed.' src/main.ts env var check karta hai. Stage 3 ke do mutation checks yahin hain: `match !== null` hatana (malformed header crash karta) aur timingSafeEqual ka result `true` hardcode karna -- dono caught. README 'Known and NOT handled': 'No rate limiting, no CORS, no per-user login at the HTTP layer.'",
+    "implementation_files": [
+      "projects/22-messaging/src/http/app.ts::keyMatches",
+      "projects/22-messaging/src/http/app.ts::MIN_API_KEY_LENGTH",
+      "projects/22-messaging/src/main.ts",
+      "projects/22-messaging/test/http.test.ts",
+      "projects/22-messaging/README.md"
+    ],
+    "code_example": "// real, src/http/app.ts (trimmed)\nconst digest = (s: string) => createHash(\"sha256\").update(s).digest();\n\nfunction keyMatches(expected: Buffer, header: string | undefined): boolean {\n  const match = /^Bearer (.+)$/.exec(header ?? \"\");\n  return match !== null && timingSafeEqual(expected, digest(match[1]!));\n}\n\n// Auth first: an unauthenticated caller gets 401 before its body is even parsed.\napp.use((req, _res, next) => {\n  if (!keyMatches(expected, req.get(\"authorization\"))) throw new HttpError(401, \"UNAUTHORIZED\", \"missing or wrong API key\");\n  next();\n});\napp.use(express.json({ limit: bodyLimit }));",
+    "code_language": "typescript",
+    "advantages": [
+      "Key ka na content na length timing se leak hota hai",
+      "Unauthenticated traffic body parsing tak pahunchta hi nahi",
+      "Chhoti ya missing key par server start hi nahi hota -- koi accidental open mode nahi"
+    ],
+    "disadvantages": [
+      "Ek shared key -- leak hone par har caller compromised, aur rotation ke liye restart",
+      "Per-user identity nahi; senderId body se trust hota hai",
+      "Rate limiting aur TLS is layer mein nahi hain"
+    ],
+    "common_mistakes": [
+      "`header === 'Bearer ' + key` likhna -- timing leak",
+      "Raw keys par timingSafeEqual se pehle length check karna, jo length leak karta hai",
+      "Auth middleware ko body parser ke baad lagana",
+      "Service API key ko end-user authentication samajhna"
+    ],
+    "follow_up_questions": [
+      "How would you support two valid keys at once so a key can be rotated without downtime?",
+      "Is the timing leak from a plain === comparison realistically exploitable over a network? Why defend against it anyway?",
+      "What would you add so that senderId comes from a verified end user instead of the request body?"
+    ],
+    "concepts": [
+      "constant-time-comparison",
+      "api-key-auth",
+      "timing-attack",
+      "service-vs-user-auth"
+    ],
+    "advanced": null
   }
 ]
