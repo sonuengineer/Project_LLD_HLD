@@ -28,6 +28,19 @@ describe("AlwaysFailsProvider", () => {
     const r = await provider.send(msg("p1", "gamma", 1));
     expect(r.status).toBe("failed");
   });
+
+  it("defaults to retryable: true, and does not put a retryable field on the result at all", async () => {
+    const provider = new AlwaysFailsProvider("nope");
+    const r = await provider.send(msg("p1", "gamma", 1));
+    expect(r).toEqual({ status: "failed", reason: "nope" }); // no `retryable` key present
+  });
+
+  it("can be constructed to fail permanently (retryable: false)", async () => {
+    const provider = new AlwaysFailsProvider("account disconnected", false);
+    const r = await provider.send(msg("p1", "gamma", 1));
+    expect(r).toEqual({ status: "failed", reason: "account disconnected", retryable: false });
+    expect(provider.attempts).toHaveLength(1);
+  });
 });
 
 describe("FlakyProvider", () => {

@@ -1,6 +1,7 @@
 # B22 Social Media Post Scheduler (low-level design): plan
 
-Status (2026-11-28): stage 1 DONE -- 84 tests, 35 mutation checks, all caught.
+Status (2026-11-28): stage 1 DONE -- 84 tests, 35 mutation checks, all caught. Stage 2 DONE -- 90 tests (+6),
+13 new mutation checks (+13), all caught, no survivors.
 
 ## Why this project
 
@@ -53,10 +54,9 @@ real network.
   21 already built, reused wholesale rather than redesigned.
 - **Retry: exponential backoff via the injected Clock, capped, with a fixed `maxAttempts`; exhausting it
   dead-letters that one channel only.** `backoffMs(attempt) = min(maxBackoffMs, initialBackoffMs * 2^(attempt-1))`.
-  No distinction between a "retryable" and a "permanent" provider failure (unlike project 21's `SendResult`):
-  every failure just retries until `maxAttempts`, then dead-letters. This is a deliberate scope cut for stage 1 --
-  real providers do have permanent failures (invalid credentials, a deleted account) that should skip straight to
-  dead-letter, and that is one more field on `ProviderResult` to add later, not a redesign.
+  Stage 1 made no distinction between a "retryable" and a "permanent" provider failure; stage 2 adds exactly that
+  (see "Stage 2 decisions" below) without touching this formula at all -- a permanent failure skips straight past
+  it, it does not change it.
 - **`cancelChannel`/`cancelPost` use a plain "still pending" rule; `editPost` is stricter: zero attempts on every
   non-canceled channel.** Cancel is safe at any point before a channel's result is final, INCLUDING while it is
   mid-retry (`attempts > 0`, status still `pending`) -- there is nothing to undo, a provider call just never
@@ -88,6 +88,51 @@ real network.
 | Stage | What | Status |
 |---|---|---|
 | 1 | Schedule a post against N channels with idempotent scheduling, per-channel fan-out and status, `tick()`-driven due dispatch, retry with exponential backoff and dead-letter, cancel/edit before dispatch; randomized invariant test; mutation checks | DONE 2026-11-28 |
+| 2 | Retryable-vs-permanent distinction on provider failures: `ProviderResult`'s failed variant gains an optional `retryable` field; a permanent failure (`retryable: false`) dead-letters its channel immediately instead of retrying until `maxAttempts` | DONE 2026-11-28 |
+
+## Stage 2 decisions (one recommendation each)
+
+- **`ProviderResult`'s failed variant gains `retryable?: boolean`, OPTIONAL and defaulting to `true` (retryable)
+  when omitted.** Mirrors project 21 (notification)'s `SendResult.retryable` in name and meaning -- a `false`
+  means "this will never succeed no matter how many times it is retried" (account disconnected, invalid
+  credentials). It differs from project 21 in one way: there, `retryable` is a REQUIRED field on `SendResult`,
+  because every sender in that project was written to decide it from the start. Here, stage 1 already shipped
+  three `FakeChannelProvider`s (`AlwaysSucceedsProvider`, `AlwaysFailsProvider`, `FlakyProvider`) and real callers
+  that return `{ status: "failed", reason }` with no `retryable` key at all -- making it required would be a
+  breaking type change for all of them. Making it optional, with "absent means retryable" as the explicit rule
+  (`dispatchChannel` checks `result.retryable === false`, not `!== true`), means every stage-1 failure path keeps
+  behaving exactly as it did, with zero code changes, which is exactly the backward compatibility this task asked
+  for. The provider-throws path (`catch` in `dispatchChannel`) also returns no `retryable` key, so a throw stays
+  retryable, same as stage 1 and the same rule project 21 uses for a sender that throws.
+- **`dispatchChannel`'s failure branch dead-letters on `permanent || attempts >= maxAttempts`, and `attempts` is
+  incremented NORMALLY either way.** `attempts` is incremented once per call, before the provider is even invoked
+  (unchanged from stage 1, for the same `editPost`-detects-in-flight reason documented above) -- a permanent
+  failure does not get special treatment there. Recommended over decrementing it back to "pretend this attempt
+  did not count": it did count, the provider really was called once and really did answer, and `attempts` is a
+  record of how many times that happened, not a record of how many times a retry COULD have happened afterward.
+  Keeping the same counter also keeps `ChannelDelivery.attempts` meaning one single thing everywhere it is read
+  (diagnostics, the randomized invariant test, a future API) instead of needing a second field to express "real
+  attempts" vs "attempts that counted toward the retry budget". `lastError` is set exactly the same way for a
+  permanent failure as for a retryable one.
+- **A new fake provider is a CONSTRUCTOR OPTION on `AlwaysFailsProvider`, not a new class.** Its signature becomes
+  `constructor(reason = "...", retryable = true)`. Considered and rejected: a separate
+  `AlwaysFailsPermanentlyProvider` class. Stage 1 already draws the class-vs-option line elsewhere in this exact
+  file -- `FlakyProvider`'s `failCount` is a constructor option that changes how many times it fails before
+  succeeding, not a family of classes (`FailsTwiceThenSucceedsProvider`, `FailsOnceThenSucceedsProvider`, ...).
+  "Always fails" is already the one behavior `AlwaysFailsProvider` models; whether that failure is retryable or
+  permanent is a configuration of the SAME behavior, exactly like `FlakyProvider`'s knob, not a new behavior that
+  needs its own Strategy implementation. The default (`retryable = true`) keeps every stage-1 call site
+  (`new AlwaysFailsProvider()`, `new AlwaysFailsProvider("some reason")`) unchanged, and `send()` only emits the
+  `retryable` key on the result at all when it is `false` -- so the existing `providers.test.ts` assertion
+  `toEqual({ status: "failed", reason: "nope" })` (no `retryable` key) keeps passing unmodified. `FlakyProvider`
+  is untouched: its failures model a platform that is temporarily down and recovers, which is inherently
+  retryable, so it has no reason to ever report a permanent failure.
+- **Backward compatibility was verified directly, not assumed.** Every one of stage 1's 84 tests was re-run
+  unmodified after this change and all still pass (confirmed below, 90 total now, the +6 are new). The mutation
+  pass specifically targeting this feature (13 breaks, listed in README.md's Mutation checks) includes a
+  permanent-failure-specific regression check: forcing `AlwaysFailsProvider`'s default to `retryable = false`
+  broke 12 existing stage-1 tests (including the original dead-letter-after-`maxAttempts` test), proving those
+  tests really do pin stage 1's "default is retryable" behavior rather than just happening to pass.
 
 ## Not in scope
 

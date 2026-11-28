@@ -20,7 +20,8 @@ function prng(seed: number) {
 }
 
 const NOW = Date.UTC(2026, 10, 28, 9, 0);
-const CHANNELS = ["alpha", "beta", "gamma"] as const; // always-succeeds, flaky(2), always-fails
+const CHANNELS = ["alpha", "beta", "gamma", "delta"] as const; // always-succeeds, flaky(2), always-fails (retryable), always-fails (permanent)
+const PERMANENT_REASON = "delta: account permanently disconnected";
 
 // Advances the clock to each pending channel's next due time and ticks, until nothing is pending anymore (every
 // channel has reached sent/dead_letter/canceled) or the round budget runs out. maxAttempts is finite, so every
@@ -51,8 +52,9 @@ for (const seed of [1, 2, 3, 4, 5]) {
     const alpha = new AlwaysSucceedsProvider();
     const beta = new FlakyProvider(2);
     const gamma = new AlwaysFailsProvider();
+    const delta = new AlwaysFailsProvider(PERMANENT_REASON, false); // stage 2: permanent failure, dead-letters on attempt 1
     const scheduler = new SocialScheduler({
-      providers: { alpha, beta, gamma },
+      providers: { alpha, beta, gamma, delta },
       clock,
       maxAttempts: 3,
       initialBackoffMs: 500,
@@ -147,7 +149,13 @@ for (const seed of [1, 2, 3, 4, 5]) {
           expect(d.sentAt).toBeDefined();
         } else if (d.status === "dead_letter") {
           expect(d.lastError).toBeTruthy();
-          expect(d.attempts).toBe(d.maxAttempts);
+          if (d.lastError === PERMANENT_REASON) {
+            // stage 2: a permanent failure (delta) dead-letters on its first attempt, never the full maxAttempts.
+            expect(d.attempts).toBeGreaterThanOrEqual(1);
+            expect(d.attempts).toBeLessThanOrEqual(d.maxAttempts);
+          } else {
+            expect(d.attempts).toBe(d.maxAttempts);
+          }
         } else if (d.status === "canceled") {
           expect(d.canceledAt).toBeDefined();
         }

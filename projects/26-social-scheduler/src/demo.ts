@@ -5,10 +5,11 @@ import { AlwaysFailsProvider, AlwaysSucceedsProvider, FlakyProvider, ManualClock
 const clock = new ManualClock(Date.UTC(2026, 10, 28, 9, 0));
 const linkedin = new AlwaysSucceedsProvider();
 const twitter = new FlakyProvider(2); // fails the first 2 attempts, then succeeds
-const mastodon = new AlwaysFailsProvider("mastodon instance is down");
+const mastodon = new AlwaysFailsProvider("mastodon instance is down"); // retryable by default
+const instagram = new AlwaysFailsProvider("account disconnected", false); // stage 2: retryable: false (permanent)
 
 const scheduler = new SocialScheduler({
-  providers: { linkedin, twitter, mastodon },
+  providers: { linkedin, twitter, mastodon, instagram },
   clock,
   maxAttempts: 3,
   initialBackoffMs: 60_000, // 1 minute
@@ -76,6 +77,18 @@ async function main(): Promise<void> {
   await scheduler.tick();
   show(second.id);
   console.log("twitter stayed canceled and was never dispatched; linkedin went out normally");
+
+  console.log("\n--- schedule a third post: instagram's provider reports a PERMANENT failure (stage 2) ---");
+  const third = scheduler.schedulePost({
+    clientRequestId: "campaign-launch-3",
+    content: "Last one for today.",
+    channels: ["linkedin", "instagram"],
+    scheduledAt: clock.now() + 60_000,
+  });
+  clock.advance(60_000 + 1);
+  console.log("attempted:", await scheduler.tick()); // one attempt each, right away
+  show(third.id);
+  console.log("instagram dead-lettered on attempt 1 (account disconnected) -- it skipped the whole backoff/retry schedule, unlike mastodon above");
 }
 
 await main();

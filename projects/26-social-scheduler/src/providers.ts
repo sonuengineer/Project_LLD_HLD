@@ -25,14 +25,26 @@ export class AlwaysSucceedsProvider implements FakeChannelProvider {
 
 // Always fails. Used to exercise the dead-letter path: a channel on this provider exhausts its attempts and is
 // never retried again.
+//
+// Retryable by default (`retryable = true`), unchanged from stage 1: a channel on this provider dead-letters only
+// after exhausting maxAttempts. Pass `retryable = false` to model a PERMANENT failure instead (account
+// disconnected, invalid credentials) -- the channel dead-letters on its very first attempt. This is a constructor
+// option rather than a separate provider class because "always fails" is already the one behavior this class
+// models; whether that failure is retryable or permanent is a configuration of it, the same way FlakyProvider's
+// `failCount` configures how many times it fails before succeeding -- not a reason to add a second class.
 export class AlwaysFailsProvider implements FakeChannelProvider {
   readonly attempts: OutboundPost[] = [];
 
-  constructor(private readonly reason: string = "platform rejected the post") {}
+  constructor(
+    private readonly reason: string = "platform rejected the post",
+    private readonly retryable: boolean = true,
+  ) {}
 
   async send(message: OutboundPost): Promise<ProviderResult> {
     this.attempts.push({ ...message });
-    return { status: "failed", reason: this.reason };
+    // `retryable: true` is never emitted explicitly -- omitting the field IS "retryable" (see types.ts), and
+    // stage 1 code/tests that only ever constructed this with one argument must see the exact same shape back.
+    return this.retryable ? { status: "failed", reason: this.reason } : { status: "failed", reason: this.reason, retryable: false };
   }
 }
 

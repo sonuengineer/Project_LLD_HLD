@@ -242,7 +242,12 @@ export class SocialScheduler {
         delivery.sentAt = now;
       } else {
         delivery.lastError = result.reason;
-        if (delivery.attempts >= delivery.maxAttempts) {
+        // `attempts` was already incremented above, the same way for every failure: a permanent failure is still
+        // one real attempt that genuinely happened, it just will never be followed by another one. A permanent
+        // failure (retryable === false) skips the remaining backoff/retry schedule entirely and dead-letters this
+        // channel right now, even on attempt 1 -- see PLAN.md Stage 2 decisions.
+        const permanent = result.retryable === false;
+        if (permanent || delivery.attempts >= delivery.maxAttempts) {
           delivery.status = "dead_letter";
         } else {
           delivery.nextAttemptAt = now + backoffMs(delivery.attempts, this.initialBackoffMs, this.maxBackoffMs);

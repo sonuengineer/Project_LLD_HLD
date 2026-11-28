@@ -36,4 +36,11 @@ export interface OutboundPost {
   readonly attempt: number;
 }
 
-export type ProviderResult = { status: "sent"; providerId: string } | { status: "failed"; reason: string };
+// `retryable` is OPTIONAL and defaults to true (retryable) when omitted -- this is stage 1's original behavior,
+// kept so the three stage-1 fake providers do not have to change just because this field exists. Set it to
+// `false` to mean "this will never succeed no matter how many times it is retried" (e.g. account disconnected,
+// invalid credentials): dispatchChannel dead-letters that channel immediately instead of scheduling a retry.
+// Mirrors project 21 (notification)'s `SendResult.retryable` in name and meaning; optional here (instead of
+// required there) specifically so stage 1's existing ProviderResult-returning code needs no changes -- see
+// PLAN.md Stage 2 decisions.
+export type ProviderResult = { status: "sent"; providerId: string } | { status: "failed"; reason: string; retryable?: boolean };

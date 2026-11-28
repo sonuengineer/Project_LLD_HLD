@@ -199,3 +199,94 @@ describe("retry, backoff and dead-letter", () => {
     expect(p.deliveries.mastodon!.status).toBe("dead_letter");
   });
 });
+
+// Stage 2: a provider can mark a failure PERMANENT (ProviderResult.retryable === false) -- that channel
+// dead-letters immediately, skipping the remaining backoff/retry schedule, instead of retrying until maxAttempts.
+describe("permanent failures (retryable: false)", () => {
+  it("dead-letters on the very first attempt, skipping the retry schedule entirely", async () => {
+    const clock = new ManualClock(NOW);
+    const mastodon = new AlwaysFailsProvider("account disconnected", false);
+    const scheduler = new SocialScheduler({ providers: { mastodon }, clock, maxAttempts: 5, initialBackoffMs: 1000, maxBackoffMs: 60_000 });
+    const post = scheduler.schedulePost({ clientRequestId: "r1", content: "hi", channels: ["mastodon"], scheduledAt: NOW });
+
+    await scheduler.tick(); // attempt 1
+    const delivery = scheduler.getPost(post.id)!.deliveries.mastodon!;
+    expect(delivery.status).toBe("dead_letter");
+    expect(delivery.attempts).toBe(1); // not 5 -- no backoff/retry schedule was ever consumed
+    expect(delivery.lastError).toBe("account disconnected");
+    expect(mastodon.attempts).toHaveLength(1);
+
+    // a further tick(), even with no clock advance at all, never calls the provider again
+    await scheduler.tick();
+    expect(mastodon.attempts).toHaveLength(1);
+  });
+
+  it("does not affect a sibling channel that succeeds", async () => {
+    const clock = new ManualClock(NOW);
+    const linkedin = new AlwaysSucceedsProvider();
+    const mastodon = new AlwaysFailsProvider("invalid credentials", false);
+    const scheduler = new SocialScheduler({ providers: { linkedin, mastodon }, clock, maxAttempts: 5, initialBackoffMs: 1000, maxBackoffMs: 60_000 });
+    const post = scheduler.schedulePost({ clientRequestId: "r1", content: "hi", channels: ["linkedin", "mastodon"], scheduledAt: NOW });
+
+    await scheduler.tick();
+    const p = scheduler.getPost(post.id)!;
+    expect(p.deliveries.linkedin!.status).toBe("sent");
+    expect(p.deliveries.mastodon!.status).toBe("dead_letter");
+    expect(p.deliveries.mastodon!.attempts).toBe(1);
+  });
+
+  it("does not affect a sibling channel that is still retrying via a flaky provider", async () => {
+    const clock = new ManualClock(NOW);
+    const twitter = new FlakyProvider(2);
+    const mastodon = new AlwaysFailsProvider("account disconnected", false);
+    const scheduler = new SocialScheduler({ providers: { twitter, mastodon }, clock, maxAttempts: 5, initialBackoffMs: 1000, maxBackoffMs: 60_000 });
+    const post = scheduler.schedulePost({ clientRequestId: "r1", content: "hi", channels: ["twitter", "mastodon"], scheduledAt: NOW });
+
+    await scheduler.tick(); // attempt 1 for both
+    let p = scheduler.getPost(post.id)!;
+    expect(p.deliveries.mastodon!.status).toBe("dead_letter");
+    expect(p.deliveries.mastodon!.attempts).toBe(1);
+    expect(p.deliveries.twitter!.status).toBe("pending");
+    expect(p.deliveries.twitter!.attempts).toBe(1);
+
+    clock.advance(1000 + 1);
+    await scheduler.tick(); // attempt 2 for twitter only; mastodon is terminal and never due again
+    p = scheduler.getPost(post.id)!;
+    expect(p.deliveries.mastodon!.attempts).toBe(1); // untouched
+    expect(p.deliveries.twitter!.attempts).toBe(2);
+
+    clock.advance(2000 + 1);
+    await scheduler.tick(); // attempt 3 for twitter succeeds
+    expect(scheduler.getPost(post.id)!.deliveries.twitter!.status).toBe("sent");
+  });
+
+  it("attempt 1 retryable, attempt 2 permanent: dead-letters after exactly 2 attempts, not maxAttempts", async () => {
+    const clock = new ManualClock(NOW);
+    let calls = 0;
+    const mastodon = {
+      send: async () => {
+        calls += 1;
+        return calls === 1
+          ? ({ status: "failed", reason: "temporary glitch" } as const)
+          : ({ status: "failed", reason: "account disconnected", retryable: false } as const);
+      },
+    };
+    const scheduler = new SocialScheduler({ providers: { mastodon }, clock, maxAttempts: 5, initialBackoffMs: 1000, maxBackoffMs: 60_000 });
+    const post = scheduler.schedulePost({ clientRequestId: "r1", content: "hi", channels: ["mastodon"], scheduledAt: NOW });
+
+    await scheduler.tick(); // attempt 1: ordinary retryable failure, behaves exactly like stage 1
+    let delivery = scheduler.getPost(post.id)!.deliveries.mastodon!;
+    expect(delivery.status).toBe("pending");
+    expect(delivery.attempts).toBe(1);
+    expect(delivery.lastError).toBe("temporary glitch");
+    expect(delivery.nextAttemptAt).toBeGreaterThan(clock.now());
+
+    clock.advance(1000 + 1);
+    await scheduler.tick(); // attempt 2: permanent failure -- dead-letters right away
+    delivery = scheduler.getPost(post.id)!.deliveries.mastodon!;
+    expect(delivery.status).toBe("dead_letter");
+    expect(delivery.attempts).toBe(2); // not 5 (maxAttempts)
+    expect(delivery.lastError).toBe("account disconnected");
+    expect(calls).toBe(2);
+  });
+});

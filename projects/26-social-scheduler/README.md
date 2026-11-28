@@ -5,14 +5,16 @@ A TypeScript library (no runtime dependencies, in memory) for the core of a soci
 track per-channel delivery status. There are no real providers: nothing in this project ever sends a real post
 over a network.
 
-Status (2026-11-28): stage 1 DONE -- 84 tests, 35 mutation checks, all caught (see "Mutation checks"). Details in
+Status (2026-11-28): stage 1 DONE -- 84 tests, 35 mutation checks, all caught. Stage 2 DONE -- retryable-vs-
+permanent provider failures, 90 tests, 48 mutation checks total, all caught (see "Mutation checks"). Details in
 [PLAN.md](PLAN.md).
 
 ```
 npm ci
-npm test        # 84 tests
-npm run demo    # a multi-channel post: one sent immediately, one retried via a flaky provider, one dead-lettered,
-                # plus a cancel-before-dispatch
+npm test        # 90 tests
+npm run demo    # a multi-channel post: one sent immediately, one retried via a flaky provider, one dead-lettered
+                # after exhausting retries, one dead-lettered on attempt 1 (permanent failure), plus a
+                # cancel-before-dispatch
 ```
 
 ## Usage
@@ -69,6 +71,12 @@ scheduler.getPost(post.id)!.deliveries;
 - **Retry with exponential backoff, capped, up to `maxAttempts`; exhausting it dead-letters that channel only.**
   `backoffMs(attempt) = min(maxBackoffMs, initialBackoffMs * 2^(attempt-1))`. A channel that reaches
   `dead_letter` is never dispatched again by any later `tick()`, however far the clock advances.
+- **A provider failure can be retryable or PERMANENT (stage 2).** `ProviderResult`'s failed variant has an
+  optional `retryable` field; a provider that returns `retryable: false` is saying "this will never succeed no
+  matter how many times it is retried" (account disconnected, invalid credentials) -- that channel goes straight
+  to `dead_letter` on that very attempt, skipping the rest of the backoff schedule entirely. Omitting the field
+  (what every stage-1 provider still does) means retryable, unchanged from stage 1: every failure retries until
+  `maxAttempts`. `attempts` and `lastError` are recorded exactly the same way either way.
 - **A provider that throws is treated as a failed attempt, not a crash.** It counts as an attempt and goes
   through the normal retry path; it never rejects `tick()`'s batch and never affects a sibling channel dispatched
   in the same `tick()` call.
@@ -105,25 +113,46 @@ See [PLAN.md](PLAN.md) for the reasoning behind each choice. In short:
   `dispatching` set covers the one race that IS possible (the same caller's `tick()` called again, or a cancel,
   while a slow provider is still pending).
 - Not used on purpose: a `failed` status next to `dead_letter` (one is always just a slower way to say
-  "pending"), a retryable-vs-permanent distinction on provider failures (every failure retries until
-  `maxAttempts`), the State pattern for a delivery (a status field with guarded transitions is enough).
+  "pending"), the State pattern for a delivery (a status field with guarded transitions is enough).
+- A retryable-vs-permanent distinction on provider failures (stage 2): `ProviderResult`'s failed variant has an
+  optional `retryable` field, defaulting to retryable when a provider omits it, so stage 1's three fake providers
+  needed no changes to keep behaving the same way.
 
 ## Tests
 
 | File | Tests | What |
 |---|---|---|
 | test/schedule.test.ts | 35 | `schedulePost` validation (content, channels, scheduledAt, clientRequestId, each boundary), idempotency (replay, channel-order-independent, conflicts on each field, invalid request leaves nothing behind), fan-out, copies returned by `getPost`, constructor retry-policy validation |
-| test/tick.test.ts | 12 | due detection (future post does not dispatch, exact boundary, no re-dispatch of a sent channel), per-channel independence (one succeeds while a sibling fails-then-retries-then-succeeds, a throwing provider does not affect a sibling), retry/backoff (respects the delay, grows, capped), dead-letter (exhausts attempts, never retried again, does not affect a sibling channel) |
+| test/tick.test.ts | 16 | due detection (future post does not dispatch, exact boundary, no re-dispatch of a sent channel), per-channel independence (one succeeds while a sibling fails-then-retries-then-succeeds, a throwing provider does not affect a sibling), retry/backoff (respects the delay, grows, capped), dead-letter (exhausts attempts, never retried again, does not affect a sibling channel); **permanent failures (stage 2)**: dead-letters on attempt 1 and skips the retry schedule, does not affect a succeeding or flaky sibling, a retryable attempt 1 followed by a permanent attempt 2 dead-letters after exactly 2 attempts (not `maxAttempts`) |
 | test/cancel-edit.test.ts | 22 | `cancelChannel` (cancel-before-dispatch, leaves siblings alone, rejects sent/dead_letter/already-canceled, unknown post/channel), `cancelPost` (cancels every pending channel, `NOTHING_PENDING`, unknown post), `editPost` (content and/or scheduledAt, rejects after any attempt on any channel including mid-retry, allows editing around a canceled channel incl. one canceled mid-retry, validates the new content/scheduledAt, requires at least one field) |
 | test/dispatch-guard.test.ts | 3 | a deferred (manually-resolved) provider proves `cancelChannel`/`cancelPost` refuse with `DISPATCH_IN_PROGRESS` while a send is actually in flight, and that two overlapping `tick()` calls never dispatch the same due channel twice |
-| test/providers.test.ts | 7 | the three fake providers themselves: always-succeeds records attempts/sent, always-fails returns the configured reason, flaky fails exactly K times then succeeds per (postId, channel) independently, input validation |
-| test/invariants.test.ts | 5 | randomized, 5 seeds x 250 operations (schedule, cancel-channel, cancel-post, tick-with-clock-advance) across many posts and 3 providers (always-succeeds, flaky, always-fails), settled to a fixed point, then: every channel is in exactly one of `pending/sent/dead_letter/canceled`; nothing terminal ever changes again or calls its provider again even far in the future; every post's delivery keys exactly match its channel list; every non-canceled channel is terminal after settling; each terminal state carries the fields it must (`sent` has `providerId`/`sentAt`, `dead_letter` has `lastError` and used every attempt, `canceled` has `canceledAt`) |
+| test/providers.test.ts | 9 | the three fake providers themselves: always-succeeds records attempts/sent, always-fails returns the configured reason, flaky fails exactly K times then succeeds per (postId, channel) independently, input validation; **stage 2**: `AlwaysFailsProvider` defaults to retryable (no `retryable` key on the result at all) and can be constructed to fail permanently (`retryable: false`) |
+| test/invariants.test.ts | 5 | randomized, 5 seeds x 250 operations (schedule, cancel-channel, cancel-post, tick-with-clock-advance) across many posts and 4 providers (always-succeeds, flaky, always-fails retryable, **always-fails permanent (stage 2)**), settled to a fixed point, then: every channel is in exactly one of `pending/sent/dead_letter/canceled`; nothing terminal ever changes again or calls its provider again even far in the future; every post's delivery keys exactly match its channel list; every non-canceled channel is terminal after settling; each terminal state carries the fields it must (`sent` has `providerId`/`sentAt`, `dead_letter` has `lastError` and either used every attempt or was a permanent failure, `canceled` has `canceledAt`) |
 
 ## Mutation checks
 
-35 deliberate breaks, each applied alone via a throwaway script (never committed) with the full suite run against
-it, the file restored byte for byte. All 35 are caught. Four survived the first run and were real test gaps, now
-closed:
+48 deliberate breaks total (35 from stage 1, 13 from stage 2), each applied alone via a throwaway script (never
+committed) with the full suite run against it, the file restored byte for byte. All 48 are caught, no survivors.
+
+### Stage 2: retryable-vs-permanent provider failures (13 breaks, all caught, no survivors)
+
+| Area | Breaks |
+|---|---|
+| `dispatchChannel`'s permanent-failure check | R1 `retryable === false` inverted to `!== false`, R2 forced to always-false (permanent never triggers), R3 forced to always-true (every failure becomes permanent), R4 `retryable == null` (undefined/missing also counts as permanent, breaking every default-retryable failure), R13 attempts decremented back by one for a permanent failure (treating it as "not a real attempt") |
+| `dispatchChannel`'s dead-letter condition | R5 `permanent \|\|` changed to `permanent &&` (permanent alone no longer dead-letters), R6 the `permanent \|\|` check removed entirely, R7 `attempts >= maxAttempts` changed to `attempts > maxAttempts` (same boundary mutation as stage 1's A2, re-checked on the changed line) |
+| `AlwaysFailsProvider` (new constructor option) | R9 default `retryable` changed from `true` to `false` (every stage-1 call site becomes permanent), R10 the ternary's two branches swapped, R11 the ternary's condition negated, R12 the permanent branch's `retryable: false` changed to `retryable: true` (configured permanent but reports retryable) |
+
+R9 is the sharpest regression check: forcing the default to `false` broke 12 of stage 1's *existing* tests
+(including the original "exhausts maxAttempts" dead-letter test), which is direct evidence those tests really do
+pin "a provider that doesn't specify `retryable` keeps retrying," not that they happened to pass by coincidence.
+
+No survivors this round -- the new tests (one dead-letters on attempt 1, one mixed retryable-then-permanent
+sequence, one permanent-vs-flaky sibling, two provider-shape tests, the 4th invariants provider) already covered
+every one of these breaks before the mutation pass even started.
+
+### Stage 1 (35 breaks, all caught, no survivors)
+
+Four survived the first run and were real test gaps, now closed:
 
 - **E3** (editPost's `canceled`-skip removed): the existing "edit around a canceled channel" test canceled that
   channel BEFORE any attempt (`attempts === 0`), so removing the skip did not change the outcome -- the
@@ -148,11 +177,6 @@ closed:
 
 - **Everything is in memory.** A restart loses every post, delivery and idempotency key. A real version stores
   posts in a database and the idempotency keys with a TTL (as projects 21/22 eventually do).
-- **No distinction between a retryable and a permanent provider failure.** Every failure retries until
-  `maxAttempts`, then dead-letters -- a real provider failure like "account disconnected" or "invalid credentials"
-  will never succeed no matter how many times it is retried, and should skip straight to `dead_letter` instead of
-  waiting through the full backoff schedule. `ProviderResult` has room to add this (an extra field, same shape as
-  project 21's `SendResult.retryable`) without a redesign.
 - **One content length limit for every channel.** Real platforms differ wildly (Twitter-style short-form vs a
   long-form post); this project uses a single `MAX_CONTENT_LENGTH` for all channels, not a per-channel limit.
 - **`tick()` is polled.** How quickly a due post actually dispatches depends on how often the caller calls
